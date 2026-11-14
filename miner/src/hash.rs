@@ -50,6 +50,10 @@ pub(crate) const DOM_REBIND: u32 = 15;
 pub(crate) const DOM_COVERED: u32 = 16;
 /// The signers of a threshold, as the block circuit hashes them.
 pub(crate) const DOM_SIGNERS: u32 = 17;
+/// A block's body: its commitment in the header ([`crate::block`]).
+pub(crate) const DOM_BLOCK_BODY: u32 = 0x12;
+/// A block's proof bytes, as the body's commitment takes them.
+pub(crate) const DOM_BLOCK_PROOF: u32 = 0x13;
 
 /// Every tag above.
 const DOMAINS: &[u32] = &[
@@ -67,6 +71,8 @@ const DOMAINS: &[u32] = &[
     DOM_REBIND,
     DOM_COVERED,
     DOM_SIGNERS,
+    DOM_BLOCK_BODY,
+    DOM_BLOCK_PROOF,
 ];
 
 // No two domains share a tag.

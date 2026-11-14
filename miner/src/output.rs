@@ -198,6 +198,11 @@ impl Output {
         Output::with_memo(key_hash, amount, EMPTY_MEMO)
     }
 
+    /// The part a block lists: the commitment, the memo and the amount.
+    pub fn block_output(&self) -> BlockOutput {
+        BlockOutput { commitment: self.commitment, memo: self.memo, amount: self.amount }
+    }
+
     /// Its memo slot ([`memo_slot`]).
     pub fn slot(&self) -> Digest {
         memo_slot(&self.memo, self.amount)
@@ -233,6 +238,52 @@ impl Output {
         let (amount, rest) = read_u64(rest)?;
         let memo = memo_from_bytes(rest)?;
         Some(Output::with_memo(&key_hash, amount, memo))
+    }
+}
+
+/// Serialized size of a [`BlockOutput`]: commitment, memo and amount.
+pub const BLOCK_OUTPUT_SIZE: usize = DIGEST_BYTES + MEMO_BYTES + 8;
+
+/// An output as a block lists it: what of an [`Output`] goes on chain.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct BlockOutput {
+    pub commitment: Commitment,
+    pub memo: Memo,
+    /// Public: every node sums these to check the supply, and the proof
+    /// binds it to the amount the commitment hides.
+    pub amount: u64,
+}
+
+impl BlockOutput {
+    /// Its memo slot: the memo and the amount, as leaves and sponges take it.
+    pub fn slot(&self) -> Digest {
+        memo_slot(&self.memo, self.amount)
+    }
+
+    /// Commitment, memo, amount.
+    pub fn to_bytes(&self) -> [u8; BLOCK_OUTPUT_SIZE] {
+        let mut out = [0u8; BLOCK_OUTPUT_SIZE];
+        out[..DIGEST_BYTES].copy_from_slice(&digest_to_bytes(&self.commitment));
+        out[DIGEST_BYTES..DIGEST_BYTES + MEMO_BYTES].copy_from_slice(&memo_to_bytes(&self.memo));
+        out[DIGEST_BYTES + MEMO_BYTES..].copy_from_slice(&self.amount.to_le_bytes());
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<BlockOutput> {
+        if bytes.len() != BLOCK_OUTPUT_SIZE {
+            return None;
+        }
+        let (commitment, rest) = read_digest(bytes)?;
+        let memo = memo_from_bytes(&rest[..MEMO_BYTES])?;
+        let (amount, _) = read_u64(&rest[MEMO_BYTES..])?;
+        Some(BlockOutput { commitment, memo, amount })
+    }
+}
+
+impl From<Commitment> for BlockOutput {
+    /// An output with an empty memo and amount zero.
+    fn from(commitment: Commitment) -> BlockOutput {
+        BlockOutput { commitment, memo: EMPTY_MEMO, amount: 0 }
     }
 }
 
@@ -520,6 +571,29 @@ mod tests {
             bad[at..at + 4].copy_from_slice(&crate::poseidon2::P.to_le_bytes());
             assert_eq!((Output::is_encoding(&bad), Output::from_bytes(&bad)), (false, None), "element at {at}");
         }
+    }
+
+    /// What a block lists of an output is its commitment, memo and amount,
+    /// and reads back from its 60 bytes.
+    #[test]
+    fn block_outputs() {
+        let out = Output::with_memo(&d(7), u64::MAX - 1, memo5(d(8)));
+        let listed = out.block_output();
+        assert_eq!((listed.commitment, listed.memo, listed.amount), (out.commitment, out.memo, out.amount));
+        assert_eq!(listed.slot(), out.slot());
+        let bytes = listed.to_bytes();
+        assert_eq!((bytes.len(), BLOCK_OUTPUT_SIZE), (60, 60));
+        assert_eq!(BlockOutput::from_bytes(&bytes), Some(listed));
+        assert_eq!(BlockOutput::from_bytes(&bytes[1..]), None);
+        for at in [0, DIGEST_BYTES - 4, DIGEST_BYTES, DIGEST_BYTES + MEMO_BYTES - 4] {
+            let mut bad = bytes;
+            bad[at..at + 4].copy_from_slice(&crate::poseidon2::P.to_le_bytes());
+            assert_eq!(BlockOutput::from_bytes(&bad), None, "element at {at}");
+        }
+        assert_eq!(BlockOutput::from(d(3)), BlockOutput { commitment: d(3), memo: EMPTY_MEMO, amount: 0 });
+        crate::test_util::fuzz_decoder("BlockOutput::from_bytes", &[bytes.to_vec()], 20_000, |b| {
+            BlockOutput::from_bytes(b).map(|o| Some(o.to_bytes().to_vec()))
+        });
     }
 
     /// The output decoder, fuzzed: no input makes it panic, and what it
