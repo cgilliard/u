@@ -1,6 +1,7 @@
 //! Helpers for tests: quiet panics, deterministic random data and a
 //! fuzzer for decoders of untrusted bytes.
 
+use crate::ext::Fp4;
 use crate::poseidon2::Fp;
 
 thread_local! {
@@ -53,6 +54,10 @@ impl Rng {
 
     pub fn fp(&mut self) -> Fp {
         Fp::from_u64(self.next_u64())
+    }
+
+    pub fn fp4(&mut self) -> Fp4 {
+        Fp4([self.fp(), self.fp(), self.fp(), self.fp()])
     }
 }
 

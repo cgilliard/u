@@ -1,10 +1,15 @@
 pub mod block;
+pub mod challenger;
 pub mod codec;
 pub mod difficulty;
+pub mod ext;
+pub mod field;
 pub mod hash;
 #[cfg(test)]
 pub mod inflate;
+pub mod merkle;
 pub mod name;
+pub mod ntt;
 pub mod output;
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 pub mod packed;
