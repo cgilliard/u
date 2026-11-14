@@ -9,4 +9,5 @@ pub mod policy;
 pub mod poseidon2;
 #[cfg(test)]
 pub(crate) mod test_util;
+pub mod transaction;
 pub mod xmss;

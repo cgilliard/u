@@ -96,7 +96,7 @@ use core::fmt;
 use crate::codec::{DIGEST_BYTES, read_digest, read_u32, read_u64};
 use crate::hash::{DomainHasher, EMPTY, hash_domain};
 use crate::hash::{DOM_COVERED, DOM_HASHLOCK, DOM_POLICY_LEAF, DOM_REBIND};
-use crate::output::{Commitment, Memo, Output, key_commitment, pubkey_hash};
+use crate::output::{Commitment, Memo, Output, OutputList, key_commitment, pubkey_hash};
 use crate::poseidon2::{DIGEST, Fp, compress, digest_from_bytes, digest_to_bytes};
 use crate::xmss::{Digest, PublicKey, Signature};
 
@@ -819,11 +819,12 @@ pub struct PolicyInputRef<'a> {
     bytes: &'a [u8],
 }
 
-/// The run of `outputs` a spend covers, start and count; `None` if it runs
-/// past them.
-fn covered_run(covered: (u8, u8), outputs: &[Output]) -> Option<&[Output]> {
-    let (start, count) = (covered.0 as usize, covered.1 as usize);
-    outputs.get(start..start.checked_add(count)?)
+/// The run of `outputs` a spend covers, start and count, as their indexes;
+/// `None` if it runs past them.
+fn covered_run(covered: (u8, u8), outputs: &(impl OutputList + ?Sized)) -> Option<core::ops::Range<usize>> {
+    let start = covered.0 as usize;
+    let end = start + covered.1 as usize;
+    (end <= outputs.len()).then_some(start..end)
 }
 
 impl<'a> PolicyInputRef<'a> {
@@ -944,18 +945,25 @@ impl<'a> PolicyInputRef<'a> {
     /// Whether the leaf is satisfied: `body` is the transaction's body hash,
     /// `outputs` its outputs, `height` the block's and `created` the spent
     /// output's creation height. Allocates nothing.
-    pub fn check(&self, body: &Digest, outputs: &[Output], height: u32, created: u32) -> Result<(), PolicyError> {
+    pub fn check(
+        &self,
+        body: &Digest,
+        outputs: &(impl OutputList + ?Sized),
+        height: u32,
+        created: u32,
+    ) -> Result<(), PolicyError> {
         if !self.leaf.valid() {
             return Err(PolicyError::Malformed);
         }
         let run = covered_run(self.covered, outputs).ok_or(PolicyError::Covered)?;
+        let covered = || run.clone().map(|i| outputs.pair(i));
         for (cond, witness) in self.witnesses() {
             match (cond, witness) {
                 (CondRef::Thresh { mode, m, keys }, WitnessRef::Signatures(signers)) => {
                     let msg = match mode {
                         Mode::Body => *body,
                         Mode::Rebindable { channel } => {
-                            rebind_message_from(&channel, self.state, &covered_digest_outputs(run))
+                            rebind_message_from(&channel, self.state, &covered_digest_of(run.len(), covered()))
                         }
                     };
                     let mut seen = [false; MAX_KEYS];
@@ -999,8 +1007,7 @@ impl<'a> PolicyInputRef<'a> {
                     }
                 }
                 (CondRef::Outputs(list), WitnessRef::None) => {
-                    let same = list.len() == run.len()
-                        && list.iter().zip(run).all(|((c, m), o)| c == o.commitment && m == o.slot());
+                    let same = list.len() == run.len() && list.iter().eq(covered());
                     if !same {
                         return Err(PolicyError::Covenant);
                     }
@@ -1342,7 +1349,7 @@ impl PolicyInput {
 
     /// The outputs a rebindable signature of this input covers.
     pub fn covered_outputs(&self, outputs: &[Output]) -> Option<Vec<(Commitment, Digest)>> {
-        Some(covered_run(self.covered, outputs)?.iter().map(|o| (o.commitment, o.slot())).collect())
+        Some(covered_run(self.covered, outputs)?.map(|i| outputs.pair(i)).collect())
     }
 
     /// Whether each condition has a witness of its kind.

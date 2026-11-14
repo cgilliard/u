@@ -25,6 +25,9 @@ pub(crate) const DOM_PUBKEY: u32 = 1;
 /// `H(key hash || amount)`: an output's commitment
 /// ([`crate::output::key_commitment`]).
 pub(crate) const DOM_COMMITMENT: u32 = 2;
+/// A transaction's body: what its inputs sign, and its id
+/// ([`crate::transaction`]).
+pub(crate) const DOM_BODY: u32 = 3;
 /// A name: its characters as elements ([`crate::name`]).
 pub(crate) const DOM_NAME: u32 = 5;
 /// A name's record: what its trie leaf holds.
@@ -52,6 +55,7 @@ pub(crate) const DOM_SIGNERS: u32 = 17;
 const DOMAINS: &[u32] = &[
     DOM_PUBKEY,
     DOM_COMMITMENT,
+    DOM_BODY,
     DOM_NAME,
     DOM_RECORD,
     DOM_COMMIT,

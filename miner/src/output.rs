@@ -217,6 +217,14 @@ impl Output {
         out
     }
 
+    /// Whether `bytes` are an output's encoding: [`Output::from_bytes`]
+    /// would read them. Does not compute the commitment.
+    pub fn is_encoding(bytes: &[u8]) -> bool {
+        bytes.len() == OUTPUT_SIZE
+            && read_digest(bytes).is_some()
+            && memo_from_bytes(&bytes[DIGEST_BYTES + 8..]).is_some()
+    }
+
     pub fn from_bytes(bytes: &[u8]) -> Option<Output> {
         if bytes.len() != OUTPUT_SIZE {
             return None;
@@ -225,6 +233,50 @@ impl Output {
         let (amount, rest) = read_u64(rest)?;
         let memo = memo_from_bytes(rest)?;
         Some(Output::with_memo(&key_hash, amount, memo))
+    }
+}
+
+/// A transaction's outputs as a spend's check reads them: how many there
+/// are, and each one's commitment and memo slot. A slice of outputs is
+/// one; so is a transaction's encoding, read where it lies.
+pub trait OutputList {
+    fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The commitment and the memo slot of output `i`. Panics past the end.
+    fn pair(&self, i: usize) -> (Commitment, Digest);
+}
+
+impl OutputList for [Output] {
+    fn len(&self) -> usize {
+        <[Output]>::len(self)
+    }
+
+    fn pair(&self, i: usize) -> (Commitment, Digest) {
+        (self[i].commitment, self[i].slot())
+    }
+}
+
+impl OutputList for Vec<Output> {
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+
+    fn pair(&self, i: usize) -> (Commitment, Digest) {
+        self.as_slice().pair(i)
+    }
+}
+
+impl<const N: usize> OutputList for [Output; N] {
+    fn len(&self) -> usize {
+        N
+    }
+
+    fn pair(&self, i: usize) -> (Commitment, Digest) {
+        self.as_slice().pair(i)
     }
 }
 
@@ -443,6 +495,31 @@ mod tests {
         assert_ne!(leaf0, output_leaf(&c, &memo5(d(4)), 5, 9));
         assert_ne!(leaf0, output_leaf(&c, &memo, 6, 9));
         assert_ne!(leaf0, output_leaf(&c, &memo, 5, 10));
+    }
+
+    /// A list of outputs gives each one's commitment and slot, whether a
+    /// slice, a vector or an array; `is_encoding` says what `from_bytes` reads.
+    #[test]
+    fn output_lists_and_encodings() {
+        let outs = [Output::with_memo(&d(1), 5, memo5(d(2))), Output::with_memo(&d(3), 6, memo5(d(4)))];
+        fn check(list: &(impl OutputList + ?Sized), outs: &[Output]) {
+            assert_eq!((list.len(), list.is_empty()), (outs.len(), outs.is_empty()));
+            for (i, o) in outs.iter().enumerate() {
+                assert_eq!(list.pair(i), (o.commitment, o.slot()));
+            }
+        }
+        check(&outs, &outs);
+        check(&outs[..], &outs);
+        check(&outs.to_vec(), &outs);
+        check(&outs[..0], &[]);
+        let bytes = outs[0].to_bytes();
+        assert!(Output::is_encoding(&bytes));
+        assert!(!Output::is_encoding(&bytes[1..]) && !Output::is_encoding(&[&bytes[..], &[0]].concat()));
+        for at in [0, DIGEST_BYTES - 4, DIGEST_BYTES + 8, OUTPUT_SIZE - 4] {
+            let mut bad = bytes;
+            bad[at..at + 4].copy_from_slice(&crate::poseidon2::P.to_le_bytes());
+            assert_eq!((Output::is_encoding(&bad), Output::from_bytes(&bad)), (false, None), "element at {at}");
+        }
     }
 
     /// The output decoder, fuzzed: no input makes it panic, and what it
