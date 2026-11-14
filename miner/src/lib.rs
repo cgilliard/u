@@ -2,6 +2,7 @@ pub mod block;
 pub mod challenger;
 pub mod codec;
 pub mod difficulty;
+pub mod expr;
 pub mod ext;
 pub mod field;
 pub mod fri;
@@ -18,6 +19,8 @@ pub mod parallel;
 pub mod policy;
 pub mod poseidon2;
 pub mod pow;
+pub mod random;
+pub mod stark;
 #[cfg(test)]
 pub(crate) mod test_util;
 pub mod transaction;
