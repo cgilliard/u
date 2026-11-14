@@ -1,4 +1,5 @@
 pub mod codec;
+pub mod difficulty;
 pub mod hash;
 pub mod name;
 pub mod output;
@@ -10,4 +11,5 @@ pub mod poseidon2;
 #[cfg(test)]
 pub(crate) mod test_util;
 pub mod transaction;
+pub mod u256;
 pub mod xmss;
