@@ -566,13 +566,8 @@ impl SecretKey {
         let n = 1usize << h;
         // The one buffer a key holds on the heap: `2^(height + 1)` digests.
         let mut tree = vec![[Fp::ZERO; DIGEST]; 2 * n];
-        // The leaves, computed in place: a run of at least 2^8 per thread.
-        let run = n.div_ceil(crate::parallel::threads()).max(1 << 8);
-        crate::parallel::par_chunks_mut(&mut tree[n..], run, |k, leaves| {
-            for (i, leaf) in leaves.iter_mut().enumerate() {
-                *leaf = wots_leaf(&pub_seed, &sk_seed, (k * run + i) as u64);
-            }
-        });
+        // The leaves, computed in place: at least 2^8 to a thread.
+        crate::parallel::par_fill_min(&mut tree[n..], 1 << 8, |i| wots_leaf(&pub_seed, &sk_seed, i as u64));
         for level in 1..=h {
             let start = 1usize << (h - level);
             for pos in start..2 * start {

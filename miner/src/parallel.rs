@@ -85,26 +85,59 @@ pub fn par_map_with<S, T: Send, I: Fn() -> S + Sync, F: Fn(&mut S, usize) -> T +
     out
 }
 
+/// Sets `out[i] = f(i)` for every `i`, in parallel: [`par_map`] into a
+/// buffer the caller holds, so the results are computed where they stay
+/// and nothing is allocated for them.
+pub fn par_fill<T: Send, F: Fn(usize) -> T + Sync>(out: &mut [T], f: F) {
+    par_fill_min(out, MIN_PARALLEL, f)
+}
+
+/// As [`par_fill`], but with an explicit serial threshold: parallel only
+/// when at least `min_per_thread` items fall to each thread.
+pub fn par_fill_min<T: Send, F: Fn(usize) -> T + Sync>(out: &mut [T], min_per_thread: usize, f: F) {
+    let n = out.len();
+    let t = threads().min(n / min_per_thread.max(1)).max(1);
+    if t <= 1 {
+        for (i, x) in out.iter_mut().enumerate() {
+            *x = f(i);
+        }
+        return;
+    }
+    // One contiguous run of `per` items per thread, the last one shorter.
+    let per = n.div_ceil(t);
+    let f = &f;
+    std::thread::scope(|s| {
+        for (k, run) in out.chunks_mut(per).enumerate() {
+            s.spawn(move || {
+                for (i, x) in run.iter_mut().enumerate() {
+                    *x = f(k * per + i);
+                }
+            });
+        }
+    });
+}
+
 /// Runs `f(chunk_index, chunk)` over `data.chunks_mut(chunk)` in parallel.
+/// Each thread takes a contiguous run of whole chunks; no list of the
+/// chunks is made, so the cost does not grow with their number.
 pub fn par_chunks_mut<T: Send, F: Fn(usize, &mut [T]) + Sync>(data: &mut [T], chunk: usize, f: F) {
     assert!(chunk > 0);
-    let chunks: Vec<(usize, &mut [T])> = data.chunks_mut(chunk).enumerate().collect();
-    let n = chunks.len();
-    let ranges = ranges(n, 1);
-    if ranges.len() <= 1 {
-        for (i, c) in chunks {
+    let n = data.len().div_ceil(chunk);
+    let t = threads().min(n).max(1);
+    if t <= 1 {
+        for (i, c) in data.chunks_mut(chunk).enumerate() {
             f(i, c);
         }
         return;
     }
+    // `per` chunks per thread, the last thread's run shorter.
+    let per = n.div_ceil(t);
     let f = &f;
-    let mut chunks = chunks.into_iter();
     std::thread::scope(|s| {
-        for r in ranges {
-            let mine: Vec<(usize, &mut [T])> = chunks.by_ref().take(r.len()).collect();
+        for (k, run) in data.chunks_mut(per * chunk).enumerate() {
             s.spawn(move || {
-                for (i, c) in mine {
-                    f(i, c);
+                for (i, c) in run.chunks_mut(chunk).enumerate() {
+                    f(k * per + i, c);
                 }
             });
         }
@@ -146,6 +179,46 @@ mod tests {
         }
     }
 
+    /// `par_fill` sets every item to `f` of its index, below the serial
+    /// threshold and above it, as `par_map` would return them.
+    #[test]
+    fn par_fill_matches_serial() {
+        for n in [0, 1, 5, MIN_PARALLEL - 1, MIN_PARALLEL, 4 * MIN_PARALLEL + 3, 100_003] {
+            let want: Vec<usize> = (0..n).map(|i| 3 * i + 1).collect();
+            let mut got = vec![usize::MAX; n];
+            par_fill(&mut got, |i| 3 * i + 1);
+            assert_eq!(got, want, "par_fill of {n}");
+            for min in [1, 7, n.max(1)] {
+                let mut got = vec![usize::MAX; n];
+                par_fill_min(&mut got, min, |i| 3 * i + 1);
+                assert_eq!(got, want, "par_fill_min of {n}, at least {min} a thread");
+            }
+        }
+    }
+
+    /// Every chunk is seen once, whole, under its own index: for lengths
+    /// that the chunk size divides and that it does not, chunks of one
+    /// item, and a chunk longer than the data.
+    #[test]
+    fn par_chunks_mut_gives_each_chunk_its_index() {
+        for len in [0usize, 1, 7, 100, 4096, 10_007] {
+            for chunk in [1usize, 3, 64, 100, 10_007, 20_000] {
+                let mut v = vec![0usize; len];
+                let seen = AtomicUsize::new(0);
+                par_chunks_mut(&mut v, chunk, |k, c| {
+                    seen.fetch_add(1, Ordering::Relaxed);
+                    let whole = (k + 1) * chunk <= len;
+                    assert_eq!(c.len(), if whole { chunk } else { len - k * chunk }, "chunk {k} of {len} by {chunk}");
+                    for (j, x) in c.iter_mut().enumerate() {
+                        *x += k * chunk + j + 1;
+                    }
+                });
+                assert_eq!(seen.load(Ordering::Relaxed), len.div_ceil(chunk), "{len} by {chunk}");
+                assert!(v.iter().enumerate().all(|(i, x)| *x == i + 1), "{len} by {chunk}");
+            }
+        }
+    }
+
     /// A panic in a worker reaches the caller: none is lost, whichever
     /// thread it happens on.
     #[test]
@@ -158,6 +231,11 @@ mod tests {
                 assert!(
                     catch_unwind(AssertUnwindSafe(|| par_map_with(n, || (), |_, i| hit(i)))).is_err(),
                     "par_map_with {n} at {at}"
+                );
+                let mut filled = vec![0usize; n];
+                assert!(
+                    catch_unwind(AssertUnwindSafe(|| par_fill_min(&mut filled, 1, hit))).is_err(),
+                    "par_fill_min {n} at {at}"
                 );
                 let mut v = vec![0usize; n];
                 let chunked = catch_unwind(AssertUnwindSafe(|| {
