@@ -22,6 +22,7 @@ BENCHES=(
     poseidon2::bench::permutation_throughput
     poseidon2::batch_tests::batch_throughput
     poseidon2::speed::compress_speed
+    pow::tests::mainnet_timing
 )
 
 out=target/bench

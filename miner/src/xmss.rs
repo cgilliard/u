@@ -43,7 +43,7 @@ use core::fmt;
 use core::ops::{Deref, DerefMut};
 
 pub use crate::codec::DIGEST_BYTES;
-use crate::codec::{FP_BYTES, read_fps, write_fps};
+use crate::codec::{FP_BYTES, pack3, read_fps, write_fps};
 pub use crate::hash::Digest;
 use crate::poseidon2::{DIGEST, Fp, WIDTH, permute_in_place};
 
@@ -162,16 +162,6 @@ impl Sponge {
         }
         self.state[..DIGEST].try_into().unwrap()
     }
-}
-
-/// Packs up to three bytes (24 bits) into a field element, little-endian;
-/// fewer than three are zero padded.
-fn pack3(bytes: &[u8]) -> Fp {
-    let mut v = 0u32;
-    for (i, b) in bytes.iter().enumerate() {
-        v |= (*b as u32) << (8 * i);
-    }
-    Fp::new(v)
 }
 
 // ---------------------------------------------------------------------------

@@ -74,6 +74,8 @@ jobs:
   # The same tests in a release build: the optimized code a node runs,
   # without debug assertions or overflow checks. The fuzzers of the
   # decoders are quick here, so they run ten times their usual iterations.
+  # Built with the dev feature, which no other job builds: the dev
+  # networks' dataset in the binary, and the test that it is the right one.
   test-release:
     name: test (ubuntu-latest, release)
     runs-on: ubuntu-latest
@@ -93,7 +95,7 @@ jobs:
           rustc --version
 
       - name: Test
-        run: cargo test --locked --release
+        run: cargo test --locked --release --features dev
 
   # Code coverage of the tests, with the toolchain's own LLVM tools
   # (miner/tools/coverage.sh, which runs the same locally). The table is

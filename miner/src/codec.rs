@@ -11,6 +11,22 @@ pub const FP_BYTES: usize = 4;
 /// Serialized size of a digest.
 pub const DIGEST_BYTES: usize = DIGEST * FP_BYTES;
 
+/// Packs up to three bytes (24 bits) into a field element, little-endian;
+/// fewer than three are zero padded.
+pub fn pack3(bytes: &[u8]) -> Fp {
+    let mut v = 0u32;
+    for (i, b) in bytes.iter().enumerate() {
+        v |= (*b as u32) << (8 * i);
+    }
+    Fp::new(v)
+}
+
+/// The elements `bytes` pack into, three bytes each ([`pack3`]), the last
+/// zero padded: `bytes.len().div_ceil(3)` of them, made as they are read.
+pub fn packed(bytes: &[u8]) -> impl ExactSizeIterator<Item = Fp> + '_ {
+    bytes.chunks(3).map(pack3)
+}
+
 /// Serialized size of an output's position where blocks carry one: six
 /// bytes, for positions below `2^48`. The chain holds `2^41` outputs at
 /// most ([`crate::output::OUTPUT_CAPACITY`]), which five bytes fall short of.
@@ -91,6 +107,13 @@ mod tests {
         buf[4..8].copy_from_slice(&P.to_le_bytes());
         assert_eq!(read_fps::<3>(&buf), None);
         assert_eq!(read_fps::<1>(&buf), Some(([fps[0]], &buf[4..])));
+        // Three bytes to an element, little-endian, the last zero padded.
+        assert_eq!(pack3(&[1, 2, 3]).to_canonical(), 0x03_0201);
+        assert_eq!(pack3(&[0xff, 0xff, 0xff]).to_canonical(), 0xff_ffff);
+        assert_eq!((pack3(&[7]).to_canonical(), pack3(&[]).to_canonical()), (7, 0));
+        let seven: Vec<u32> = packed(&bytes[..7]).map(|x| x.to_canonical()).collect();
+        assert_eq!(seven, [0x03_0201, 0x06_0504, 0x07]);
+        assert_eq!((packed(&bytes[..7]).len(), packed(&bytes[..6]).len(), packed(&[]).len()), (3, 2, 0));
         // Positions: six bytes, the largest that fits and the first that does not.
         let most = (1u64 << 48) - 1;
         for position in [0, 1, crate::output::OUTPUT_CAPACITY - 1, crate::output::OUTPUT_CAPACITY, most] {
