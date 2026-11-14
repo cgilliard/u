@@ -1,18 +1,21 @@
 //! The prover.
 
+use super::air::{Air, DynAir, Scratch, Trace, evaluate_into, measure_degree_dyn, shape};
+use super::config::{
+    Constrained, StarkConfig, ZK_AUX, ZK_COLS, grinding_of, kept_stride, lookup_columns, num_constraints_lookup,
+    quotient_point, table_degree,
+};
+use super::deep::{Deep, coset_points, observe_setup, sample_coefficients, table_shift};
+use super::lookup::{LookupArgs, LookupChallenges, combine, eval_ext_poly_at, powers};
+use super::proof::{Proof, QueryOpening, TableProof};
 use crate::challenger::Challenger;
 use crate::ext::{DEGREE, Fp4, as_fp4};
-use crate::field::{Field, batch_inverse};
+use crate::field::{Field, batch_inverse, batch_inverse_into};
 use crate::fri::{self};
 use crate::merkle::{Digest, MerkleTree};
 use crate::ntt::{MULTIPLICATIVE_GENERATOR, coset_evals, coset_intt_ext, intt, lde_cosets, log2_strict, root_of_unity};
 use crate::parallel::{par_chunks_mut, par_map, par_map_min, par_map_with};
 use crate::poseidon2::{Fp, zeroed_vec};
-use super::air::*;
-use super::config::*;
-use super::lookup::*;
-use super::proof::*;
-use super::deep::*;
 
 /// Randomness for zero-knowledge proofs: Poseidon2 in counter mode, with
 /// feed-forward, under a key from the operating system.
@@ -250,7 +253,12 @@ pub(super) fn zk_domain(k: usize, purpose: u32) -> u32 {
 /// blinding rows, then random rows, with [`ZK_COLS`] random columns
 /// appended. Row 0 of a table's `v` repeats the `u` of the previous table
 /// with lookups (cyclically), so the blinding messages cancel.
-pub(super) fn blind_traces(config: &StarkConfig, tables: &[TableInput<'_>], shapes: &[(usize, usize)], rng: &Rng) -> Vec<Trace> {
+pub(super) fn blind_traces(
+    config: &StarkConfig,
+    tables: &[TableInput<'_>],
+    shapes: &[(usize, usize)],
+    rng: &Rng,
+) -> Vec<Trace> {
     let blind = config.blind_rows();
     let mut out: Vec<Trace> = tables
         .iter()
@@ -322,7 +330,10 @@ impl Committed {
         let n = coeffs[0].len();
         let b = 1usize << log_blowup;
         let w_big = root_of_unity(log2_strict(n) + log_blowup);
-        let mut leaves: Vec<Digest> = vec![[Fp::ZERO; crate::poseidon2::DIGEST]; n * b];
+        // Room for the whole tree: the leaves' buffer becomes it, where it is.
+        let mut leaves: Vec<Digest> = Vec::with_capacity(2 * n * b - 1);
+        leaves.resize(n * b, [Fp::ZERO; crate::poseidon2::DIGEST]);
+        let mut hashes: Vec<Digest> = vec![[Fp::ZERO; crate::poseidon2::DIGEST]; n];
         let mut kept = Vec::new();
         let mut rows = zeroed_vec(n * width);
         let mut s_j = shift;
@@ -337,8 +348,9 @@ impl Committed {
                 }
             });
             drop(cols);
-            for (m, h) in crate::merkle::leaf_hashes(&rows, width).into_iter().enumerate() {
-                leaves[j + b * m] = h;
+            crate::merkle::leaf_hashes_into(&rows, width, &mut hashes);
+            for (m, h) in hashes.iter().enumerate() {
+                leaves[j + b * m] = *h;
             }
             if stride.is_some_and(|s| j.is_multiple_of(s)) {
                 kept.push(std::mem::replace(&mut rows, zeroed_vec(n * width)));
@@ -793,14 +805,6 @@ pub fn try_prove_tables(
         offset += deep.len();
         let log_m = t.log_n + log_blowup;
         let zeta_q = quotient_point(config, zeta, q.chunks);
-        let xs = coset_points(t.shift, log_m);
-        let mut denoms: Vec<Fp4> = Vec::with_capacity(2 * xs.len());
-        for x in &xs {
-            let xe = Fp4::from_base(*x);
-            denoms.push((xe - zeta) * (xe - zeta_next));
-            denoms.push(xe - zeta_q);
-        }
-        let inv = par_batch_inverse(&denoms);
         // The combination on coefficients, extended once per component.
         let no_coeffs: Vec<Vec<Fp>> = Vec::new();
         let aux_coeffs = t.aux.as_ref().map_or(&no_coeffs, |(c, _)| &c.coeffs);
@@ -812,12 +816,35 @@ pub fn try_prove_tables(
         });
         drop(polys);
         let (n, b) = (1usize << t.log_n, 1usize << log_blowup);
-        let reduced: Vec<Fp4> = par_map(xs.len(), |i| {
-            let e = (i % b) * n + i / b;
-            let v = |p: usize| Fp4(core::array::from_fn(|k| ext[p * DEGREE + k][e]));
-            let [line, c_q] = deep.constants(xs[i]);
-            (v(0) - line) * inv[2 * i] + (v(1) - c_q) * inv[2 * i + 1]
+        // The combination at each point `x_i = shift * omega^i`, less its
+        // constants and over its denominators `(x - zeta)(x - g zeta)` and
+        // `x - zeta_q`. The points and the denominators' inverses are made
+        // a run of points at a time, where they are used: no table of
+        // either over the domain.
+        const RUN: usize = 1 << 10;
+        let omega = root_of_unity(log_m);
+        let mut reduced = vec![Fp4::ZERO; 1usize << log_m];
+        par_chunks_mut(&mut reduced, RUN, |c, out| {
+            let start = c * RUN;
+            let (mut xs, mut denoms, mut inv) = ([Fp::ZERO; RUN], [Fp4::ZERO; 2 * RUN], [Fp4::ZERO; 2 * RUN]);
+            let mut x = t.shift.mul(&omega.pow(start as u64));
+            for k in 0..out.len() {
+                xs[k] = x;
+                let xe = Fp4::from_base(x);
+                denoms[2 * k] = (xe - zeta) * (xe - zeta_next);
+                denoms[2 * k + 1] = xe - zeta_q;
+                x = x.mul(&omega);
+            }
+            batch_inverse_into(&denoms[..2 * out.len()], &mut inv[..2 * out.len()]);
+            for (k, o) in out.iter_mut().enumerate() {
+                let i = start + k;
+                let e = (i % b) * n + i / b;
+                let v = |p: usize| Fp4(core::array::from_fn(|d| ext[p * DEGREE + d][e]));
+                let [line, c_q] = deep.constants(xs[k]);
+                *o = (v(0) - line) * inv[2 * k] + (v(1) - c_q) * inv[2 * k + 1];
+            }
         });
+        drop(ext);
         if input_log_sizes.last() == Some(&log_m) {
             let last = inputs.last_mut().unwrap();
             for (a, b) in last.iter_mut().zip(&reduced) {

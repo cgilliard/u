@@ -3,11 +3,11 @@
 //! code for the prover, on the evaluation domain, and for the verifier, at
 //! the out-of-domain point.
 
+use super::air::LookupTerm;
+use super::config::BLIND_TAG;
 use crate::challenger::Challenger;
 use crate::ext::{DEGREE, Fp4};
 use crate::field::Field;
-use super::air::*;
-use super::config::*;
 
 /// Lookup challenges, with the powers of `delta` that denominators use.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,19 +55,6 @@ impl LookupChallenges {
         }
         acc
     }
-}
-
-/// Auxiliary extension columns for `terms` lookup terms summed `group` at
-/// a time: one per group and the running sum.
-pub(crate) fn lookup_columns(terms: usize, group: usize) -> usize {
-    if terms == 0 { 0 } else { terms.div_ceil(group) + 1 }
-}
-
-/// Number of lookup constraints for `terms` lookup terms in groups of
-/// `group`: one per group plus the running-sum transition and its two
-/// boundary checks.
-pub(crate) fn num_lookup_constraints(terms: usize, group: usize) -> usize {
-    if terms == 0 { 0 } else { terms.div_ceil(group) + 3 }
 }
 
 /// Lookup settings of a table for [`combine`]: challenges, the table's

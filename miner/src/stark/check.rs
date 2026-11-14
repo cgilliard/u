@@ -1,11 +1,11 @@
 //! A trace checked against its AIR directly, row by row: a debugging aid
 //! for AIR authors, which names the constraint that fails.
 
+use super::air::{Air, Builder, DynAir, Trace};
+use super::lookup::LookupChallenges;
 use crate::ext::Fp4;
 use crate::field::Field;
 use crate::poseidon2::Fp;
-use super::air::*;
-use super::lookup::*;
 
 /// Evaluates every constraint on every row pair of `trace` with the
 /// selectors as plain 0/1 flags and reports the first violation as

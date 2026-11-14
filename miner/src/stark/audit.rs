@@ -5,13 +5,13 @@
 //! Some of these have no caller yet: the circuits' tests are theirs.
 #![allow(dead_code)]
 
+use super::air::{Builder, DynAir, Trace};
+use super::check::check_tables;
+use super::lookup::LookupChallenges;
+use super::proof::Proof;
 use crate::ext::Fp4;
 use crate::field::Field;
 use crate::poseidon2::Fp;
-use super::air::*;
-use super::lookup::*;
-use super::check::*;
-use super::proof::*;
 
 /// Tests: what one row pair of a table gives: whether every constraint
 /// holds there (else the label of the first that fails) and its lookup

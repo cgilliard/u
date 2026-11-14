@@ -1,19 +1,18 @@
 //! The proof system's tests: small AIRs proved and verified, tampered
 //! with, and audited.
 
+use super::air::{Air, Builder, DynAir, Trace, measure_degree};
+use super::audit::{freedom_audit, mutation_audit};
+use super::check::{check_constraints, check_tables};
+use super::config::{StarkConfig, ZK_COLS, grinding_of, log_quotient_degree};
+use super::proof::{Proof, VerifyError};
+use super::prove::{TableInput, prove, prove_tables};
+use super::verify::{TableSpec, verify, verify_bytes, verify_tables};
 use crate::challenger::Challenger;
 use crate::ext::Fp4;
 use crate::field::Field;
 use crate::fri::FriError;
 use crate::poseidon2::Fp;
-use super::air::*;
-use super::audit::*;
-use super::check::*;
-use super::config::*;
-use super::proof::*;
-use super::prove::*;
-use super::verify::*;
-
 
 /// Fibonacci: columns (a, b); next = (b, a + b); a_0 = 0, b_0 = 1;
 /// last b equals the public value. Max degree 2 (selector + column).
@@ -164,10 +163,7 @@ fn fibonacci_roundtrip() {
         assert_eq!(verify(&CONFIG, &Fibonacci, &public, &proof, &mut transcript()), Ok(()), "log_n={log_n}");
         // Wrong public value fails the constraint identity.
         let bad = vec![public[0] + Fp::ONE];
-        assert_eq!(
-            verify(&CONFIG, &Fibonacci, &bad, &proof, &mut transcript()),
-            Err(VerifyError::ConstraintIdentity)
-        );
+        assert_eq!(verify(&CONFIG, &Fibonacci, &bad, &proof, &mut transcript()), Err(VerifyError::ConstraintIdentity));
     }
 }
 
@@ -344,10 +340,7 @@ fn rom_lookup_roundtrip() {
     assert!(verify(&CONFIG, &RomAir, &[], &p, &mut transcript()).is_err());
     let mut p = proof.clone();
     p.openings[0][0].aux_row[0] += Fp::ONE;
-    assert_eq!(
-        verify(&CONFIG, &RomAir, &[], &p, &mut transcript()),
-        Err(VerifyError::InvalidAuxOpening { table: 0 })
-    );
+    assert_eq!(verify(&CONFIG, &RomAir, &[], &p, &mut transcript()), Err(VerifyError::InvalidAuxOpening { table: 0 }));
 }
 
 /// [`RomAir`] with its two lookup terms summed in one column.
@@ -533,10 +526,8 @@ fn zk_exchange(mults: [u32; 4]) -> (Trace, Trace) {
 fn zero_knowledge_tables() {
     let real = 128 - ZK.blind_rows();
     let (send, recv) = zk_exchange([real as u32 / 4; 4]);
-    let tables = [
-        TableInput { air: &Sender, trace: &send, pre: None },
-        TableInput { air: &Receiver, trace: &recv, pre: None },
-    ];
+    let tables =
+        [TableInput { air: &Sender, trace: &send, pre: None }, TableInput { air: &Receiver, trace: &recv, pre: None }];
     let specs = [TableSpec { air: &Sender, pre_root: None }, TableSpec { air: &Receiver, pre_root: None }];
     let proof = prove_tables(&ZK, &tables, &[], &mut transcript());
     assert_eq!(verify_tables(&ZK, &specs, &[], &proof, &mut transcript()), Ok(()));
@@ -725,8 +716,20 @@ fn the_byte_verifier_accepts_a_proof_and_nothing_near_it() {
             &public,
             prove(&grinding, &Fibonacci, &fib, &public, &mut transcript()),
         ),
-        ("rom", CONFIG, vec![TableSpec { air: &RomAir, pre_root: None }], &[], prove(&CONFIG, &RomAir, &rom, &[], &mut transcript())),
-        ("exchange", CONFIG, exchange_specs.to_vec(), &[], prove_tables(&CONFIG, &exchange_inputs, &[], &mut transcript())),
+        (
+            "rom",
+            CONFIG,
+            vec![TableSpec { air: &RomAir, pre_root: None }],
+            &[],
+            prove(&CONFIG, &RomAir, &rom, &[], &mut transcript()),
+        ),
+        (
+            "exchange",
+            CONFIG,
+            exchange_specs.to_vec(),
+            &[],
+            prove_tables(&CONFIG, &exchange_inputs, &[], &mut transcript()),
+        ),
     ];
     for (name, config, specs, public, proof) in &cases {
         let bytes = proof.to_bytes();
@@ -765,7 +768,10 @@ fn the_byte_verifier_accepts_a_proof_and_nothing_near_it() {
         let mut bad = bytes.clone();
         *bad.last_mut().unwrap() ^= 1;
         assert!(
-            matches!(check(&bad), Err(VerifyError::InvalidFriOpening { .. } | VerifyError::InvalidQuotientOpening { .. })),
+            matches!(
+                check(&bad),
+                Err(VerifyError::InvalidFriOpening { .. } | VerifyError::InvalidQuotientOpening { .. })
+            ),
             "{name}: {:?}",
             check(&bad)
         );

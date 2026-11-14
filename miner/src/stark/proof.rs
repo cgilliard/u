@@ -242,8 +242,17 @@ impl Proof {
     /// A verifier reads the bytes as they are ([`super::verify_bytes`]).
     /// The whole slice must be consumed.
     pub fn from_bytes(bytes: &[u8]) -> Option<Proof> {
-        let ProofHead { tables, commitments, final_value, pow_witness, fold_witnesses, grinding, num_queries, rounds, rest } =
-            ProofHead::read(bytes)?;
+        let ProofHead {
+            tables,
+            commitments,
+            final_value,
+            pow_witness,
+            fold_witnesses,
+            grinding,
+            num_queries,
+            rounds,
+            rest,
+        } = ProofHead::read(bytes)?;
         let (nt, nq) = (tables.len(), num_queries);
         let mut r = Reader(rest);
         // Capacity from the untrusted count, but not beyond any real proof's.
@@ -371,7 +380,17 @@ impl<'a> ProofHead<'a> {
         if num_queries == 0 || rounds > 32 {
             return None;
         }
-        Some(ProofHead { tables, commitments, final_value, pow_witness, fold_witnesses, grinding, num_queries, rounds, rest: r.0 })
+        Some(ProofHead {
+            tables,
+            commitments,
+            final_value,
+            pow_witness,
+            fold_witnesses,
+            grinding,
+            num_queries,
+            rounds,
+            rest: r.0,
+        })
     }
 }
 

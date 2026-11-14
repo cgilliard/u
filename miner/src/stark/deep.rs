@@ -1,13 +1,13 @@
 //! The DEEP combination of a table's openings, which prover and verifier
 //! form alike, and the transcript's first words.
 
+use super::proof::TableProof;
 use crate::challenger::Challenger;
 use crate::ext::Fp4;
 use crate::field::Field;
 use crate::ntt::{MULTIPLICATIVE_GENERATOR, root_of_unity};
 use crate::parallel::par_chunks_mut;
 use crate::poseidon2::Fp;
-use super::proof::*;
 
 /// The coset `shift * H` of the `2^log_n`-th roots of unity, in order.
 pub(super) fn coset_points(shift: Fp, log_n: usize) -> Vec<Fp> {
@@ -79,7 +79,13 @@ impl<'a> Deep<'a> {
     /// and the chunk sum (by `x - zeta_q`), each of `n` coefficients.
     /// Evaluated at a point, less the constants of [`Deep::constants`],
     /// they give [`Deep::value`].
-    pub(super) fn polys(&self, trace: &[Vec<Fp>], aux: &[Vec<Fp>], pre: &[Vec<Fp>], quotient: &[Vec<Fp4>]) -> [Vec<Fp4>; 2] {
+    pub(super) fn polys(
+        &self,
+        trace: &[Vec<Fp>],
+        aux: &[Vec<Fp>],
+        pre: &[Vec<Fp>],
+        quotient: &[Vec<Fp4>],
+    ) -> [Vec<Fp4>; 2] {
         const CHUNK: usize = 4096;
         let n = trace[0].len();
         let r = self.coeffs;

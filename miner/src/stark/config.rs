@@ -1,13 +1,12 @@
 //! A proof's parameters, and what follows from them and a table's AIR: its
 //! quotient, its grinding, the rows its constraints hold on.
 
+use super::air::{DynAir, lookup_weight, shape};
 use crate::ext::{DEGREE, Fp4};
 use crate::field::Field;
 use crate::fri::{self, FriConfig};
 use crate::ntt::root_of_unity;
 use crate::poseidon2::Fp;
-use super::air::*;
-use super::lookup::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StarkConfig {
@@ -231,4 +230,17 @@ pub(crate) fn num_constraints_lookup(config: &StarkConfig, terms: usize, air: &d
 /// chunks, `zeta` for the contiguous chunks of a zero-knowledge proof.
 pub(super) fn quotient_point(config: &StarkConfig, zeta: Fp4, chunks: usize) -> Fp4 {
     if config.zk { zeta } else { zeta.exp(chunks as u64) }
+}
+
+/// Auxiliary extension columns for `terms` lookup terms summed `group` at
+/// a time: one per group and the running sum.
+pub(crate) fn lookup_columns(terms: usize, group: usize) -> usize {
+    if terms == 0 { 0 } else { terms.div_ceil(group) + 1 }
+}
+
+/// Number of lookup constraints for `terms` lookup terms in groups of
+/// `group`: one per group plus the running-sum transition and its two
+/// boundary checks.
+pub(crate) fn num_lookup_constraints(terms: usize, group: usize) -> usize {
+    if terms == 0 { 0 } else { terms.div_ceil(group) + 3 }
 }

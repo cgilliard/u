@@ -1,19 +1,22 @@
 //! The verifier.
 
+use super::air::{Air, DynAir, evaluate, shape};
+use super::config::{
+    BLIND_TAG, Constrained, StarkConfig, ZK_AUX, ZK_COLS, grinding_of, lookup_columns, num_constraints_lookup,
+    quotient_point, table_degree,
+};
+use super::deep::{Deep, observe_setup, sample_coefficients, table_shift};
+use super::lookup::{LookupArgs, LookupChallenges, combine, ext_from_base_openings, powers};
+use super::proof::{Proof, ProofHead, VerifyError};
 use crate::challenger::Challenger;
+use crate::codec::Reader;
 use crate::ext::{DEGREE, Fp4, as_fp4};
 use crate::field::Field;
 use crate::fri::{self};
-use crate::codec::Reader;
 use crate::hash::EMPTY;
 use crate::merkle::{Digest, batch_root, hash_row};
 use crate::ntt::{MULTIPLICATIVE_GENERATOR, root_of_unity};
 use crate::poseidon2::Fp;
-use super::air::*;
-use super::config::*;
-use super::lookup::*;
-use super::proof::*;
-use super::deep::*;
 
 pub fn verify<A: Air>(
     config: &StarkConfig,
