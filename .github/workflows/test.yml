@@ -76,3 +76,36 @@ jobs:
           name: coverage-html
           path: miner/target/coverage/html
           retention-days: 14
+
+  # The benchmarks: the timing tests marked #[ignore], built with --release
+  # (miner/tools/bench.sh, which runs the same locally). The figures are
+  # shown on the run's summary page and kept as the bench artifact. A
+  # shared runner's timings vary from run to run.
+  bench:
+    name: bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: miner
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+
+      - name: Run the benchmarks
+        run: ./tools/bench.sh
+
+      - name: Show the figures on the run's page
+        run: cat target/bench/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the figures
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench
+          path: miner/target/bench/bench.txt
+          retention-days: 90
