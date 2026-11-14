@@ -37,6 +37,16 @@ case "$host" in
     *) variants="native" ;;
 esac
 export LLVM_PROFILE_FILE="$PWD/$out/prof/%p-%m.profraw"
+
+# The tests are hash after hash, and an unoptimized, instrumented build of
+# them is many times slower than a debug build: too slow for CI's runners.
+# So this build is optimized, with debug assertions and overflow checks
+# still on (the test profile's and its dependencies'), and the decoder
+# fuzzers run a fraction of their iterations: they reach their lines in
+# the first few hundred, and the test jobs run them in full.
+export CARGO_PROFILE_TEST_OPT_LEVEL=2
+export CARGO_PROFILE_DEV_OPT_LEVEL=2
+export TABMINER_FUZZ_ITERS="${TABMINER_FUZZ_ITERS:-500}"
 objects=""
 for cpu in $variants; do
     export RUSTFLAGS="-C instrument-coverage -C target-cpu=$cpu"
