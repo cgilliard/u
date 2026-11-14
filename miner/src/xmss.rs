@@ -1,0 +1,951 @@
+//! XMSS (eXtended Merkle Signature Scheme) with WOTS+ one-time signatures,
+//! built on the Poseidon2 permutation over BabyBear from [`crate::poseidon2`].
+//!
+//! The Merkle tree height is a property of each key, 1 to [`MAX_HEIGHT`],
+//! part of its public key; a key pair of height `h` can sign `2^h`
+//! messages. Payment keys use [`PLAIN_HEIGHT`]; channel keys (see
+//! `docs/ELTOO.md`) use taller trees, one leaf per channel state.
+//!
+//! # Construction
+//!
+//! All hashing goes through one tweakable sponge, [`th`], whose 8-element
+//! capacity is initialised with the public seed, a domain tag, a 60-bit index
+//! and a small extra word. Every call site therefore has a distinct tweak:
+//!
+//! | use                        | domain          | index          | extra             |
+//! |----------------------------|-----------------|----------------|-------------------|
+//! | WOTS secret chain starts   | `DOM_WOTS_PRF`  | leaf index     | chain             |
+//! | WOTS chain steps           | `DOM_WOTS_CHAIN`| leaf index     | chain + step<<16  |
+//! | WOTS public key (leaf)     | `DOM_WOTS_PK`   | leaf index     | 0                 |
+//! | Merkle tree nodes          | `DOM_TREE`      | node index at its level, tree height in the high limb | level |
+//! | message digest             | `DOM_MSG`       | leaf index     | 0                 |
+//! | message randomizer         | `DOM_RAND`      | leaf index     | 0                 |
+//! | seed expansion             | `DOM_KEYGEN`    | 0 or 1         | 0                 |
+//!
+//! Digests are 8 BabyBear elements (248 bits). WOTS+ uses the Winternitz
+//! parameter `w = 16`. Each 31-bit element is split into eight digits: seven
+//! of four bits and a top digit of three bits, so every digit comes from a
+//! single element (which keeps the in-circuit decomposition simple). That
+//! gives 64 message chains plus 3 checksum chains. Chain steps use
+//! per-position tweaks instead of bitmasks, as in SPHINCS+.
+//!
+//! Secret chain starts are derived from a secret seed with the PRF above, so
+//! the secret key is just the two seeds plus the next unused leaf index. The
+//! [`SecretKey`] additionally caches the full tree (`2^(H+1)` digests, 32
+//! bytes each) so that signing does not recompute leaves.
+//!
+//! XMSS is stateful: a leaf must never be used twice. [`SecretKey::sign`]
+//! advances the index before producing a signature, and
+//! [`SecretKey::to_bytes`] records the index, so persist the key after each
+//! signature and never restore an older copy.
+
+use core::fmt;
+use core::ops::{Deref, DerefMut};
+
+use crate::poseidon2::{DIGEST, Fp, WIDTH, permute_in_place};
+
+/// A hash output: 8 BabyBear elements.
+pub type Digest = [Fp; DIGEST];
+
+/// Winternitz parameter.
+pub const W: usize = 16;
+/// `log2(W)`: bits of message digest consumed per chain.
+pub const LOG_W: usize = 4;
+/// Bits of a digest used for the message part of a WOTS signature.
+pub const MSG_BITS: usize = DIGEST * 31;
+/// Digits per digest element: seven 4-bit digits and one 3-bit digit.
+pub const DIGITS_PER_ELEMENT: usize = 8;
+/// Number of WOTS chains covering the message digest.
+pub const MSG_CHAINS: usize = DIGEST * DIGITS_PER_ELEMENT;
+/// Number of WOTS chains covering the checksum.
+pub const CSUM_CHAINS: usize = 3;
+/// Total number of WOTS chains.
+pub const CHAINS: usize = MSG_CHAINS + CSUM_CHAINS;
+/// Largest possible checksum: 56 four-bit digits and 8 three-bit digits.
+pub const MAX_CSUM: usize = DIGEST * 7 * (W - 1) + DIGEST * (W - 1);
+
+const _: () = assert!(31 == 7 * LOG_W + 3);
+const _: () = assert!(MAX_CSUM < 1 << (CSUM_CHAINS * LOG_W));
+const _: () = assert!(2 * DIGEST == WIDTH);
+
+/// Size in bytes of the seed accepted by [`SecretKey::generate`].
+pub const SEED_SIZE: usize = 32;
+/// Tree height of ordinary payment keys: 16 leaves.
+pub const PLAIN_HEIGHT: usize = 4;
+/// The tallest tree a key may have: a million leaves.
+pub const MAX_HEIGHT: usize = 20;
+/// Number of field elements in the public seed.
+pub const PUB_SEED_LEN: usize = 4;
+/// Serialized size of one field element.
+const FP_BYTES: usize = 4;
+/// Serialized size of a digest.
+pub const DIGEST_BYTES: usize = DIGEST * FP_BYTES;
+/// Serialized size of a [`SecretKey`]: seeds, index and height.
+pub const SECRET_KEY_SIZE: usize = (DIGEST + PUB_SEED_LEN) * FP_BYTES + 8 + 1;
+
+const DOM_WOTS_PRF: u32 = 1;
+pub(crate) const DOM_WOTS_CHAIN: u32 = 2;
+pub(crate) const DOM_WOTS_PK: u32 = 3;
+pub(crate) const DOM_TREE: u32 = 4;
+pub(crate) const DOM_MSG: u32 = 5;
+const DOM_RAND: u32 = 6;
+const DOM_KEYGEN: u32 = 7;
+
+const MASK30: u64 = (1 << 30) - 1;
+
+// ---------------------------------------------------------------------------
+// Tweakable hash
+// ---------------------------------------------------------------------------
+
+/// Tweakable sponge hash. The capacity holds `pub_seed`, `domain`, the
+/// 60-bit `index` and `extra`; `msg` is absorbed 8 elements at a time by
+/// addition into the rate with a permutation after every block (a short
+/// final block is zero padded). Returns the first 8 state elements.
+///
+/// Callers must make the (domain, index, extra, message length) combination
+/// unique per use so that zero padding is unambiguous.
+pub(crate) fn th(pub_seed: &[Fp; PUB_SEED_LEN], domain: u32, index: u64, extra: u32, msg: &[Fp]) -> Digest {
+    let mut state = th_state(pub_seed, domain, index, extra);
+    let mut absorbed = false;
+    for chunk in msg.chunks(DIGEST) {
+        for (s, x) in state.iter_mut().zip(chunk) {
+            *s = s.add(x);
+        }
+        permute_in_place(&mut state);
+        absorbed = true;
+    }
+    if !absorbed {
+        permute_in_place(&mut state);
+    }
+    state[..DIGEST].try_into().unwrap()
+}
+
+/// The state [`th`] starts from: the tweak in the capacity, an empty rate.
+fn th_state(pub_seed: &[Fp; PUB_SEED_LEN], domain: u32, index: u64, extra: u32) -> [Fp; WIDTH] {
+    debug_assert!(index >> 60 == 0, "index exceeds 60 bits");
+    let mut state = [Fp::ZERO; WIDTH];
+    state[DIGEST..DIGEST + PUB_SEED_LEN].copy_from_slice(pub_seed);
+    state[DIGEST + PUB_SEED_LEN] = Fp::new(domain);
+    // Integers are split into 30-bit limbs: the modulus is below 2^31.
+    state[DIGEST + PUB_SEED_LEN + 1] = Fp::new((index & MASK30) as u32);
+    state[DIGEST + PUB_SEED_LEN + 2] = Fp::new((index >> 30) as u32);
+    state[DIGEST + PUB_SEED_LEN + 3] = Fp::new(extra);
+    state
+}
+
+/// [`th`] over a message given in parts: the same digest as `th` over the
+/// parts joined, without a buffer to join them in.
+struct Sponge {
+    state: [Fp; WIDTH],
+    /// Elements absorbed into the current block.
+    fill: usize,
+    permuted: bool,
+}
+
+impl Sponge {
+    fn new(pub_seed: &[Fp; PUB_SEED_LEN], domain: u32, index: u64, extra: u32) -> Sponge {
+        Sponge { state: th_state(pub_seed, domain, index, extra), fill: 0, permuted: false }
+    }
+
+    fn absorb(&mut self, msg: &[Fp]) {
+        for x in msg {
+            self.state[self.fill] = self.state[self.fill].add(x);
+            self.fill += 1;
+            if self.fill == DIGEST {
+                permute_in_place(&mut self.state);
+                self.fill = 0;
+                self.permuted = true;
+            }
+        }
+    }
+
+    fn finish(mut self) -> Digest {
+        // A short final block is zero padded; an empty message is one block.
+        if self.fill > 0 || !self.permuted {
+            permute_in_place(&mut self.state);
+        }
+        self.state[..DIGEST].try_into().unwrap()
+    }
+}
+
+/// Packs up to three bytes (24 bits) into a field element, little-endian;
+/// fewer than three are zero padded.
+fn pack3(bytes: &[u8]) -> Fp {
+    let mut v = 0u32;
+    for (i, b) in bytes.iter().enumerate() {
+        v |= (*b as u32) << (8 * i);
+    }
+    Fp::new(v)
+}
+
+/// Writes `fps` to the front of `out`, four bytes each, and returns the
+/// rest of `out`.
+fn write_fps<'a>(out: &'a mut [u8], fps: &[Fp]) -> &'a mut [u8] {
+    let (head, rest) = out.split_at_mut(fps.len() * FP_BYTES);
+    for (c, x) in head.chunks_exact_mut(FP_BYTES).zip(fps) {
+        c.copy_from_slice(&x.to_le_bytes());
+    }
+    rest
+}
+
+/// Parses `N` canonical field elements from the front of `bytes`, returning
+/// them and the remaining slice. Fails on short input or non-canonical values.
+fn read_fps<const N: usize>(bytes: &[u8]) -> Option<([Fp; N], &[u8])> {
+    if bytes.len() < N * FP_BYTES {
+        return None;
+    }
+    let mut out = [Fp::ZERO; N];
+    for (i, c) in bytes[..N * FP_BYTES].chunks_exact(FP_BYTES).enumerate() {
+        out[i] = Fp::from_le_bytes(c.try_into().unwrap())?;
+    }
+    Some((out, &bytes[N * FP_BYTES..]))
+}
+
+// ---------------------------------------------------------------------------
+// WOTS+
+// ---------------------------------------------------------------------------
+
+/// Secret start of chain `chain` of the WOTS key pair at `leaf`.
+fn wots_sk(pub_seed: &[Fp; PUB_SEED_LEN], sk_seed: &Digest, leaf: u64, chain: usize) -> Digest {
+    th(pub_seed, DOM_WOTS_PRF, leaf, chain as u32, sk_seed)
+}
+
+/// Applies `steps` chain steps to `x`, starting at step `start`.
+fn chain(pub_seed: &[Fp; PUB_SEED_LEN], leaf: u64, chain: usize, x: &Digest, start: usize, steps: usize) -> Digest {
+    debug_assert!(start + steps < W);
+    let mut x = *x;
+    for step in start..start + steps {
+        x = th(pub_seed, DOM_WOTS_CHAIN, leaf, (chain as u32) | ((step as u32) << 16), &x);
+    }
+    x
+}
+
+/// Compresses the `CHAINS` chain end points into the WOTS public key, which
+/// is the Merkle leaf.
+fn wots_pk_from_ends(pub_seed: &[Fp; PUB_SEED_LEN], leaf: u64, ends: &[Digest; CHAINS]) -> Digest {
+    th(pub_seed, DOM_WOTS_PK, leaf, 0, ends.as_flattened())
+}
+
+/// Computes the WOTS public key (Merkle leaf) at `leaf` from the secret seed.
+fn wots_leaf(pub_seed: &[Fp; PUB_SEED_LEN], sk_seed: &Digest, leaf: u64) -> Digest {
+    let mut ends = [[Fp::ZERO; DIGEST]; CHAINS];
+    for (c, end) in ends.iter_mut().enumerate() {
+        let sk = wots_sk(pub_seed, sk_seed, leaf, c);
+        *end = chain(pub_seed, leaf, c, &sk, 0, W - 1);
+    }
+    wots_pk_from_ends(pub_seed, leaf, &ends)
+}
+
+/// Splits a digest into `MSG_CHAINS` digits, eight per element (bits 0..28
+/// as seven 4-bit digits, bits 28..31 as one 3-bit digit, least significant
+/// first), and appends the `CSUM_CHAINS` base-16 checksum digits of
+/// `sum(15 - digit)`.
+pub(crate) fn digits(d: &Digest) -> [u8; CHAINS] {
+    let mut out = [0u8; CHAINS];
+    for (e, x) in d.iter().enumerate() {
+        let v = x.to_canonical();
+        for k in 0..DIGITS_PER_ELEMENT {
+            out[e * DIGITS_PER_ELEMENT + k] = ((v >> (LOG_W * k)) & (W as u32 - 1)) as u8;
+        }
+    }
+    let csum: u32 = out[..MSG_CHAINS].iter().map(|&x| (W - 1) as u32 - x as u32).sum();
+    for i in 0..CSUM_CHAINS {
+        out[MSG_CHAINS + i] = ((csum >> (LOG_W * i)) & (W as u32 - 1)) as u8;
+    }
+    out
+}
+
+/// Randomized digest of a message of field elements, bound to the leaf
+/// index. The randomizer and the element count are absorbed first.
+pub(crate) fn message_digest(pub_seed: &[Fp; PUB_SEED_LEN], leaf: u64, randomizer: &Digest, msg: &[Fp]) -> Digest {
+    let mut s = Sponge::new(pub_seed, DOM_MSG, leaf, 0);
+    s.absorb(randomizer);
+    s.absorb(&[Fp::from_u64(msg.len() as u64)]);
+    s.absorb(msg);
+    s.finish()
+}
+
+/// [`message_digest`] of a byte string: of the message whose elements are
+/// the byte length followed by the bytes packed three per element
+/// ([`pack3`]), absorbed as they are packed.
+fn message_digest_bytes(pub_seed: &[Fp; PUB_SEED_LEN], leaf: u64, randomizer: &Digest, bytes: &[u8]) -> Digest {
+    let mut s = Sponge::new(pub_seed, DOM_MSG, leaf, 0);
+    s.absorb(randomizer);
+    // The message's element count, then its first element: the byte length.
+    s.absorb(&[Fp::from_u64(1 + bytes.len().div_ceil(3) as u64), Fp::from_u64(bytes.len() as u64)]);
+    for c in bytes.chunks(3) {
+        s.absorb(&[pack3(c)]);
+    }
+    s.finish()
+}
+
+// ---------------------------------------------------------------------------
+// Merkle tree
+// ---------------------------------------------------------------------------
+
+/// Hashes two children into node `index` of level `level` (leaves are
+/// level 0, the root is level `height`) of a tree of `height`. The tweak
+/// is the index with the height in its high limb, so a circuit computes it
+/// from the leaf index bits and the height alone.
+fn tree_node(
+    pub_seed: &[Fp; PUB_SEED_LEN],
+    index: u64,
+    height: u8,
+    level: u32,
+    left: &Digest,
+    right: &Digest,
+) -> Digest {
+    let mut input = [Fp::ZERO; 2 * DIGEST];
+    input[..DIGEST].copy_from_slice(left);
+    input[DIGEST..].copy_from_slice(right);
+    th(pub_seed, DOM_TREE, (height as u64) << 30 | index, level, &input)
+}
+
+// ---------------------------------------------------------------------------
+// Keys and signatures
+// ---------------------------------------------------------------------------
+
+/// Returned by [`SecretKey::sign`] once all of a key's leaves have been used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyExhausted;
+
+impl fmt::Display for KeyExhausted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("XMSS key exhausted: all one-time leaves have been used")
+    }
+}
+
+impl std::error::Error for KeyExhausted {}
+
+/// XMSS public key: Merkle root, public seed and tree height. The height
+/// is part of the key (and so of its hash): the root alone does not fix
+/// how tall the tree is.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct PublicKey {
+    pub root: Digest,
+    pub pub_seed: [Fp; PUB_SEED_LEN],
+    pub height: u8,
+}
+
+/// XMSS signature; its tree height is the authentication path's length.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Signature {
+    /// Leaf index used for this signature.
+    pub index: u64,
+    /// Randomizer mixed into the message digest.
+    pub randomizer: Digest,
+    /// WOTS+ signature: one intermediate chain value per chain.
+    pub wots: [Digest; CHAINS],
+    /// Sibling nodes from the leaf up to (but excluding) the root.
+    pub auth_path: AuthPath,
+}
+
+/// A signature's authentication path: up to [`MAX_HEIGHT`] nodes held in
+/// place, so a signature owns no heap memory. Reads and indexes as the
+/// slice of its nodes.
+#[derive(Clone, Copy)]
+pub struct AuthPath {
+    len: u8,
+    nodes: [Digest; MAX_HEIGHT],
+}
+
+impl AuthPath {
+    pub const fn new() -> AuthPath {
+        AuthPath { len: 0, nodes: [[Fp::ZERO; DIGEST]; MAX_HEIGHT] }
+    }
+
+    /// Appends a node. Panics past [`MAX_HEIGHT`] nodes.
+    pub fn push(&mut self, node: Digest) {
+        self.nodes[self.len as usize] = node;
+        self.len += 1;
+    }
+}
+
+impl Default for AuthPath {
+    fn default() -> AuthPath {
+        AuthPath::new()
+    }
+}
+
+impl Deref for AuthPath {
+    type Target = [Digest];
+
+    fn deref(&self) -> &[Digest] {
+        &self.nodes[..self.len as usize]
+    }
+}
+
+impl DerefMut for AuthPath {
+    fn deref_mut(&mut self) -> &mut [Digest] {
+        &mut self.nodes[..self.len as usize]
+    }
+}
+
+impl PartialEq for AuthPath {
+    fn eq(&self, other: &AuthPath) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for AuthPath {}
+
+impl fmt::Debug for AuthPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+/// XMSS secret key, with the tree cached.
+#[derive(Clone)]
+pub struct SecretKey {
+    height: u8,
+    sk_seed: Digest,
+    pub_seed: [Fp; PUB_SEED_LEN],
+    next_index: u64,
+    /// Heap layout: position 1 is the root, leaf `i` is at `2^height + i`.
+    tree: Vec<Digest>,
+}
+
+impl PublicKey {
+    /// Serialized size in bytes.
+    pub const SIZE: usize = (DIGEST + PUB_SEED_LEN) * FP_BYTES + 1;
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut out = [0u8; Self::SIZE];
+        let rest = write_fps(&mut out, &self.root);
+        let rest = write_fps(rest, &self.pub_seed);
+        rest[0] = self.height;
+        out
+    }
+
+    /// Parses a key; its height must be 1 to [`MAX_HEIGHT`].
+    pub fn from_bytes(bytes: &[u8]) -> Option<PublicKey> {
+        if bytes.len() != Self::SIZE {
+            return None;
+        }
+        let (root, rest) = read_fps::<DIGEST>(bytes)?;
+        let (pub_seed, rest) = read_fps::<PUB_SEED_LEN>(rest)?;
+        let height = rest[0];
+        if height == 0 || height as usize > MAX_HEIGHT {
+            return None;
+        }
+        Some(PublicKey { root, pub_seed, height })
+    }
+
+    /// The tree height.
+    pub fn height(&self) -> usize {
+        self.height as usize
+    }
+
+    /// Verifies `sig` over a message of field elements. Returns `false` for
+    /// a signature of another height, an out-of-range leaf index or any
+    /// mismatch.
+    pub fn verify(&self, msg: &[Fp], sig: &Signature) -> bool {
+        self.fits(sig) && self.verify_digest(&message_digest(&self.pub_seed, sig.index, &sig.randomizer, msg), sig)
+    }
+
+    /// Verifies a signature made with [`SecretKey::sign_bytes`].
+    pub fn verify_bytes(&self, msg: &[u8], sig: &Signature) -> bool {
+        self.fits(sig)
+            && self.verify_digest(&message_digest_bytes(&self.pub_seed, sig.index, &sig.randomizer, msg), sig)
+    }
+
+    /// Whether `sig` is of this key's height and names one of its leaves.
+    /// Checked before anything is hashed under the signature's index.
+    fn fits(&self, sig: &Signature) -> bool {
+        let h = self.height();
+        h != 0 && h <= MAX_HEIGHT && sig.auth_path.len() == h && sig.index < (1u64 << h)
+    }
+
+    /// Verifies `sig`, which [`PublicKey::fits`], over a message digest.
+    fn verify_digest(&self, digest: &Digest, sig: &Signature) -> bool {
+        let d = digits(digest);
+        let mut ends = [[Fp::ZERO; DIGEST]; CHAINS];
+        for (c, end) in ends.iter_mut().enumerate() {
+            let done = d[c] as usize;
+            *end = chain(&self.pub_seed, sig.index, c, &sig.wots[c], done, W - 1 - done);
+        }
+        let mut node = wots_pk_from_ends(&self.pub_seed, sig.index, &ends);
+        let mut index = sig.index;
+        for (level, sibling) in sig.auth_path.iter().enumerate() {
+            let (left, right) = if index & 1 == 0 { (&node, sibling) } else { (sibling, &node) };
+            index >>= 1;
+            node = tree_node(&self.pub_seed, index, self.height, (level + 1) as u32, left, right);
+        }
+        node == self.root
+    }
+}
+
+impl Signature {
+    /// Serialized size in bytes of a signature of a tree of `height`.
+    pub const fn size(height: usize) -> usize {
+        8 + (1 + CHAINS + height) * DIGEST_BYTES
+    }
+
+    /// The tree height this signature belongs to.
+    pub fn height(&self) -> usize {
+        self.auth_path.len()
+    }
+
+    /// Serialized size of the tallest signature: room for any.
+    pub const MAX_SIZE: usize = Self::size(MAX_HEIGHT);
+
+    /// Writes the signature to `out`, which must be [`Signature::size`] of
+    /// its height long.
+    pub fn write_bytes(&self, out: &mut [u8]) {
+        assert_eq!(out.len(), Self::size(self.height()), "buffer is not the signature's size");
+        let (index, rest) = out.split_at_mut(8);
+        index.copy_from_slice(&self.index.to_le_bytes());
+        let mut rest = write_fps(rest, &self.randomizer);
+        for d in self.wots.iter().chain(self.auth_path.iter()) {
+            rest = write_fps(rest, d);
+        }
+    }
+
+    /// The signature's bytes, in a new buffer on the heap. Use
+    /// [`Signature::write_bytes`] to write into a buffer already held.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = vec![0u8; Self::size(self.height())];
+        self.write_bytes(&mut out);
+        out
+    }
+
+    /// Parses a signature of a tree of `height` (the signer's key says).
+    pub fn from_bytes(bytes: &[u8], height: usize) -> Option<Signature> {
+        if height == 0 || height > MAX_HEIGHT || bytes.len() != Self::size(height) {
+            return None;
+        }
+        let index = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        let (randomizer, mut rest) = read_fps::<DIGEST>(&bytes[8..])?;
+        let mut wots = [[Fp::ZERO; DIGEST]; CHAINS];
+        for d in wots.iter_mut() {
+            let (v, r) = read_fps::<DIGEST>(rest)?;
+            *d = v;
+            rest = r;
+        }
+        let mut auth_path = AuthPath::new();
+        for _ in 0..height {
+            let (v, r) = read_fps::<DIGEST>(rest)?;
+            auth_path.push(v);
+            rest = r;
+        }
+        Some(Signature { index, randomizer, wots, auth_path })
+    }
+}
+
+impl SecretKey {
+    /// Serialized size in bytes (seeds, index and height; the tree is
+    /// rebuilt on load).
+    pub const SIZE: usize = SECRET_KEY_SIZE;
+
+    /// Derives a payment key pair ([`PLAIN_HEIGHT`]) deterministically from
+    /// `seed`, which must be uniformly random (for example 32 bytes from
+    /// the operating system RNG).
+    pub fn generate(seed: &[u8; SEED_SIZE]) -> SecretKey {
+        Self::generate_with_height(seed, PLAIN_HEIGHT)
+    }
+
+    /// Derives a key pair of tree height `height` (1 to [`MAX_HEIGHT`])
+    /// from `seed`. Builds the whole tree: cost grows as `2^height`, about
+    /// a second per 2^16 leaves per core, so tall keys are made in the
+    /// background.
+    pub fn generate_with_height(seed: &[u8; SEED_SIZE], height: usize) -> SecretKey {
+        assert!((1..=MAX_HEIGHT).contains(&height), "tree height must be between 1 and {MAX_HEIGHT}");
+        // The seed packed three bytes per element.
+        let mut seed_fps = [Fp::ZERO; SEED_SIZE.div_ceil(3)];
+        for (x, c) in seed_fps.iter_mut().zip(seed.chunks(3)) {
+            *x = pack3(c);
+        }
+        let zero = [Fp::ZERO; PUB_SEED_LEN];
+        let sk_seed = th(&zero, DOM_KEYGEN, 0, 0, &seed_fps);
+        let ps = th(&zero, DOM_KEYGEN, 1, 0, &seed_fps);
+        let pub_seed = ps[..PUB_SEED_LEN].try_into().unwrap();
+        Self::from_parts(height as u8, sk_seed, pub_seed, 0)
+    }
+
+    fn from_parts(height: u8, sk_seed: Digest, pub_seed: [Fp; PUB_SEED_LEN], next_index: u64) -> SecretKey {
+        let h = height as usize;
+        let n = 1usize << h;
+        // The one buffer a key holds on the heap: `2^(height + 1)` digests.
+        let mut tree = vec![[Fp::ZERO; DIGEST]; 2 * n];
+        // The leaves, computed in place: a run of at least 2^8 per thread.
+        let run = n.div_ceil(crate::parallel::threads()).max(1 << 8);
+        crate::parallel::par_chunks_mut(&mut tree[n..], run, |k, leaves| {
+            for (i, leaf) in leaves.iter_mut().enumerate() {
+                *leaf = wots_leaf(&pub_seed, &sk_seed, (k * run + i) as u64);
+            }
+        });
+        for level in 1..=h {
+            let start = 1usize << (h - level);
+            for pos in start..2 * start {
+                let index = (pos - start) as u64;
+                tree[pos] = tree_node(&pub_seed, index, height, level as u32, &tree[2 * pos], &tree[2 * pos + 1]);
+            }
+        }
+        SecretKey { height, sk_seed, pub_seed, next_index, tree }
+    }
+
+    pub fn public_key(&self) -> PublicKey {
+        PublicKey { root: self.tree[1], pub_seed: self.pub_seed, height: self.height }
+    }
+
+    /// The tree height.
+    pub fn height(&self) -> usize {
+        self.height as usize
+    }
+
+    /// Number of signatures a key pair can produce.
+    pub fn leaves(&self) -> u64 {
+        1 << self.height
+    }
+
+    /// Index of the leaf the next signature will use.
+    pub fn next_index(&self) -> u64 {
+        self.next_index
+    }
+
+    /// Moves to leaf `index`, skipping the ones before it. Used to resume a
+    /// key whose leaf count is kept elsewhere; never move backwards.
+    pub fn set_next_index(&mut self, index: u64) {
+        assert!(index <= self.leaves(), "leaf index beyond the tree");
+        self.next_index = index;
+    }
+
+    /// Number of signatures left.
+    pub fn remaining(&self) -> u64 {
+        self.leaves() - self.next_index
+    }
+
+    /// Signs a message of field elements with the next unused leaf and
+    /// advances the index.
+    pub fn sign(&mut self, msg: &[Fp]) -> Result<Signature, KeyExhausted> {
+        self.sign_with(|pub_seed, index, randomizer| message_digest(pub_seed, index, randomizer, msg))
+    }
+
+    /// Signs a byte string: the message of its length and its bytes packed
+    /// three per element, as [`PublicKey::verify_bytes`] takes it.
+    pub fn sign_bytes(&mut self, msg: &[u8]) -> Result<Signature, KeyExhausted> {
+        self.sign_with(|pub_seed, index, randomizer| message_digest_bytes(pub_seed, index, randomizer, msg))
+    }
+
+    /// Signs the message whose digest `digest` gives for this key's public
+    /// seed, the leaf used and the randomizer.
+    fn sign_with(
+        &mut self,
+        digest: impl FnOnce(&[Fp; PUB_SEED_LEN], u64, &Digest) -> Digest,
+    ) -> Result<Signature, KeyExhausted> {
+        if self.next_index >= self.leaves() {
+            return Err(KeyExhausted);
+        }
+        let index = self.next_index;
+        self.next_index += 1;
+
+        let randomizer = th(&self.pub_seed, DOM_RAND, index, 0, &self.sk_seed);
+        let d = digits(&digest(&self.pub_seed, index, &randomizer));
+        let mut wots = [[Fp::ZERO; DIGEST]; CHAINS];
+        for (c, out) in wots.iter_mut().enumerate() {
+            let sk = wots_sk(&self.pub_seed, &self.sk_seed, index, c);
+            *out = chain(&self.pub_seed, index, c, &sk, 0, d[c] as usize);
+        }
+        let mut auth_path = AuthPath::new();
+        let mut pos = (1usize << self.height()) + index as usize;
+        for _ in 0..self.height() {
+            auth_path.push(self.tree[pos ^ 1]);
+            pos >>= 1;
+        }
+        Ok(Signature { index, randomizer, wots, auth_path })
+    }
+
+    /// Serializes the seeds and the next index. Store this after every
+    /// signature; restoring an older copy reuses leaves and breaks security.
+    pub fn to_bytes(&self) -> [u8; SECRET_KEY_SIZE] {
+        let mut out = [0u8; SECRET_KEY_SIZE];
+        let rest = write_fps(&mut out, &self.sk_seed);
+        let rest = write_fps(rest, &self.pub_seed);
+        rest[..8].copy_from_slice(&self.next_index.to_le_bytes());
+        rest[8] = self.height;
+        out
+    }
+
+    /// Restores a key from [`SecretKey::to_bytes`], rebuilding the tree.
+    pub fn from_bytes(bytes: &[u8]) -> Option<SecretKey> {
+        if bytes.len() != Self::SIZE {
+            return None;
+        }
+        let (sk_seed, rest) = read_fps::<DIGEST>(bytes)?;
+        let (pub_seed, rest) = read_fps::<PUB_SEED_LEN>(rest)?;
+        let next_index = u64::from_le_bytes(rest[..8].try_into().unwrap());
+        let height = rest[8];
+        if height == 0 || height as usize > MAX_HEIGHT || next_index > 1 << height {
+            return None;
+        }
+        Some(Self::from_parts(height, sk_seed, pub_seed, next_index))
+    }
+}
+
+impl fmt::Debug for SecretKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretKey")
+            .field("height", &self.height)
+            .field("next_index", &self.next_index)
+            .field("public_key", &self.public_key())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::poseidon2::P;
+
+    const SEED: [u8; SEED_SIZE] = [7u8; SEED_SIZE];
+
+    fn other_seed() -> [u8; SEED_SIZE] {
+        let mut s = SEED;
+        s[0] ^= 1;
+        s
+    }
+
+    #[test]
+    fn parameters() {
+        assert_eq!(MSG_BITS, 248);
+        assert_eq!(MSG_CHAINS, 64);
+        assert_eq!(CHAINS, 67);
+        assert_eq!(MAX_CSUM, 960);
+        assert_eq!(PublicKey::SIZE, 49);
+        assert_eq!(Signature::size(3), 8 + 32 + 67 * 32 + 3 * 32);
+        assert_eq!(SecretKey::SIZE, 57);
+        assert_eq!((1u64 << 3), 8);
+    }
+
+    #[test]
+    fn digits_cover_all_bits_and_checksum() {
+        let z = digits(&[Fp::ZERO; DIGEST]);
+        assert!(z[..MSG_CHAINS].iter().all(|&x| x == 0));
+        // checksum = 64 * 15 = 960 = 0x3c0 -> digits [0, 12, 3]
+        assert_eq!(&z[MSG_CHAINS..], &[0, 12, 3]);
+
+        let max = [Fp::new(P - 1); DIGEST];
+        let v = digits(&max);
+        // p - 1 = 0x78000000: digits 0..7 of each element are 0,0,0,0,0,0,8,7.
+        for e in 0..DIGEST {
+            assert_eq!(&v[e * 8..e * 8 + 8], &[0, 0, 0, 0, 0, 0, 8, 7], "element {e}");
+        }
+        // Independent reconstruction from the bit string, element by element.
+        let mixed: Digest = core::array::from_fn(|i| Fp::new(0x1234_5678u32.wrapping_mul(i as u32 + 1) % P));
+        let d = digits(&mixed);
+        for (e, x) in mixed.iter().enumerate() {
+            let c = x.to_canonical();
+            for k in 0..8 {
+                let bits = if k < 7 { 4 } else { 3 };
+                let want = (c >> (4 * k)) & ((1 << bits) - 1);
+                assert_eq!(d[e * 8 + k] as u32, want, "element {e} digit {k}");
+            }
+            // Every bit of the element is covered exactly once.
+            let rebuilt: u32 = (0..8).map(|k| (d[e * 8 + k] as u32) << (4 * k)).sum();
+            assert_eq!(rebuilt, c);
+        }
+        let csum: u32 = d[..MSG_CHAINS].iter().map(|&x| 15 - x as u32).sum();
+        assert!(csum as usize <= MAX_CSUM);
+        let csum_digits = (0..3).map(|i| (csum >> (4 * i)) & 15).collect::<Vec<_>>();
+        assert_eq!(d[MSG_CHAINS..].iter().map(|&x| x as u32).collect::<Vec<_>>(), csum_digits);
+    }
+
+    #[test]
+    fn th_separates_domains_and_tweaks() {
+        let ps = [Fp::new(1), Fp::new(2), Fp::new(3), Fp::new(4)];
+        let m = [Fp::new(9); DIGEST];
+        let base = th(&ps, DOM_TREE, 5, 6, &m);
+        assert_eq!(base, th(&ps, DOM_TREE, 5, 6, &m));
+        assert_ne!(base, th(&ps, DOM_MSG, 5, 6, &m));
+        assert_ne!(base, th(&ps, DOM_TREE, 4, 6, &m));
+        assert_ne!(base, th(&ps, DOM_TREE, 5, 7, &m));
+        assert_ne!(base, th(&ps, DOM_TREE, 5 | (1 << 40), 6, &m));
+        // Low limb at the modulus boundary must not panic.
+        let _ = th(&ps, DOM_TREE, (1 << 31) - 1, 6, &m);
+        let _ = th(&ps, DOM_TREE, (1 << 60) - 1, 6, &m);
+        let mut ps2 = ps;
+        ps2[3] = Fp::new(5);
+        assert_ne!(base, th(&ps2, DOM_TREE, 5, 6, &m));
+        // Zero padding: an empty message and a single zero element collide,
+        // which is why every call site fixes the message length per tweak or
+        // absorbs the length explicitly.
+        assert_eq!(th(&ps, DOM_TREE, 0, 0, &[]), th(&ps, DOM_TREE, 0, 0, &[Fp::ZERO]));
+        assert_ne!(th(&ps, DOM_TREE, 0, 0, &m), th(&ps, DOM_TREE, 0, 0, &m[..7]));
+    }
+
+    #[test]
+    fn keygen_is_deterministic() {
+        let a = SecretKey::generate_with_height(&SEED, 2);
+        let b = SecretKey::generate_with_height(&SEED, 2);
+        let c = SecretKey::generate_with_height(&other_seed(), 2);
+        assert_eq!(a.public_key(), b.public_key());
+        assert_ne!(a.public_key(), c.public_key());
+        assert_ne!(a.public_key().root, [Fp::ZERO; DIGEST]);
+    }
+
+    #[test]
+    fn sign_verify_every_leaf_then_exhaust() {
+        const H: usize = 3;
+        let mut sk = SecretKey::generate_with_height(&SEED, H);
+        let pk = sk.public_key();
+        assert_eq!(sk.remaining(), 8);
+        for i in 0..(1u64 << H) {
+            let msg = format!("message number {i}");
+            assert_eq!(sk.next_index(), i);
+            let sig = sk.sign_bytes(msg.as_bytes()).unwrap();
+            assert_eq!(sig.index, i);
+            assert!(pk.verify_bytes(msg.as_bytes(), &sig), "leaf {i}");
+            assert!(!pk.verify_bytes(b"message number 99", &sig));
+        }
+        assert_eq!(sk.remaining(), 0);
+        assert_eq!(sk.sign_bytes(b"one more"), Err(KeyExhausted));
+    }
+
+    #[test]
+    fn tampered_signatures_fail() {
+        const H: usize = 2;
+        let mut sk = SecretKey::generate_with_height(&SEED, H);
+        let pk = sk.public_key();
+        let msg = b"hello";
+        let sig = sk.sign_bytes(msg).unwrap();
+        assert!(pk.verify_bytes(msg, &sig));
+
+        let mut s = sig.clone();
+        s.index = 1;
+        assert!(!pk.verify_bytes(msg, &s));
+        let mut s = sig.clone();
+        s.index = 1 << H;
+        assert!(!pk.verify_bytes(msg, &s));
+        let mut s = sig.clone();
+        s.randomizer[0] += Fp::ONE;
+        assert!(!pk.verify_bytes(msg, &s));
+        for c in [0, 31, MSG_CHAINS - 1, CHAINS - 1] {
+            let mut s = sig.clone();
+            s.wots[c][3] += Fp::ONE;
+            assert!(!pk.verify_bytes(msg, &s), "chain {c}");
+        }
+        for l in 0..H {
+            let mut s = sig.clone();
+            s.auth_path[l][0] += Fp::ONE;
+            assert!(!pk.verify_bytes(msg, &s), "auth level {l}");
+        }
+        let other = SecretKey::generate_with_height(&other_seed(), H).public_key();
+        assert!(!other.verify_bytes(msg, &sig));
+        // Empty message and a long multi-block message both round-trip.
+        let sig = sk.sign_bytes(b"").unwrap();
+        assert!(pk.verify_bytes(b"", &sig));
+        assert!(!pk.verify_bytes(b"\0", &sig));
+        let long = vec![0xabu8; 1000];
+        let sig = sk.sign_bytes(&long).unwrap();
+        assert!(pk.verify_bytes(&long, &sig));
+        assert!(!pk.verify_bytes(&long[..999], &sig));
+        // Field-element messages: empty and single zero element differ.
+        let sig = sk.sign(&[]).unwrap();
+        assert!(pk.verify(&[], &sig));
+        assert!(!pk.verify(&[Fp::ZERO], &sig));
+    }
+
+    /// A message absorbed in parts hashes as the parts joined, wherever
+    /// the parts are cut and whatever its length (empty, short of a block,
+    /// whole blocks, past them).
+    #[test]
+    fn sponge_in_parts_is_th_of_the_whole() {
+        let seed = [Fp::new(1), Fp::new(2), Fp::new(3), Fp::new(4)];
+        let msg: Vec<Fp> = (0..40).map(|i| Fp::new(1000 + i)).collect();
+        for len in [0, 1, 7, 8, 9, 15, 16, 17, 40] {
+            let want = th(&seed, DOM_MSG, 5, 9, &msg[..len]);
+            for cut in 0..=len {
+                let mut s = Sponge::new(&seed, DOM_MSG, 5, 9);
+                s.absorb(&msg[..cut]);
+                s.absorb(&[]);
+                s.absorb(&msg[cut..len]);
+                assert_eq!(s.finish(), want, "length {len} cut at {cut}");
+            }
+        }
+    }
+
+    /// A byte string is signed as the message of its length and its bytes
+    /// packed three per element, built here in full.
+    #[test]
+    fn byte_messages_are_their_packed_elements() {
+        let mut sk = SecretKey::generate_with_height(&SEED, 4);
+        let pk = sk.public_key();
+        let bytes: Vec<u8> = (0..50u8).map(|i| i.wrapping_mul(37)).collect();
+        for len in [0, 1, 2, 3, 4, 20, 21, 22, 50] {
+            let mut msg = vec![Fp::from_u64(len as u64)];
+            msg.extend(bytes[..len].chunks(3).map(pack3));
+            let by_bytes = sk.sign_bytes(&bytes[..len]).unwrap();
+            sk.set_next_index(by_bytes.index);
+            let by_elements = sk.sign(&msg).unwrap();
+            assert_eq!(by_bytes, by_elements, "length {len}");
+            assert!(pk.verify(&msg, &by_bytes) && pk.verify_bytes(&bytes[..len], &by_elements));
+        }
+    }
+
+    #[test]
+    fn signatures_differ_per_leaf_and_message() {
+        let mut sk = SecretKey::generate_with_height(&SEED, 1);
+        let a = sk.sign_bytes(b"same").unwrap();
+        let b = sk.sign_bytes(b"same").unwrap();
+        assert_ne!(a.index, b.index);
+        assert_ne!(a.randomizer, b.randomizer);
+        assert_ne!(a.wots, b.wots);
+    }
+
+    #[test]
+    fn serialization_roundtrip() {
+        const H: usize = 2;
+        let mut sk = SecretKey::generate_with_height(&SEED, H);
+        let pk = sk.public_key();
+        let sig0 = sk.sign_bytes(b"first").unwrap();
+        // TODO: restore the two decoder fuzz checks (PublicKey::from_bytes and
+        // Signature::from_bytes) once `test_util::fuzz_decoder` is ported.
+
+        let pk_bytes = pk.to_bytes();
+        assert_eq!(pk_bytes.len(), PublicKey::SIZE);
+        assert_eq!(PublicKey::from_bytes(&pk_bytes), Some(pk));
+        assert!(PublicKey::from_bytes(&pk_bytes[1..]).is_none());
+        let mut bad = pk_bytes;
+        bad[..4].copy_from_slice(&0x7800_0001u32.to_le_bytes()); // == p, non-canonical
+        assert!(PublicKey::from_bytes(&bad).is_none());
+
+        let sig_bytes = sig0.to_bytes();
+        assert_eq!(sig_bytes.len(), Signature::size(H));
+        let back = Signature::from_bytes(&sig_bytes, H).unwrap();
+        assert_eq!(back, sig0);
+        assert!(pk.verify_bytes(b"first", &back));
+        assert!(Signature::from_bytes(&sig_bytes[..sig_bytes.len() - 1], H).is_none());
+        assert!(Signature::from_bytes(&sig_bytes, H + 1).is_none());
+
+        let sk_bytes = sk.to_bytes();
+        assert_eq!(sk_bytes.len(), SecretKey::SIZE);
+        let mut restored = SecretKey::from_bytes(&sk_bytes).unwrap();
+        assert_eq!(restored.public_key(), pk);
+        assert_eq!(restored.next_index(), 1);
+        let sig1 = restored.sign_bytes(b"second").unwrap();
+        assert_eq!(sig1.index, 1);
+        assert!(pk.verify_bytes(b"second", &sig1));
+        // The original key continues independently and produces the same leaf.
+        let sig1_orig = sk.sign_bytes(b"second").unwrap();
+        assert_eq!(sig1, sig1_orig);
+        // An index past the end is rejected.
+        let mut bad = sk_bytes;
+        bad[48..56].copy_from_slice(&((1u64 << H) + 1).to_le_bytes());
+        assert!(SecretKey::from_bytes(&bad).is_none());
+    }
+
+    #[test]
+    fn taller_tree() {
+        const H: usize = 5;
+        let mut sk = SecretKey::generate_with_height(&SEED, H);
+        let pk = sk.public_key();
+        for _ in 0..7 {
+            let _ = sk.sign_bytes(b"skip").unwrap();
+        }
+        let sig = sk.sign_bytes(b"leaf seven").unwrap();
+        assert_eq!(sig.index, 7);
+        assert_eq!(sig.auth_path.len(), H);
+        assert!(pk.verify_bytes(b"leaf seven", &sig));
+    }
+}
