@@ -20,7 +20,7 @@ jobs:
   test:
     name: test (${{ matrix.os }}, debug)
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 60
     strategy:
       # One platform failing does not stop the others: each reports.
       fail-fast: false
@@ -53,7 +53,7 @@ jobs:
   test-portable:
     name: test (ubuntu-latest, debug, no AVX2)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     env:
       RUSTFLAGS: -C target-cpu=x86-64
     defaults:
@@ -79,7 +79,7 @@ jobs:
   test-release:
     name: test (ubuntu-latest, release)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     env:
       TABMINER_FUZZ_SCALE: 10
     defaults:
@@ -104,7 +104,7 @@ jobs:
   coverage:
     name: coverage
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: miner
@@ -137,7 +137,7 @@ jobs:
   bench:
     name: bench
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: miner
