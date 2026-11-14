@@ -43,3 +43,36 @@ jobs:
       # Debug build: overflow checks and debug assertions are on.
       - name: Test
         run: cargo test --locked
+
+  # Code coverage of the tests, with the toolchain's own LLVM tools
+  # (miner/tools/coverage.sh, which runs the same locally). The table is
+  # shown on the run's summary page; the source annotated line by line is
+  # the coverage-html artifact.
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: miner
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable, with llvm-tools)
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools --no-self-update
+          rustup default stable
+          rustc --version
+
+      - name: Measure coverage
+        run: ./tools/coverage.sh
+
+      - name: Show the table on the run's page
+        run: cat target/coverage/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the annotated source
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: miner/target/coverage/html
+          retention-days: 14
