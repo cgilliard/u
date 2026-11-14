@@ -26,14 +26,26 @@ fi
 rm -rf "$out/prof" "$out/html"
 mkdir -p "$out/prof"
 
-# Its own target directory: instrumented objects do not mix with ordinary ones.
-export RUSTFLAGS="-C instrument-coverage"
+# The code has two paths where it matters for speed: AVX2 (packed.rs and
+# what uses it) and a portable one. A build has one or the other, so on
+# x86-64 the tests run twice, built for this CPU and for the plainest
+# x86-64, and a line counts as covered if either run reached it. Each
+# build has its own target directory: instrumented objects do not mix
+# with ordinary ones, nor the two with each other.
+case "$host" in
+    x86_64-*) variants="native x86-64" ;;
+    *) variants="native" ;;
+esac
 export LLVM_PROFILE_FILE="$PWD/$out/prof/%p-%m.profraw"
-cargo test --locked --target-dir "$out"
-
-# The test binaries just run, as cargo names them.
-objects=$(cargo test --locked --target-dir "$out" --no-run --message-format=json \
-    | grep -o '"executable":"[^"]*"' | cut -d'"' -f4 | sed 's/^/--object=/')
+objects=""
+for cpu in $variants; do
+    export RUSTFLAGS="-C instrument-coverage -C target-cpu=$cpu"
+    cargo test --locked --target-dir "$out/$cpu"
+    # The test binaries just run, as cargo names them.
+    objects="$objects $(cargo test --locked --target-dir "$out/$cpu" --no-run --message-format=json \
+        | grep -o '"executable":"[^"]*"' | cut -d'"' -f4 | sed 's/^/--object=/' | tr '\n' ' ')"
+done
+unset RUSTFLAGS
 
 "$bin/llvm-profdata" merge -sparse "$out"/prof/*.profraw -o "$out/coverage.profdata"
 

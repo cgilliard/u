@@ -40,7 +40,32 @@ jobs:
           rustc --version
           cargo --version
 
-      # Debug build: overflow checks and debug assertions are on.
+      # Debug build: overflow checks and debug assertions are on. Built for
+      # the runner's CPU (miner/.cargo/config.toml): the AVX2 code path on
+      # the x86-64 runners, the portable one on macOS (ARM).
+      - name: Test
+        run: cargo test --locked
+
+  # The portable code path on x86-64, which the job above does not build
+  # there: the same tests, built for the plainest x86-64, without AVX2.
+  test-portable:
+    name: test (ubuntu-latest, no AVX2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: -C target-cpu=x86-64
+    defaults:
+      run:
+        working-directory: miner
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+
       - name: Test
         run: cargo test --locked
 
