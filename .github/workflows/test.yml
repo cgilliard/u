@@ -17,6 +17,26 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The code is formatted as rustfmt formats it (miner/rustfmt.toml).
+  format:
+    name: format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: miner
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable) with rustfmt
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --no-self-update
+          rustup default stable
+          cargo fmt --version
+
+      - name: Check formatting
+        run: cargo fmt --check
+
   test:
     name: test (${{ matrix.os }}, debug)
     runs-on: ${{ matrix.os }}

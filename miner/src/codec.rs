@@ -229,7 +229,8 @@ pub(crate) fn u32_fields(bytes: &[u8], decode: impl FnOnce(&[u8])) -> Vec<usize>
     decode(bytes);
     let reads = READS.with(|r| r.borrow_mut().take()).unwrap_or_default();
     let base = bytes.as_ptr() as usize;
-    let mut out: Vec<usize> = reads.into_iter().filter(|&a| a >= base && a + 4 <= base + bytes.len()).map(|a| a - base).collect();
+    let mut out: Vec<usize> =
+        reads.into_iter().filter(|&a| a >= base && a + 4 <= base + bytes.len()).map(|a| a - base).collect();
     out.sort_unstable();
     out.dedup();
     out
@@ -251,7 +252,8 @@ pub(crate) fn sweep_fields(bytes: &[u8], check: impl Fn(&[u8]) -> Option<bool>) 
     let quiet = crate::test_util::Quiet::new();
     for &at in &fields {
         let own = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
-        let values = [0, 1, 2, 31, 32, 33, 63, 64, 255, 256, 1 << 31, u32::MAX, own.wrapping_add(1), own.wrapping_sub(1)];
+        let values =
+            [0, 1, 2, 31, 32, 33, 63, 64, 255, 256, 1 << 31, u32::MAX, own.wrapping_add(1), own.wrapping_sub(1)];
         for v in values {
             if v == own {
                 continue;
@@ -260,7 +262,8 @@ pub(crate) fn sweep_fields(bytes: &[u8], check: impl Fn(&[u8]) -> Option<bool>) 
             b[at..at + 4].copy_from_slice(&v.to_le_bytes());
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(&b))) {
                 Err(e) => {
-                    let msg = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()));
+                    let msg =
+                        e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()));
                     panicked.push(format!("u32 at {at} ({own}) set to {v}: {}", msg.unwrap_or_default()));
                 }
                 Ok(Some(true)) => accepted.push(format!("u32 at {at} ({own}) set to {v}")),

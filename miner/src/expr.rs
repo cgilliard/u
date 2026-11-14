@@ -207,7 +207,8 @@ mod tests {
         assert!(std::panic::catch_unwind(|| Expr(0) + Expr(1)).is_err());
         assert!(std::panic::catch_unwind(|| Expr::from(Fp::ONE)).is_err());
         // One at a time; and a panic inside leaves none installed.
-        let nested = std::panic::catch_unwind(|| with_backend(Memory::new(&[]), || with_backend(Memory::new(&[]), || ())));
+        let nested =
+            std::panic::catch_unwind(|| with_backend(Memory::new(&[]), || with_backend(Memory::new(&[]), || ())));
         assert!(nested.is_err());
         assert!(std::panic::catch_unwind(|| Expr(0) * Expr(1)).is_err());
         let (_, sum) = with_backend(Memory::new(&[]), || Expr(1) + Expr(1));

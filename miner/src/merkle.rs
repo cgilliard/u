@@ -18,8 +18,8 @@
 //! the siblings are read: three words and two digests for each opening,
 //! held while the root is made.
 
-use crate::hash::EMPTY;
 pub use crate::hash::Digest;
+use crate::hash::EMPTY;
 use crate::parallel::{par_chunks_mut, par_fill};
 use crate::poseidon2::{Fp, LANES, compress, compress_batch, hash, hash_batch};
 

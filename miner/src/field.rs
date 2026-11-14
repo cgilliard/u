@@ -229,8 +229,14 @@ mod tests {
         assert_eq!(z, Deg(5));
         z -= Deg(9);
         assert_eq!(z, Deg(9));
-        assert_eq!((Deg::from(Fp::new(7)), <Deg as Field>::ZERO, <Deg as Field>::ONE, Deg::default()), (Deg(0), Deg(0), Deg(0), Deg(0)));
-        assert_eq!((x.scale(Fp::new(9)), x.inv(), x.exp(3), <Deg as Field>::from_u32(4)), (Deg(2), Some(Deg(2)), Deg(6), Deg(0)));
+        assert_eq!(
+            (Deg::from(Fp::new(7)), <Deg as Field>::ZERO, <Deg as Field>::ONE, Deg::default()),
+            (Deg(0), Deg(0), Deg(0), Deg(0))
+        );
+        assert_eq!(
+            (x.scale(Fp::new(9)), x.inv(), x.exp(3), <Deg as Field>::from_u32(4)),
+            (Deg(2), Some(Deg(2)), Deg(6), Deg(0))
+        );
         let e = Fp4::from_u32(3);
         assert_eq!(x.mul_ext(e), e);
         // A constraint of the shape a * b * c - d: degree 3 in degree-1 columns.

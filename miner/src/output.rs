@@ -55,7 +55,6 @@ pub type Memo = [Fp; MEMO_LEN];
 /// The empty memo.
 pub const EMPTY_MEMO: Memo = [Fp::ZERO; MEMO_LEN];
 
-
 /// Serialized size of a memo.
 pub const MEMO_BYTES: usize = MEMO_LEN * FP_BYTES;
 /// Serialized size of an [`Output`].
@@ -451,7 +450,12 @@ mod tests {
         let body = d(99);
         for height in [1usize, TREE_HEIGHT, 7] {
             let mut sk = SecretKey::generate_with_height(&[height as u8; 32], height);
-            let input = Input { pubkey: sk.public_key(), amount: u64::MAX - 3, position: 1 << 39, signature: sk.sign(&body).unwrap() };
+            let input = Input {
+                pubkey: sk.public_key(),
+                amount: u64::MAX - 3,
+                position: 1 << 39,
+                signature: sk.sign(&body).unwrap(),
+            };
             assert_eq!(input.size(), PublicKey::SIZE + 16 + Signature::size(height));
             assert_eq!(input.commitment(), commitment(&sk.public_key(), u64::MAX - 3));
             let bytes = input.to_bytes();

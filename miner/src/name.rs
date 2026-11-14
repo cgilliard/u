@@ -58,9 +58,7 @@ use core::ops::Deref;
 
 use crate::codec::{DIGEST_BYTES, POSITION_BYTES, read_digest, read_position, write_position};
 use crate::hash::{DOM_COMMIT, DOM_COMMIT_LEAF, DOM_NAME, DOM_OP, DOM_RECORD, DOM_UPDATE, Digest, hash_domain};
-use crate::output::{
-    Key as OwnerKey, MEMO_BYTES, Memo, Sig, memo_from_bytes, memo_slot, memo_to_bytes, pubkey_hash,
-};
+use crate::output::{Key as OwnerKey, MEMO_BYTES, Memo, Sig, memo_from_bytes, memo_slot, memo_to_bytes, pubkey_hash};
 use crate::poseidon2::{DIGEST, Fp, digest_to_bytes};
 use crate::xmss::{KeyExhausted, PublicKey};
 
@@ -873,7 +871,8 @@ mod tests {
         assert_eq!(count_ops(kinds(MAX_UPDATES + 1, OpKind::Update)), Err(OpKind::Update));
         assert_eq!(count_ops(kinds(MAX_SWEEPS + 1, OpKind::Sweep)), Err(OpKind::Sweep));
         assert_eq!(count_ops(kinds(MAX_SWEEPS, OpKind::Sweep)), Ok([0, 0, 0, 16]));
-        let names: Vec<&str> = [OpKind::Commit, OpKind::Reveal, OpKind::Update, OpKind::Sweep].map(OpKind::name).to_vec();
+        let names: Vec<&str> =
+            [OpKind::Commit, OpKind::Reveal, OpKind::Update, OpKind::Sweep].map(OpKind::name).to_vec();
         assert_eq!(names, ["commit", "reveal", "update", "sweep"]);
     }
 

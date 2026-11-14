@@ -867,7 +867,8 @@ mod tests {
     /// A table that does not grow, as small as the dev networks'.
     const SMALL: PowParams = PowParams::DEV;
     /// One that grows: 16 KB doubling to 64 KB, in epochs of 100 blocks.
-    const GROWING: PowParams = PowParams { log_dataset_items: 8, max_log_dataset_items: 10, epoch_blocks: 100, ..SMALL };
+    const GROWING: PowParams =
+        PowParams { log_dataset_items: 8, max_log_dataset_items: 10, epoch_blocks: 100, ..SMALL };
 
     fn small_seed() -> &'static SeedText<'static> {
         static SEED: OnceLock<SeedText<'static>> = OnceLock::new();
@@ -942,15 +943,29 @@ mod tests {
         let m = PowParams::MAINNET;
         let year = 52_560u64;
         assert_eq!(m.epoch_blocks as u64, year);
-        for (height, epoch) in [(0, 0), (1, 0), (year - 1, 0), (year, 1), (2 * year - 1, 1), (5 * year, 5), (1007 * year, 1007)] {
+        for (height, epoch) in
+            [(0, 0), (1, 0), (year - 1, 0), (year, 1), (2 * year - 1, 1), (5 * year, 5), (1007 * year, 1007)]
+        {
             assert_eq!(m.epoch_of(height), epoch, "height {height}");
         }
         assert_eq!(m.epoch_of(u64::MAX), u32::MAX);
         let gb = 1u64 << 30;
-        for (epoch, size) in [(0, gb), (1, 2 * gb), (2, 4 * gb), (3, 8 * gb), (4, 16 * gb), (5, 32 * gb), (6, 32 * gb), (1000, 32 * gb), (u32::MAX, 32 * gb)] {
+        for (epoch, size) in [
+            (0, gb),
+            (1, 2 * gb),
+            (2, 4 * gb),
+            (3, 8 * gb),
+            (4, 16 * gb),
+            (5, 32 * gb),
+            (6, 32 * gb),
+            (1000, 32 * gb),
+            (u32::MAX, 32 * gb),
+        ] {
             assert_eq!(table_bytes(m.log_items(epoch)), size, "epoch {epoch}");
         }
-        for (height, size) in [(0, gb), (year - 1, gb), (year, 2 * gb), (5 * year - 1, 16 * gb), (5 * year, 32 * gb), (u64::MAX, 32 * gb)] {
+        for (height, size) in
+            [(0, gb), (year - 1, gb), (year, 2 * gb), (5 * year - 1, 16 * gb), (5 * year, 32 * gb), (u64::MAX, 32 * gb)]
+        {
             assert_eq!(table_bytes(m.log_items_at(height)), size, "height {height}");
             let items = SeedText::new(m).at(height);
             assert_eq!((table_bytes(items.log_items()), items.pairs() as u64 * 128), (size, size));
@@ -1025,7 +1040,10 @@ mod tests {
                 assert!(!verify(&other, &h, &nonce, &out.mix, &Target::MAX));
                 results.push(out.result);
             }
-            assert_eq!((table.log_items(), table.params(), table.pairs()), (seed.at(height).log_items(), &GROWING, table.len() / 2));
+            assert_eq!(
+                (table.log_items(), table.params(), table.pairs()),
+                (seed.at(height).log_items(), &GROWING, table.len() / 2)
+            );
         }
         let n = results.len();
         results.sort_by_key(|r| r.map(|x| x.to_canonical()));
@@ -1253,8 +1271,14 @@ mod tests {
         }
         // A table does not shrink, nor grow past the last epoch's.
         let quiet = crate::test_util::Quiet::new();
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| LazyDataset::new(&seed, 9).unwrap().grow(8))).is_err());
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| LazyDataset::new(&seed, 9).unwrap().grow(11))).is_err());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| LazyDataset::new(&seed, 9).unwrap().grow(8)))
+                .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| LazyDataset::new(&seed, 9).unwrap().grow(11)))
+                .is_err()
+        );
         drop(quiet);
     }
 
@@ -1342,13 +1366,56 @@ mod tests {
         assert!(refused(&|b| b.push(0)), "a byte long");
         assert!(refused(&|b| b[FILE_HEADER + 32 + 1000] ^= 1), "an item changed");
         assert!(refused(&|b| *b.last_mut().unwrap() ^= 1), "the checksum changed");
-        assert!(refused(&|b| { b[0] ^= 1; refit(b) }), "not a table's file");
-        assert!(refused(&|b| { b[8] = 8; refit(b) }), "a size no epoch has");
-        assert!(refused(&|b| { b[8] = 10; refit(b) }), "a size the file is not");
-        assert!(refused(&|b| { b[12] ^= 1; refit(b) }), "other parents");
-        assert!(refused(&|b| { b[FILE_HEADER + 32..][..4].copy_from_slice(&P.to_le_bytes()); refit(b) }), "an element that is none");
-        assert!(refused(&|b| { b[FILE_HEADER + 32] ^= 1; refit(b) }), "the first item is not the text's");
-        assert!(refused(&|b| { let at = b.len() - CHECKSUM_BYTES - 4; b[at] ^= 1; refit(b) }), "the last item is not the text's");
+        assert!(
+            refused(&|b| {
+                b[0] ^= 1;
+                refit(b)
+            }),
+            "not a table's file"
+        );
+        assert!(
+            refused(&|b| {
+                b[8] = 8;
+                refit(b)
+            }),
+            "a size no epoch has"
+        );
+        assert!(
+            refused(&|b| {
+                b[8] = 10;
+                refit(b)
+            }),
+            "a size the file is not"
+        );
+        assert!(
+            refused(&|b| {
+                b[12] ^= 1;
+                refit(b)
+            }),
+            "other parents"
+        );
+        assert!(
+            refused(&|b| {
+                b[FILE_HEADER + 32..][..4].copy_from_slice(&P.to_le_bytes());
+                refit(b)
+            }),
+            "an element that is none"
+        );
+        assert!(
+            refused(&|b| {
+                b[FILE_HEADER + 32] ^= 1;
+                refit(b)
+            }),
+            "the first item is not the text's"
+        );
+        assert!(
+            refused(&|b| {
+                let at = b.len() - CHECKSUM_BYTES - 4;
+                b[at] ^= 1;
+                refit(b)
+            }),
+            "the last item is not the text's"
+        );
         // Another network's table of that size is of other work.
         std::fs::write(&path, &good).unwrap();
         let other = SeedText::new(PowParams { log_dataset_items: 9, ..SMALL });

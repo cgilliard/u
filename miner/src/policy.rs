@@ -94,8 +94,8 @@
 use core::fmt;
 
 use crate::codec::{DIGEST_BYTES, read_digest, read_u32, read_u64};
-use crate::hash::{DomainHasher, EMPTY, hash_domain};
 use crate::hash::{DOM_COVERED, DOM_HASHLOCK, DOM_POLICY_LEAF, DOM_REBIND};
+use crate::hash::{DomainHasher, EMPTY, hash_domain};
 use crate::output::{Commitment, Memo, Output, OutputList, key_commitment, pubkey_hash};
 use crate::poseidon2::{DIGEST, Fp, compress, digest_from_bytes, digest_to_bytes};
 use crate::xmss::{Digest, PublicKey, Signature};
@@ -1441,7 +1441,7 @@ impl PolicyInput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output::{memo5, memo_slot};
+    use crate::output::{memo_slot, memo5};
     use crate::xmss::SecretKey as Key;
 
     fn key(tag: u8) -> Key {
@@ -1828,12 +1828,7 @@ mod tests {
             assert_eq!((again.as_bytes(), rest), (&bytes[..], &[1u8, 2, 3][..]));
         }
         // Every kind of verdict the sample can give was seen.
-        for want in [
-            Ok(()),
-            Err(PolicyError::Signatures),
-            Err(PolicyError::Locked),
-            Err(PolicyError::Covenant),
-        ] {
+        for want in [Ok(()), Err(PolicyError::Signatures), Err(PolicyError::Locked), Err(PolicyError::Covenant)] {
             assert!(verdicts.contains(&want), "{want:?} never seen");
         }
         // The update's own failures: a state no newer, a run past the outputs.

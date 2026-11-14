@@ -65,8 +65,8 @@ use core::fmt;
 use crate::codec::{POSITION_BYTES, packed, read_digest, read_position, read_u32, read_u64, write_position};
 use crate::hash::{DOM_BLOCK_BODY, DOM_BLOCK_PROOF, Digest, DomainHasher};
 use crate::name::{BlockNameOp, OpKind, count_ops};
-pub use crate::output::{BLOCK_OUTPUT_SIZE, BlockOutput};
 use crate::output::OUTPUT_CAPACITY;
+pub use crate::output::{BLOCK_OUTPUT_SIZE, BlockOutput};
 use crate::poseidon2::{DIGEST, Fp, digest_to_bytes};
 use crate::pow::{self, ItemSource, Nonce, PowOutput, Target};
 
@@ -1078,7 +1078,8 @@ mod tests {
             assert_eq!(proof_hash(&proof), hash_domain(DOM_BLOCK_PROOF, &v), "proof of {len} bytes");
         }
         let far = OUTPUT_CAPACITY - 1;
-        let body = Body { inputs: vec![3, far], outputs: outputs(), ops: ops(), sweeps: vec![6, 1 << 35], proof: vec![9; 50] };
+        let body =
+            Body { inputs: vec![3, far], outputs: outputs(), ops: ops(), sweeps: vec![6, 1 << 35], proof: vec![9; 50] };
         let limbs = |p: u64| [Fp::new((p & ((1 << 30) - 1)) as u32), Fp::new((p >> 30) as u32)];
         let mut v = vec![Fp::new(2)];
         v.extend([limbs(3), limbs(far)].concat());
@@ -1121,7 +1122,8 @@ mod tests {
     /// header, every list, the proof, sizes, positions, hashes.
     #[test]
     fn the_view_agrees_with_the_owned_form() {
-        let body = Body { inputs: vec![1, 2], outputs: outputs(), ops: ops(), sweeps: vec![6], proof: vec![0xab; 1000] };
+        let body =
+            Body { inputs: vec![1, 2], outputs: outputs(), ops: ops(), sweeps: vec![6], proof: vec![0xab; 1000] };
         let mut h = header();
         h.body_commitment = body.commitment();
         let block = Block { header: h, body: body.clone() };
@@ -1131,7 +1133,10 @@ mod tests {
         assert_eq!((view.header(), view.to_block()), (&h, block.clone()));
         assert!(view.body_commitment_matches());
         let b = view.body();
-        assert_eq!((b.as_bytes(), b.size(), body.size()), (&bytes[HEADER_SIZE..], bytes.len() - HEADER_SIZE, bytes.len() - HEADER_SIZE));
+        assert_eq!(
+            (b.as_bytes(), b.size(), body.size()),
+            (&bytes[HEADER_SIZE..], bytes.len() - HEADER_SIZE, bytes.len() - HEADER_SIZE)
+        );
         assert_eq!(b.to_body(), body);
         assert_eq!(b.inputs().collect::<Vec<_>>(), body.inputs);
         assert_eq!(b.outputs().collect::<Vec<_>>(), body.outputs);
@@ -1174,7 +1179,13 @@ mod tests {
         let n_ops = n_out + 4 + 2 * BLOCK_OUTPUT_SIZE;
         let n_sweeps = n_ops + 4 + body.ops.iter().map(BlockNameOp::size).sum::<usize>();
         let n_proof = n_sweeps + 4 + POSITION_BYTES;
-        for (name, at, n) in [("inputs", 0, 2u32), ("outputs", n_out, 2), ("operations", n_ops, 4), ("sweeps", n_sweeps, 1), ("proof", n_proof, 1000)] {
+        for (name, at, n) in [
+            ("inputs", 0, 2u32),
+            ("outputs", n_out, 2),
+            ("operations", n_ops, 4),
+            ("sweeps", n_sweeps, 1),
+            ("proof", n_proof, 1000),
+        ] {
             assert_eq!(body_bytes[at..at + 4], n.to_le_bytes(), "{name}");
             for other in [n - 1, n + 1, u32::MAX] {
                 let mut bad = body_bytes.clone();
@@ -1200,7 +1211,8 @@ mod tests {
     /// body or a short one does not.
     #[test]
     fn lite_block_commits_as_the_block() {
-        let body = Body { inputs: vec![1, 2], outputs: outputs(), ops: ops(), sweeps: vec![6], proof: vec![0xab; 3000] };
+        let body =
+            Body { inputs: vec![1, 2], outputs: outputs(), ops: ops(), sweeps: vec![6], proof: vec![0xab; 3000] };
         let mut h = header();
         h.body_commitment = body.commitment();
         let block = Block { header: h, body };
@@ -1275,7 +1287,8 @@ mod tests {
     #[test]
     fn header_proof_of_work() {
         // A table that doubles once: epochs of 10 blocks.
-        let params = PowParams { log_dataset_items: 8, max_log_dataset_items: 9, epoch_blocks: 10, parents: 64, accesses: 64 };
+        let params =
+            PowParams { log_dataset_items: 8, max_log_dataset_items: 9, epoch_blocks: 10, parents: 64, accesses: 64 };
         let text: Vec<u8> = (0..20_000u32).map(|i| (i * 31 % 253) as u8).collect();
         let seed = SeedText::from_bytes(params, &text);
         let dataset = Dataset::generate(&seed, 8);

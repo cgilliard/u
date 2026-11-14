@@ -1179,7 +1179,9 @@ mod tests {
         let (n_in, n_policy) = (0, 4 + inputs);
         let n_out = n_policy + 4 + policy;
         let n_ops = n_out + 4 + 3 * OUTPUT_SIZE;
-        for (name, at, n) in [("inputs", n_in, 2u32), ("policy inputs", n_policy, 1), ("outputs", n_out, 3), ("operations", n_ops, 3)] {
+        for (name, at, n) in
+            [("inputs", n_in, 2u32), ("policy inputs", n_policy, 1), ("outputs", n_out, 3), ("operations", n_ops, 3)]
+        {
             assert_eq!(bytes[at..at + 4], n.to_le_bytes(), "{name}");
             for other in [n - 1, n + 1, u32::MAX] {
                 let mut b = bytes.clone();

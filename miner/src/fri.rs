@@ -873,7 +873,9 @@ mod tests {
         p.queries[1][0].path.pop();
         assert_eq!(check(&[log_n], shift, &p, &inputs).unwrap_err(), FriError::InvalidOpening { query: 1, round: 0 });
         // The caller's own refusal comes back as it is.
-        let refuse = |q: usize, i: usize, v: &mut [Fp4]| if q == 4 { Err(FriError::FinalMismatch { query: 99 }) } else { open(q, i, v) };
+        let refuse = |q: usize, i: usize, v: &mut [Fp4]| {
+            if q == 4 { Err(FriError::FinalMismatch { query: 99 }) } else { open(q, i, v) }
+        };
         assert_eq!(
             verify(&CONFIG, &mut transcript(), shift, &[log_n], &proof, refuse).unwrap_err(),
             FriError::FinalMismatch { query: 99 }
@@ -1010,10 +1012,16 @@ mod tests {
             for (q, steps) in proof.queries.iter().enumerate() {
                 let index = v.sample_index(&mut ch);
                 let at: Vec<Fp4> = inputs.iter().map(|c| c[index % c.len()]).collect();
-                v.query(q, index, &at, |r| steps.get(r).map(|st| &st.values[..]), |r, i, values| {
-                    noted[r * nq + q] = (i, hash_row(leaf_row(values)));
-                    true
-                })?;
+                v.query(
+                    q,
+                    index,
+                    &at,
+                    |r| steps.get(r).map(|st| &st.values[..]),
+                    |r, i, values| {
+                        noted[r * nq + q] = (i, hash_row(leaf_row(values)));
+                        true
+                    },
+                )?;
             }
             for r in 0..rounds {
                 let (idx, leaves): (Vec<usize>, Vec<Digest>) = noted[r * nq..(r + 1) * nq].iter().copied().unzip();
@@ -1042,11 +1050,24 @@ mod tests {
         let mut p = proof.clone();
         let pos = indices[3] >> s.log_leaves(0);
         p.queries[3][0].values[(pos + 1) % 4] += Fp4::ONE;
-        assert!(matches!(check(&p, &siblings), Err(FriError::FoldMismatch { query: 3, round: 1 } | FriError::InvalidOpening { .. })));
+        assert!(matches!(
+            check(&p, &siblings),
+            Err(FriError::FoldMismatch { query: 3, round: 1 } | FriError::InvalidOpening { .. })
+        ));
         // A query's parts that are none: a round with no leaf, an index
         // outside the domain, an input too few.
         let mut ch = transcript();
-        let v = Verifier::new(&CONFIG, &mut ch, shift, &sizes, &proof.commitments, &proof.fold_witnesses, &proof.final_value, proof.pow_witness).unwrap();
+        let v = Verifier::new(
+            &CONFIG,
+            &mut ch,
+            shift,
+            &sizes,
+            &proof.commitments,
+            &proof.fold_witnesses,
+            &proof.final_value,
+            proof.pow_witness,
+        )
+        .unwrap();
         let index = v.sample_index(&mut ch);
         assert_eq!(index, indices[0]);
         let at: Vec<Fp4> = inputs.iter().map(|c| c[index % c.len()]).collect();
@@ -1056,7 +1077,10 @@ mod tests {
         assert_eq!(v.query(0, index, &at, |r| leaf(r).filter(|_| r < 2), |_, _, _| true), Err(FriError::Shape));
         assert_eq!(v.query(0, index + (1 << 11), &at, leaf, |_, _, _| true), Err(FriError::Shape));
         assert_eq!(v.query(0, index, &at[..2], leaf, |_, _, _| true), Err(FriError::Shape));
-        assert_eq!(v.query(7, index, &at, leaf, |r, _, _| r != 1), Err(FriError::InvalidOpening { query: 7, round: 1 }));
+        assert_eq!(
+            v.query(7, index, &at, leaf, |r, _, _| r != 1),
+            Err(FriError::InvalidOpening { query: 7, round: 1 })
+        );
         assert!(size_of::<Verifier>() <= 1024);
     }
 

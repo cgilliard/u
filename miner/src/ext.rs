@@ -308,7 +308,10 @@ mod tests {
             assert_eq!((Fp4::from_base(k).as_base(), Fp4::new(a.0)), (Some(k), a));
         }
         assert_eq!(Fp4::from(7u32), Fp4::from_base(Fp::new(7)));
-        assert_eq!((Fp4::X.as_base(), Fp4::ZERO.is_zero(), Fp4::ONE.is_zero(), Fp4::default()), (None, true, false, Fp4::ZERO));
+        assert_eq!(
+            (Fp4::X.as_base(), Fp4::ZERO.is_zero(), Fp4::ONE.is_zero(), Fp4::default()),
+            (None, true, false, Fp4::ZERO)
+        );
         assert_eq!(Fp4::ZERO.inverse(), None);
         assert!(!format!("{:?}", Fp4::X).is_empty());
         assert_eq!(DEGREE, 4);

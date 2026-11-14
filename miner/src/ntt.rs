@@ -388,7 +388,14 @@ mod tests {
             let n = 1usize << log_n;
             let w = root_of_unity(log_n);
             let coeffs: Vec<Fp> = (0..n).map(|_| rng.fp()).collect();
-            for shift in [Fp::ONE, w, w.inverse().unwrap(), root_of_unity((log_n + 1).min(TWO_ADICITY)), MULTIPLICATIVE_GENERATOR, rng.fp()] {
+            for shift in [
+                Fp::ONE,
+                w,
+                w.inverse().unwrap(),
+                root_of_unity((log_n + 1).min(TWO_ADICITY)),
+                MULTIPLICATIVE_GENERATOR,
+                rng.fp(),
+            ] {
                 // The transform of the size first, as a prover runs it.
                 let mut plain = coeffs.clone();
                 ntt(&mut plain);
