@@ -42,10 +42,8 @@
 use core::fmt;
 use core::ops::{Deref, DerefMut};
 
+pub use crate::hash::Digest;
 use crate::poseidon2::{DIGEST, Fp, WIDTH, permute_in_place};
-
-/// A hash output: 8 BabyBear elements.
-pub type Digest = [Fp; DIGEST];
 
 /// Winternitz parameter.
 pub const W: usize = 16;
@@ -899,8 +897,12 @@ mod tests {
         let mut sk = SecretKey::generate_with_height(&SEED, H);
         let pk = sk.public_key();
         let sig0 = sk.sign_bytes(b"first").unwrap();
-        // TODO: restore the two decoder fuzz checks (PublicKey::from_bytes and
-        // Signature::from_bytes) once `test_util::fuzz_decoder` is ported.
+        crate::test_util::fuzz_decoder("xmss PublicKey::from_bytes", &[pk.to_bytes().to_vec()], 20_000, |b| {
+            PublicKey::from_bytes(b).map(|x| Some(x.to_bytes().to_vec()))
+        });
+        crate::test_util::fuzz_decoder("xmss Signature::from_bytes", &[sig0.to_bytes()], 20_000, |b| {
+            Signature::from_bytes(b, H).map(|x| Some(x.to_bytes()))
+        });
 
         let pk_bytes = pk.to_bytes();
         assert_eq!(pk_bytes.len(), PublicKey::SIZE);
