@@ -18,7 +18,7 @@ env:
 
 jobs:
   test:
-    name: test (${{ matrix.os }})
+    name: test (${{ matrix.os }}, debug)
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -41,7 +41,8 @@ jobs:
           rustc --version
           cargo --version
 
-      # Debug build: overflow checks and debug assertions are on. Built for
+      # The debug test suite: a debug build, so overflow checks and debug
+      # assertions are on (the release build has its own job below). Built for
       # the runner's CPU (miner/.cargo/config.toml): the AVX2 code path on
       # the x86-64 runners, the portable one on the arm64 ones.
       - name: Test
@@ -50,7 +51,7 @@ jobs:
   # The portable code path on x86-64, which the job above does not build
   # there: the same tests, built for the plainest x86-64, without AVX2.
   test-portable:
-    name: test (ubuntu-latest, no AVX2)
+    name: test (ubuntu-latest, debug, no AVX2)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -69,6 +70,30 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+  # The same tests in a release build: the optimized code a node runs,
+  # without debug assertions or overflow checks. The fuzzers of the
+  # decoders are quick here, so they run ten times their usual iterations.
+  test-release:
+    name: test (ubuntu-latest, release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TABMINER_FUZZ_SCALE: 10
+    defaults:
+      run:
+        working-directory: miner
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+
+      - name: Test
+        run: cargo test --locked --release
 
   # Code coverage of the tests, with the toolchain's own LLVM tools
   # (miner/tools/coverage.sh, which runs the same locally). The table is
