@@ -891,6 +891,61 @@ mod tests {
         assert_ne!(a.wots, b.wots);
     }
 
+    /// A stored key is refused if it is not the right length, if its
+    /// height is none a key may have, if its next leaf is beyond the tree
+    /// or if a seed element is not below the modulus. A used-up key (its
+    /// next leaf just past the last) is restored, and signs nothing.
+    #[test]
+    fn stored_keys_with_bad_fields_are_refused() {
+        const H: usize = 2;
+        let bytes = SecretKey::generate_with_height(&SEED, H).to_bytes();
+        let (index_at, height_at) = (SECRET_KEY_SIZE - 9, SECRET_KEY_SIZE - 1);
+        assert!(SecretKey::from_bytes(&bytes).is_some());
+        assert!(SecretKey::from_bytes(&bytes[1..]).is_none());
+        assert!(SecretKey::from_bytes(&[bytes.as_slice(), &[0]].concat()).is_none());
+        assert!(SecretKey::from_bytes(&[]).is_none());
+        for height in [0u8, MAX_HEIGHT as u8 + 1, 255] {
+            let mut bad = bytes;
+            bad[height_at] = height;
+            assert!(SecretKey::from_bytes(&bad).is_none(), "height {height}");
+        }
+        for (index, ok) in [(0u64, true), (3, true), (4, true), (5, false), (u64::MAX, false)] {
+            let mut b = bytes;
+            b[index_at..index_at + 8].copy_from_slice(&index.to_le_bytes());
+            assert_eq!(SecretKey::from_bytes(&b).is_some(), ok, "next leaf {index}");
+        }
+        let mut used = bytes;
+        used[index_at..index_at + 8].copy_from_slice(&(1u64 << H).to_le_bytes());
+        let mut used = SecretKey::from_bytes(&used).unwrap();
+        assert_eq!(used.remaining(), 0);
+        assert_eq!(used.sign_bytes(b"x").unwrap_err(), KeyExhausted);
+        // An element equal to the modulus, in the secret seed and in the public one.
+        for at in [0, DIGEST - 1, DIGEST, DIGEST + PUB_SEED_LEN - 1] {
+            let mut bad = bytes;
+            bad[4 * at..4 * at + 4].copy_from_slice(&P.to_le_bytes());
+            assert!(SecretKey::from_bytes(&bad).is_none(), "element {at}");
+        }
+    }
+
+    /// Printing a key for debugging shows its height, its next leaf and
+    /// its public key, and nothing of the secret seed or the tree.
+    #[test]
+    fn debug_output_keeps_the_secret_seed() {
+        let sk = SecretKey::generate(&SEED);
+        let text = format!("{sk:?}");
+        assert!(text.contains("height: 4") && text.contains("next_index: 0") && text.contains("public_key"), "{text}");
+        assert!(!text.contains("sk_seed") && !text.contains("tree"), "{text}");
+        for x in sk.sk_seed {
+            assert!(!text.contains(&x.to_canonical().to_string()), "a secret seed element is printed: {text}");
+        }
+        // The path and the error print too.
+        let mut sk = sk;
+        let sig = sk.sign_bytes(b"m").unwrap();
+        assert_eq!(format!("{:?}", sig.auth_path), format!("{:?}", &sig.auth_path[..]));
+        assert_eq!(AuthPath::default(), AuthPath::new());
+        assert!(KeyExhausted.to_string().contains("exhausted"));
+    }
+
     #[test]
     fn serialization_roundtrip() {
         const H: usize = 2;

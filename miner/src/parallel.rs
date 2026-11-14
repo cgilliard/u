@@ -114,6 +114,63 @@ pub fn par_chunks_mut<T: Send, F: Fn(usize, &mut [T]) + Sync>(data: &mut [T], ch
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// `par_map` and `par_map_with` give `(0..n).map(f)` in order, below
+    /// the serial threshold and above it. The state of `par_map_with` is
+    /// made once per thread and carried from one item to the next: each
+    /// thread sees its items in order, a contiguous run.
+    #[test]
+    fn par_map_with_carries_state_per_thread() {
+        for n in [0, 1, 5, MIN_PARALLEL - 1, MIN_PARALLEL, 4 * MIN_PARALLEL + 3, 100_003] {
+            let want: Vec<usize> = (0..n).map(|i| 3 * i + 1).collect();
+            assert_eq!(par_map(n, |i| 3 * i + 1), want, "par_map of {n}");
+            let made = AtomicUsize::new(0);
+            let got = par_map_with(
+                n,
+                || {
+                    made.fetch_add(1, Ordering::Relaxed);
+                    None::<usize>
+                },
+                |last, i| {
+                    assert!(last.is_none_or(|l| l + 1 == i), "item {i} after {last:?}");
+                    *last = Some(i);
+                    3 * i + 1
+                },
+            );
+            assert_eq!(got, want, "par_map_with of {n}");
+            let made = made.load(Ordering::Relaxed);
+            let most = threads().min(n / MIN_PARALLEL).max(1);
+            assert!((1..=most).contains(&made), "{made} states for {n} items, at most {most} threads");
+        }
+    }
+
+    /// A panic in a worker reaches the caller: none is lost, whichever
+    /// thread it happens on.
+    #[test]
+    fn a_panic_in_a_worker_reaches_the_caller() {
+        for n in [10usize, 50_000] {
+            for at in [0, n / 2, n - 1] {
+                let hit = |i: usize| if i == at { panic!("item {i} fails") } else { i };
+                assert!(catch_unwind(AssertUnwindSafe(|| par_map_min(n, 1, hit))).is_err(), "par_map_min {n} at {at}");
+                assert!(catch_unwind(AssertUnwindSafe(|| par_map(n, hit))).is_err(), "par_map {n} at {at}");
+                assert!(
+                    catch_unwind(AssertUnwindSafe(|| par_map_with(n, || (), |_, i| hit(i)))).is_err(),
+                    "par_map_with {n} at {at}"
+                );
+                let mut v = vec![0usize; n];
+                let chunked = catch_unwind(AssertUnwindSafe(|| {
+                    par_chunks_mut(&mut v, 7, |k, c| {
+                        for (j, x) in c.iter_mut().enumerate() {
+                            *x = hit(7 * k + j);
+                        }
+                    })
+                }));
+                assert!(chunked.is_err(), "par_chunks_mut {n} at {at}");
+            }
+        }
+    }
 
     #[test]
     fn par_map_matches_serial() {

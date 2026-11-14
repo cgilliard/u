@@ -599,6 +599,40 @@ pub fn digest_from_bytes(bytes: &[u8]) -> Option<[Fp; DIGEST]> {
 mod tests {
     use super::*;
 
+    /// `zeroed_vec` gives `n` zeros in a buffer that is an ordinary `Vec`
+    /// afterwards: it grows, shrinks and frees as one.
+    #[test]
+    fn zeroed_vec_is_zeros() {
+        for n in [0usize, 1, 7, 1000, 1 << 16] {
+            let mut v = zeroed_vec(n);
+            assert_eq!(v.len(), n);
+            assert!(v.iter().all(|x| *x == Fp::ZERO));
+            v.push(Fp::ONE);
+            v.extend((0..100).map(Fp::new));
+            assert_eq!((v.len(), v[n], v[n + 100]), (n + 101, Fp::ONE, Fp::new(99)));
+            v.truncate(n / 2);
+            v.shrink_to_fit();
+            assert!(v.iter().all(|x| *x == Fp::ZERO));
+        }
+    }
+
+    /// A digest's bytes parse back to it; other lengths and elements not
+    /// below the modulus are refused.
+    #[test]
+    fn digest_bytes_are_canonical() {
+        let d = hash(&[Fp::new(3)]);
+        let bytes = digest_to_bytes(&d);
+        assert_eq!(digest_from_bytes(&bytes), Some(d));
+        assert_eq!(digest_from_bytes(&bytes[1..]), None);
+        assert_eq!(digest_from_bytes(&[bytes.as_slice(), &[0]].concat()), None);
+        assert_eq!(digest_from_bytes(&[]), None);
+        for at in [0, DIGEST - 1] {
+            let mut bad = bytes;
+            bad[4 * at..4 * at + 4].copy_from_slice(&P.to_le_bytes());
+            assert_eq!(digest_from_bytes(&bad), None, "element {at}");
+        }
+    }
+
     #[test]
     fn modulus_is_babybear() {
         assert_eq!(P, 2_013_265_921);
@@ -1121,6 +1155,18 @@ pub fn compress_all(pairs: &[(&[Fp; DIGEST], &[Fp; DIGEST])]) -> Vec<[Fp; DIGEST
 #[cfg(test)]
 mod batch_tests {
     use super::*;
+
+    /// `compress_all` is `compress` of each pair, in order: whole batches
+    /// and the pairs left over that do not fill one.
+    #[test]
+    fn compress_all_matches_compress() {
+        for n in [0, 1, LANES - 1, LANES, LANES + 1, 2 * LANES, 3 * LANES + 5] {
+            let a: Vec<[Fp; DIGEST]> = (0..2 * n as u32).map(|i| hash(&[Fp::new(i), Fp::new(n as u32)])).collect();
+            let pairs: Vec<(&[Fp; DIGEST], &[Fp; DIGEST])> = a.chunks(2).map(|c| (&c[0], &c[1])).collect();
+            let want: Vec<[Fp; DIGEST]> = pairs.iter().map(|(x, y)| compress(x, y)).collect();
+            assert_eq!(compress_all(&pairs), want, "{n} pairs");
+        }
+    }
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[test]
