@@ -93,6 +93,7 @@
 
 use core::fmt;
 
+use crate::codec::{DIGEST_BYTES, read_digest, read_u32, read_u64};
 use crate::hash::{DomainHasher, EMPTY, hash_domain};
 use crate::hash::{DOM_COVERED, DOM_HASHLOCK, DOM_POLICY_LEAF, DOM_REBIND};
 use crate::output::{Commitment, Memo, Output, key_commitment, pubkey_hash};
@@ -113,8 +114,6 @@ pub const MAX_LEAVES: usize = 1 << POLICY_DEPTH;
 pub const MAX_STATE: u32 = (1 << 30) - 1;
 /// The heights and ages of timelocks fit one element, as state numbers do.
 pub const MAX_LOCK: u32 = (1 << 30) - 1;
-
-const DIGEST_BYTES: usize = DIGEST * 4;
 
 const TAG_THRESH: u8 = 0;
 const TAG_HASH: u8 = 1;
@@ -251,21 +250,6 @@ fn tree(mut level: [Digest; MAX_LEAVES], index: usize) -> (Digest, [Digest; POLI
 // ---------------------------------------------------------------------------
 // Reading bytes
 // ---------------------------------------------------------------------------
-
-fn read_digest(bytes: &[u8]) -> Option<(Digest, &[u8])> {
-    let (head, rest) = bytes.split_at_checked(DIGEST_BYTES)?;
-    Some((digest_from_bytes(head)?, rest))
-}
-
-fn read_u32(bytes: &[u8]) -> Option<(u32, &[u8])> {
-    let (head, rest) = bytes.split_at_checked(4)?;
-    Some((u32::from_le_bytes(head.try_into().unwrap()), rest))
-}
-
-fn read_u64(bytes: &[u8]) -> Option<(u64, &[u8])> {
-    let (head, rest) = bytes.split_at_checked(8)?;
-    Some((u64::from_le_bytes(head.try_into().unwrap()), rest))
-}
 
 /// A list of digests in their encoding: 32 bytes each, every element
 /// canonical (checked when the list is read).

@@ -42,6 +42,8 @@
 use core::fmt;
 use core::ops::{Deref, DerefMut};
 
+pub use crate::codec::DIGEST_BYTES;
+use crate::codec::{FP_BYTES, read_fps, write_fps};
 pub use crate::hash::Digest;
 use crate::poseidon2::{DIGEST, Fp, WIDTH, permute_in_place};
 
@@ -74,10 +76,6 @@ pub const PLAIN_HEIGHT: usize = 4;
 pub const MAX_HEIGHT: usize = 20;
 /// Number of field elements in the public seed.
 pub const PUB_SEED_LEN: usize = 4;
-/// Serialized size of one field element.
-const FP_BYTES: usize = 4;
-/// Serialized size of a digest.
-pub const DIGEST_BYTES: usize = DIGEST * FP_BYTES;
 /// Serialized size of a [`SecretKey`]: seeds, index and height.
 pub const SECRET_KEY_SIZE: usize = (DIGEST + PUB_SEED_LEN) * FP_BYTES + 8 + 1;
 
@@ -174,29 +172,6 @@ fn pack3(bytes: &[u8]) -> Fp {
         v |= (*b as u32) << (8 * i);
     }
     Fp::new(v)
-}
-
-/// Writes `fps` to the front of `out`, four bytes each, and returns the
-/// rest of `out`.
-fn write_fps<'a>(out: &'a mut [u8], fps: &[Fp]) -> &'a mut [u8] {
-    let (head, rest) = out.split_at_mut(fps.len() * FP_BYTES);
-    for (c, x) in head.chunks_exact_mut(FP_BYTES).zip(fps) {
-        c.copy_from_slice(&x.to_le_bytes());
-    }
-    rest
-}
-
-/// Parses `N` canonical field elements from the front of `bytes`, returning
-/// them and the remaining slice. Fails on short input or non-canonical values.
-fn read_fps<const N: usize>(bytes: &[u8]) -> Option<([Fp; N], &[u8])> {
-    if bytes.len() < N * FP_BYTES {
-        return None;
-    }
-    let mut out = [Fp::ZERO; N];
-    for (i, c) in bytes[..N * FP_BYTES].chunks_exact(FP_BYTES).enumerate() {
-        out[i] = Fp::from_le_bytes(c.try_into().unwrap())?;
-    }
-    Some((out, &bytes[N * FP_BYTES..]))
 }
 
 // ---------------------------------------------------------------------------

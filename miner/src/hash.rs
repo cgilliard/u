@@ -25,6 +25,18 @@ pub(crate) const DOM_PUBKEY: u32 = 1;
 /// `H(key hash || amount)`: an output's commitment
 /// ([`crate::output::key_commitment`]).
 pub(crate) const DOM_COMMITMENT: u32 = 2;
+/// A name: its characters as elements ([`crate::name`]).
+pub(crate) const DOM_NAME: u32 = 5;
+/// A name's record: what its trie leaf holds.
+pub(crate) const DOM_RECORD: u32 = 6;
+/// A commit to a name: `H(H(name), salt, owner)`.
+pub(crate) const DOM_COMMIT: u32 = 7;
+/// A commit bound to the height of its block.
+pub(crate) const DOM_COMMIT_LEAF: u32 = 8;
+/// A name operation's digest.
+pub(crate) const DOM_OP: u32 = 9;
+/// The message a name's owner signs to update its record.
+pub(crate) const DOM_UPDATE: u32 = 10;
 /// A spend policy's leaf: its conditions ([`crate::policy`]).
 pub(crate) const DOM_POLICY_LEAF: u32 = 13;
 /// A hash lock: `H(preimage)`.
@@ -37,8 +49,21 @@ pub(crate) const DOM_COVERED: u32 = 16;
 pub(crate) const DOM_SIGNERS: u32 = 17;
 
 /// Every tag above.
-const DOMAINS: &[u32] =
-    &[DOM_PUBKEY, DOM_COMMITMENT, DOM_POLICY_LEAF, DOM_HASHLOCK, DOM_REBIND, DOM_COVERED, DOM_SIGNERS];
+const DOMAINS: &[u32] = &[
+    DOM_PUBKEY,
+    DOM_COMMITMENT,
+    DOM_NAME,
+    DOM_RECORD,
+    DOM_COMMIT,
+    DOM_COMMIT_LEAF,
+    DOM_OP,
+    DOM_UPDATE,
+    DOM_POLICY_LEAF,
+    DOM_HASHLOCK,
+    DOM_REBIND,
+    DOM_COVERED,
+    DOM_SIGNERS,
+];
 
 // No two domains share a tag.
 const _: () = {

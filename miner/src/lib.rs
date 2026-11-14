@@ -1,4 +1,6 @@
+pub mod codec;
 pub mod hash;
+pub mod name;
 pub mod output;
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 pub mod packed;
