@@ -224,7 +224,6 @@ thread_local! {
 /// formats here is one, so this finds a format's structural fields without
 /// describing the format. Reads from copies of `bytes` are not seen.
 #[cfg(test)]
-#[allow(dead_code)] // the proof formats' tests call it
 pub(crate) fn u32_fields(bytes: &[u8], decode: impl FnOnce(&[u8])) -> Vec<usize> {
     READS.with(|r| *r.borrow_mut() = Some(Vec::new()));
     decode(bytes);
@@ -244,7 +243,6 @@ pub(crate) fn u32_fields(bytes: &[u8], decode: impl FnOnce(&[u8])) -> Vec<usize>
 /// should be empty. Deterministic, unlike random mutation, which rarely
 /// lands a chosen value on a chosen field of a large proof.
 #[cfg(test)]
-#[allow(dead_code)] // the proof formats' tests call it
 pub(crate) fn sweep_fields(bytes: &[u8], check: impl Fn(&[u8]) -> Option<bool>) -> (usize, Vec<String>, Vec<String>) {
     let fields = u32_fields(bytes, |b| {
         check(b);
@@ -322,5 +320,60 @@ mod tests {
         assert_eq!(read_digest(&enc[..DIGEST_BYTES - 1]), None);
         enc[28..32].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(read_digest(&enc), None);
+    }
+
+    #[test]
+    fn writer_and_reader_round_trip_and_reject() {
+        let mut w = Writer::default();
+        w.u32(7);
+        w.u64(u64::MAX);
+        w.fp4(&Fp4([Fp::new(1), Fp::new(2), Fp::new(3), Fp::new(4)]));
+        w.fp_vec(&[Fp::new(9), Fp::new(10)]);
+        w.digest_vec(&[[Fp::new(5); DIGEST]]);
+        let bytes = w.finish();
+        let mut r = Reader(&bytes);
+        assert_eq!(r.u32(), Some(7));
+        assert_eq!(r.u64(), Some(u64::MAX));
+        assert_eq!(r.fp4(), Some(Fp4([Fp::new(1), Fp::new(2), Fp::new(3), Fp::new(4)])));
+        assert_eq!(r.fp_vec(), Some(vec![Fp::new(9), Fp::new(10)]));
+        assert_eq!(r.digest_vec(), Some(vec![[Fp::new(5); DIGEST]]));
+        assert!(r.is_empty());
+        assert_eq!(r.u32(), None);
+        // Non-canonical element and oversized length prefix are rejected.
+        let mut r = Reader(&0x7800_0001u32.to_le_bytes());
+        assert_eq!(r.fp(), None);
+        let mut r = Reader(&u32::MAX.to_le_bytes());
+        assert_eq!(r.fp_vec(), None);
+    }
+
+    /// The tests' sweep finds every count a decoder reads and tries the
+    /// values at its bounds: a decoder that trusts one is found out.
+    #[test]
+    fn the_sweep_finds_a_trusted_count() {
+        let mut w = Writer::default();
+        w.fp_vec(&[Fp::new(1), Fp::new(2), Fp::new(3)]);
+        w.u32(9);
+        let bytes = w.finish();
+        let fields = u32_fields(&bytes, |b| {
+            let mut r = Reader(b);
+            let _ = (r.fp_vec(), r.u32());
+        });
+        assert_eq!(fields, vec![0, 16]);
+        // A careful decoder: nothing but the bytes it was given decodes.
+        let careful = |b: &[u8]| {
+            let mut r = Reader(b);
+            let (v, n) = (r.fp_vec()?, r.u32()?);
+            (r.is_empty() && v.len() == 3 && n == 9).then_some(false)
+        };
+        let (found, panicked, accepted) = sweep_fields(&bytes, careful);
+        assert_eq!((found, panicked.len(), accepted.len()), (2, 0, 0));
+        // One that accepts any count, and one that indexes by it.
+        let (_, panicked, accepted) = sweep_fields(&bytes, |b| Reader(&b[16..]).u32().map(|_| true));
+        assert!(panicked.is_empty() && accepted.len() >= 10);
+        let (_, panicked, _) = sweep_fields(&bytes, |b| {
+            let n = Reader(&b[16..]).u32()? as usize;
+            Some([0u8; 16][n] == 1)
+        });
+        assert!(!panicked.is_empty());
     }
 }

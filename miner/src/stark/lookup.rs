@@ -6,7 +6,6 @@
 use crate::challenger::Challenger;
 use crate::ext::{DEGREE, Fp4};
 use crate::field::Field;
-use crate::poseidon2::Fp;
 use super::air::*;
 use super::config::*;
 
@@ -154,10 +153,6 @@ pub(crate) fn powers(base: Fp4, count: usize) -> Vec<Fp4> {
 /// Horner evaluation of extension coefficients at an extension point.
 pub(super) fn eval_ext_poly_at(coeffs: &[Fp4], x: Fp4) -> Fp4 {
     coeffs.iter().rev().fold(Fp4::ZERO, |acc, c| acc * x + *c)
-}
-
-pub(super) fn ext_from_row(row: &[Fp]) -> Vec<Fp4> {
-    row.chunks_exact(DEGREE).map(|c| Fp4([c[0], c[1], c[2], c[3]])).collect()
 }
 
 /// Reconstructs extension column values from their four base-column

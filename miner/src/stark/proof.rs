@@ -114,8 +114,9 @@ pub struct Proof {
     /// For every FRI query, one opening per table.
     pub openings: Vec<Vec<QueryOpening>>,
     /// The sampled query indices into the largest domain. The verifier
-    /// samples them itself and rejects a proof that disagrees; the encoding
-    /// needs them to rebuild the Merkle paths it leaves out.
+    /// samples them itself and rejects a proof that disagrees; a decoder
+    /// that rebuilds the Merkle paths the encoding leaves out
+    /// ([`Proof::from_bytes`]) needs them before any transcript is run.
     pub query_indices: Vec<usize>,
     /// Proof-of-work witnesses before the lookup challenges, the constraint
     /// combination, the out-of-domain point and the batching challenge
@@ -174,16 +175,30 @@ impl Proof {
     /// that another opening determines, or that an earlier query already
     /// sent, is left out (see [`crate::merkle::compress_paths`]).
     pub fn to_bytes(&self) -> Vec<u8> {
+        self.try_to_bytes().expect("a proof of one shape")
+    }
+
+    /// [`Proof::to_bytes`], or `None` for a proof the encoding cannot
+    /// hold: queries, openings and indices that are not one for one,
+    /// paths of one tree that differ in length, or a lookup total where
+    /// there are no lookups. A prover makes none such.
+    pub fn try_to_bytes(&self) -> Option<Vec<u8>> {
         let mut w = Writer::with_capacity(1 << 16);
         w.u32(self.tables.len() as u32);
         for t in &self.tables {
             t.write(&mut w);
         }
         let nq = self.openings.len();
-        assert_eq!(self.query_indices.len(), nq, "one index per query");
-        assert_eq!(self.fri.queries.len(), nq, "one fri query per opening");
         let rounds = self.fri.queries.first().map_or(0, |q| q.len());
-        assert!(self.fri.queries.iter().all(|q| q.len() == rounds), "fri queries of one shape");
+        if self.query_indices.len() != nq
+            || self.fri.queries.len() != nq
+            || self.fri.queries.iter().any(|q| q.len() != rounds)
+            || self.openings.iter().any(|o| o.len() != self.tables.len())
+            || self.query_indices.iter().any(|&i| i > u32::MAX as usize)
+            || self.tables.iter().any(|t| t.aux_root.is_none() && !t.lookup_sum.is_zero())
+        {
+            return None;
+        }
         w.digest_vec(&self.fri.commitments);
         w.fp4(&self.fri.final_value);
         w.fp(&self.fri.pow_witness);
@@ -207,7 +222,9 @@ impl Proof {
         }
         let trees = self.trees();
         for (height, per_q) in &trees {
-            assert!(per_q.iter().all(|p| p.1.len() == *height), "paths of one tree have one length");
+            if per_q.iter().any(|p| p.1.len() != *height) {
+                return None;
+            }
             w.u32(*height as u32);
         }
         for (height, per_q) in &trees {
@@ -217,30 +234,18 @@ impl Proof {
                 w.digest(&d);
             }
         }
-        w.finish()
+        Some(w.finish())
     }
 
-    /// Parses a proof; the whole slice must be consumed.
+    /// Parses a proof into its owned form, every path rebuilt: a
+    /// prover's, and the recursion's, which lay a proof out as a witness.
+    /// A verifier reads the bytes as they are ([`super::verify_bytes`]).
+    /// The whole slice must be consumed.
     pub fn from_bytes(bytes: &[u8]) -> Option<Proof> {
-        let mut r = Reader(bytes);
-        let nt = r.len(64)?;
-        if nt == 0 {
-            return None;
-        }
-        let tables = (0..nt).map(|_| TableProof::read(&mut r)).collect::<Option<Vec<_>>>()?;
-        let commitments = r.digest_vec()?;
-        let final_value = r.fp4()?;
-        let pow_witness = r.fp()?;
-        let fold_witnesses = r.fp_vec()?;
-        let grinding = [r.fp()?, r.fp()?, r.fp()?, r.fp()?];
-        let nq = r.len(4)?;
-        let rounds = r.len(0)?;
-        // No queries is no proof, and the FRI trees are counted from the
-        // first query below: with none, `rounds` would claim trees that
-        // are not there.
-        if nq == 0 || rounds > 32 {
-            return None;
-        }
+        let ProofHead { tables, commitments, final_value, pow_witness, fold_witnesses, grinding, num_queries, rounds, rest } =
+            ProofHead::read(bytes)?;
+        let (nt, nq) = (tables.len(), num_queries);
+        let mut r = Reader(rest);
         // Capacity from the untrusted count, but not beyond any real proof's.
         let mut query_indices = Vec::with_capacity(nq.min(128));
         let mut fri_queries = Vec::with_capacity(nq.min(128));
@@ -323,8 +328,60 @@ impl Proof {
     }
 }
 
+/// What a proof's bytes begin with, read: everything before the queries.
+/// Small, of a size set by the tables' widths and the FRI rounds, not by
+/// the queries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProofHead<'a> {
+    /// One part per table, tallest table first.
+    pub tables: Vec<TableProof>,
+    /// The FRI rounds' roots, final value and witnesses.
+    pub commitments: Vec<Digest>,
+    pub final_value: Fp4,
+    pub pow_witness: Fp,
+    pub fold_witnesses: Vec<Fp>,
+    pub grinding: [Fp; 4],
+    /// Queries the proof says it has (not zero), and FRI rounds a query.
+    pub num_queries: usize,
+    pub rounds: usize,
+    /// The rest: for each query its index, its FRI leaves and its rows of
+    /// each table; then every tree's height; then the siblings the
+    /// openings of each tree do not determine, tree by tree.
+    pub rest: &'a [u8],
+}
+
+impl<'a> ProofHead<'a> {
+    pub fn read(bytes: &'a [u8]) -> Option<ProofHead<'a>> {
+        let mut r = Reader(bytes);
+        let nt = r.len(64)?;
+        if nt == 0 {
+            return None;
+        }
+        let tables = (0..nt).map(|_| TableProof::read(&mut r)).collect::<Option<Vec<_>>>()?;
+        let commitments = r.digest_vec()?;
+        let final_value = r.fp4()?;
+        let pow_witness = r.fp()?;
+        let fold_witnesses = r.fp_vec()?;
+        let grinding = [r.fp()?, r.fp()?, r.fp()?, r.fp()?];
+        let num_queries = r.len(4)?;
+        let rounds = r.len(0)?;
+        // No queries is no proof, and the FRI trees are counted from the
+        // first query: with none, `rounds` would claim trees that are not
+        // there.
+        if num_queries == 0 || rounds > 32 {
+            return None;
+        }
+        Some(ProofHead { tables, commitments, final_value, pow_witness, fold_witnesses, grinding, num_queries, rounds, rest: r.0 })
+    }
+}
+
+/// Why a verifier refuses a proof. An opening that is not its tree's is
+/// reported by tree: the openings of one tree travel and are checked
+/// together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VerifyError {
+    /// The bytes are not the encoding of a proof.
+    Malformed,
     Shape,
     /// A proof-of-work witness before a commit-phase challenge is wrong.
     ProofOfWork,
@@ -333,38 +390,44 @@ pub enum VerifyError {
     LookupSum,
     Fri(FriError),
     InvalidTraceOpening {
-        query: usize,
+        table: usize,
     },
     InvalidAuxOpening {
-        query: usize,
+        table: usize,
     },
     InvalidPreprocessedOpening {
-        query: usize,
+        table: usize,
     },
     InvalidQuotientOpening {
-        query: usize,
+        table: usize,
+    },
+    /// An opening of a FRI round's tree is not the tree's.
+    InvalidFriOpening {
+        round: usize,
     },
 }
 
 impl core::fmt::Display for VerifyError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            VerifyError::Malformed => f.write_str("not the encoding of a stark proof"),
             VerifyError::Shape => f.write_str("stark proof has the wrong shape"),
             VerifyError::ProofOfWork => f.write_str("wrong proof of work before a challenge"),
             VerifyError::ConstraintIdentity => f.write_str("constraints do not hold at the out-of-domain point"),
             VerifyError::LookupSum => f.write_str("lookup totals of the tables do not cancel"),
             VerifyError::Fri(e) => write!(f, "{e}"),
-            VerifyError::InvalidTraceOpening { query } => {
-                write!(f, "query {query}: invalid trace opening")
+            VerifyError::InvalidFriOpening { round } => write!(f, "fri round {round}: invalid merkle opening"),
+            VerifyError::InvalidTraceOpening { table } => {
+                write!(f, "table {table}: invalid trace opening")
             }
-            VerifyError::InvalidAuxOpening { query } => {
-                write!(f, "query {query}: invalid auxiliary opening")
+            VerifyError::InvalidAuxOpening { table } => {
+                write!(f, "table {table}: invalid auxiliary opening")
             }
-            VerifyError::InvalidPreprocessedOpening { query } => {
-                write!(f, "query {query}: invalid preprocessed opening")
+            VerifyError::InvalidPreprocessedOpening { table } => {
+                write!(f, "table {table}: invalid preprocessed opening")
             }
-            VerifyError::InvalidQuotientOpening { query } => {
-                write!(f, "query {query}: invalid quotient opening")
+            VerifyError::InvalidQuotientOpening { table } => {
+                write!(f, "table {table}: invalid quotient opening")
             }
         }
     }

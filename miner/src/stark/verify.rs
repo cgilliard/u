@@ -1,10 +1,12 @@
 //! The verifier.
 
 use crate::challenger::Challenger;
-use crate::ext::{DEGREE, Fp4};
+use crate::ext::{DEGREE, Fp4, as_fp4};
 use crate::field::Field;
 use crate::fri::{self};
-use crate::merkle::{Digest, verify as merkle_verify};
+use crate::codec::Reader;
+use crate::hash::EMPTY;
+use crate::merkle::{Digest, batch_root, hash_row};
 use crate::ntt::{MULTIPLICATIVE_GENERATOR, root_of_unity};
 use crate::poseidon2::Fp;
 use super::air::*;
@@ -55,6 +57,10 @@ pub(super) struct TableShape {
 }
 
 /// Verifies a proof of [`prove_tables`] for the given tables, in order.
+///
+/// The proof is checked as its bytes are: this encodes it and calls
+/// [`verify_bytes`], the one verifier there is. A proof the encoding
+/// cannot hold has the wrong shape.
 pub fn verify_tables(
     config: &StarkConfig,
     specs: &[TableSpec<'_>],
@@ -62,8 +68,34 @@ pub fn verify_tables(
     proof: &Proof,
     challenger: &mut Challenger,
 ) -> Result<(), VerifyError> {
+    match proof.try_to_bytes() {
+        Some(bytes) => verify_bytes(config, specs, public, &bytes, challenger),
+        None => Err(VerifyError::Shape),
+    }
+}
+
+/// Verifies the bytes of a proof of [`prove_tables`] for the given tables,
+/// in order.
+///
+/// What comes before the queries is read into place ([`ProofHead`]): its
+/// size is the tables' widths', not the queries'. The queries are then
+/// read where they lie, one at a time: each row is decoded into one
+/// buffer, hashed and combined there, and its hash noted. The openings of
+/// each tree are checked together at the end, against the siblings the
+/// proof sends for them ([`crate::merkle::batch_root`]); no path is
+/// rebuilt. A query whose folds fail is reported after the trees, so that
+/// a row that is not its tree's is reported as that.
+pub fn verify_bytes(
+    config: &StarkConfig,
+    specs: &[TableSpec<'_>],
+    public: &[Fp],
+    bytes: &[u8],
+    challenger: &mut Challenger,
+) -> Result<(), VerifyError> {
+    let head = ProofHead::read(bytes).ok_or(VerifyError::Malformed)?;
+    let proof = &head;
     let log_blowup = config.log_blowup;
-    if specs.is_empty() || proof.tables.len() != specs.len() || proof.openings.len() != config.num_queries {
+    if specs.is_empty() || proof.tables.len() != specs.len() || proof.num_queries != config.num_queries {
         return Err(VerifyError::Shape);
     }
     let log_ns: Vec<usize> = proof.tables.iter().map(|t| t.log_n).collect();
@@ -220,67 +252,182 @@ pub fn verify_tables(
         .collect();
     let mut log_sizes: Vec<usize> = log_ns.iter().map(|l| l + log_blowup).collect();
     log_sizes.dedup();
-    if proof.query_indices.len() != config.num_queries {
+    let fri_verifier = fri::Verifier::new(
+        &config.fri(),
+        challenger,
+        MULTIPLICATIVE_GENERATOR,
+        &log_sizes,
+        &proof.commitments,
+        &proof.fold_witnesses,
+        &proof.final_value,
+        proof.pow_witness,
+    )?;
+    let schedule = *fri_verifier.schedule();
+    let rounds = schedule.rounds();
+    if proof.rounds != rounds {
         return Err(VerifyError::Shape);
     }
-    let open = |q: usize, index: usize, values: &mut [Fp4]| -> Result<(), VerifyError> {
-        let openings = &proof.openings[q];
-        if openings.len() != specs.len() || proof.query_indices[q] != index {
+
+    // What each table's openings are read with: the same for every query.
+    struct At {
+        log_m: usize,
+        shift: Fp,
+        omega: Fp,
+        zeta_next: Fp4,
+        zeta_q: Fp4,
+        /// Lengths of its trace, auxiliary, preprocessed and quotient rows.
+        lens: [usize; 4],
+    }
+    let ats: Vec<At> = proof
+        .tables
+        .iter()
+        .zip(&shapes)
+        .map(|(t, s)| {
+            let log_m = t.log_n + log_blowup;
+            At {
+                log_m,
+                shift: table_shift(log_big, log_m),
+                omega: root_of_unity(log_m),
+                zeta_next: zeta.mul_base(&root_of_unity(t.log_n)),
+                zeta_q: quotient_point(config, zeta, s.chunks),
+                lens: [s.w, s.aux_w, s.pre_w, s.chunks * DEGREE],
+            }
+        })
+        .collect();
+
+    // The trees the proof opens: each table's trace, auxiliary,
+    // preprocessed and quotient trees, then the FRI rounds'. For each, its
+    // root and height, or `None` for a tree a table does not have.
+    let (nt, nq) = (specs.len(), config.num_queries);
+    let num_trees = 4 * nt + rounds;
+    let tree = |k: usize| -> Option<(&Digest, usize)> {
+        if k >= 4 * nt {
+            let r = k - 4 * nt;
+            return Some((&proof.commitments[r], schedule.log_leaves(r)));
+        }
+        let (t, log_m) = (&proof.tables[k / 4], ats[k / 4].log_m);
+        match k % 4 {
+            0 => Some((&t.trace_root, log_m)),
+            1 => t.aux_root.as_ref().map(|r| (r, log_m)),
+            2 => specs[k / 4].pre_root.map(|r| (r, log_m)),
+            _ => Some((&t.quotient_root, log_m)),
+        }
+    };
+    let not_the_trees = |k: usize| -> VerifyError {
+        if k >= 4 * nt {
+            return VerifyError::InvalidFriOpening { round: k - 4 * nt };
+        }
+        let table = k / 4;
+        match k % 4 {
+            0 => VerifyError::InvalidTraceOpening { table },
+            1 => VerifyError::InvalidAuxOpening { table },
+            2 => VerifyError::InvalidPreprocessedOpening { table },
+            _ => VerifyError::InvalidQuotientOpening { table },
+        }
+    };
+
+    // The queries, where they lie. All the heap a query needs is here:
+    // every opened leaf's hash, the queries' indices, and one row.
+    let mut leaves = vec![EMPTY; num_trees * nq];
+    let mut indices = vec![0usize; nq];
+    let mut row = vec![Fp::ZERO; ats.iter().map(|a| a.lens.iter().sum::<usize>()).max().unwrap_or(0)];
+    let mut steps = [Fp4::ZERO; 4 * fri::MAX_ROUNDS];
+    let mut inputs = [Fp4::ZERO; fri::MAX_ROUNDS];
+    let mut fold_error = None;
+    let mut r = Reader(proof.rest);
+    let malformed = VerifyError::Malformed;
+    for q in 0..nq {
+        let index = fri_verifier.sample_index(challenger);
+        if r.u32().ok_or(malformed)? as usize != index {
             return Err(VerifyError::Shape);
+        }
+        indices[q] = index;
+        for rd in 0..rounds {
+            let arity = 1usize << schedule.log_arity(rd);
+            if r.u32().ok_or(malformed)? as usize != arity {
+                return Err(VerifyError::Shape);
+            }
+            for v in &mut steps[4 * rd..4 * rd + arity] {
+                *v = r.fp4().ok_or(malformed)?;
+            }
         }
         // One value for each size of domain: tables of one size add up.
         let mut filled = 0;
         let mut last_size = None;
-        for ((((spec, t), s), opening), deep) in specs.iter().zip(&proof.tables).zip(&shapes).zip(openings).zip(&deeps)
-        {
-            if opening.trace_row.len() != s.w
-                || opening.aux_row.len() != s.aux_w
-                || opening.pre_row.len() != s.pre_w
-                || opening.quotient_row.len() != s.chunks * DEGREE
-            {
-                return Err(VerifyError::Shape);
+        for (t, (at, deep)) in ats.iter().zip(&deeps).enumerate() {
+            let mut ends = [0usize; 5];
+            for (k, &len) in at.lens.iter().enumerate() {
+                if r.u32().ok_or(malformed)? as usize != len {
+                    return Err(VerifyError::Shape);
+                }
+                let part = &mut row[ends[k]..ends[k] + len];
+                for x in part.iter_mut() {
+                    *x = r.fp().ok_or(malformed)?;
+                }
+                leaves[(4 * t + k) * nq + q] = if len == 0 { EMPTY } else { hash_row(part) };
+                ends[k + 1] = ends[k] + len;
             }
-            let log_m = t.log_n + log_blowup;
-            let i = index % (1 << log_m);
-            if !merkle_verify(&t.trace_root, log_m, i, &opening.trace_row, &opening.trace_path) {
-                return Err(VerifyError::InvalidTraceOpening { query: q });
-            }
-            if let Some(root) = &t.aux_root
-                && !merkle_verify(root, log_m, i, &opening.aux_row, &opening.aux_path)
-            {
-                return Err(VerifyError::InvalidAuxOpening { query: q });
-            }
-            if let Some(root) = spec.pre_root
-                && !merkle_verify(root, log_m, i, &opening.pre_row, &opening.pre_path)
-            {
-                return Err(VerifyError::InvalidPreprocessedOpening { query: q });
-            }
-            if !merkle_verify(&t.quotient_root, log_m, i, &opening.quotient_row, &opening.quotient_path) {
-                return Err(VerifyError::InvalidQuotientOpening { query: q });
-            }
-            let shift = table_shift(log_big, log_m);
-            let x_base = shift.mul(&root_of_unity(log_m).pow(i as u64));
+            let i = index & ((1usize << at.log_m) - 1);
+            let x_base = at.shift.mul(&at.omega.pow(i as u64));
             let x = Fp4::from_base(x_base);
-            let zeta_next = zeta.mul_base(&root_of_unity(t.log_n));
-            let zeta_q = quotient_point(config, zeta, s.chunks);
             // Zeta is drawn from the transcript, so a zero here is a 2^-90
             // chance; still an error, not a panic.
-            let (Some(inv0), Some(inv1)) = (((x - zeta) * (x - zeta_next)).inv(), (x - zeta_q).inv()) else {
-                return Err(VerifyError::InvalidQuotientOpening { query: q });
+            let (Some(inv0), Some(inv1)) = (((x - zeta) * (x - at.zeta_next)).inv(), (x - at.zeta_q).inv()) else {
+                return Err(VerifyError::InvalidQuotientOpening { table: t });
             };
-            let inv = [inv0, inv1];
-            let rows = (&opening.trace_row[..], &opening.aux_row[..], &opening.pre_row[..]);
-            let quotient = ext_from_row(&opening.quotient_row);
-            let v = deep.value((rows.0, rows.1, rows.2, &quotient), x_base, inv[0], inv[1]);
-            if last_size == Some(log_m) {
-                values[filled - 1] += v;
+            let rows =
+                (&row[..ends[1]], &row[ends[1]..ends[2]], &row[ends[2]..ends[3]], as_fp4(&row[ends[3]..ends[4]]));
+            let v = deep.value(rows, x_base, inv0, inv1);
+            if last_size == Some(at.log_m) {
+                inputs[filled - 1] += v;
             } else {
-                values[filled] = v;
+                inputs[filled] = v;
                 filled += 1;
-                last_size = Some(log_m);
+                last_size = Some(at.log_m);
             }
         }
-        Ok(())
-    };
-    fri::verify(&config.fri(), challenger, MULTIPLICATIVE_GENERATOR, &log_sizes, &proof.fri, open)
+        let folds = fri_verifier.query(
+            q,
+            index,
+            &inputs[..filled],
+            |rd| Some(&steps[4 * rd..4 * rd + (1usize << schedule.log_arity(rd))]),
+            |rd, _, values| {
+                leaves[(4 * nt + rd) * nq + q] = hash_row(fri::leaf_row(values));
+                true
+            },
+        );
+        match folds {
+            Ok(()) => {}
+            Err(fri::FriError::Shape) => return Err(VerifyError::Shape),
+            Err(e) => {
+                fold_error.get_or_insert(e);
+            }
+        }
+    }
+
+    // Every tree's height, as the proof says it: what it must be.
+    for k in 0..num_trees {
+        let height = r.u32().ok_or(malformed)? as usize;
+        if height != tree(k).map_or(0, |(_, h)| h) {
+            return Err(not_the_trees(k));
+        }
+    }
+    // Each tree's openings together, against the siblings sent for them.
+    let mut at = vec![0usize; nq];
+    for k in 0..num_trees {
+        let Some((root, height)) = tree(k) else { continue };
+        for (a, i) in at.iter_mut().zip(&indices) {
+            *a = i & ((1usize << height) - 1);
+        }
+        if batch_root(height, &at, &leaves[k * nq..(k + 1) * nq], || r.digest()) != Some(*root) {
+            return Err(not_the_trees(k));
+        }
+    }
+    if !r.is_empty() {
+        return Err(malformed);
+    }
+    match fold_error {
+        Some(e) => Err(e.into()),
+        None => Ok(()),
+    }
 }
