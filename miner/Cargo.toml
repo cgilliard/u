@@ -1,0 +1,24 @@
+[package]
+name = "tabminer"
+version = "0.1.0"
+edition = "2024"
+default-run = "tabminer"
+
+[[bin]]
+name = "genesis"
+path = "tools/genesis.rs"
+
+[features]
+# The dev networks (`--network dev`, `dev-recursive`): their built-in
+# dataset and plan. Off by default, so release builds carry none of it.
+dev = []
+
+[dependencies]
+# read-txn-no-tls: environments opened with MDB_NOTLS. LMDB on Windows
+# keeps at most 64 thread-local keys, one per open environment, and the
+# test suite opens more than that at once.
+heed = { version = "0.20", default-features = false, features = ["read-txn-no-tls"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
