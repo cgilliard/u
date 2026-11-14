@@ -25,7 +25,8 @@ jobs:
       # One platform failing does not stop the others: each reports.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # ubuntu-24.04-arm is Linux on arm64; macos-latest is arm64 too.
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-latest]
     defaults:
       run:
         working-directory: miner
@@ -42,7 +43,7 @@ jobs:
 
       # Debug build: overflow checks and debug assertions are on. Built for
       # the runner's CPU (miner/.cargo/config.toml): the AVX2 code path on
-      # the x86-64 runners, the portable one on macOS (ARM).
+      # the x86-64 runners, the portable one on the arm64 ones.
       - name: Test
         run: cargo test --locked
 
