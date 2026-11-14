@@ -34,6 +34,13 @@ pub fn as_fp4(v: &[Fp]) -> &[Fp4] {
     unsafe { core::slice::from_raw_parts(v.as_ptr().cast::<Fp4>(), v.len() / DEGREE) }
 }
 
+/// Extension values read as their base values, four for each: what a row
+/// of them is hashed as.
+pub fn as_base(v: &[Fp4]) -> &[Fp] {
+    // SAFETY: as in `as_fp4`, the other way: each `Fp4` is four `Fp` in a row.
+    unsafe { core::slice::from_raw_parts(v.as_ptr().cast::<Fp>(), v.len() * DEGREE) }
+}
+
 impl Fp4 {
     pub const ZERO: Fp4 = Fp4([Fp::ZERO; DEGREE]);
     pub const ONE: Fp4 = Fp4([Fp::ONE, Fp::ZERO, Fp::ZERO, Fp::ZERO]);
@@ -269,6 +276,10 @@ mod tests {
         assert_eq!(as_fp4(&flat[4 * 5..4 * 9]), &elements[5..9]);
         assert_eq!(as_fp4(&flat[..4]), &elements[..1]);
         assert!(as_fp4(&[]).is_empty());
+        // And back: extension values as the base values they are made of.
+        assert_eq!(as_base(&elements), &flat[..]);
+        assert_eq!(as_base(&elements[5..9]), &flat[20..36]);
+        assert!(as_base(&[]).is_empty());
         assert_eq!((size_of::<Fp4>(), align_of::<Fp4>()), (4 * size_of::<Fp>(), align_of::<Fp>()));
         for cut in [1, 2, 3, 5] {
             assert!(std::panic::catch_unwind(|| as_fp4(&flat[..cut]).len()).is_err(), "{cut} values");

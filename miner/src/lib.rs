@@ -4,6 +4,7 @@ pub mod codec;
 pub mod difficulty;
 pub mod ext;
 pub mod field;
+pub mod fri;
 pub mod hash;
 #[cfg(test)]
 pub mod inflate;
