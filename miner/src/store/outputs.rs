@@ -352,6 +352,11 @@ impl Outputs {
         self.pass(txn, 0, Edits { removes, puts, ..Edits::none() }, next)
     }
 
+    /// Frees every page of the set.
+    pub fn free<B: Backend>(&self, txn: &Txn<'_, B>) -> io::Result<()> {
+        trie::free::<OutputTree, B>(txn, self.root)
+    }
+
     /// The set before a block that spent `spends` (ascending) and made
     /// the outputs from position `next` on: those are removed, and the
     /// spent ones are unspent again. `height` is the block's less one.

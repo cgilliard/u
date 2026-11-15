@@ -374,6 +374,11 @@ impl Names {
         self.pass(txn, Edits { removes, puts, ..Edits::none() })
     }
 
+    /// Frees every page of the names.
+    pub fn free<B: Backend>(&self, txn: &Txn<'_, B>) -> io::Result<()> {
+        trie::free::<NameTree, B>(txn, self.root)
+    }
+
     /// The record registered at `key`, if any.
     pub fn get(&self, pages: &impl ReadPages, key: Key) -> io::Result<Option<Record>> {
         Ok(trie::get::<NameTree>(pages, self.root, key)?.map(|(record, _)| record))

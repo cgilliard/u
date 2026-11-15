@@ -43,6 +43,9 @@
 //! - [`names`]: the names, a trie over the keys of names, hashed by their
 //!   own rule.
 //! - [`window`]: what undoes each of the last blocks.
+//! - [`blob`]: bytes too many for a page, as a chain of pages.
+//! - [`blocks`]: the headers, the bodies kept and the chain by height,
+//!   in tries of the same file.
 //! - [`state`]: the two under one root record, with the block they are
 //!   the state after: what a node applies blocks to.
 //! - [`receive`]: a state taken from other nodes part by part, each
@@ -53,6 +56,8 @@
 //! whatever buffers a caller reads into.
 
 pub mod backend;
+pub mod blob;
+pub mod blocks;
 pub mod crc32c;
 pub mod freemap;
 pub mod names;

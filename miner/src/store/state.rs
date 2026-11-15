@@ -50,9 +50,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use super::backend::Backend;
+use super::blocks::Blocks;
 use super::names::{NameProof, Names, PART_LEVEL as NAME_PART_LEVEL};
 use super::outputs::{Outputs, PART_LEVEL, Record};
-use super::pagefile::{PageFile, Pin, Root};
+use super::pagefile::{PageFile, Pin, Root, Txn};
 use super::sparse::STATE_HEIGHT;
 use super::trie::Part;
 use super::window::{BlockRecord, Window};
@@ -65,8 +66,11 @@ const VERSION: u8 = 1;
 /// What a root record begins with while its state is still being
 /// received from other nodes ([`super::receive`]): not a state to open.
 pub(super) const RECEIVING: u8 = 2;
-const RECORD: usize = 1 + 4 + 32 + Outputs::BYTES + Names::BYTES + Window::BYTES + 8;
+const RECORD: usize = BLOCKS_AT + Blocks::BYTES;
 const NAMES_AT: usize = 37 + Outputs::BYTES;
+const WINDOW_AT: usize = NAMES_AT + Names::BYTES;
+const BLOCKS_AT: usize = WINDOW_AT + Window::BYTES + 8;
+const _: () = assert!(RECORD <= super::pagefile::ROOT_MAX);
 /// Records the sweep goes past with a block, at least.
 const SWEEP_MIN: usize = 2048;
 /// And for each output the block spends.
@@ -82,8 +86,12 @@ fn corrupt(what: &'static str) -> io::Error {
 /// map. If the pages contradict each other the file takes no more
 /// transactions.
 fn mark_all<B: Backend>(file: &PageFile<B>, opened: &Meta) -> Result<(), io::ErrorKind> {
-    let marked =
-        opened.outputs.mark(file).and_then(|()| opened.names.mark(file)).and_then(|()| opened.window.mark(file));
+    let marked = opened
+        .outputs
+        .mark(file)
+        .and_then(|()| opened.names.mark(file))
+        .and_then(|()| opened.window.mark(file))
+        .and_then(|()| opened.blocks.mark(file));
     match marked {
         Ok(()) => {
             file.seal();
@@ -120,6 +128,8 @@ pub(super) struct Meta {
     pub(super) window: Window,
     /// The position the sweep of the outputs has reached.
     pub(super) sweep: u64,
+    /// The blocks known of.
+    pub(super) blocks: Blocks,
 }
 
 impl Meta {
@@ -131,6 +141,7 @@ impl Meta {
             names: Names::EMPTY,
             window: Window::default(),
             sweep: 0,
+            blocks: Blocks::EMPTY,
         }
     }
 
@@ -143,6 +154,7 @@ impl Meta {
         out.extend_from_slice(&self.names.to_bytes());
         out.extend_from_slice(&self.window.to_bytes());
         out.extend_from_slice(&self.sweep.to_le_bytes());
+        out.extend_from_slice(&self.blocks.to_bytes());
         out.try_into().unwrap()
     }
 
@@ -153,10 +165,18 @@ impl Meta {
             return Ok(Meta::empty());
         }
         let (height, tip, outputs, names) = Meta::head(root)?;
-        let rest = &root.payload()[RECORD - Window::BYTES - 8..];
+        let rest = &root.payload()[WINDOW_AT..];
         let window = Window::read(pages, &rest[..Window::BYTES])?;
-        let sweep = u64::from_le_bytes(rest[Window::BYTES..].try_into().unwrap());
-        Ok(Meta { height, tip, outputs, names, window, sweep })
+        let sweep = u64::from_le_bytes(rest[Window::BYTES..Window::BYTES + 8].try_into().unwrap());
+        Ok(Meta { height, tip, outputs, names, window, sweep, blocks: Meta::blocks(root)? })
+    }
+
+    /// The blocks of a root record.
+    fn blocks(root: &Root) -> io::Result<Blocks> {
+        match root.payload() {
+            b if b.len() == RECORD => Blocks::from_bytes(&b[BLOCKS_AT..]),
+            _ => Ok(Blocks::EMPTY),
+        }
     }
 
     /// The tip, the outputs and the names of a root record: what a
@@ -248,7 +268,7 @@ impl<B: Backend + 'static> State<B> {
 
     /// The state of a file whose root record is `meta`'s: one just
     /// received whole.
-    pub(super) fn of(file: PageFile<B>, meta: Meta, keep: usize) -> io::Result<State<B>> {
+    pub(super) fn of(file: Arc<PageFile<B>>, meta: Meta, keep: usize) -> io::Result<State<B>> {
         let state = State::with(file, meta, keep);
         state.start()?;
         Ok(state)
@@ -260,9 +280,9 @@ impl<B: Backend + 'static> State<B> {
         (self.part_level, self.name_level) = (outputs, names);
     }
 
-    fn with(file: PageFile<B>, meta: Meta, keep: usize) -> State<B> {
+    fn with(file: Arc<PageFile<B>>, meta: Meta, keep: usize) -> State<B> {
         State {
-            file: Arc::new(file),
+            file,
             meta: Mutex::new(meta),
             keep,
             part_level: PART_LEVEL,
@@ -278,7 +298,7 @@ impl<B: Backend + 'static> State<B> {
     fn open_idle(backend: B, keep: usize) -> io::Result<State<B>> {
         let file = PageFile::open_or_create(backend)?;
         let meta = Meta::read(&file, &file.root())?;
-        Ok(State::with(file, meta, keep))
+        Ok(State::with(Arc::new(file), meta, keep))
     }
 
     /// Rebuilds the map on the calling thread, from the state as it is:
@@ -328,7 +348,8 @@ impl<B: Backend + 'static> State<B> {
     pub fn snapshot(&self) -> io::Result<Snapshot<'_, B>> {
         let pin = self.file.pin();
         let (height, tip, outputs, names) = Meta::head(pin.root())?;
-        Ok(Snapshot { pin, height, tip, outputs, names })
+        let blocks = Meta::blocks(pin.root())?;
+        Ok(Snapshot { pin, height, tip, outputs, names, blocks })
     }
 
     /// The state as of the block at `height`, to hand to another node:
@@ -404,6 +425,30 @@ impl<B: Backend + 'static> State<B> {
         })
     }
 
+    /// Changes the blocks known of ([`Blocks`]) and nothing of the
+    /// state: a header that arrived, a body, a file. Durable when this
+    /// returns; if `change` fails nothing is changed.
+    pub fn write_blocks<T>(
+        &self,
+        change: impl FnOnce(&Txn<'_, B>, &mut Blocks) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let txn = self.file.begin()?;
+        let mut meta = self.meta().clone();
+        let done = change(&txn, &mut meta.blocks)?;
+        txn.commit(&meta.to_bytes())?;
+        *self.meta() = meta;
+        Ok(done)
+    }
+
+    /// The state taken apart, to receive another in its file: the file
+    /// and what its root record says, the map of free space whole.
+    pub(super) fn dissolve(self) -> io::Result<(Arc<PageFile<B>>, Meta)> {
+        self.wait_ready()?;
+        let parts = (self.file.clone(), self.meta().clone());
+        drop(self);
+        Ok(parts)
+    }
+
     /// Applies the next block, and returns the state's root after it.
     /// Refused, with the state as it was: a block that spends what is not
     /// there ([`Error::NoSuchOutput`]), registers a name that is taken
@@ -411,6 +456,17 @@ impl<B: Backend + 'static> State<B> {
     /// registered ([`Error::NoSuchName`]), or whose header commits to
     /// another state ([`Error::StateRoot`]).
     pub fn apply(&self, block: &BlockEdit<'_>) -> Result<Digest, Error> {
+        self.apply_with(block, |_, _| Ok(()))
+    }
+
+    /// [`State::apply`], and in the same step whatever `also` does to
+    /// the blocks known of ([`Blocks`]): the block's body kept, its
+    /// place in the chain. If `also` fails the block is not applied.
+    pub fn apply_with(
+        &self,
+        block: &BlockEdit<'_>,
+        also: impl FnOnce(&Txn<'_, B>, &mut Blocks) -> Result<(), Error>,
+    ) -> Result<Digest, Error> {
         let mut txn = self.file.begin()?;
         let mut meta = self.meta().clone();
         assert_eq!(block.height, meta.height + 1, "blocks are applied in order");
@@ -459,6 +515,7 @@ impl<B: Backend + 'static> State<B> {
         }
         (meta.outputs, meta.sweep) = meta.outputs.sweep(&mut txn, meta.sweep, budget, horizon)?;
         (meta.height, meta.tip) = (block.height, block.block);
+        also(&txn, &mut meta.blocks)?;
         #[cfg(test)]
         {
             times[2] = clock.elapsed();
@@ -477,6 +534,15 @@ impl<B: Backend + 'static> State<B> {
     /// it, whose height and id are returned. [`Error::NoUndoRecord`] if
     /// the tip's record is no longer kept.
     pub fn undo(&self) -> Result<(u32, Digest), Error> {
+        self.undo_with(|_, _| Ok(()))
+    }
+
+    /// [`State::undo`], and in the same step whatever `also` does to
+    /// the blocks known of.
+    pub fn undo_with(
+        &self,
+        also: impl FnOnce(&Txn<'_, B>, &mut Blocks) -> Result<(), Error>,
+    ) -> Result<(u32, Digest), Error> {
         let mut txn = self.file.begin()?;
         let mut meta = self.meta().clone();
         let record = meta.window.pop(&mut txn)?.ok_or(Error::NoUndoRecord)?;
@@ -487,6 +553,7 @@ impl<B: Backend + 'static> State<B> {
         let restore: Vec<(Key, NameRecord, bool)> = record.replaced.iter().map(|r| (r.key(), *r, true)).collect();
         meta.names = meta.names.undo(&mut txn, &restore, &record.registered)?;
         (meta.height, meta.tip) = (record.height - 1, record.before);
+        also(&txn, &mut meta.blocks)?;
         txn.commit(&meta.to_bytes())?;
         let tip = (meta.height, meta.tip);
         *self.meta() = meta;
@@ -604,6 +671,20 @@ pub struct Snapshot<'a, B: Backend + 'static> {
     tip: Digest,
     outputs: Outputs,
     names: Names,
+    blocks: Blocks,
+}
+
+impl<'a, B: Backend + 'static> Snapshot<'a, B> {
+    /// The blocks known of when the snapshot was taken, and what reads
+    /// them: `snapshot.blocks().entry(snapshot.pages(), &id)`.
+    pub fn blocks(&self) -> &Blocks {
+        &self.blocks
+    }
+
+    /// The pages of the snapshot's state.
+    pub fn pages(&self) -> &Pin<'a, B> {
+        &self.pin
+    }
 }
 
 impl<B: Backend + 'static> Snapshot<'_, B> {
@@ -1377,6 +1458,136 @@ mod tests {
             again.name_level = level;
             check(&again, &then);
         }
+    }
+
+    /// A header, its work and status, as the index holds them.
+    fn entry(rng: &mut Rng, height: u32, block: Digest) -> crate::store::blocks::Entry {
+        let mut header = [0u8; crate::block::HEADER_SIZE];
+        header.iter_mut().for_each(|b| *b = rng.next_u64() as u8);
+        header[32..36].copy_from_slice(&height.to_le_bytes());
+        crate::store::blocks::Entry { id: block, header, work: crate::u256::U256([height as u64, 0, 0, 0]), status: 1 }
+    }
+
+    /// A block's change to the state, its header, its body and its
+    /// place in the chain are one step: wherever the power is lost,
+    /// all of them are there or none is.
+    #[test]
+    fn a_block_and_what_is_kept_of_it_are_one_step() {
+        let mut rng = Rng::new(0xb0d7);
+        let body: Vec<u8> = (0..200_000).map(|_| rng.next_u64() as u8).collect();
+        let outputs: Vec<Record> = (0..300).map(|_| record(&mut rng, 3)).collect();
+        let header = entry(&mut rng, 3, id(3, 0));
+        let mut whole = 0;
+        for crash in 1.. {
+            let mut chain = Chain::new(0x57e9);
+            let state = State::open(MemBackend::new(), 4).unwrap();
+            chain.extend(&state, 0, 500, 0).unwrap();
+            chain.extend(&state, 100, 100, 0).unwrap();
+            let before = (state.tip(), state.root());
+            // Outputs of the second block: none of them spent.
+            let spends: Vec<u64> = (0..50).map(|i| 500 + i * 2).collect();
+            let block = BlockEdit {
+                height: 3,
+                block: id(3, 0),
+                spends: &spends,
+                outputs: &outputs,
+                names: &[],
+                state_root: None,
+            };
+            state.file().backend().crash_at(crash);
+            let applied = state.apply_with(&block, |txn, blocks| {
+                blocks.put_entry(txn, &header)?;
+                blocks.put_body(txn, 3, &header.id, &body)?;
+                blocks.set_at(txn, 3, Some(header.id))
+            });
+            assert!(matches!(applied, Ok(_) | Err(Error::Io(_))), "{applied:?}");
+            let lost = if crash % 2 == 0 { Lost::Some(crash) } else { Lost::All };
+            let again = State::open(MemBackend::from_image(state.file().backend().image(lost)), 4).unwrap();
+            let snap = again.snapshot().unwrap();
+            let (blocks, pages) = (snap.blocks(), snap.pages());
+            if again.tip().0 == 3 {
+                assert_eq!(blocks.entry(pages, &header.id).unwrap(), Some(header));
+                assert_eq!(blocks.body(pages, 3, &header.id).unwrap().as_ref(), Some(&body));
+                assert_eq!(blocks.at(pages, 3).unwrap(), Some(header.id));
+                whole += 1;
+            } else {
+                assert_eq!((again.tip(), again.root()), before, "the power lost at write {crash}");
+                assert_eq!(blocks.entry(pages, &header.id).unwrap(), None);
+                assert!(!blocks.has_body(pages, 3, &header.id).unwrap());
+                assert_eq!(blocks.at(pages, 3).unwrap(), None);
+            }
+            drop(snap);
+            if applied.is_ok() {
+                assert_eq!(again.tip().0, 3);
+                // Undone, with its place in the chain: the body stays
+                // until it is dropped, and then nothing of the block is
+                // left in the file.
+                again.wait_ready().unwrap();
+                again.undo_with(|txn, blocks| blocks.set_at(txn, 3, None)).unwrap();
+                let snap = again.snapshot().unwrap();
+                assert_eq!(snap.blocks().at(snap.pages(), 3).unwrap(), None);
+                assert!(snap.blocks().has_body(snap.pages(), 3, &header.id).unwrap());
+                drop(snap);
+                assert!(again.write_blocks(|txn, blocks| blocks.remove_entry(txn, &header.id)).unwrap());
+                let old = State::open(MemBackend::from_image(state.file().backend().image(Lost::All)), 4).unwrap();
+                old.wait_ready().unwrap();
+                old.undo_with(|txn, blocks| blocks.set_at(txn, 3, None)).unwrap();
+                old.write_blocks(|txn, blocks| blocks.remove_entry(txn, &header.id)).unwrap();
+                assert_eq!(again.file().space().0, old.file().space().0);
+                break;
+            }
+        }
+        assert!(whole >= 1);
+    }
+
+    /// The blocks known of change without the state, a change that
+    /// fails changes nothing, and a snapshot goes on reading the blocks
+    /// as they were.
+    #[test]
+    fn blocks_change_without_the_state() {
+        let mut rng = Rng::new(0xb10c);
+        let mut chain = Chain::new(0xb10d);
+        let state = State::open(MemBackend::new(), 4).unwrap();
+        chain.extend(&state, 0, 200, 0).unwrap();
+        let root = state.root();
+        let headers: Vec<_> = (5..25).map(|h| entry(&mut rng, h, id(h, 3))).collect();
+        state.write_blocks(|txn, blocks| headers[..10].iter().try_for_each(|e| blocks.put_entry(txn, e))).unwrap();
+        let snap = state.snapshot().unwrap();
+        let used = state.file().space().0;
+        // Refused half way: none of it is kept.
+        let failed: Result<(), Error> = state.write_blocks(|txn, blocks| {
+            headers[10..].iter().try_for_each(|e| blocks.put_entry(txn, e))?;
+            blocks.put_file(txn, &[9; 32], &[1; 70_000])?;
+            Err(Error::NoSuchName)
+        });
+        assert_eq!(failed, Err(Error::NoSuchName));
+        assert_eq!(state.file().space().0, used);
+        assert_eq!(state.snapshot().unwrap().blocks(), snap.blocks());
+        // And then kept.
+        state
+            .write_blocks(|txn, blocks| {
+                blocks.chain[0] = 7;
+                blocks.put_file(txn, &[9; 32], &[1; 70_000])?;
+                headers[10..].iter().try_for_each(|e| blocks.put_entry(txn, e))
+            })
+            .unwrap();
+        chain.extend(&state, 20, 20, 0).unwrap();
+        let now = state.snapshot().unwrap();
+        for (i, e) in headers.iter().enumerate() {
+            assert_eq!(now.blocks().entry(now.pages(), &e.id).unwrap(), Some(*e));
+            assert_eq!(snap.blocks().entry(snap.pages(), &e.id).unwrap(), (i < 10).then_some(*e));
+        }
+        assert_eq!(snap.blocks().file(snap.pages(), &[9; 32]).unwrap(), None);
+        assert_eq!((snap.root(), snap.blocks().chain[0]), (root, 0));
+        drop((snap, now));
+        // Opened again: the same blocks, and no space lost to them.
+        let again = State::open(MemBackend::from_image(state.file().backend().image(Lost::All)), 4).unwrap();
+        again.wait_ready().unwrap();
+        assert_eq!(again.file().space().0, state.file().space().0);
+        let now = again.snapshot().unwrap();
+        assert_eq!(now.blocks().file(now.pages(), &[9; 32]).unwrap(), Some(vec![1; 70_000]));
+        assert_eq!(now.blocks().chain[0], 7);
+        assert_eq!(now.blocks().entry(now.pages(), &headers[19].id).unwrap(), Some(headers[19]));
     }
 
     /// On a real file, closed and opened.

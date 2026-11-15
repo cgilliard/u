@@ -1447,6 +1447,62 @@ fn for_each_under<T: Tree>(
     }
 }
 
+/// Frees every page of the trie under `root`: the tree is no more. The
+/// nodes are read, the leaves are not.
+pub fn free<T: Tree, B: Backend>(txn: &Txn<'_, B>, root: Child) -> io::Result<()> {
+    fn under<B: Backend>(txn: &Txn<'_, B>, child: Child, height: u32) -> io::Result<()> {
+        match child {
+            Child::Empty => Ok(()),
+            Child::Leaf { page, .. } => {
+                txn.free(page);
+                Ok(())
+            }
+            Child::Node { page, .. } => {
+                for c in load_node(txn, page, height)? {
+                    under(txn, c, below(height))?;
+                }
+                txn.free(page);
+                Ok(())
+            }
+        }
+    }
+    under(txn, root, T::HEIGHT)
+}
+
+/// The least key kept that is `from` or more.
+pub fn next_key<T: Tree>(pages: &impl ReadPages, root: Child, from: u128) -> io::Result<Option<u128>> {
+    fn under<T: Tree>(
+        pages: &impl ReadPages,
+        child: Child,
+        height: u32,
+        base: u128,
+        from: u128,
+    ) -> io::Result<Option<u128>> {
+        match child {
+            Child::Empty => Ok(None),
+            Child::Leaf { .. } => {
+                Ok(load_leaf::<T>(pages, child, height, base)?.iter().map(|s| s.key).find(|k| *k >= from))
+            }
+            Child::Node { page, .. } => {
+                let children = load_node(pages, page, height)?;
+                let low = below(height);
+                for (k, c) in children.iter().enumerate() {
+                    let (at, covers) = (base + ((k as u128) << low), low + span_of(*c));
+                    // All of it before `from`: not read.
+                    if at + ((1u128 << covers) - 1) < from {
+                        continue;
+                    }
+                    if let Some(key) = under::<T>(pages, *c, covers, at, from)? {
+                        return Ok(Some(key));
+                    }
+                }
+                Ok(None)
+            }
+        }
+    }
+    under::<T>(pages, root, T::HEIGHT, 0, from)
+}
+
 /// Calls `f` with the part of every nonempty subtree at `level`, in key
 /// order: its index there and its part. Reads the nodes above the level,
 /// and the leaves that cover more than one such subtree.

@@ -359,6 +359,14 @@ impl Window {
         Ok(())
     }
 
+    /// Drops every record: no block can be undone.
+    pub fn clear<B: Backend>(&mut self, txn: &mut Txn<'_, B>) -> io::Result<()> {
+        while let Some((_, first)) = self.blocks.pop_front() {
+            Window::drop_record(txn, first)?;
+        }
+        self.write_list(txn)
+    }
+
     /// Writes the list anew.
     fn write_list<B: Backend>(&mut self, txn: &mut Txn<'_, B>) -> io::Result<()> {
         if let Some(old) = self.list.take() {
