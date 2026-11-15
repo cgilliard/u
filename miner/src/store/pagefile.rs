@@ -33,9 +33,17 @@
 //!
 //! The root record is the valid one with the higher sequence number. The
 //! map of free space is not stored: whoever knows what the pages mean
-//! walks them from the root, marks each ([`PageFile::mark`]) and then
-//! seals the map ([`PageFile::seal`]). Pages written by a transaction
-//! that never committed are reached by nothing, so they are free.
+//! walks them from the root as it was at opening, marks each
+//! ([`PageFile::mark`]) and then seals the map ([`PageFile::seal`]).
+//! Pages written by a transaction that never committed are reached by
+//! nothing, so they are free.
+//!
+//! A large file has millions of pages to walk, and transactions do not
+//! wait for it. Until the map is sealed a new page goes past the end of
+//! the file, where nothing can be, and no page is given back: what
+//! transactions free meanwhile waits, and is given back at the sealing,
+//! when every page of the root at opening has been marked and the map
+//! is whole.
 //!
 //! # Readers
 //!
@@ -224,6 +232,9 @@ struct State {
     map: FreeMap,
     /// Whether the map is whole: every reachable page marked.
     sealed: bool,
+    /// Until it is, the unit the next new page takes: past the end of
+    /// the file as it was opened.
+    append: u64,
     /// Pages freed by the commit of each sequence number, oldest first,
     /// that a pin may still reach.
     pending: VecDeque<(u64, Vec<Extent>)>,
@@ -237,6 +248,11 @@ impl State {
     /// Gives back the pages no pin can reach any more: those freed by a
     /// commit no later than the oldest pin's root.
     fn release(&mut self) {
+        // Not before the map is whole: a page freed may not be marked
+        // yet, and would be marked after.
+        if !self.sealed {
+            return;
+        }
         let oldest = self.pins.keys().next().copied().unwrap_or(u64::MAX);
         while self.pending.front().is_some_and(|(seq, _)| *seq <= oldest) {
             let (_, freed) = self.pending.pop_front().unwrap();
@@ -252,6 +268,8 @@ pub struct PageFile<B: Backend> {
     backend: B,
     state: Mutex<State>,
     writer: Mutex<()>,
+    /// Set to stop a rebuilding of the map.
+    stop: std::sync::atomic::AtomicBool,
 }
 
 impl<B: Backend> PageFile<B> {
@@ -267,7 +285,7 @@ impl<B: Backend> PageFile<B> {
         backend.write_at(0, &vec![0u8; HEADER_UNITS as usize * UNIT])?;
         backend.write_at(Root::slot(0), &root.encode())?;
         backend.sync()?;
-        Ok(PageFile::with(backend, root, true))
+        Ok(PageFile::with(backend, root, true, HEADER_UNITS))
     }
 
     /// Opens the file of `backend` at its last committed root. Its map of
@@ -287,7 +305,8 @@ impl<B: Backend> PageFile<B> {
             }
         }
         let root = best.ok_or_else(|| corrupt("no root record is valid"))?;
-        Ok(PageFile::with(backend, root, false))
+        let end = backend.len()?.div_ceil(UNIT as u64);
+        Ok(PageFile::with(backend, root, false, end))
     }
 
     /// Opens the file of `backend`, or makes it if there is none: nothing
@@ -313,19 +332,25 @@ impl<B: Backend> PageFile<B> {
         backend.write_at(0, &vec![0u8; HEADER_UNITS as usize * UNIT])?;
         backend.write_at(Root::slot(0), &root.encode())?;
         backend.sync()?;
-        Ok(PageFile::with(backend, root, true))
+        Ok(PageFile::with(backend, root, true, HEADER_UNITS))
     }
 
-    fn with(backend: B, root: Root, sealed: bool) -> PageFile<B> {
+    fn with(backend: B, root: Root, sealed: bool, end: u64) -> PageFile<B> {
         let state = State {
             root,
             map: FreeMap::new(HEADER_UNITS),
             sealed,
+            append: end.max(HEADER_UNITS),
             pending: VecDeque::new(),
             pins: BTreeMap::new(),
             poisoned: false,
         };
-        PageFile { backend, state: Mutex::new(state), writer: Mutex::new(()) }
+        PageFile {
+            backend,
+            state: Mutex::new(state),
+            writer: Mutex::new(()),
+            stop: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -351,6 +376,9 @@ impl<B: Backend> PageFile<B> {
     /// error if it runs into the header or a page already marked: the
     /// file's pages contradict each other.
     pub fn mark(&self, e: Extent) -> io::Result<()> {
+        if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
         let mut s = self.state();
         assert!(!s.sealed, "the map is sealed");
         if e.units == 0 || e.units > MAX_UNITS || !s.map.mark(e.start, e.units as u64) {
@@ -359,10 +387,45 @@ impl<B: Backend> PageFile<B> {
         Ok(())
     }
 
-    /// Declares every reachable page marked: the rest of the file is free.
-    /// (A file just made has none, and is sealed already.)
+    /// Declares every page the root at opening reaches marked: the rest
+    /// of the file is free, and what transactions have freed since is
+    /// given back. (A file just made is sealed already.)
     pub fn seal(&self) {
-        self.state().sealed = true;
+        let mut s = self.state();
+        s.sealed = true;
+        s.release();
+    }
+
+    /// Whether the map of free space is whole.
+    pub fn is_sealed(&self) -> bool {
+        self.state().sealed
+    }
+
+    /// Makes any marking under way fail, with
+    /// [`io::ErrorKind::Interrupted`]: for closing a file whose map is
+    /// still being rebuilt.
+    pub fn stop_marking(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Refuses further transactions: what marks the pages found the file
+    /// damaged.
+    pub fn poison(&self) {
+        self.state().poisoned = true;
+    }
+
+    /// Takes `units` units for a new page: from the map once it is
+    /// whole, and until then past the end.
+    fn alloc(&self, units: u32) -> u64 {
+        let mut s = self.state();
+        if s.sealed {
+            return s.map.alloc(units);
+        }
+        let start = s.append;
+        s.append += units as u64;
+        let fresh = s.map.mark(start, units as u64);
+        debug_assert!(fresh, "nothing is past the end");
+        start
     }
 
     /// Reads the page at `e` into `buf` (at least [`Extent::bytes`] long)
@@ -396,14 +459,14 @@ impl<B: Backend> PageFile<B> {
         Pin { file: self, root }
     }
 
-    /// Begins a transaction, waiting for the one before it to end. An
-    /// error if a commit has failed and the file must be reopened.
+    /// Begins a transaction, waiting for the one before it to end. It
+    /// need not wait for the map of free space. An error if a commit has
+    /// failed, or the file was found damaged, and it must be reopened.
     pub fn begin(&self) -> io::Result<Txn<'_, B>> {
         let guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let s = self.state();
-        assert!(s.sealed, "the map of free space is not sealed");
         if s.poisoned {
-            return Err(io::Error::other("a commit failed: the file must be reopened"));
+            return Err(io::Error::other("the file must be reopened"));
         }
         drop(s);
         Ok(Txn { file: self, _guard: guard, inner: Mutex::new(Pending::default()), committed: false })
@@ -493,7 +556,7 @@ impl<B: Backend> Txn<'_, B> {
     pub fn write(&self, payload: &[u8]) -> io::Result<Extent> {
         let units = Extent::units_for(payload.len());
         assert!(units <= MAX_UNITS, "a page of {} bytes is too long", payload.len());
-        let e = Extent { start: self.file.state().map.alloc(units), units };
+        let e = Extent { start: self.file.alloc(units), units };
         // Encoded with no lock held: the lock is for placing it.
         let mut page = [0u8; 4096];
         let mut long = Vec::new();
@@ -530,7 +593,13 @@ impl<B: Backend> Txn<'_, B> {
     /// after it does not reach. It is not touched, and not reused until
     /// the commit is durable and no pin reaches it.
     pub fn free(&self, e: Extent) {
-        debug_assert!(self.file.state().map.is_used(e.start, e.units as u64), "freed a page that is not in use");
+        debug_assert!(
+            {
+                let s = self.file.state();
+                !s.sealed || s.map.is_used(e.start, e.units as u64)
+            },
+            "freed a page that is not in use"
+        );
         self.inner().freed.push(e);
     }
 
@@ -1137,6 +1206,53 @@ mod tests {
         // Both happen: a commit under way is sometimes lost, sometimes kept.
         assert!(outcomes[0] > 50 && outcomes[1] > 10, "{outcomes:?}");
         assert_eq!(states.len() as u64, STEPS + 1);
+    }
+
+    /// Transactions before the map is sealed: their pages lie past the
+    /// end of the file as it was opened, one dropped gives its pages
+    /// back, and once the pages of the root at opening are marked and
+    /// the map sealed, it is the map a fresh opening builds.
+    #[test]
+    fn transactions_do_not_wait_for_the_map() {
+        let first = PageFile::create(MemBackend::new()).unwrap();
+        let (mut toy, mut rng) = (Toy::default(), Rng::new(0xea71));
+        for v in 1..=12 {
+            toy.step(&first, &mut rng, v).unwrap();
+        }
+        let image = first.backend().image(Lost::All);
+        let end = image.len() as u64 / UNIT as u64;
+
+        let file = PageFile::open(MemBackend::from_image(image)).unwrap();
+        let opened = Toy::load(&file, false).unwrap();
+        assert!(!file.is_sealed());
+        for v in 13..=20 {
+            toy.step(&file, &mut rng, v).unwrap();
+            assert!(toy.list.unwrap().start >= end, "a new page past the end");
+            assert!(toy.entries.iter().all(|e| e.1 < 13 || e.2.start >= end));
+        }
+        // One dropped: nothing of it stays.
+        let used = file.space().0;
+        let txn = file.begin().unwrap();
+        txn.write(&[1; 3000]).unwrap();
+        drop(txn);
+        assert_eq!(file.space().0, used);
+        assert_eq!(Toy::load(&file, false).unwrap(), toy);
+
+        // The pages of the state as it was opened, marked; then sealed.
+        file.mark(opened.list.unwrap()).unwrap();
+        opened.entries.iter().for_each(|e| file.mark(e.2).unwrap());
+        file.seal();
+        let fresh = PageFile::open(MemBackend::from_image(file.backend().image(Lost::All))).unwrap();
+        assert_eq!(Toy::load(&fresh, true).unwrap(), toy);
+        fresh.seal();
+        assert_eq!(file.space().0, fresh.space().0);
+        // Sealed, the space freed meanwhile is used: the file's end stays.
+        let end = file.space().1;
+        for v in 21..=40 {
+            toy.step(&file, &mut rng, v).unwrap();
+        }
+        assert!(file.space().1 <= end + 16, "{end} units at the sealing, {} after", file.space().1);
+        assert_eq!(Toy::load(&file, false).unwrap(), toy);
     }
 
     /// The same on a real file: transactions, a second opening refused

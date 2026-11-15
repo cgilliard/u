@@ -24,7 +24,8 @@
 //! are applied: whoever reads through it sees that state, whole.
 
 use std::io;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use super::backend::Backend;
 use super::names::{NameProof, Names};
@@ -49,6 +50,36 @@ pub const DEFAULT_WINDOW: usize = 7 * 144;
 
 fn corrupt(what: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what)
+}
+
+/// Marks every page the state reaches as it was opened, and seals the
+/// map. If the pages contradict each other the file takes no more
+/// transactions.
+fn mark_all<B: Backend>(file: &PageFile<B>, opened: &Meta) -> Result<(), io::ErrorKind> {
+    let marked =
+        opened.outputs.mark(file).and_then(|()| opened.names.mark(file)).and_then(|()| opened.window.mark(file));
+    match marked {
+        Ok(()) => {
+            file.seal();
+            Ok(())
+        }
+        Err(e) => {
+            // Stopped because the state is being closed is not damage.
+            if e.kind() != io::ErrorKind::Interrupted {
+                file.poison();
+            }
+            Err(e.kind())
+        }
+    }
+}
+
+/// Closing a state stops the rebuilding of its map, and waits for the
+/// thread to be gone: nothing touches the file after.
+impl<B: Backend + 'static> Drop for State<B> {
+    fn drop(&mut self) {
+        self.file.stop_marking();
+        let _ = self.wait_ready();
+    }
 }
 
 /// What a root record says the state is.
@@ -129,23 +160,43 @@ pub struct BlockEdit<'a> {
 }
 
 /// The state, in a file of pages.
-pub struct State<B: Backend> {
-    file: PageFile<B>,
+pub struct State<B: Backend + 'static> {
+    file: Arc<PageFile<B>>,
     meta: Mutex<Meta>,
     /// Blocks whose records the window keeps.
     keep: usize,
+    /// The thread that rebuilds the file's map of free space, until it
+    /// has been waited for.
+    marking: Mutex<Option<JoinHandle<Result<(), io::ErrorKind>>>>,
     /// Tests: how long each step of the last block applied took (the
     /// outputs, the names and the window, the sweep, the commit).
     #[cfg(test)]
     times: Mutex<[std::time::Duration; 4]>,
 }
 
-impl<B: Backend> State<B> {
+impl<B: Backend + 'static> State<B> {
     /// Opens the state in `backend`, making an empty one if there is
-    /// none, with a window of `keep` blocks. Opening reads every node of
-    /// the outputs' trie and every page of the window, to know what of
-    /// the file is in use.
+    /// none, with a window of `keep` blocks.
+    ///
+    /// It is ready at once: blocks can be applied and the state read. To
+    /// know what of the file is free every node of the tries and every
+    /// page of the window is read, which for a large state takes
+    /// seconds, and that is done on a thread of its own; until it is
+    /// done, new pages go at the end of the file
+    /// ([`super::pagefile`]). [`State::wait_ready`] waits for it.
     pub fn open(backend: B, keep: usize) -> io::Result<State<B>> {
+        let state = State::open_idle(backend, keep)?;
+        if !state.file.is_sealed() {
+            let (file, meta) = (state.file.clone(), state.meta().clone());
+            let thread = std::thread::Builder::new().name("state-map".into());
+            *state.marking.lock().unwrap() = Some(thread.spawn(move || mark_all(&file, &meta))?);
+        }
+        Ok(state)
+    }
+
+    /// As [`State::open`], with no thread started: the map is rebuilt
+    /// when [`State::mark_now`] is called.
+    fn open_idle(backend: B, keep: usize) -> io::Result<State<B>> {
         let file = PageFile::open_or_create(backend)?;
         let root = file.root();
         let meta = if root.payload().is_empty() && root.seq == 0 {
@@ -155,19 +206,34 @@ impl<B: Backend> State<B> {
             let rest = &root.payload()[RECORD - Window::BYTES - 8..];
             let window = Window::read(&file, &rest[..Window::BYTES])?;
             let sweep = u64::from_le_bytes(rest[Window::BYTES..].try_into().unwrap());
-            outputs.mark(&file)?;
-            names.mark(&file)?;
-            window.mark(&file)?;
             Meta { height, tip, outputs, names, window, sweep }
         };
-        file.seal();
         Ok(State {
-            file,
+            file: Arc::new(file),
             meta: Mutex::new(meta),
             keep,
+            marking: Mutex::new(None),
             #[cfg(test)]
             times: Mutex::new([std::time::Duration::ZERO; 4]),
         })
+    }
+
+    /// Rebuilds the map on the calling thread, from the state as it is:
+    /// for a state opened idle that nothing has been applied to.
+    #[cfg(test)]
+    fn mark_now(&self, opened: &Meta) -> io::Result<()> {
+        mark_all(&self.file, opened).map_err(io::Error::from)
+    }
+
+    /// Waits until the map of free space is whole. An error if the file
+    /// was found damaged on the way: it then takes no more blocks.
+    pub fn wait_ready(&self) -> io::Result<()> {
+        let thread = self.marking.lock().unwrap_or_else(|e| e.into_inner()).take();
+        match thread.map(|t| t.join()) {
+            None | Some(Ok(Ok(()))) => Ok(()),
+            Some(Ok(Err(kind))) => Err(kind.into()),
+            Some(Err(_)) => Err(io::Error::other("the thread rebuilding the map panicked")),
+        }
     }
 
     fn meta(&self) -> std::sync::MutexGuard<'_, Meta> {
@@ -288,7 +354,7 @@ impl<B: Backend> State<B> {
 /// The state after one block, held: reads through it see that state
 /// however many blocks are applied or undone meanwhile. While it is held
 /// the pages of that state are not reused, so it should not be held long.
-pub struct Snapshot<'a, B: Backend> {
+pub struct Snapshot<'a, B: Backend + 'static> {
     pin: Pin<'a, B>,
     height: u32,
     tip: Digest,
@@ -296,7 +362,7 @@ pub struct Snapshot<'a, B: Backend> {
     names: Names,
 }
 
-impl<B: Backend> Snapshot<'_, B> {
+impl<B: Backend + 'static> Snapshot<'_, B> {
     pub fn tip(&self) -> (u32, Digest) {
         (self.height, self.tip)
     }
@@ -383,7 +449,7 @@ mod tests {
         }
 
         /// Makes the next block and applies it to `state`.
-        fn extend<B: Backend>(
+        fn extend<B: Backend + 'static>(
             &mut self,
             state: &State<B>,
             spends: usize,
@@ -493,6 +559,7 @@ mod tests {
             assert_eq!(state.tip(), chain.tip());
         }
         assert_eq!(state.root(), *empty(STATE_HEIGHT));
+        state.wait_ready().unwrap();
         assert_eq!(state.file().space().0, crate::store::pagefile::HEADER_UNITS);
     }
 
@@ -688,6 +755,7 @@ mod tests {
         assert!(late * 512 < 3000 * 66 * 5, "{late} units for 3,000 unspent outputs and a window of five blocks");
         // Opened again, every unit in use is reached.
         let again = State::open(MemBackend::from_image(state.file().backend().image(Lost::All)), keep).unwrap();
+        again.wait_ready().unwrap();
         assert_eq!(again.file().space().0, state.file().space().0);
         assert_eq!(again.root(), state.root());
     }
@@ -768,7 +836,84 @@ mod tests {
         // And block 1: no name, no output, no page.
         state.undo().unwrap();
         assert_eq!(state.root(), *empty(STATE_HEIGHT));
+        state.wait_ready().unwrap();
         assert_eq!(state.file().space().0, crate::store::pagefile::HEADER_UNITS);
+    }
+
+    /// Blocks are applied, and undone, before the map of free space is
+    /// rebuilt: their pages go past the end of the file, and nothing
+    /// they free is given back. When the map is then rebuilt from the
+    /// state as it was opened, it is the map of the state as it is: the
+    /// same units in use as a fresh opening finds, and the space the
+    /// blocks freed is there to be used.
+    #[test]
+    fn blocks_are_applied_before_the_map_is_rebuilt() {
+        let mut chain = Chain::new(0xea51);
+        let first = State::open(MemBackend::new(), 6).unwrap();
+        for _ in 0..5 {
+            chain.extend(&first, 100, 400, 0).unwrap();
+        }
+        let image = first.file().backend().image(Lost::All);
+        let end = first.file().space().1;
+
+        // Opened with no thread rebuilding the map.
+        let state = State::open_idle(MemBackend::from_image(image), 6).unwrap();
+        let opened = state.meta().clone();
+        assert!(!state.file().is_sealed());
+        let snap = state.snapshot().unwrap();
+        for _ in 0..4 {
+            chain.extend(&state, 200, 150, 0).unwrap();
+        }
+        state.undo().unwrap();
+        chain.forget();
+        chain.extend(&state, 50, 50, 1).unwrap();
+        // The state at opening is still read whole: none of its pages
+        // was written over.
+        assert_eq!(snap.tip().0, 5);
+        for p in chain.blocks[4].2.iter().enumerate().map(|(i, _)| opened.outputs.next - 1 - i as u64).take(50) {
+            assert!(snap.output(p).unwrap().is_some());
+        }
+        drop(snap);
+        // Everything written since lies past where the file ended.
+        let grown = state.file().backend().image(Lost::All).len() as u64 / 512;
+        assert!(grown > end);
+
+        // The map rebuilt, from the state as it was opened.
+        state.mark_now(&opened).unwrap();
+        assert!(state.file().is_sealed());
+        let fresh = State::open(MemBackend::from_image(state.file().backend().image(Lost::All)), 6).unwrap();
+        fresh.wait_ready().unwrap();
+        assert_eq!(state.file().space().0, fresh.file().space().0, "units in use, and units a fresh opening reaches");
+        assert_eq!((state.root(), state.tip()), (fresh.root(), fresh.tip()));
+        // What was freed meanwhile is used again: the file stops growing.
+        let before = state.file().space().1;
+        for _ in 0..6 {
+            chain.extend(&state, 150, 150, 1).unwrap();
+        }
+        let after = state.file().space().1;
+        assert!(after < before + before / 5, "{before} units at the sealing, {after} six blocks on");
+        // And every block in the window can still be undone.
+        while state.oldest_undo().is_some() {
+            state.undo().unwrap();
+        }
+    }
+
+    /// A file whose pages are damaged is found out by the rebuilding:
+    /// waiting for it says so, and the state takes no more blocks.
+    #[test]
+    fn a_damaged_file_takes_no_blocks() {
+        use crate::store::trie::Child;
+        let mut chain = Chain::new(0xda3a);
+        let state = State::open(MemBackend::new(), 4).unwrap();
+        chain.extend(&state, 0, 2000, 0).unwrap();
+        let Child::Node { page, .. } = state.meta().outputs.root else { panic!("a node") };
+        let mut image = state.file().backend().image(Lost::All);
+        image[page.start as usize * 512 + 40] ^= 1;
+        let damaged = State::open(MemBackend::from_image(image), 4).unwrap();
+        assert_eq!(damaged.wait_ready().unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(chain.extend(&damaged, 0, 1, 0), Err(Error::Io(_))));
+        // Waiting again is not an error of its own.
+        assert!(damaged.wait_ready().is_ok());
     }
 
     /// On a real file, closed and opened.
@@ -886,15 +1031,20 @@ mod tests {
             );
         }
 
-        let t = std::time::Instant::now();
+        // Opened, and at once ready: the map of free space is rebuilt
+        // behind the blocks, unless `TABMINER_STORE_WAIT` says to wait.
+        let opening = std::time::Instant::now();
         let state = State::open(Counting::open(&path), DEFAULT_WINDOW).unwrap();
-        let [reads, read_bytes, ..] = state.file().backend().take();
-        println!(
-            "opened in {:.1?}: {reads} pages read ({} MB) to mark what is in use; memory held {} MB",
-            t.elapsed(),
-            read_bytes >> 20,
-            peak_memory()
-        );
+        println!("opened in {:.1?}; memory held {} MB", opening.elapsed(), peak_memory());
+        if std::env::var("TABMINER_STORE_WAIT").is_ok() {
+            state.wait_ready().unwrap();
+            let [reads, read_bytes, ..] = state.file().backend().take();
+            println!(
+                "the map of free space rebuilt {:.1?} after opening: {reads} pages read ({} MB)",
+                opening.elapsed(),
+                read_bytes >> 20
+            );
+        }
         let start = state.tip().0;
 
         // The sample may hold a position twice over: each is spent once.
@@ -938,6 +1088,8 @@ mod tests {
         let t = std::time::Instant::now();
         state.undo().unwrap();
         println!("the last block undone in {:.2?}", t.elapsed());
+        state.wait_ready().unwrap();
+        println!("the map of free space whole {:.1?} after opening", opening.elapsed());
         // Undone to where it began, so that a kept file is as it was.
         while state.tip().0 > start {
             state.undo().unwrap();
