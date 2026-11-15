@@ -132,6 +132,10 @@ pub struct State<B: Backend> {
     meta: Mutex<Meta>,
     /// Blocks whose records the window keeps.
     keep: usize,
+    /// Tests: how long each step of the last block applied took (the
+    /// outputs, the names and the window, the sweep, the commit).
+    #[cfg(test)]
+    times: Mutex<[std::time::Duration; 4]>,
 }
 
 impl<B: Backend> State<B> {
@@ -155,7 +159,13 @@ impl<B: Backend> State<B> {
             Meta { height, tip, outputs, names, window, sweep }
         };
         file.seal();
-        Ok(State { file, meta: Mutex::new(meta), keep })
+        Ok(State {
+            file,
+            meta: Mutex::new(meta),
+            keep,
+            #[cfg(test)]
+            times: Mutex::new([std::time::Duration::ZERO; 4]),
+        })
     }
 
     fn meta(&self) -> std::sync::MutexGuard<'_, Meta> {
@@ -201,7 +211,13 @@ impl<B: Backend> State<B> {
         let mut meta = self.meta().clone();
         assert_eq!(block.height, meta.height + 1, "blocks are applied in order");
         let first_new = meta.outputs.next;
+        #[cfg(test)]
+        let (clock, mut times) = (std::time::Instant::now(), [std::time::Duration::ZERO; 4]);
         meta.outputs = meta.outputs.apply(&mut txn, block.height, block.spends, block.outputs)?;
+        #[cfg(test)]
+        {
+            times[0] = clock.elapsed();
+        }
         // The records the block replaces, as they are, to undo it with.
         let mut replaced = Vec::new();
         for (key, _, _) in block.names.iter().filter(|n| n.2) {
@@ -226,9 +242,22 @@ impl<B: Backend> State<B> {
         // for good.
         let horizon = (block.height + 1).saturating_sub(self.keep as u32);
         let budget = SWEEP_MIN.max(2 * block.spends.len());
+        #[cfg(test)]
+        {
+            times[1] = clock.elapsed();
+        }
         (meta.outputs, meta.sweep) = meta.outputs.sweep(&mut txn, meta.sweep, budget, horizon)?;
         (meta.height, meta.tip) = (block.height, block.block);
+        #[cfg(test)]
+        {
+            times[2] = clock.elapsed();
+        }
         txn.commit(&meta.to_bytes())?;
+        #[cfg(test)]
+        {
+            times[3] = clock.elapsed();
+            *self.times.lock().unwrap() = times;
+        }
         *self.meta() = meta;
         Ok(root)
     }
@@ -763,5 +792,157 @@ mod tests {
         assert_eq!(state.tip(), (12, id(12, 1)));
         drop(state);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The memory the process holds now, in megabytes (Linux).
+    fn peak_memory() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("VmHWM:"))
+                    .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+            })
+            .map_or(0, |kb| kb / 1024)
+    }
+
+    /// A full block applied to a large set on a real disk: 25,000 outputs
+    /// spent, picked evenly among those unspent, and 25,000 made, in a
+    /// set of unspent outputs spread one in eight over its positions.
+    ///
+    /// `TABMINER_STORE_UNSPENT` sets the unspent outputs (2,000,000
+    /// unless given; 170,000,000 is the scale of Bitcoin's set), and
+    /// `TABMINER_STORE_DIR` where the file goes (a disk, not memory).
+    /// `cargo test --release --lib store::state::tests::cost_at_scale -- --ignored --nocapture`
+    #[test]
+    #[ignore = "slow: builds a state of millions of outputs on disk"]
+    fn cost_at_scale() {
+        use crate::store::testing::Counting;
+        let unspent: u64 =
+            std::env::var("TABMINER_STORE_UNSPENT").ok().and_then(|s| s.parse().ok()).unwrap_or(2_000_000);
+        let dir =
+            std::env::var("TABMINER_STORE_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| temp_dir("scale"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state");
+        const BLOCK: usize = 25_000;
+        const BLOCKS: usize = 4;
+        let mut rng = Rng::new(0x5ca1e);
+
+        // The positions, from a generator of their own, so that a file
+        // kept from an earlier run (`TABMINER_STORE_KEEP`) is known
+        // without being read: of them, a sample is kept to spend from.
+        let keep = std::env::var("TABMINER_STORE_KEEP").is_ok();
+        let mut sample: Vec<u64> = Vec::with_capacity(BLOCKS * BLOCK);
+        let mut walk = Rng::new(0x9051);
+        let (mut position, mut made) = (0u64, 0u64);
+        let mut step = |rng: &mut Rng, sample: &mut Vec<u64>| {
+            position += 1 + walk.next_u64() % 15;
+            made += 1;
+            if sample.len() < BLOCKS * BLOCK {
+                sample.push(position);
+            } else if rng.next_u64() % made < (BLOCKS * BLOCK) as u64 {
+                let at = rng.next_u64() as usize % sample.len();
+                sample[at] = position;
+            }
+            position
+        };
+        if keep && path.exists() {
+            let mut pick = Rng::new(0x51c);
+            for _ in 0..unspent {
+                step(&mut pick, &mut sample);
+            }
+            println!("kept the file of an earlier run");
+        } else {
+            let _ = std::fs::remove_file(&path);
+            // Installed a part at a time, as a state received from
+            // elsewhere would be.
+            let t = std::time::Instant::now();
+            let file = PageFile::create(Counting::open(&path)).unwrap();
+            let mut outputs = Outputs::EMPTY;
+            let mut pick = Rng::new(0x51c);
+            let mut done = 0;
+            while done < unspent {
+                let part: Vec<(u64, Record, bool)> = (0..(unspent - done).min(1_000_000))
+                    .map(|_| (step(&mut pick, &mut sample), record(&mut rng, 1), false))
+                    .collect();
+                done += part.len() as u64;
+                let last = part.last().unwrap().0;
+                let mut txn = file.begin().unwrap();
+                outputs = outputs.install(&mut txn, &part, last + 1).unwrap();
+                let meta = Meta { height: 1, tip: id(1, 0), outputs, ..Meta::empty() };
+                txn.commit(&meta.to_bytes()).unwrap();
+            }
+            let (used, end) = file.space();
+            println!(
+                "installed {} outputs among {} positions in {:.1?}: file {:.1} GB, {} bytes an output; memory held {} MB",
+                outputs.count,
+                outputs.next,
+                t.elapsed(),
+                end as f64 * 512.0 / 1e9,
+                used * 512 / outputs.count,
+                peak_memory()
+            );
+        }
+
+        let t = std::time::Instant::now();
+        let state = State::open(Counting::open(&path), DEFAULT_WINDOW).unwrap();
+        let [reads, read_bytes, ..] = state.file().backend().take();
+        println!(
+            "opened in {:.1?}: {reads} pages read ({} MB) to mark what is in use; memory held {} MB",
+            t.elapsed(),
+            read_bytes >> 20,
+            peak_memory()
+        );
+        let start = state.tip().0;
+
+        // The sample may hold a position twice over: each is spent once.
+        sample.sort_unstable();
+        sample.dedup();
+        let mut order: Vec<usize> = (0..sample.len()).collect();
+        for i in (1..order.len()).rev() {
+            order.swap(i, rng.next_u64() as usize % (i + 1));
+        }
+        for (b, picked) in order.chunks(BLOCK).take(BLOCKS).enumerate() {
+            let height = start + 1 + b as u32;
+            let mut spends: Vec<u64> = picked.iter().map(|i| sample[*i]).collect();
+            spends.sort_unstable();
+            let new: Vec<Record> = (0..BLOCK).map(|_| record(&mut rng, height)).collect();
+            let block = BlockEdit {
+                height,
+                block: id(height, 0),
+                spends: &spends,
+                outputs: &new,
+                names: &[],
+                state_root: None,
+            };
+            let t = std::time::Instant::now();
+            state.apply(&block).unwrap();
+            let times = *state.times.lock().unwrap();
+            let [reads, read_bytes, writes, written] = state.file().backend().take();
+            println!(
+                "block {height}: {} spent, {BLOCK} made | applied and durable in {:.2?} (outputs {:.2?}, names and window {:.2?}, sweep {:.2?}, commit {:.2?}) | read {reads} pages ({} MB) | wrote {} MB in {writes} writes | memory held {} MB",
+                spends.len(),
+                t.elapsed(),
+                times[0],
+                times[1] - times[0],
+                times[2] - times[1],
+                times[3] - times[2],
+                read_bytes >> 20,
+                written >> 20,
+                peak_memory()
+            );
+        }
+        // The last block undone.
+        let t = std::time::Instant::now();
+        state.undo().unwrap();
+        println!("the last block undone in {:.2?}", t.elapsed());
+        // Undone to where it began, so that a kept file is as it was.
+        while state.tip().0 > start {
+            state.undo().unwrap();
+        }
+        drop(state);
+        if !keep {
+            std::fs::remove_file(&path).unwrap();
+        }
     }
 }

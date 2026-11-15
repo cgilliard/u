@@ -406,17 +406,7 @@ impl<B: Backend> PageFile<B> {
             return Err(io::Error::other("a commit failed: the file must be reopened"));
         }
         drop(s);
-        Ok(Txn {
-            file: self,
-            _guard: guard,
-            buffer: Vec::new(),
-            queued: Vec::new(),
-            index: HashMap::new(),
-            allocated: Vec::new(),
-            freed: Vec::new(),
-            written: 0,
-            committed: false,
-        })
+        Ok(Txn { file: self, _guard: guard, inner: Mutex::new(Pending::default()), committed: false })
     }
 }
 
@@ -450,9 +440,20 @@ impl<B: Backend> Drop for Pin<'_, B> {
 }
 
 /// A transaction: the one writer, until it commits or is dropped.
+///
+/// Its pages may be written from several threads at once (a pass over
+/// the state splits among them): what it holds is behind a lock, taken
+/// for the moment it takes to place a page.
 pub struct Txn<'a, B: Backend> {
     file: &'a PageFile<B>,
     _guard: MutexGuard<'a, ()>,
+    inner: Mutex<Pending>,
+    committed: bool,
+}
+
+/// What a transaction holds until it commits.
+#[derive(Default)]
+struct Pending {
     /// Pages encoded and not yet handed to the backend, end to end.
     buffer: Vec<u8>,
     /// Where each of them goes, in the order they lie in the buffer.
@@ -464,24 +465,30 @@ pub struct Txn<'a, B: Backend> {
     /// Every page it replaces.
     freed: Vec<Extent>,
     written: u64,
-    committed: bool,
 }
 
 impl<B: Backend> Txn<'_, B> {
+    fn inner(&self) -> MutexGuard<'_, Pending> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Writes a new page of `payload` and returns where it is.
-    pub fn write(&mut self, payload: &[u8]) -> io::Result<Extent> {
+    pub fn write(&self, payload: &[u8]) -> io::Result<Extent> {
         let units = Extent::units_for(payload.len());
         assert!(units <= MAX_UNITS, "a page of {} bytes is too long", payload.len());
+        let mut p = self.inner();
+        // Taken and placed under the one lock: pages lie in the buffer in
+        // the order they lie in the file.
         let start = self.file.state().map.alloc(units);
         let e = Extent { start, units };
-        self.allocated.push(e);
-        let at = self.buffer.len();
-        self.buffer.resize(at + e.bytes(), 0);
-        e.encode(payload, &mut self.buffer[at..]);
-        self.index.insert(start, at);
-        self.queued.push(e);
-        if self.buffer.len() >= WRITE_BUFFER {
-            self.flush()?;
+        p.allocated.push(e);
+        let at = p.buffer.len();
+        p.buffer.resize(at + e.bytes(), 0);
+        e.encode(payload, &mut p.buffer[at..]);
+        p.index.insert(start, at);
+        p.queued.push(e);
+        if p.buffer.len() >= WRITE_BUFFER {
+            self.flush(&mut p)?;
         }
         Ok(e)
     }
@@ -489,37 +496,42 @@ impl<B: Backend> Txn<'_, B> {
     /// Names a page of the state before this transaction that the state
     /// after it does not reach. It is not touched, and not reused until
     /// the commit is durable and no pin reaches it.
-    pub fn free(&mut self, e: Extent) {
+    pub fn free(&self, e: Extent) {
         debug_assert!(self.file.state().map.is_used(e.start, e.units as u64), "freed a page that is not in use");
-        self.freed.push(e);
+        self.inner().freed.push(e);
     }
 
     /// As [`PageFile::read`]; a page this transaction wrote is read back
     /// as written, whether or not it has reached the file.
     pub fn read<'b>(&self, e: Extent, buf: &'b mut [u8]) -> io::Result<&'b [u8]> {
-        if let Some(&at) = self.index.get(&e.start) {
-            let buf = buf.get_mut(..e.bytes()).ok_or_else(|| corrupt("a page's buffer is shorter than the page"))?;
-            buf.copy_from_slice(&self.buffer[at..at + e.bytes()]);
-            return e.payload(buf);
+        {
+            let p = self.inner();
+            if let Some(&at) = p.index.get(&e.start) {
+                let buf =
+                    buf.get_mut(..e.bytes()).ok_or_else(|| corrupt("a page's buffer is shorter than the page"))?;
+                buf.copy_from_slice(&p.buffer[at..at + e.bytes()]);
+                return e.payload(buf);
+            }
         }
         self.file.read(e, buf)
     }
 
     /// Bytes of pages written so far, those still waiting among them.
     pub fn written(&self) -> u64 {
-        self.written + self.buffer.len() as u64
+        let p = self.inner();
+        p.written + p.buffer.len() as u64
     }
 
     /// Hands the waiting pages to the backend: pages that lie one after
     /// another in the file, as those taken together mostly do, go as one
     /// write.
-    fn flush(&mut self) -> io::Result<()> {
+    fn flush(&self, p: &mut Pending) -> io::Result<()> {
         let mut writes: Vec<WriteReq<'_>> = Vec::new();
         let (mut at, mut run_start, mut run_offset, mut next_offset) = (0usize, 0usize, 0u64, u64::MAX);
-        for e in &self.queued {
+        for e in &p.queued {
             if e.offset() != next_offset {
                 if at > run_start {
-                    writes.push(WriteReq { offset: run_offset, data: &self.buffer[run_start..at] });
+                    writes.push(WriteReq { offset: run_offset, data: &p.buffer[run_start..at] });
                 }
                 (run_start, run_offset) = (at, e.offset());
             }
@@ -527,13 +539,13 @@ impl<B: Backend> Txn<'_, B> {
             next_offset = e.offset() + e.bytes() as u64;
         }
         if at > run_start {
-            writes.push(WriteReq { offset: run_offset, data: &self.buffer[run_start..at] });
+            writes.push(WriteReq { offset: run_offset, data: &p.buffer[run_start..at] });
         }
         self.file.backend.write_many(&writes)?;
-        self.written += self.buffer.len() as u64;
-        self.buffer.clear();
-        self.queued.clear();
-        self.index.clear();
+        p.written += p.buffer.len() as u64;
+        p.buffer.clear();
+        p.queued.clear();
+        p.index.clear();
         Ok(())
     }
 
@@ -545,11 +557,15 @@ impl<B: Backend> Txn<'_, B> {
     /// written or made durable, whether it took is not known: the file
     /// refuses further transactions until it is reopened.
     pub fn commit(mut self, payload: &[u8]) -> io::Result<u64> {
-        self.flush()?;
+        {
+            let mut p = self.inner();
+            self.flush(&mut p)?;
+        }
         self.file.backend.sync()?;
         let root = Root::new(self.file.root().seq + 1, payload);
         let recorded =
             self.file.backend.write_at(Root::slot(root.seq), &root.encode()).and_then(|()| self.file.backend.sync());
+        let freed = std::mem::take(&mut self.inner().freed);
         let mut s = self.file.state();
         self.committed = true;
         if let Err(e) = recorded {
@@ -557,7 +573,7 @@ impl<B: Backend> Txn<'_, B> {
             return Err(e);
         }
         s.root = root;
-        s.pending.push_back((root.seq, std::mem::take(&mut self.freed)));
+        s.pending.push_back((root.seq, freed));
         s.release();
         Ok(root.seq)
     }
@@ -567,8 +583,9 @@ impl<B: Backend> Drop for Txn<'_, B> {
     /// Without a commit, what was taken is given back: nothing reaches it.
     fn drop(&mut self) {
         if !self.committed {
+            let allocated = std::mem::take(&mut self.inner().allocated);
             let mut s = self.file.state();
-            for e in self.allocated.drain(..) {
+            for e in allocated {
                 s.map.release(e.start, e.units as u64);
             }
         }
@@ -606,7 +623,7 @@ mod tests {
             Some(io::ErrorKind::AlreadyExists)
         );
 
-        let mut txn = file.begin().unwrap();
+        let txn = file.begin().unwrap();
         let a = txn.write(b"alpha").unwrap();
         let b = txn.write(&[7u8; 3000]).unwrap();
         let empty = txn.write(&[]).unwrap();
@@ -631,7 +648,7 @@ mod tests {
         assert!(again.mark(Extent { start: 3, units: 1 }).is_err(), "in the header");
         again.seal();
         assert_eq!(page_of(&again, b).unwrap(), vec![7u8; 3000]);
-        let mut txn = again.begin().unwrap();
+        let txn = again.begin().unwrap();
         assert_eq!(txn.write(b"next").unwrap().start, HEADER_UNITS + 8);
         assert_eq!(txn.commit(b"").unwrap(), 2);
     }
@@ -640,7 +657,7 @@ mod tests {
     #[test]
     fn damaged_and_misplaced_pages_are_refused() {
         let file = PageFile::create(MemBackend::new()).unwrap();
-        let mut txn = file.begin().unwrap();
+        let txn = file.begin().unwrap();
         let a = txn.write(&[1u8; 600]).unwrap();
         let b = txn.write(&[1u8; 600]).unwrap();
         txn.commit(b"").unwrap();
@@ -729,14 +746,14 @@ mod tests {
     #[test]
     fn space_comes_back() {
         let file = PageFile::create(MemBackend::new()).unwrap();
-        let mut txn = file.begin().unwrap();
+        let txn = file.begin().unwrap();
         let old: Vec<Extent> = (0..10).map(|i| txn.write(&[i; 1000]).unwrap()).collect();
         txn.commit(b"one").unwrap();
         let used = file.space().0;
         assert_eq!(used, HEADER_UNITS + 20);
 
         // Dropped: as if it had not been.
-        let mut txn = file.begin().unwrap();
+        let txn = file.begin().unwrap();
         for i in 0..50 {
             txn.write(&[i; 2000]).unwrap();
         }
@@ -748,7 +765,7 @@ mod tests {
 
         // Committed: the replaced pages are not written over before the
         // commit (the new ones lie elsewhere), and are free after it.
-        let mut txn = file.begin().unwrap();
+        let txn = file.begin().unwrap();
         for e in &old[..5] {
             txn.free(*e);
         }
@@ -757,7 +774,7 @@ mod tests {
         txn.commit(b"two").unwrap();
         assert_eq!(file.space().0, used);
         // The next transaction writes where they were.
-        let mut txn = file.begin().unwrap();
+        let txn = file.begin().unwrap();
         let reused = txn.write(&[0; 4000]).unwrap();
         assert_eq!(reused.start, old[0].start);
         txn.commit(b"three").unwrap();
@@ -768,7 +785,7 @@ mod tests {
     #[test]
     fn a_pin_keeps_its_pages() {
         let file = PageFile::create(MemBackend::new()).unwrap();
-        let mut txn = file.begin().unwrap();
+        let txn = file.begin().unwrap();
         let first: Vec<Extent> = (0..8).map(|i| txn.write(&[i; 900]).unwrap()).collect();
         txn.commit(b"first").unwrap();
         let pin = file.pin();
@@ -777,7 +794,7 @@ mod tests {
         // Ten transactions each replace everything.
         let mut live = first.clone();
         for round in 1..=10u8 {
-            let mut txn = file.begin().unwrap();
+            let txn = file.begin().unwrap();
             for e in live.drain(..) {
                 txn.free(e);
             }
@@ -799,7 +816,7 @@ mod tests {
         assert_eq!(file.space().0, HEADER_UNITS + 16);
         // A pin of the present state holds nothing back.
         let now = file.pin();
-        let mut txn = file.begin().unwrap();
+        let txn = file.begin().unwrap();
         txn.write(b"x").unwrap();
         txn.commit(b"").unwrap();
         assert_eq!(now.root().payload(), &[10u8][..]);
@@ -811,7 +828,7 @@ mod tests {
     fn a_large_transaction_is_written_as_it_goes() {
         let file = PageFile::create(MemBackend::new()).unwrap();
         let mut rng = Rng::new(0xb16);
-        let mut txn = file.begin().unwrap();
+        let txn = file.begin().unwrap();
         let mut pages = Vec::new();
         for i in 0..1500u32 {
             let len = rng.next_u64() as usize % 4000;
@@ -842,7 +859,7 @@ mod tests {
         let file = PageFile::create(MemBackend::new()).unwrap();
         // The transaction's page, the sync of the pages, the root record.
         file.backend().crash_at(3);
-        let mut txn = file.begin().unwrap();
+        let txn = file.begin().unwrap();
         txn.write(b"page").unwrap();
         assert!(txn.commit(b"lost").is_err());
         assert!(file.begin().is_err());
@@ -850,7 +867,7 @@ mod tests {
         // Failing before the root record is only a transaction dropped.
         let file = PageFile::create(MemBackend::new()).unwrap();
         file.backend().crash_at(2);
-        let mut txn = file.begin().unwrap();
+        let txn = file.begin().unwrap();
         txn.write(b"page").unwrap();
         assert!(txn.commit(b"lost").is_err());
         assert_eq!(file.space().0, HEADER_UNITS);
@@ -932,7 +949,7 @@ mod tests {
         /// removed, the list written anew.
         fn step<B: Backend>(&mut self, file: &PageFile<B>, rng: &mut Rng, version: u64) -> io::Result<u64> {
             let mut next = self.clone();
-            let mut txn = file.begin()?;
+            let txn = file.begin()?;
             for _ in 0..1 + rng.next_u64() % 6 {
                 let key = (rng.next_u64() % 40) as u32;
                 let e = txn.write(&value(key, version))?;

@@ -40,7 +40,7 @@ use crate::hash::Digest;
 use crate::output::{
     Commitment, MEMO_BYTES, Memo, height_digest, memo_from_bytes, memo_slot, memo_to_bytes, output_leaf,
 };
-use crate::poseidon2::{LANES, compress_batch, digest_from_bytes, digest_to_bytes};
+use crate::poseidon2::{BATCH_FROM, LANES, compress_batch, digest_from_bytes, digest_to_bytes};
 
 /// Height of the outputs' tree: positions are below `2^HEIGHT`.
 pub const HEIGHT: u32 = 41;
@@ -104,7 +104,7 @@ impl Tree for OutputTree {
         r.leaf()
     }
 
-    /// A leaf is two compressions; those of eight records are done
+    /// A leaf is two compressions; those of up to eight records are done
     /// together.
     fn leaves(slots: &[Slot<Record>], out: &mut [(u128, Part); LEAF_RECORDS]) -> usize {
         let mut n = 0;
@@ -116,21 +116,25 @@ impl Tree for OutputTree {
                 *b = Some(s);
                 got += 1;
             }
-            if got < LANES {
+            if got < BATCH_FROM {
                 for s in batch.iter().flatten() {
                     out[n] = (s.key, Part { hash: s.record.leaf(), single: true });
                     n += 1;
                 }
                 return n;
             }
-            let batch = batch.map(|s| s.unwrap());
+            // A batch not full: the lanes left over repeat the first.
+            let batch = batch.map(|s| s.unwrap_or(batch[0].unwrap()));
             let slot = batch.map(|s| memo_slot(&s.record.memo, s.record.amount));
             let height = batch.map(|s| height_digest(s.record.height));
             let inner = compress_batch(core::array::from_fn(|i| (&batch[i].record.commitment, &slot[i])));
             let leaf = compress_batch(core::array::from_fn(|i| (&inner[i], &height[i])));
-            for (s, hash) in batch.iter().zip(leaf) {
+            for (s, hash) in batch.iter().zip(leaf).take(got) {
                 out[n] = (s.key, Part { hash, single: true });
                 n += 1;
+            }
+            if got < LANES {
+                return n;
             }
         }
     }
@@ -242,6 +246,19 @@ impl Outputs {
         }
         let edits = Edits { flips: spends, run: outputs, run_from: self.next as u128, ..Edits::none() };
         self.pass(txn, height, edits, next)
+    }
+
+    /// The set with `outputs` put in, each at its position (ascending,
+    /// none of them taken), and `next` the next position after: how a
+    /// state received from elsewhere is installed, a part at a time.
+    pub fn install<B: Backend>(
+        &self,
+        txn: &mut Txn<'_, B>,
+        outputs: &[(u64, Record, bool)],
+        next: u64,
+    ) -> Result<Outputs, Error> {
+        debug_assert!(outputs.windows(2).all(|w| w[0].0 < w[1].0) && outputs.iter().all(|o| !o.2 && o.0 < next));
+        self.pass(txn, 0, Edits { puts: outputs, ..Edits::none() }, next.max(self.next))
     }
 
     /// The set before a block that spent `spends` (ascending) and made
@@ -825,6 +842,45 @@ mod tests {
         assert_eq!(w.file.space().0, crate::store::pagefile::HEADER_UNITS);
     }
 
+    /// A pass split among threads gives what one thread gives: the same
+    /// root and count, and for a block that spends what is not there,
+    /// the same fault, the first in position order.
+    #[test]
+    fn a_pass_on_many_threads_is_the_same() {
+        let mut w = World::new();
+        let mut rng = Rng::new(0x7417);
+        w.block(&mut rng, 0, 6000).unwrap();
+        w.block(&mut rng, 1500, 0).unwrap();
+        let live = w.model.live();
+        let spends: Vec<u64> = live.iter().copied().step_by(2).collect();
+        let records: Vec<Record> = (0..700).map(|_| record(&mut rng, 3)).collect();
+        assert!(spends.len() > 2000);
+        let run = |spends: &[u64], threads: usize| {
+            let txn = w.file.begin().unwrap();
+            let edits = Edits { flips: spends, run: &records, run_from: w.set.next as u128, ..Edits::none() };
+            let done = trie::update_on::<OutputTree, _>(&txn, w.set.root, 3, edits, threads);
+            done.map(|(root, count)| (root.part(), count))
+        };
+        let one = run(&spends, 1).unwrap();
+        for threads in [2, 3, 8, 64] {
+            assert_eq!(run(&spends, threads).unwrap(), one, "{threads} threads");
+        }
+        assert_eq!(one.1, 700 - spends.len() as i64);
+        // Two spends of nothing, far apart: the earlier is the fault.
+        let dead: Vec<u64> = w.history[1].2.clone();
+        let mut bad = spends.clone();
+        bad.extend([dead[3], dead[dead.len() - 2]]);
+        bad.sort_unstable();
+        for threads in [1, 2, 8, 64] {
+            assert_eq!(run(&bad, threads).err(), Some(Error::NoSuchOutput(dead[3])), "{threads} threads");
+        }
+        // Nothing was committed, and nothing is held.
+        assert_eq!(w.file.space().0, {
+            w.reopen();
+            w.file.space().0
+        });
+    }
+
     /// Hashed eight at a time or one by one, a record's leaf is the same.
     #[test]
     fn leaves_hashed_together_are_the_same() {
@@ -844,34 +900,6 @@ mod tests {
         }
     }
 
-    /// A file that counts what is asked of it.
-    struct Counting {
-        file: crate::store::backend::FileBackend,
-        reads: std::sync::atomic::AtomicU64,
-        read_bytes: std::sync::atomic::AtomicU64,
-        writes: std::sync::atomic::AtomicU64,
-        written: std::sync::atomic::AtomicU64,
-    }
-
-    impl Backend for Counting {
-        fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-            self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.read_bytes.fetch_add(buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            self.file.read_at(offset, buf)
-        }
-        fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
-            self.writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.written.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            self.file.write_at(offset, data)
-        }
-        fn sync(&self) -> io::Result<()> {
-            self.file.sync()
-        }
-        fn len(&self) -> io::Result<u64> {
-            self.file.len()
-        }
-    }
-
     /// What a worst-case block costs on a real file: 25,000 outputs
     /// spent, picked evenly among those unspent, and 25,000 made, in a
     /// set built by blocks like it.
@@ -884,13 +912,7 @@ mod tests {
         use std::sync::atomic::Ordering::Relaxed;
         let total: u64 = std::env::var("TABMINER_STORE_OUTPUTS").ok().and_then(|s| s.parse().ok()).unwrap_or(4_000_000);
         let dir = crate::store::testing::temp_dir("outputs-cost");
-        let backend = Counting {
-            file: crate::store::backend::FileBackend::open(&dir.join("state")).unwrap(),
-            reads: 0.into(),
-            read_bytes: 0.into(),
-            writes: 0.into(),
-            written: 0.into(),
-        };
+        let backend = crate::store::testing::Counting::open(&dir.join("state"));
         let file = PageFile::create(backend).unwrap();
         let mut rng = Rng::new(0xc057);
         let mut set = Outputs::EMPTY;

@@ -13,7 +13,7 @@
 use std::sync::OnceLock;
 
 use crate::hash::Digest;
-use crate::poseidon2::{DIGEST, Fp, LANES, compress, compress_batch};
+use crate::poseidon2::{BATCH_FROM, DIGEST, Fp, LANES, compress, compress_batch};
 
 /// The height of the whole state tree: the outputs' half and the names'
 /// half, each of height 41, under one root.
@@ -101,9 +101,21 @@ pub fn root_with_path(
                 waiting = 0;
             }
         }
-        for p in &pending[..waiting] {
-            nodes[w] = (p.0, compress(&p.1, &p.2));
-            w += 1;
+        if waiting >= BATCH_FROM {
+            // A batch not full: the lanes left over repeat the first.
+            let out = compress_batch(core::array::from_fn(|k| {
+                let p = &pending[if k < waiting { k } else { 0 }];
+                (&p.1, &p.2)
+            }));
+            for (k, d) in out.into_iter().take(waiting).enumerate() {
+                nodes[w + k] = (pending[k].0, d);
+            }
+            w += waiting;
+        } else {
+            for p in &pending[..waiting] {
+                nodes[w] = (p.0, compress(&p.1, &p.2));
+                w += 1;
+            }
         }
         n = w;
     }

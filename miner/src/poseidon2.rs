@@ -1122,6 +1122,12 @@ pub fn hash_batch(rows: [&[Fp]; LANES]) -> [[Fp; DIGEST]; LANES] {
     out
 }
 
+/// The fewest compressions it pays to do with [`compress_batch`], the
+/// lanes left over filled with a repeat: where the lanes are one vector
+/// a batch costs little more than one compression, and where they are a
+/// loop it costs eight.
+pub const BATCH_FROM: usize = if cfg!(all(target_arch = "x86_64", target_feature = "avx2")) { 2 } else { LANES };
+
 /// [`compress`] of `LANES` pairs, in lockstep.
 pub fn compress_batch(pairs: [(&[Fp; DIGEST], &[Fp; DIGEST]); LANES]) -> [[Fp; DIGEST]; LANES] {
     let mut s: BatchState = [[0u32; LANES]; WIDTH];

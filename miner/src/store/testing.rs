@@ -167,3 +167,65 @@ impl Backend for MemBackend {
         Ok(self.inner.lock().unwrap().current.len() as u64)
     }
 }
+
+/// A file on disk that counts what is asked of it.
+pub(crate) struct Counting {
+    pub(crate) file: super::backend::FileBackend,
+    pub(crate) reads: std::sync::atomic::AtomicU64,
+    pub(crate) read_bytes: std::sync::atomic::AtomicU64,
+    pub(crate) writes: std::sync::atomic::AtomicU64,
+    pub(crate) written: std::sync::atomic::AtomicU64,
+}
+
+impl Counting {
+    pub(crate) fn open(path: &std::path::Path) -> Counting {
+        Counting {
+            file: super::backend::FileBackend::open(path).unwrap(),
+            reads: 0.into(),
+            read_bytes: 0.into(),
+            writes: 0.into(),
+            written: 0.into(),
+        }
+    }
+
+    /// Reads, bytes read, writes and bytes written since the last call.
+    pub(crate) fn take(&self) -> [u64; 4] {
+        use std::sync::atomic::Ordering::Relaxed;
+        [
+            self.reads.swap(0, Relaxed),
+            self.read_bytes.swap(0, Relaxed),
+            self.writes.swap(0, Relaxed),
+            self.written.swap(0, Relaxed),
+        ]
+    }
+}
+
+impl Backend for Counting {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.read_bytes.fetch_add(buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.file.read_at(offset, buf)
+    }
+
+    fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.written.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.file.write_at(offset, data)
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        self.file.sync()
+    }
+
+    fn len(&self) -> io::Result<u64> {
+        self.file.len()
+    }
+
+    /// A batch goes to the file as a batch, to be read as it reads one.
+    fn read_many(&self, reads: &mut [super::backend::ReadReq<'_>]) -> io::Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.reads.fetch_add(reads.len() as u64, Relaxed);
+        self.read_bytes.fetch_add(reads.iter().map(|r| r.buf.len() as u64).sum(), Relaxed);
+        self.file.read_many(reads)
+    }
+}

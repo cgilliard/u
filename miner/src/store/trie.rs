@@ -42,6 +42,10 @@
 //! the way is read once, and written once when the pass leaves it.
 //! Nothing is changed in place; the pages replaced are named to the
 //! transaction, and the new root is returned to be committed with it.
+//!
+//! A pass that changes much is split among threads where the trie
+//! branches: the subtrees under a node share nothing, so each is a pass
+//! of its own, and what a block costs is mostly their hashing.
 
 use std::io;
 
@@ -60,6 +64,8 @@ pub const LEAF_RECORDS: usize = 64;
 /// The most bytes of a leaf page's payload: eight units.
 const LEAF_BYTES: usize = Extent::capacity(8);
 const PAGE: usize = 4096;
+/// A pass with fewer keys to change than this stays on one thread.
+const SPLIT: usize = 512;
 
 fn corrupt(what: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what)
@@ -93,8 +99,8 @@ pub trait Tree {
     /// Bits of a key: the height of the tree.
     const HEIGHT: u32;
     /// A key as the tree's users give it.
-    type Key: Copy + Into<u128>;
-    type Record: Copy + PartialEq + core::fmt::Debug;
+    type Key: Copy + Into<u128> + Send + Sync;
+    type Record: Copy + PartialEq + core::fmt::Debug + Send + Sync;
 
     /// Bytes [`Tree::write_record`] appends for `r`.
     fn record_len(r: &Self::Record) -> usize;
@@ -460,6 +466,18 @@ impl<'a, T: Tree> Edits<'a, T> {
         }
     }
 
+    /// How much there is to do: the keys it names.
+    fn weight(&self) -> usize {
+        self.flips.len() + self.run.len() + self.puts.len() + self.removes.len()
+    }
+
+    /// Whether there is nothing to do under `child`, of `height` levels
+    /// from `base`: nothing of it falls there, or all that does is the
+    /// removal of what an empty subtree does not have.
+    fn idle(&self, child: Child, base: u128, height: u32) -> bool {
+        self.is_empty(base, height) || (child == Child::Empty && self.weight() == 0)
+    }
+
     /// Whether nothing of it falls in `base..base + 2^height`: `self` is
     /// already cut down to that.
     fn is_empty(&self, base: u128, height: u32) -> bool {
@@ -484,7 +502,7 @@ struct Sweep {
 
 /// One pass over the trie, inside a transaction.
 struct Pass<'t, 'f, T: Tree, B: Backend> {
-    txn: &'t mut Txn<'f, B>,
+    txn: &'t Txn<'f, B>,
     /// The height of the block the pass applies, or of the tip a pass
     /// that undoes one leaves.
     height: u32,
@@ -495,18 +513,69 @@ struct Pass<'t, 'f, T: Tree, B: Backend> {
 }
 
 impl<T: Tree, B: Backend> Pass<'_, '_, T, B> {
-    /// The subtree `child` (of `height` levels from `base`) after `edits`.
-    fn update(&mut self, child: Child, height: u32, base: u128, edits: Edits<'_, T>) -> Result<Child, Error> {
-        if edits.is_empty(base, height) {
+    /// The subtree `child` (of `height` levels from `base`) after `edits`,
+    /// on up to `threads` threads.
+    fn update(
+        &mut self,
+        child: Child,
+        height: u32,
+        base: u128,
+        edits: Edits<'_, T>,
+        threads: usize,
+    ) -> Result<Child, Error> {
+        if edits.idle(child, base, height) {
             return Ok(child);
         }
-        let Child::Node { page, .. } = child else { return self.update_leaf(child, height, base, edits) };
+        let Child::Node { page, .. } = child else { return self.update_leaf(child, height, base, edits, threads) };
         let mut buf = [0u8; PAGE];
         let mut children = read_node(self.txn.read(page, &mut buf)?, height)?;
         let low = below(height);
-        for (k, c) in children.iter_mut().enumerate().take(1 << (height - low)) {
-            let at = base + ((k as u128) << low);
-            *c = self.update(*c, low, at, edits.within(at, low))?;
+        let slots = 1usize << (height - low);
+        let at = |k: usize| base + ((k as u128) << low);
+        let busy = (0..slots).filter(|k| !edits.within(at(*k), low).idle(children[*k], at(*k), low)).count();
+        if threads >= 2 && busy >= 2 && edits.weight() >= SPLIT {
+            // Each worker takes the next child not yet taken, and is a
+            // pass of its own; the threads are shared out below it.
+            let workers = threads.min(busy);
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let (txn, height_now, kids) = (self.txn, self.height, &children);
+            let done: Vec<(i64, Vec<(usize, Result<Child, Error>)>)> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..workers)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            let mut pass =
+                                Pass::<T, B> { txn, height: height_now, count: 0, slots: Vec::new(), out: Vec::new() };
+                            let mut made = Vec::new();
+                            loop {
+                                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if k >= slots {
+                                    return (pass.count, made);
+                                }
+                                made.push((
+                                    k,
+                                    pass.update(kids[k], low, at(k), edits.within(at(k), low), threads / workers),
+                                ));
+                            }
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().expect("a pass does not panic")).collect()
+            });
+            // The first fault in key order is the one reported, as when
+            // one thread does it all.
+            let mut made: Vec<(usize, Result<Child, Error>)> = Vec::with_capacity(slots);
+            for (count, part) in done {
+                self.count += count;
+                made.extend(part);
+            }
+            made.sort_by_key(|m| m.0);
+            for (k, child) in made {
+                children[k] = child?;
+            }
+        } else {
+            for (k, c) in children.iter_mut().enumerate().take(slots) {
+                *c = self.update(*c, low, at(k), edits.within(at(k), low), threads)?;
+            }
         }
         self.txn.free(page);
         if children.iter().all(|c| *c == Child::Empty) {
@@ -522,7 +591,14 @@ impl<T: Tree, B: Backend> Pass<'_, '_, T, B> {
     }
 
     /// A leaf, or an empty subtree, after `edits`.
-    fn update_leaf(&mut self, child: Child, height: u32, base: u128, edits: Edits<'_, T>) -> Result<Child, Error> {
+    fn update_leaf(
+        &mut self,
+        child: Child,
+        height: u32,
+        base: u128,
+        edits: Edits<'_, T>,
+        threads: usize,
+    ) -> Result<Child, Error> {
         let mut slots = std::mem::take(&mut self.slots);
         slots.clear();
         let mut old = None;
@@ -531,7 +607,7 @@ impl<T: Tree, B: Backend> Pass<'_, '_, T, B> {
             read_leaf::<T>(self.txn.read(page, &mut buf)?, base, height, records, live, &mut slots)?;
             old = Some((page, last_spend));
         }
-        let done = self.edit(&mut slots, old, height, base, edits);
+        let done = self.edit(&mut slots, old, height, base, edits, threads);
         self.slots = slots;
         done
     }
@@ -543,6 +619,7 @@ impl<T: Tree, B: Backend> Pass<'_, '_, T, B> {
         height: u32,
         base: u128,
         edits: Edits<'_, T>,
+        threads: usize,
     ) -> Result<Child, Error> {
         let mut last_spend = old.map_or(0, |o| o.1);
         for k in edits.flips {
@@ -609,7 +686,7 @@ impl<T: Tree, B: Backend> Pass<'_, '_, T, B> {
                 if let Some((page, _)) = old {
                     self.txn.free(page);
                 }
-                self.build(slots, height, base, last_spend)
+                self.build(slots, height, base, last_spend, threads)
             }
         }
     }
@@ -644,7 +721,7 @@ impl<T: Tree, B: Backend> Pass<'_, '_, T, B> {
                 let mut buf = [0u8; PAGE];
                 read_leaf::<T>(self.txn.read(page, &mut buf)?, base, height, records, live, &mut slots)?;
                 slots.retain(|s| s.live);
-                let built = self.build(&slots, height, base, 0);
+                let built = self.build(&slots, height, base, 0, 1);
                 self.slots = slots;
                 built
             }
@@ -712,13 +789,21 @@ impl<T: Tree, B: Backend> Pass<'_, '_, T, B> {
                 self.txn.free(*page);
             }
         }
-        self.build(&slots, height, base, 0).map(Some)
+        self.build(&slots, height, base, 0, 1).map(Some)
     }
 
     /// The subtree of `height` levels from `base` holding `slots`, all
     /// of it written anew: a leaf if they fit one, else a node over the
-    /// sixteen parts of them.
-    fn build(&mut self, slots: &[Slot<T::Record>], height: u32, base: u128, last_spend: u32) -> Result<Child, Error> {
+    /// sixteen parts of them. Many records (a state being installed) are
+    /// built on up to `threads` threads.
+    fn build(
+        &mut self,
+        slots: &[Slot<T::Record>],
+        height: u32,
+        base: u128,
+        last_spend: u32,
+        threads: usize,
+    ) -> Result<Child, Error> {
         if slots.is_empty() {
             return Ok(Child::Empty);
         }
@@ -738,13 +823,47 @@ impl<T: Tree, B: Backend> Pass<'_, '_, T, B> {
         // Keys differ, so a subtree of one key always fits.
         assert!(height > 0, "records of one key do not fit a page");
         let low = below(height);
+        let count = 1usize << (height - low);
+        // Where each child's records lie.
+        let mut cuts = [0usize; FANOUT + 1];
+        for k in 0..count {
+            let end = base + ((k as u128 + 1) << low);
+            cuts[k + 1] = cuts[k] + slots[cuts[k]..].partition_point(|s| s.key < end);
+        }
+        let part = |k: usize| &slots[cuts[k]..cuts[k + 1]];
+        let at = |k: usize| base + ((k as u128) << low);
         let mut children = [Child::Empty; FANOUT];
-        let mut rest = slots;
-        for (k, c) in children.iter_mut().enumerate().take(1 << (height - low)) {
-            let at = base + ((k as u128) << low);
-            let n = rest.partition_point(|s| s.key < at + (1u128 << low));
-            *c = self.build(&rest[..n], low, at, last_spend)?;
-            rest = &rest[n..];
+        let busy = (0..count).filter(|k| !part(*k).is_empty()).count();
+        if threads >= 2 && busy >= 2 && slots.len() >= 8 * SPLIT {
+            let workers = threads.min(busy);
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let (txn, height_now) = (self.txn, self.height);
+            let made: Vec<Vec<(usize, Result<Child, Error>)>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..workers)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            let mut pass =
+                                Pass::<T, B> { txn, height: height_now, count: 0, slots: Vec::new(), out: Vec::new() };
+                            let mut made = Vec::new();
+                            loop {
+                                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if k >= count {
+                                    return made;
+                                }
+                                made.push((k, pass.build(part(k), low, at(k), last_spend, threads / workers)));
+                            }
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().expect("a pass does not panic")).collect()
+            });
+            for (k, child) in made.into_iter().flatten() {
+                children[k] = child?;
+            }
+        } else {
+            for (k, c) in children.iter_mut().enumerate().take(count) {
+                *c = self.build(part(k), low, at(k), last_spend, threads)?;
+            }
         }
         self.write_node(&children, height, base)
     }
@@ -753,13 +872,25 @@ impl<T: Tree, B: Backend> Pass<'_, '_, T, B> {
 /// The trie of root `root` after `edits`, made at block `height`, and
 /// the change in the number of its live records.
 pub fn update<T: Tree, B: Backend>(
-    txn: &mut Txn<'_, B>,
+    txn: &Txn<'_, B>,
     root: Child,
     height: u32,
     edits: Edits<'_, T>,
 ) -> Result<(Child, i64), Error> {
+    update_on(txn, root, height, edits, crate::parallel::threads())
+}
+
+/// [`update`] on up to `threads` threads: the result is the same on any
+/// number.
+pub fn update_on<T: Tree, B: Backend>(
+    txn: &Txn<'_, B>,
+    root: Child,
+    height: u32,
+    edits: Edits<'_, T>,
+    threads: usize,
+) -> Result<(Child, i64), Error> {
     let mut pass = Pass::<T, B> { txn, height, count: 0, slots: Vec::new(), out: Vec::new() };
-    let root = pass.update(root, T::HEIGHT, 0, edits.within(0, T::HEIGHT))?;
+    let root = pass.update(root, T::HEIGHT, 0, edits.within(0, T::HEIGHT), threads)?;
     Ok((root, pass.count))
 }
 
@@ -768,7 +899,7 @@ pub fn update<T: Tree, B: Backend>(
 /// `horizon` and it is a quarter of the leaf or more. Returns the root,
 /// whose part is as it was, and the key the sweep reached.
 pub fn sweep<T: Tree, B: Backend>(
-    txn: &mut Txn<'_, B>,
+    txn: &Txn<'_, B>,
     root: Child,
     from: u128,
     budget: usize,
@@ -858,21 +989,39 @@ pub fn get<T: Tree>(pages: &impl ReadPages, root: Child, key: u128) -> io::Resul
 }
 
 /// Marks every page of the trie in `file`'s map of free space, as must
-/// be done when the file is opened. Reads the nodes, not the leaves.
+/// be done when the file is opened. Reads the nodes, not the leaves, and
+/// reads them many at a time: a large trie has millions.
 pub fn mark<T: Tree, B: Backend>(file: &PageFile<B>, root: Child) -> io::Result<()> {
-    fn walk<B: Backend>(file: &PageFile<B>, child: Child, height: u32) -> io::Result<()> {
+    /// Nodes read together.
+    const BATCH: usize = 2048;
+    // Nodes still to read, the deepest last: taken from the end, so that
+    // the list stays short however many nodes there are.
+    let mut todo: Vec<(Extent, u32)> = Vec::new();
+    let see = |child: Child, height: u32, todo: &mut Vec<(Extent, u32)>| -> io::Result<()> {
         match child {
             Child::Empty => Ok(()),
             Child::Leaf { page, .. } => file.mark(page),
             Child::Node { page, .. } => {
-                file.mark(page)?;
-                let mut buf = [0u8; PAGE];
-                let children = read_node(file.read(page, &mut buf)?, height)?;
-                children.iter().try_for_each(|c| walk(file, *c, below(height)))
+                todo.push((page, height));
+                file.mark(page)
+            }
+        }
+    };
+    see(root, T::HEIGHT, &mut todo)?;
+    let mut bufs = vec![0u8; BATCH * PAGE];
+    while !todo.is_empty() {
+        let batch: Vec<(Extent, u32)> = todo.split_off(todo.len().saturating_sub(BATCH));
+        let mut pages: Vec<(Extent, &mut [u8])> =
+            batch.iter().zip(bufs.chunks_mut(PAGE)).map(|((e, _), buf)| (*e, buf)).collect();
+        file.read_many(&mut pages)?;
+        for ((e, height), buf) in batch.iter().zip(bufs.chunks(PAGE)) {
+            let children = read_node(e.payload(buf)?, *height)?;
+            for c in children {
+                see(c, below(*height), &mut todo)?;
             }
         }
     }
-    walk(file, root, T::HEIGHT)
+    Ok(())
 }
 
 /// Calls `f` with every record kept, in key order: its key, the record
