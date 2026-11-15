@@ -7,10 +7,16 @@
 //!
 //! # What it keeps, and its bounds
 //!
-//! A request waits here until its chunks are sent: [`MAX_JOBS`] requests
-//! in all, [`MAX_JOBS_EACH`] and [`MAX_CHUNKS_EACH`] chunks for any one
-//! address. A request over a bound is dropped. Nothing is said: the
-//! asking side sees silence, takes it for loss and asks for less.
+//! A request waits here until its chunks are sent, and how much may
+//! wait is bounded ([`Limits`]): so many requests in all, so many
+//! requests and so many chunks for any one address. A request over a
+//! bound is dropped. Nothing is said: the asking side sees silence,
+//! takes it for loss and asks for less.
+//!
+//! The bounds are a node's own to set: they are how much it is willing
+//! to do for others at once, and a node many others lean on (a seed)
+//! sets them higher. What is here is kept by address, so that finding
+//! whose turn it is costs the same however many are waiting.
 //!
 //! A request for more of the fetch its address asked for last is joined
 //! to that one while there is room in it, so that a fetch asking a
@@ -22,8 +28,8 @@
 //! The chunks of one address go out in the order it asked for them, over
 //! all its requests: the asking side tells what was lost by what was
 //! overtaken, and that holds only if nothing here overtakes.
-//! Between addresses, turns are taken a chunk at a time, so one large
-//! fetch does not hold up a small one.
+//! Between addresses, turns are taken a chunk at a time, in the order
+//! of the addresses, so one large fetch does not hold up a small one.
 //!
 //! # Pace
 //!
@@ -32,18 +38,37 @@
 //! overruns the first small buffer on the path, and the losses look to
 //! the asking side like a path that carries less than it does.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
+use std::ops::Bound;
 
 use super::token::Tokens;
 use super::wire::{Get, MAX_NAME, MAX_RANGES, Range};
 use super::{MAX_WINDOW, Micros, SECOND};
 
-/// Requests waiting, at most.
-pub const MAX_JOBS: usize = 64;
-/// Requests of one address waiting, at most.
-pub const MAX_JOBS_EACH: usize = 8;
-/// Chunks of one address waiting, at most: two full windows.
-pub const MAX_CHUNKS_EACH: u32 = 2 * MAX_WINDOW;
+/// How much a node serves, and how much may wait to be served.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// Chunks sent a second, to everyone together.
+    pub rate: u32,
+    /// Requests waiting, in all.
+    pub waiting: usize,
+    /// Requests of one address waiting.
+    pub waiting_each: usize,
+    /// Chunks of one address waiting. Under a full window
+    /// ([`MAX_WINDOW`]) a fetch that has grown to one could never be
+    /// answered whole.
+    pub chunks_each: u32,
+}
+
+impl Default for Limits {
+    /// Sixty-four requests waiting, eight of one address, and two full
+    /// windows of chunks for it, at 8,192 chunks a second.
+    fn default() -> Limits {
+        Limits { rate: 8192, waiting: 64, waiting_each: 8, chunks_each: 2 * MAX_WINDOW }
+    }
+}
+
 /// Chunks sent at once after idleness, before the pace holds.
 pub const BURST: u64 = 32;
 
@@ -145,11 +170,13 @@ pub enum Refused {
 }
 
 pub struct Serve {
-    /// In the order they came.
-    jobs: Vec<Job>,
-    /// Where the turn has got to: the next is the first job of an
-    /// address at or after this place, or failing that the first of all.
-    after: usize,
+    limits: Limits,
+    /// Each address's requests, in the order they came.
+    queues: BTreeMap<SocketAddr, VecDeque<Job>>,
+    /// Requests waiting, in all.
+    jobs: usize,
+    /// The address served last: the turn passes to the next after it.
+    last: Option<SocketAddr>,
     /// Microseconds a chunk.
     cost: Micros,
     /// The time the next chunk may go, were there no burst: it runs
@@ -159,15 +186,29 @@ pub struct Serve {
 }
 
 impl Serve {
-    /// Serving `rate` chunks a second at most.
+    /// Serving `rate` chunks a second at most, within the usual bounds
+    /// on what waits.
     pub fn new(rate: u32) -> Serve {
-        assert!(rate > 0);
-        Serve { jobs: Vec::with_capacity(MAX_JOBS), after: 0, cost: (SECOND / rate as u64).max(1), due: 0 }
+        Serve::with(Limits { rate, ..Limits::default() })
+    }
+
+    /// Serving within `limits`.
+    pub fn with(limits: Limits) -> Serve {
+        assert!(limits.rate > 0 && limits.waiting > 0 && limits.waiting_each > 0);
+        assert!(limits.chunks_each >= MAX_WINDOW, "room for a full window");
+        Serve {
+            limits,
+            queues: BTreeMap::new(),
+            jobs: 0,
+            last: None,
+            cost: (SECOND / limits.rate as u64).max(1),
+            due: 0,
+        }
     }
 
     /// Requests waiting.
     pub fn waiting(&self) -> usize {
-        self.jobs.len()
+        self.jobs
     }
 
     /// Takes a request from `from`, if it carries `from`'s token and
@@ -176,22 +217,23 @@ impl Serve {
         if !tokens.check(&from, get.token) {
             return Err(Refused::Token);
         }
-        let (mut jobs, mut chunks) = (0, 0u32);
-        for j in self.jobs.iter().filter(|j| j.to == from) {
-            jobs += 1;
-            chunks += j.left;
-        }
-        if self.jobs.len() == MAX_JOBS || jobs == MAX_JOBS_EACH || chunks + get.ranges.chunks() > MAX_CHUNKS_EACH {
+        let l = self.limits;
+        let queue = self.queues.get_mut(&from);
+        let (mine, chunks) = queue.as_ref().map_or((0, 0), |q| (q.len(), q.iter().map(|j| j.left).sum::<u32>()));
+        if chunks + get.ranges.chunks() > l.chunks_each {
             return Err(Refused::Full);
         }
         // More of what its address asked for last: one request with it,
         // while there is room in that one.
-        if let Some(j) = self.jobs.iter_mut().rev().find(|j| j.to == from)
+        if let Some(j) = queue.and_then(|q| q.back_mut())
             && j.transfer == get.transfer
             && j.name[..j.name_len as usize] == *get.name
             && j.extend(get)
         {
             return Ok(());
+        }
+        if self.jobs == l.waiting || mine == l.waiting_each {
+            return Err(Refused::Full);
         }
         let mut name = [0; MAX_NAME];
         name[..get.name.len()].copy_from_slice(get.name);
@@ -206,28 +248,34 @@ impl Serve {
             left: 0,
         };
         job.extend(get);
-        self.jobs.push(job);
+        self.queues.entry(from).or_default().push_back(job);
+        self.jobs += 1;
         Ok(())
     }
 
     /// Forgets what `to` is still to be sent of the fetch `transfer`:
     /// there is no such object, or no more of it.
     pub fn cancel(&mut self, to: SocketAddr, transfer: u64) {
-        self.jobs.retain(|j| !(j.to == to && j.transfer == transfer));
+        if let Some(q) = self.queues.get_mut(&to) {
+            let before = q.len();
+            q.retain(|j| j.transfer != transfer);
+            self.jobs -= before - q.len();
+            if q.is_empty() {
+                self.queues.remove(&to);
+            }
+        }
     }
 
-    /// The job whose turn it is. Only the first job of an address may
-    /// be sent from, and addresses are in the order of their first jobs.
-    fn turn(&self) -> Option<usize> {
-        let first_of = |i: usize| !self.jobs[..i].iter().any(|j| j.to == self.jobs[i].to);
-        let mut firsts = (0..self.jobs.len()).filter(|&i| first_of(i));
-        let first = firsts.next()?;
-        Some(if first >= self.after { first } else { firsts.find(|&i| i >= self.after).unwrap_or(first) })
+    /// The address whose turn it is: the next after the one served
+    /// last, in the order of addresses, and round again from the first.
+    fn turn(&self) -> Option<SocketAddr> {
+        let after = self.last.and_then(|last| self.queues.range((Bound::Excluded(last), Bound::Unbounded)).next());
+        after.or_else(|| self.queues.iter().next()).map(|(to, _)| *to)
     }
 
     /// What to send at `now`.
     pub fn next(&mut self, now: Micros) -> Next {
-        let Some(i) = self.turn() else {
+        let Some(to) = self.turn() else {
             return Next::Idle;
         };
         // Never more than a burst behind the clock.
@@ -236,7 +284,9 @@ impl Serve {
             return Next::Wait(due);
         }
         self.due = due + self.cost;
-        let j = &mut self.jobs[i];
+        let queue = self.queues.get_mut(&to).expect("its turn");
+        // An address's requests one after another, the first first.
+        let j = queue.front_mut().expect("no address waits with nothing");
         let (r, seq) = &mut j.runs[j.run];
         let send =
             Send { to: j.to, transfer: j.transfer, name: j.name, name_len: j.name_len, index: r.start, seq: *seq };
@@ -248,20 +298,14 @@ impl Serve {
         if r.count == 0 {
             j.run += 1;
         }
-        let (to, done) = (j.to, j.left == 0);
-        self.after = i + 1;
-        if done {
-            self.jobs.remove(i);
-            // Its address's next request takes its place, so that the
-            // address keeps its turn and no other loses one.
-            match self.jobs[i..].iter().position(|j| j.to == to) {
-                Some(p) => {
-                    let next = self.jobs.remove(i + p);
-                    self.jobs.insert(i, next);
-                }
-                None => self.after = i,
+        if j.left == 0 {
+            queue.pop_front();
+            self.jobs -= 1;
+            if queue.is_empty() {
+                self.queues.remove(&to);
             }
         }
+        self.last = Some(to);
         Next::Send(send)
     }
 }
@@ -403,7 +447,8 @@ mod tests {
         let tokens = Tokens::new([1; 32]);
         let mut s = Serve::new(1000);
         // Requests of one address.
-        for i in 0..MAX_JOBS_EACH as u64 {
+        let l = Limits::default();
+        for i in 0..l.waiting_each as u64 {
             assert_eq!(s.get(&tokens, addr(1), &get(&tokens, addr(1), i, b"x", ranges(0..1))), Ok(()));
         }
         assert_eq!(s.get(&tokens, addr(1), &get(&tokens, addr(1), 99, b"x", ranges(0..1))), Err(Refused::Full));
@@ -416,7 +461,7 @@ mod tests {
         // Requests in all.
         let mut n = s.waiting();
         let mut a = 10;
-        while n < MAX_JOBS {
+        while n < l.waiting {
             assert_eq!(s.get(&tokens, addr(a), &get(&tokens, addr(a), 1, b"x", ranges(0..1))), Ok(()));
             n += 1;
             a += 1;
@@ -424,8 +469,49 @@ mod tests {
         assert_eq!(s.get(&tokens, addr(200), &get(&tokens, addr(200), 1, b"x", ranges(0..1))), Err(Refused::Full));
         // Once sent, there is room again.
         let sent = drain(&mut s);
-        assert_eq!(sent.len(), MAX_JOBS_EACH + 2 * MAX_WINDOW as usize + (MAX_JOBS - MAX_JOBS_EACH - 3));
+        assert_eq!(sent.len(), l.waiting_each + 2 * MAX_WINDOW as usize + (l.waiting - l.waiting_each - 3));
         assert_eq!(s.get(&tokens, addr(200), &get(&tokens, addr(200), 1, b"x", ranges(0..1))), Ok(()));
+    }
+
+    /// The bounds are the node's to set: a node many lean on holds more
+    /// for more of them, and whose turn it is costs no more to find.
+    #[test]
+    fn a_node_that_serves_many_sets_its_bounds_higher() {
+        let tokens = Tokens::new([1; 32]);
+        let limits = Limits { rate: 1_000_000, waiting: 5000, waiting_each: 2, chunks_each: MAX_WINDOW };
+        let mut s = Serve::with(limits);
+        let who = |n: u32| SocketAddr::from(([10, (n >> 16) as u8, (n >> 8) as u8, n as u8], 4000));
+        for n in 0..5000 {
+            assert_eq!(s.get(&tokens, who(n), &get(&tokens, who(n), 1, b"x", ranges(0..3))), Ok(()), "{n}");
+        }
+        assert_eq!(s.waiting(), 5000);
+        assert_eq!(s.get(&tokens, who(5000), &get(&tokens, who(5000), 1, b"x", ranges(0..3))), Err(Refused::Full));
+        // Its own bounds for one address: two requests, one window.
+        let again = |transfer, r| get(&tokens, who(7), transfer, b"x", r);
+        assert_eq!(s.get(&tokens, who(7), &again(2, ranges(0..MAX_WINDOW))), Err(Refused::Full));
+        s.cancel(who(8), 1);
+        assert_eq!(s.get(&tokens, who(7), &again(2, ranges(0..3))), Ok(()));
+        s.cancel(who(9), 1);
+        assert_eq!(s.get(&tokens, who(7), &again(3, ranges(0..3))), Err(Refused::Full));
+        // Everyone gets a chunk before anyone gets a second.
+        let mut now = 1 << 40;
+        let mut first_round = std::collections::BTreeSet::new();
+        for _ in 0..4998 {
+            match s.next(now) {
+                Next::Send(x) => assert!(first_round.insert(x.to), "{} twice", x.to),
+                Next::Wait(t) => now = t,
+                Next::Idle => panic!(),
+            }
+        }
+        let mut sent = first_round.len();
+        loop {
+            match s.next(now) {
+                Next::Send(_) => sent += 1,
+                Next::Wait(t) => now = t,
+                Next::Idle => break,
+            }
+        }
+        assert_eq!((sent, s.waiting()), (4998 * 3 + 3, 0));
     }
 
     #[test]

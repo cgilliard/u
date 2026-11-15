@@ -31,6 +31,7 @@
 //! sent: [`Peers::pings_due`] says whom to ping, and the caller does
 //! it.
 
+use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use super::config;
@@ -105,21 +106,21 @@ pub struct Peers {
     pass_over: Micros,
     /// How long a peer may take to send a header we lack.
     header_wait: Micros,
-    peers: Vec<Peer>,
+    /// By address, so that a peer is found, and the peers of a host or
+    /// of a network counted, without going through the table: a node
+    /// many others lean on may keep thousands.
+    peers: BTreeMap<SocketAddrV4, Peer>,
     /// Addresses found to be this node's own.
     selves: Vec<SocketAddrV4>,
     /// Hosts refused, and since when. (A host is its address with no
     /// port; on this machine, where many nodes may run, the address
     /// with its port.)
-    banned: Vec<(SocketAddrV4, Micros)>,
+    banned: BTreeMap<SocketAddrV4, Micros>,
+    /// How many in the table are neither proven nor seeds: the ones a
+    /// full table gives up.
+    unproven: usize,
     /// The state of the generator peers are sampled with.
     random: u64,
-}
-
-/// The network of an address, for the limit on peers of one network:
-/// its first sixteen bits.
-fn network(ip: &Ipv4Addr) -> u16 {
-    (u32::from(*ip) >> 16) as u16
 }
 
 /// What a ban is of: the host, whatever the port (a new port would get
@@ -142,9 +143,10 @@ impl Peers {
             cfg: cfg.peers.clone(),
             pass_over: cfg.sync.pass_over,
             header_wait: cfg.sync.header_wait,
-            peers: Vec::with_capacity(cfg.peers.max),
+            peers: BTreeMap::new(),
             selves: Vec::new(),
-            banned: Vec::new(),
+            banned: BTreeMap::new(),
+            unproven: 0,
             random: seed | 1,
         }
     }
@@ -158,21 +160,31 @@ impl Peers {
     }
 
     pub fn get(&self, addr: &SocketAddrV4) -> Option<&Peer> {
-        self.peers.iter().find(|p| p.addr == *addr)
+        self.peers.get(addr)
     }
 
     fn get_mut(&mut self, addr: &SocketAddrV4) -> Option<&mut Peer> {
-        self.peers.iter_mut().find(|p| p.addr == *addr)
+        self.peers.get_mut(addr)
     }
 
-    /// Every peer in the table.
+    /// Every peer in the table, in the order of their addresses.
     pub fn all(&self) -> impl Iterator<Item = &Peer> {
-        self.peers.iter()
+        self.peers.values()
+    }
+
+    /// The peers whose addresses' first `bits` bits are `addr`'s: of
+    /// its host (32) or of its network (16). They lie together in the
+    /// order of addresses.
+    fn of(&self, addr: &SocketAddrV4, bits: u32) -> impl Iterator<Item = &Peer> {
+        let ip = u32::from(*addr.ip());
+        let mask = u32::MAX << (32 - bits);
+        let first = SocketAddrV4::new(Ipv4Addr::from(ip & mask), 0);
+        let last = SocketAddrV4::new(Ipv4Addr::from(ip | !mask), u16::MAX);
+        self.peers.range(first..=last).map(|(_, p)| p)
     }
 
     fn is_banned(&self, addr: &SocketAddrV4, now: Micros) -> bool {
-        let key = ban_key(addr);
-        self.banned.iter().any(|(k, since)| *k == key && now.saturating_sub(*since) < self.cfg.ban)
+        self.banned.get(&ban_key(addr)).is_some_and(|since| now.saturating_sub(*since) < self.cfg.ban)
     }
 
     /// Why `addr` would not be taken into the table now, if it would
@@ -193,19 +205,18 @@ impl Peers {
         // Seeds are a node's own choice, and this machine is one host
         // however many nodes run on it: neither is counted.
         if !seed && !addr.ip().is_loopback() {
-            let of_host = self.peers.iter().filter(|p| p.addr.ip() == addr.ip()).count();
+            let of_host = self.of(addr, 32).count();
             if of_host >= self.cfg.per_host && self.stale_of_host(addr, now).is_none() {
                 return Some(Refused::Host);
             }
-            let of_network =
-                self.peers.iter().filter(|p| !p.seed && network(p.addr.ip()) == network(addr.ip())).count();
+            let of_network = self.of(addr, 16).filter(|p| !p.seed).count();
             // (One of the host's own may be about to give way to it.)
             let leaving = (of_host >= self.cfg.per_host) as usize;
             if of_network - leaving.min(of_network) >= self.cfg.per_network {
                 return Some(Refused::Network);
             }
         }
-        if self.peers.len() >= self.cfg.max && !self.peers.iter().any(|p| !p.proven && !p.seed) {
+        if self.peers.len() >= self.cfg.max && self.unproven == 0 {
             return Some(Refused::Full);
         }
         None
@@ -218,41 +229,53 @@ impl Peers {
         if let Some(why) = self.refusal(&addr, seed, now) {
             return Err(why);
         }
-        if let Some(p) = self.get_mut(&addr) {
+        if let Some(p) = self.peers.get_mut(&addr) {
+            // A seed from now on, and so not one a full table gives up.
+            self.unproven -= (seed && !p.seed && !p.proven) as usize;
             p.seed |= seed;
             return Ok(false);
         }
         if !seed && !addr.ip().is_loopback() {
-            let of_host = self.peers.iter().filter(|p| p.addr.ip() == addr.ip()).count();
-            if of_host >= self.cfg.per_host {
+            if self.of(&addr, 32).count() >= self.cfg.per_host {
                 // The host's longest silent peer gives way.
                 let old = self.stale_of_host(&addr, now).expect("or it was refused");
-                self.peers.retain(|p| p.addr != old);
+                self.remove(&old);
             }
         }
         if self.peers.len() >= self.cfg.max {
             // One that never proved itself gives way, and no other.
-            let at = self.peers.iter().position(|p| !p.proven && !p.seed).expect("or it was refused");
-            self.peers.swap_remove(at);
+            let old = self.peers.values().find(|p| !p.proven && !p.seed).expect("or it was refused").addr;
+            self.remove(&old);
         }
-        self.peers.push(Peer {
+        self.unproven += !seed as usize;
+        self.peers.insert(
             addr,
-            seed,
-            proven: false,
-            status: None,
-            last_seen: None,
-            path: Path::new(),
-            delivered: 0,
-            last_ping: None,
-            first_ping: None,
-            pending: None,
-            repeats: 0,
-            strikes: 0,
-            last_strike: None,
-            failed: None,
-            headers_asked: None,
-        });
+            Peer {
+                addr,
+                seed,
+                proven: false,
+                status: None,
+                last_seen: None,
+                path: Path::new(),
+                delivered: 0,
+                last_ping: None,
+                first_ping: None,
+                pending: None,
+                repeats: 0,
+                strikes: 0,
+                last_strike: None,
+                failed: None,
+                headers_asked: None,
+            },
+        );
         Ok(true)
+    }
+
+    /// Takes a peer out of the table.
+    fn remove(&mut self, addr: &SocketAddrV4) {
+        if let Some(p) = self.peers.remove(addr) {
+            self.unproven -= (!p.proven && !p.seed) as usize;
+        }
     }
 
     /// The peer of `addr`'s host (not a seed) silent longest, if silent
@@ -261,9 +284,8 @@ impl Peers {
     /// first pinged. One not yet pinged does not give way, or addresses
     /// from a list would push each other out.
     fn stale_of_host(&self, addr: &SocketAddrV4, now: Micros) -> Option<SocketAddrV4> {
-        self.peers
-            .iter()
-            .filter(|p| p.addr.ip() == addr.ip() && !p.seed)
+        self.of(addr, 32)
+            .filter(|p| !p.seed)
             .filter_map(|p| p.last_seen.or(p.first_ping).map(|t| (t, p.addr)))
             .filter(|(t, _)| now.saturating_sub(*t) >= self.cfg.host_stale)
             .min_by_key(|(t, _)| *t)
@@ -299,7 +321,7 @@ impl Peers {
     /// a flood of someone else's making.
     pub fn pings_due(&mut self, now: Micros, mut number: impl FnMut() -> u64, mut ping: impl FnMut(SocketAddrV4, u64)) {
         let mut budget = self.cfg.unproven_pings;
-        for p in self.peers.iter_mut() {
+        for p in self.peers.values_mut() {
             let every = if p.proven {
                 self.cfg.ping
             } else {
@@ -353,7 +375,7 @@ impl Peers {
 
     /// `addr` is this node: out of the table, and never in it again.
     pub fn mark_self(&mut self, addr: SocketAddrV4) {
-        self.peers.retain(|p| p.addr != addr);
+        self.remove(&addr);
         if !self.selves.contains(&addr) {
             if self.selves.len() == SELVES {
                 self.selves.remove(0);
@@ -377,6 +399,7 @@ impl Peers {
         }
         p.pending = None;
         p.status = Some(status);
+        let newly = !p.proven && !p.seed;
         p.proven = true;
         p.last_seen = Some(now);
         if p.repeats == 0
@@ -385,13 +408,15 @@ impl Peers {
             p.path.sample(now.saturating_sub(sent));
         }
         p.repeats = 0;
+        self.unproven -= newly as usize;
         true
     }
 
     /// `addr` said it is going: not live, nor asked anything, until it
     /// answers a ping again. Its place is kept, for when it is back.
     pub fn gone(&mut self, addr: &SocketAddrV4) {
-        if let Some(p) = self.get_mut(addr) {
+        if let Some(p) = self.peers.get_mut(addr) {
+            self.unproven += (p.proven && !p.seed) as usize;
             p.proven = false;
             p.status = None;
             p.pending = None;
@@ -421,12 +446,21 @@ impl Peers {
             return false;
         }
         let key = ban_key(addr);
-        self.banned.retain(|(k, _)| *k != key);
-        if self.banned.len() >= BANS_EACH * self.cfg.max {
-            self.banned.remove(0);
+        if self.banned.len() >= BANS_EACH * self.cfg.max && !self.banned.contains_key(&key) {
+            // No room: the oldest ban is let go.
+            let oldest = *self.banned.iter().min_by_key(|(_, since)| **since).expect("it is full").0;
+            self.banned.remove(&oldest);
         }
-        self.banned.push((key, now));
-        self.peers.retain(|p| p.seed || ban_key(&p.addr) != key);
+        self.banned.insert(key, now);
+        // Every peer of the host goes with it (on this machine, the one).
+        let bits = if addr.ip().is_loopback() { None } else { Some(32) };
+        let out: Vec<SocketAddrV4> = match bits {
+            Some(bits) => self.of(addr, bits).filter(|p| !p.seed).map(|p| p.addr).collect(),
+            None => vec![*addr],
+        };
+        for a in out {
+            self.remove(&a);
+        }
         true
     }
 
@@ -435,12 +469,13 @@ impl Peers {
     /// stay. `dropped` is called with each that never answered at all.
     pub fn prune(&mut self, now: Micros, mut dropped: impl FnMut(SocketAddrV4)) {
         let (silence, ban) = (self.cfg.drop_silence, self.cfg.ban);
-        self.banned.retain(|(_, since)| now.saturating_sub(*since) < ban);
-        self.peers.retain(|p| {
+        self.banned.retain(|_, since| now.saturating_sub(*since) < ban);
+        let mut unproven = self.unproven;
+        self.peers.retain(|_, p| {
             if p.seed {
                 return true;
             }
-            match (p.last_seen, p.first_ping) {
+            let keep = match (p.last_seen, p.first_ping) {
                 (Some(seen), _) => now.saturating_sub(seen) < silence,
                 (None, Some(pinged)) => {
                     let keep = now.saturating_sub(pinged) < silence;
@@ -450,15 +485,20 @@ impl Peers {
                     keep
                 }
                 (None, None) => true,
+            };
+            if !keep && !p.proven {
+                unproven -= 1;
             }
+            keep
         });
+        self.unproven = unproven;
     }
 
     /// The peers that are proven and were heard from lately: the only
     /// ones told things, asked things, or believed.
     pub fn live(&self, now: Micros) -> impl Iterator<Item = &Peer> {
         let silence = self.cfg.live_silence;
-        self.peers.iter().filter(move |p| p.proven && p.last_seen.is_some_and(|t| now.saturating_sub(t) < silence))
+        self.peers.values().filter(move |p| p.proven && p.last_seen.is_some_and(|t| now.saturating_sub(t) < silence))
     }
 
     /// Whether more peers are to be looked for.
@@ -579,7 +619,7 @@ impl Peers {
     /// since reached, from it or from another, is not to blame.
     pub fn doubt_silent_claimants(&mut self, ours: U256, now: Micros, mut doubted: impl FnMut(SocketAddrV4)) {
         let wait = self.header_wait;
-        for p in self.peers.iter_mut() {
+        for p in self.peers.values_mut() {
             if p.headers_asked.is_some_and(|t| now.saturating_sub(t) >= wait) {
                 p.headers_asked = None;
                 if p.status.is_some_and(|s| s.work > ours) {
@@ -593,7 +633,7 @@ impl Peers {
     /// The addresses worth keeping for the next start: of peers that
     /// have ever answered.
     pub fn worth_saving(&self) -> impl Iterator<Item = SocketAddrV4> + '_ {
-        self.peers.iter().filter(|p| p.last_seen.is_some()).map(|p| p.addr)
+        self.peers.values().filter(|p| p.last_seen.is_some()).map(|p| p.addr)
     }
 }
 
@@ -1027,6 +1067,81 @@ mod tests {
         t.asked_headers(&b, T0 + 20 * SECOND);
         t.doubt_silent_claimants(U256::from_u64(500), T0 + 40 * SECOND, |x| doubted.push(x));
         assert_eq!(doubted, [a]);
+    }
+
+    /// A table of thousands, as a node many lean on keeps: everything
+    /// done to it at random, and its bounds and its count of the
+    /// unproven hold throughout.
+    #[test]
+    fn a_large_table_keeps_its_bounds_through_anything() {
+        use crate::test_util::Rng;
+        let mut cfg = config::Config::default();
+        (cfg.peers.max, cfg.peers.target, cfg.peers.unproven_pings) = (3000, 100, 500);
+        assert_eq!(cfg.check(), Ok(()));
+        let mut t = Peers::new(&cfg, 3);
+        let mut rng = Rng::new(0x9ee5);
+        // Addresses crowded into few hosts and networks, so that every
+        // bound is met.
+        let pick = |rng: &mut Rng| {
+            let r = rng.next_u64();
+            addr(
+                10 + (r % 3) as u8,
+                (r >> 8) as u8 % 120,
+                (r >> 16) as u8 % 4,
+                (r >> 24) as u8 % 6,
+                1 + (r >> 32) as u16 % 8,
+            )
+        };
+        let mut now = T0;
+        let mut number = 0u64;
+        for round in 0..400 {
+            now += rng.next_u64() % (3 * SECOND);
+            for _ in 0..40 {
+                let a = pick(&mut rng);
+                match rng.next_u64() % 10 {
+                    0..=4 => {
+                        let _ = t.add(a, rng.next_u64() % 50 == 0, now);
+                    }
+                    5 => t.gone(&a),
+                    6 => {
+                        t.strike(&a, now);
+                    }
+                    7 => t.seen(&a, now),
+                    8 => t.mark_self(a),
+                    _ => t.failed(&a, now),
+                }
+            }
+            // Pings, most of them answered.
+            let mut due = Vec::new();
+            t.pings_due(
+                now,
+                || {
+                    number += 1;
+                    number
+                },
+                |a, n| due.push((a, n)),
+            );
+            for (a, n) in due {
+                if rng.next_u64() % 4 != 0 {
+                    assert!(t.pong(&a, status(n, 5), now));
+                }
+            }
+            if round % 7 == 0 {
+                t.prune(now, |_| {});
+            }
+            // The bounds.
+            assert!(t.len() <= 3000);
+            assert_eq!(t.unproven, t.all().filter(|p| !p.proven && !p.seed).count(), "round {round}");
+            let mut hosts = BTreeMap::new();
+            let mut networks = BTreeMap::new();
+            for p in t.all().filter(|p| !p.seed) {
+                *hosts.entry(*p.addr.ip()).or_insert(0) += 1;
+                *networks.entry(u32::from(*p.addr.ip()) >> 16).or_insert(0) += 1;
+            }
+            assert!(hosts.values().all(|n| *n <= 4) && networks.values().all(|n| *n <= 8), "round {round}");
+            assert!(t.sample(None, now).as_slice().len() <= 32);
+        }
+        assert!(t.len() > 500, "{}", t.len());
     }
 
     #[test]

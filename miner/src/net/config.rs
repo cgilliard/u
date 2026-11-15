@@ -11,7 +11,7 @@
 //! object ([`super::object::MAX_HEADERS`]).
 //!
 //! Nor are the transport's own numbers here (its windows, its retry
-//! times): they are how it works, and a node that set them badly would
+//! times; how much a node serves is here): they are how it works, and a node that set them badly would
 //! hurt its peers as well as itself.
 
 use crate::error::Error;
@@ -106,6 +106,14 @@ pub struct Sync {
 pub struct Serve {
     /// Chunks sent a second, to everyone together.
     pub rate: u32,
+    /// Requests for chunks that may wait to be answered, in all. One
+    /// over is dropped, and looks to its sender like loss.
+    pub waiting: usize,
+    /// Requests of one address that may wait.
+    pub waiting_each: usize,
+    /// Chunks of one address that may wait: a full window
+    /// ([`crate::transport::MAX_WINDOW`]) at the least.
+    pub chunks_each: u32,
     /// How often the secret behind the tokens is replaced. A token is
     /// honoured for this long at least and twice it at most.
     pub token_life: Micros,
@@ -151,9 +159,28 @@ impl Default for Sync {
     }
 }
 
+impl Serve {
+    /// The transport's part of these.
+    pub fn limits(&self) -> crate::transport::serve::Limits {
+        crate::transport::serve::Limits {
+            rate: self.rate,
+            waiting: self.waiting,
+            waiting_each: self.waiting_each,
+            chunks_each: self.chunks_each,
+        }
+    }
+}
+
 impl Default for Serve {
     fn default() -> Serve {
-        Serve { rate: 8192, token_life: 10 * MINUTE }
+        let l = crate::transport::serve::Limits::default();
+        Serve {
+            rate: l.rate,
+            waiting: l.waiting,
+            waiting_each: l.waiting_each,
+            chunks_each: l.chunks_each,
+            token_life: 10 * MINUTE,
+        }
     }
 }
 
@@ -186,6 +213,12 @@ impl Config {
         need(s.lookahead >= 1, "sync.lookahead is zero")?;
         need(s.parts >= 1, "sync.parts is zero")?;
         need(self.serve.rate >= 1, "serve.rate is zero")?;
+        need(self.serve.waiting_each >= 1, "serve.waiting_each is zero")?;
+        need(self.serve.waiting >= self.serve.waiting_each, "serve.waiting is under serve.waiting_each")?;
+        need(
+            self.serve.chunks_each >= crate::transport::MAX_WINDOW,
+            "serve.chunks_each is under a full window (2048)",
+        )?;
         need(self.serve.token_life >= MINUTE, "serve.token_life is under a minute")?;
         Ok(())
     }
@@ -209,6 +242,9 @@ mod tests {
         assert_eq!((s.sync_point, s.parts, s.snapshot_attempts), (144, 32, 4));
         assert_eq!((s.leaves_retry, s.leaves_tries), (2 * SECOND, 16));
         assert_eq!((c.serve.rate, c.serve.token_life), (8192, 600 * SECOND));
+        assert_eq!((c.serve.waiting, c.serve.waiting_each, c.serve.chunks_each), (64, 8, 4096));
+        // What it hands the transport is what the transport would take.
+        let _ = crate::transport::serve::Serve::with(c.serve.limits());
     }
 
     #[test]
@@ -235,6 +271,9 @@ mod tests {
         assert!(bad(|c| c.sync.blocks_per_peer = 0).contains("sync.blocks"));
         assert!(bad(|c| c.sync.parts = 0).contains("sync.parts"));
         assert!(bad(|c| c.serve.rate = 0).contains("serve.rate"));
+        assert!(bad(|c| c.serve.waiting_each = 0).contains("serve.waiting_each"));
+        assert!(bad(|c| c.serve.waiting = 7).contains("serve.waiting"));
+        assert!(bad(|c| c.serve.chunks_each = 2047).contains("serve.chunks_each"));
         assert!(bad(|c| c.serve.token_life = SECOND).contains("serve.token_life"));
         // Unwise, and a node's own business: no snapshot, one peer.
         let mut c = Config::default();

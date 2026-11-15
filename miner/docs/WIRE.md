@@ -463,6 +463,9 @@ The defaults are the reference's unless noted.
 | Setting | Default |
 |---|---|
 | Chunks sent a second, in all | 8,192 (about 10 MB/s) |
+| Requests for chunks waiting, in all | 64 |
+| Requests waiting for one address | 8 |
+| Chunks waiting for one address | 4,096 (two full windows; one at the least) |
 | How often the token secret changes | 10 min (new) |
 
 ### Where a node is
@@ -475,10 +478,15 @@ The defaults are the reference's unless noted.
 
 The settings above are `net::config::Config` in the code (the last
 group comes with the node itself). The transport's own numbers (window
-bounds, retry bounds, how many places count as overtaken, how much may
-wait to be served to one address) stay constants: they are how the mechanism
+bounds, retry bounds, how many places count as overtaken) stay
+constants: they are how the mechanism
 works, and a node that set them badly would hurt its peers as well as
 itself.
+
+A node many others lean on, a seed above all, sets the table and the
+serving bounds higher: thousands of peers, thousands of requests
+waiting. Both are kept by address, so that neither costs more per
+datagram for being large.
 
 A few things are not settings because the two ends must agree on them:
 the datagram size, the chunk size, the part sizes, the most headers an
