@@ -167,6 +167,7 @@ fn spanning_setup(name: &str) -> Setup {
 }
 
 #[test]
+#[cfg_attr(debug_assertions, ignore = "proves proofs of proofs; run with --release")]
 fn nodes_chain_open_transactions() {
     let s = spanning_setup("span");
     assert_eq!(s.proofs.len(), 3);
@@ -430,6 +431,7 @@ fn dev_block_timing() {
 /// openings can reveal of a column (`stark::tests::zero_knowledge_tables`
 /// counts them on a real proof).
 #[test]
+#[cfg_attr(debug_assertions, ignore = "proves proofs of proofs; run with --release")]
 fn zero_knowledge_configurations_blind_enough() {
     for (name, c) in [("mainnet wrap", AggregatorParams::MAINNET.wrap), ("small wrap", SMALL.wrap)] {
         assert!(c.zk, "{name}");
@@ -473,6 +475,7 @@ fn spanning_transaction_roundtrip() {
 }
 
 #[test]
+#[cfg_attr(debug_assertions, ignore = "proves proofs of proofs; run with --release")]
 fn root_program_accepts_and_rejects() {
     let s = setup("program", &[30, 25], 55);
     // Each segment proof verifies natively.
@@ -554,6 +557,7 @@ fn root_program_accepts_and_rejects() {
 }
 
 #[test]
+#[cfg_attr(debug_assertions, ignore = "proves proofs of proofs; run with --release")]
 fn inner_node_program_outputs_record() {
     let s = setup("record", &[30, 25], 55);
     let c = compile_node(&SMALL, &seg_children(&s.proofs), Output::Record);
@@ -612,6 +616,7 @@ fn tree_plans() {
 }
 
 #[test]
+#[cfg_attr(debug_assertions, ignore = "proves proofs of proofs; run with --release")]
 fn aggregator_size() {
     for (name, params) in [
         ("mainnet", AggregatorParams::MAINNET),
@@ -1175,6 +1180,7 @@ fn soundness_parameters() {
 }
 
 #[test]
+#[cfg_attr(debug_assertions, ignore = "proves proofs of proofs; run with --release")]
 fn wrap_program_accepts_and_rejects() {
     let s = setup("wrap", &[30, 25], 55);
     let shape = plan(&SMALL, 2);
@@ -1368,4 +1374,138 @@ fn a_works_table_is_its_heights() {
     let h = c.scalar_inputs(&[Fp::new(7)]);
     table_of_height(&mut c, &PowParams::DEV, h, h);
     assert!(VmAir::execute(&c.prog, &c.inputs).is_ok());
+}
+
+/// A chain whose blocks each carry one proof, of themselves and of
+/// every block before, and whose only verifier is that proof's: the
+/// chain takes the proven blocks and refuses a proof that is another
+/// block's, one changed anywhere, and one on a body that is not its
+/// own.
+#[test]
+#[ignore = "slow: one job each in .github/workflows/test.yml"]
+fn the_chain_connects_only_proven_blocks() {
+    use crate::block::{Block, BlockRef};
+    use crate::chain::Chain;
+    use crate::chain::apply::Applied;
+    use crate::chain::params::ChainParams;
+    use crate::pow::{Dataset, hashimoto};
+    use crate::store::testing::MemBackend;
+    const EMISSION: &[(u32, u64)] = &[(10, 55)];
+    // The aggregator's proof of work (the work segment proves parents'
+    // under it), with the built-in text, and every target met.
+    let params = ChainParams {
+        pow: SMALL.pow,
+        genesis_timestamp: 1_700_000_000,
+        genesis_nonce: [0u8; 32],
+        genesis_target: ChainParams::MAINNET.max_target,
+        max_block_size: 16 << 20,
+        emission: EMISSION,
+        min_reveal: SMALL.min_reveal,
+        ..ChainParams::MAINNET
+    };
+    let seed = SeedText::new(params.pow);
+    let table = Dataset::generate(&seed, 10);
+    let genesis = Genesis::of(&params.genesis().header, &seed);
+    let verifier = AggregateVerifier::new(SMALL, EMISSION, genesis);
+    let chain = Chain::open(MemBackend::new(), 8, params, seed, verifier).unwrap();
+    let miner = key(9).public_key();
+    let now = params.genesis_timestamp + 100_000;
+    // The body of the block on the tip paying `amount`, its statement,
+    // its state root after, and its proof on `prev`.
+    let build = |amount: u64, prev: Option<(u32, &Statement, &[u8])>| {
+        let tip = chain.tip().unwrap();
+        let height = tip.height + 1;
+        let snap = chain.state().snapshot().unwrap();
+        let (prev_root, first) = (snap.root(), snap.outputs().next);
+        let txs = vec![reward(&miner, amount)];
+        let segments = SegmentWitness::collect_by_rows(&snap, &txs, SMALL.segment_rows(), height).unwrap();
+        drop(snap);
+        let names = empty_names(&segments, height);
+        let mut body = Body {
+            inputs: vec![],
+            outputs: segments.iter().flat_map(|s| s.block_outputs()).collect(),
+            proof: vec![],
+            ..Default::default()
+        };
+        let bytes = body.to_bytes();
+        let view = BodyRef::from_bytes(&bytes).unwrap();
+        let new_root = chain.state_root_after(&view).unwrap();
+        let statement = Statement::from_block(&BlockStatement {
+            height,
+            prev_state_root: prev_root,
+            new_state_root: new_root,
+            first_output_position: first,
+            subsidy: 55,
+            body: view,
+            parent_work: chain.parent_work(&tip),
+            parent_hash: tip.hash(),
+        });
+        let prev = prev.map(|(h, st, proof)| (h, st, proof, &tip));
+        body.proof =
+            chain.verifier().prove_block(height, &statement, &segments, &names, prev, 2, &|_| {}, &|| false).unwrap();
+        (height, body, statement, new_root)
+    };
+    // The block of `body` on the tip, sealed.
+    let mine = |body: &Body, state_root: Digest| {
+        let tip = chain.tip().unwrap();
+        let mut header = Header {
+            prev_hash: tip.hash(),
+            height: tip.height + 1,
+            timestamp: tip.timestamp + 600,
+            body_commitment: body.commitment(),
+            state_root,
+            aux: [0; 32],
+            mix: [Fp::ZERO; DIGEST],
+            nonce: [0; 32],
+        };
+        header.mix = hashimoto(&table, &header.pow_hash(), &header.nonce).mix;
+        Block { header, body: body.clone() }.to_bytes()
+    };
+    let apply = |block: &[u8]| chain.apply_block(&BlockRef::from_bytes(block).unwrap(), now);
+
+    let (h1, body1, st1, root1) = build(55, None);
+    assert_eq!(apply(&mine(&body1, root1)), Ok(Applied::Extended));
+    assert_eq!(chain.tip().unwrap().height, 1);
+    let (_, body2, _, root2) = build(55, Some((h1, &st1, &body1.proof)));
+    // Block 1's proof on block 2's body: another statement.
+    let stale = Body { proof: body1.proof.clone(), ..body2.clone() };
+    assert_eq!(apply(&mine(&stale, root2)), Err(Error::BadProof));
+    // Block 2's proof with one byte changed, anywhere.
+    for at in [0, body2.proof.len() / 2, body2.proof.len() - 1] {
+        let mut tampered = body2.clone();
+        tampered.proof[at] ^= 1;
+        assert_eq!(apply(&mine(&tampered, root2)), Err(Error::BadProof), "byte {at}");
+    }
+    // Block 2's proof on a body paying the reward elsewhere: the
+    // outputs, and so the statement, differ. The state's root is that
+    // body's own, so that it is the proof that refuses it.
+    let mut moved = body2.clone();
+    moved.outputs[0] = TxOutput::new(&key(8).public_key(), 55).block_output();
+    let moved_root = chain.state_root_after(&BodyRef::from_bytes(&moved.to_bytes()).unwrap()).unwrap();
+    assert_eq!(apply(&mine(&moved, moved_root)), Err(Error::BadProof));
+    assert_eq!(chain.tip().unwrap().height, 1);
+    // The real one connects.
+    assert_eq!(apply(&mine(&body2, root2)), Ok(Applied::Extended));
+    assert_eq!(chain.tip().unwrap().height, 2);
+    assert_eq!(chain.state().root(), root2);
+}
+
+/// A network's chain and its aggregator are of one network: the same
+/// proof of work, the same wait before a reveal. They are kept apart so
+/// that the chain's rules do not depend on how its proofs are made.
+#[test]
+fn a_networks_chain_and_aggregator_agree() {
+    use crate::chain::params::ChainParams;
+    for (chain, aggregator) in [
+        (ChainParams::MAINNET, AggregatorParams::MAINNET),
+        (ChainParams::DEV, AggregatorParams::DEV),
+        (ChainParams::DEV_RECURSIVE, AggregatorParams::DEV_RECURSIVE),
+    ] {
+        assert_eq!(chain.pow, aggregator.pow);
+        assert_eq!(chain.min_reveal, aggregator.min_reveal);
+    }
+    assert!(
+        AggregatorParams::DEV.direct && !AggregatorParams::MAINNET.direct && !AggregatorParams::DEV_RECURSIVE.direct
+    );
+    assert_eq!(AggregatorParams::MAINNET.name_log_n, crate::name_air::NAME_LOG_ROWS);
 }

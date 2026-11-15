@@ -723,4 +723,51 @@ mod tests {
         assert!(v.verify(&public, &proof) && verifier_for(&taller).verify(&public2, &taller));
         assert!(!v.verify(&public2, &taller));
     }
+
+    fn dev_recursive() -> Arc<ChainVerifier> {
+        let c = crate::aggregate::DEV_RECURSIVE_CHAIN.unwrap();
+        chain_verifier(&crate::aggregate::AggregatorParams::DEV_RECURSIVE.wrap, c.log_n, c.hash_log_n)
+    }
+
+    fn mainnet() -> Arc<ChainVerifier> {
+        let c = crate::aggregate::MAINNET_CHAIN.unwrap();
+        chain_verifier(&crate::aggregate::AggregatorParams::MAINNET.wrap, c.log_n, c.hash_log_n)
+    }
+
+    /// The verifier of a network's chain proofs is one program, the
+    /// same each time it is made, and kept once made.
+    #[test]
+    fn a_networks_verifier_is_one_program() {
+        let v = dev_recursive();
+        assert!(Arc::ptr_eq(&v, &dev_recursive()), "kept");
+        let c = crate::aggregate::DEV_RECURSIVE_CHAIN.unwrap();
+        let again = ChainVerifier::new(&crate::aggregate::AggregatorParams::DEV_RECURSIVE.wrap, c.log_n, c.hash_log_n);
+        assert!(v.to_bytes() == again.to_bytes());
+        assert!(!v.ops.is_empty() && v.stream_len > 0);
+    }
+
+    /// Writes the chain-proof verifiers a node that keeps no chain runs
+    /// (the fam node: `chainver.bin` for mainnet, `chainver_dev.bin` for
+    /// the recursive dev network), under `target/fam` or
+    /// `TABMINER_FAM_DIR`. They are the circuits': made again whenever a
+    /// circuit changes.
+    #[test]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
+    fn write_fam_verifier() {
+        let dir = std::env::var("TABMINER_FAM_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/fam"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (v, file) in [(mainnet(), "chainver.bin"), (dev_recursive(), "chainver_dev.bin")] {
+            let path = dir.join(file);
+            std::fs::write(&path, v.to_bytes()).unwrap();
+            println!(
+                "{}: {} operations, {} words of memory, a stream of {}",
+                path.display(),
+                v.ops.len(),
+                v.mem,
+                v.stream_len
+            );
+        }
+    }
 }

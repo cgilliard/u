@@ -825,6 +825,55 @@ fn commits_reveals_updates_and_sweeps() {
     let _ = (k2, o1);
 }
 
+/// The name segment at mainnet parameters: an empty one (every block
+/// pays this) and one with every kind of operation, proven and
+/// verified.
+#[test]
+#[ignore = "proves mainnet name segments; run with --release"]
+fn mainnet_name_segment_timing() {
+    use crate::aggregate::AggregatorParams;
+    use crate::block_proof::{name_transcript, prove_name_padded};
+    let params = AggregatorParams::MAINNET;
+    let w = world("timing");
+    let mut k1 = owner_key(1);
+    let o1 = pubkey_hash(&k1.public_key());
+    let o2 = pubkey_hash(&owner_key(2).public_key());
+    let alice = Record::new(b"alice", o1, d(11), d(12)).unwrap();
+    let salt = d(500);
+    let c = commit_hash(&name_hash(&alice.elements()), &salt, &o1);
+    let empty = NameWitness { min_reveal: MIN_REVEAL, root_in: w.root(), pos_in: 5, height: 1, ops: vec![] };
+    // One commit a block: positions 5 and 6. The first is revealed in
+    // its window; the second is left to be swept.
+    block(&w, 2, &[NameOp::Commit { commit: c, memo: crate::output::memo5(d(1)) }], &[]);
+    block(&w, 3, &[NameOp::Commit { commit: d(2), memo: crate::output::memo5(d(3)) }], &[]);
+    block(&w, 14, &[NameOp::Reveal { record: alice, salt, commit: 5 }], &[]);
+    let alice2 = Record::new(b"alice", o2, d(13), d(14)).unwrap();
+    let ops =
+        [NameOp::update(alice2, &mut k1).unwrap(), NameOp::Commit { commit: d(4), memo: crate::output::memo5(d(5)) }];
+    let full = w.collect(400, &ops, &[6]).unwrap();
+    for (name, witness) in [("empty", &empty), ("update, commit and sweep", &full)] {
+        let t = std::time::Instant::now();
+        let p = prove_name_padded(&params.segment, witness, params.name_log_n);
+        let proved = t.elapsed();
+        let t = std::time::Instant::now();
+        let ok = crate::stark::verify(
+            &params.segment,
+            &NameAir::MAINNET,
+            &p.public.to_values(),
+            &p.proof,
+            &mut name_transcript(),
+        );
+        println!(
+            "name segment ({name}, {} rows used of 2^{}): proven in {proved:?}, {} bytes, verified {ok:?} in {:?}",
+            witness.num_rows(),
+            params.name_log_n,
+            p.proof.to_bytes().len(),
+            t.elapsed()
+        );
+        assert_eq!(ok, Ok(()));
+    }
+}
+
 #[test]
 fn forged_traces_fail() {
     let w = world("forge");
