@@ -47,6 +47,8 @@
 //! - [`blocks`]: the headers, the bodies kept and the chain by height,
 //!   in tries of the same file.
 //! - [`commits`]: which outputs are commits of names, and of what.
+//! - [`partial`]: the paths of some leaves, changed in memory: what
+//!   proving a block takes from the state.
 //! - [`state`]: the two under one root record, with the block they are
 //!   the state after: what a node applies blocks to.
 //! - [`receive`]: a state taken from other nodes part by part, each
@@ -65,6 +67,7 @@ pub mod freemap;
 pub mod names;
 pub mod outputs;
 pub mod pagefile;
+pub mod partial;
 pub mod receive;
 pub mod sparse;
 pub mod state;

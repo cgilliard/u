@@ -32,10 +32,30 @@
 //! The circuit itself is not here yet.
 
 use crate::block::BlockOutput;
-use crate::hash::{DOM_INPUTS, DOM_NAME_OPS, DOM_OUTPUTS, DOM_SWEEPS, Digest};
-use crate::output::Commitment;
+use crate::error::Error;
+use crate::field::Field;
+use crate::hash::{DOM_BODY, DOM_COMMITMENT, DOM_INPUTS, DOM_NAME_OPS, DOM_OUTPUTS, DOM_PUBKEY, DOM_SWEEPS, Digest};
+use crate::hash_machine::{
+    COL_ABSORB, COL_ACC, COL_CHAIN, COL_COMPRESS, COL_DATA, COL_DIR, COL_LOAD, COL_PASS, COL_START, HashTraceBuilder,
+    NUM_COLS as HM_COLS, eval_hash_machine,
+};
+use crate::output::{Commitment, MEMO_LEN, Output, Sig, amount_fps};
+use crate::policy::{Cond, CondWitness, LEAF_CONDS, POLICY_DEPTH, PolicyInput};
 use crate::poseidon2::{DIGEST, Fp, RATE, WIDTH, permute};
+use crate::poseidon2_air::{COL_INPUT, COL_OUTPUT};
+use crate::stark::{Air, Builder, Trace};
+use crate::store::backend::Backend;
+use crate::store::partial::Partial;
+use crate::store::sparse::{EMPTY, STATE_HEIGHT};
+use crate::store::state::Snapshot;
+use crate::transaction::Transaction;
+use crate::xmss::{PUB_SEED_LEN, PublicKey};
+use crate::xmss_fragment::{self, Cols as XCols, Types as XTypes};
 
+/// Levels of the state tree a leaf's path climbs: the outputs' half and
+/// the node above it, whose other child is the names' root.
+pub const DEPTH: usize = STATE_HEIGHT;
+const AMOUNT_BITS: usize = 64;
 /// 16-bit limbs of amount sums: four hold an amount, six any sum of a
 /// block's amounts (fewer than `2^32` of them).
 pub const LIMBS: usize = 6;
@@ -43,6 +63,219 @@ pub const LIMBS: usize = 6;
 pub const POS_LOW_BITS: u32 = 30;
 pub const POS_HIGH_BITS: u32 = crate::store::outputs::HEIGHT - POS_LOW_BITS;
 const MASK30: u64 = (1 << POS_LOW_BITS) - 1;
+
+// ---- row types ----
+pub const T_TX_START: usize = HM_COLS;
+pub const T_TX_END: usize = HM_COLS + 1;
+pub const T_MSG_START: usize = HM_COLS + 2;
+pub const T_MSG_ABS: usize = HM_COLS + 3;
+pub const T_LOAD: usize = HM_COLS + 4;
+pub const T_STEP: usize = HM_COLS + 5;
+pub const T_LEAF: usize = HM_COLS + 6;
+pub const T_TREE_START: usize = HM_COLS + 7;
+pub const T_TREE_ABS: usize = HM_COLS + 8;
+pub const T_PKH0: usize = HM_COLS + 9;
+pub const T_PKH1: usize = HM_COLS + 10;
+pub const T_CM0: usize = HM_COLS + 11;
+pub const T_CM1: usize = HM_COLS + 12;
+pub const T_ILIST: usize = HM_COLS + 13;
+pub const T_OLD: usize = HM_COLS + 14;
+pub const T_NEW: usize = HM_COLS + 15;
+pub const T_BODY_IN0: usize = HM_COLS + 16;
+pub const T_BODY_IN1: usize = HM_COLS + 17;
+pub const T_OCM0: usize = HM_COLS + 18;
+pub const T_OCM1: usize = HM_COLS + 19;
+pub const T_OLIST: usize = HM_COLS + 20;
+pub const T_BODY_OUT0: usize = HM_COLS + 21;
+pub const T_BODY_OUT1: usize = HM_COLS + 22;
+pub const T_DONE: usize = HM_COLS + 23;
+pub const T_RESUME: usize = HM_COLS + 24;
+pub const T_OLIST2: usize = HM_COLS + 25;
+pub const T_BODY_OUT2: usize = HM_COLS + 26;
+pub const T_ILEAF: usize = HM_COLS + 27;
+pub const T_OLEAF: usize = HM_COLS + 28;
+pub const T_OP_BODY: usize = HM_COLS + 29;
+pub const T_OP_LIST: usize = HM_COLS + 30;
+/// The second leaf row: the first's digest compressed with the creation
+/// height (see [`crate::transaction::leaf`]).
+pub const T_ILEAF2: usize = HM_COLS + 31;
+pub const T_OLEAF2: usize = HM_COLS + 32;
+// ---- policy input rows (see `docs/ELTOO.md` and `crate::policy`) ----
+/// Pass row loading the policy input's registers.
+pub const T_PSTART: usize = HM_COLS + 33;
+/// Covered-run sponge start: `[count, 0, …]`.
+pub const T_CVS: usize = HM_COLS + 34;
+/// Leaf sponge start: the header block.
+pub const T_LHDR: usize = HM_COLS + 35;
+/// Threshold header block `[mode, m, n, 0, …]`.
+pub const T_THR: usize = HM_COLS + 36;
+/// Threshold channel block.
+pub const T_CHAN: usize = HM_COLS + 37;
+/// One listed key hash.
+pub const T_KEY: usize = HM_COLS + 38;
+/// A selected key, absorbed into the keys sponge after its `key` row.
+pub const T_KSEL: usize = HM_COLS + 39;
+/// The hash lock's preimage hashed (its own permutation).
+pub const T_HL: usize = HM_COLS + 40;
+/// The hash lock block, equal to the preimage's hash.
+pub const T_HASH: usize = HM_COLS + 41;
+pub const T_AFTER: usize = HM_COLS + 42;
+pub const T_OLDER: usize = HM_COLS + 43;
+pub const T_STATE: usize = HM_COLS + 44;
+/// The covenant block: the covered digest.
+pub const T_OUTS: usize = HM_COLS + 45;
+/// The policy tree path, one row per level.
+pub const T_PP0: usize = HM_COLS + 46;
+pub const T_PP1: usize = HM_COLS + 47;
+pub const T_PP2: usize = HM_COLS + 48;
+pub const T_PP3: usize = HM_COLS + 49;
+/// A signer's key hash absorbed into the signers sponge.
+pub const T_PSIG: usize = HM_COLS + 50;
+/// Pass row ending the signatures: signers and selected keys agree.
+pub const T_PEND: usize = HM_COLS + 51;
+/// A covered output's commitment, then memo, into the covered sponge.
+pub const T_CVC: usize = HM_COLS + 52;
+pub const T_CVM: usize = HM_COLS + 53;
+/// The rebindable message over the channel, state and covered digest.
+pub const T_RB0: usize = HM_COLS + 54;
+pub const T_RB1: usize = HM_COLS + 55;
+pub const T_RB2: usize = HM_COLS + 56;
+const NUM_TYPES: usize = 57;
+// ---- xmss fragment ----
+pub const XCOLS: XCols = XCols::new(HM_COLS + NUM_TYPES);
+pub const XTYPES: XTypes = XTypes {
+    msg_start: T_MSG_START,
+    msg_abs: T_MSG_ABS,
+    load: T_LOAD,
+    step: T_STEP,
+    leaf: T_LEAF,
+    tree_start: T_TREE_START,
+    tree_abs: T_TREE_ABS,
+};
+/// The fragment's sibling register, shared with the tree update.
+pub const R_SIB: usize = XCOLS.sib(0);
+// ---- tree update ----
+pub const C_LEVEL: usize = XCOLS.base + xmss_fragment::LEN;
+pub const C_LEVEL_INV: usize = C_LEVEL + 1;
+pub const C_IS_LAST: usize = C_LEVEL_INV + 1;
+pub const C_SMT_END: usize = C_IS_LAST + 1;
+pub const R_PBITS: usize = C_SMT_END + 1;
+pub const R_ROOT: usize = R_PBITS + DEPTH;
+pub const R_OLD: usize = R_ROOT + DIGEST;
+pub const R_NEW: usize = R_OLD + DIGEST;
+// ---- block registers ----
+pub const R_IS_OUT: usize = R_NEW + DIGEST;
+pub const C_OUT_END: usize = R_IS_OUT + 1;
+pub const R_MSG: usize = C_OUT_END + 1;
+pub const R_BSP: usize = R_MSG + DIGEST;
+pub const R_ISP: usize = R_BSP + WIDTH;
+pub const R_OSP: usize = R_ISP + WIDTH;
+pub const R_PKROOT: usize = R_OSP + WIDTH;
+pub const R_OCM: usize = R_PKROOT + DIGEST;
+pub const R_ABITS: usize = R_OCM + DIGEST;
+pub const R_SUM_IN: usize = R_ABITS + AMOUNT_BITS;
+pub const R_SUM_OUT: usize = R_SUM_IN + LIMBS;
+pub const R_OPOS_LO: usize = R_SUM_OUT + LIMBS;
+pub const R_OPOS_HI: usize = R_OPOS_LO + 1;
+pub const C_WRAP: usize = R_OPOS_HI + 1;
+pub const C_WRAP_INV: usize = C_WRAP + 1;
+pub const R_IN_LEFT: usize = C_WRAP_INV + 1;
+pub const R_OUT_LEFT: usize = R_IN_LEFT + 1;
+pub const C_IN_ZERO: usize = R_OUT_LEFT + 1;
+pub const C_IN_INV: usize = C_IN_ZERO + 1;
+pub const C_OUT_ZERO: usize = C_IN_INV + 1;
+pub const C_OUT_INV: usize = C_OUT_ZERO + 1;
+pub const C_GO_OUT: usize = C_OUT_INV + 1;
+pub const C_GO_END: usize = C_GO_OUT + 1;
+/// One while a transaction is open: from its start (or resume) until the
+/// row after its end.
+pub const R_OPEN: usize = C_GO_END + 1;
+/// The current item's memo, set entering its first row.
+pub const R_MEMO: usize = R_OPEN + 1;
+/// The current output's tree leaf, set after its leaf row.
+pub const R_LEAF: usize = R_MEMO + DIGEST;
+/// The current name operation's digest, set entering its first row.
+pub const R_OPD: usize = R_LEAF + DIGEST;
+/// The name operations sponge.
+pub const R_NSP: usize = R_OPD + DIGEST;
+pub const R_OPS_LEFT: usize = R_NSP + WIDTH;
+pub const C_OPS_ZERO: usize = R_OPS_LEFT + 1;
+pub const C_OPS_INV: usize = C_OPS_ZERO + 1;
+pub const C_GO_OPS: usize = C_OPS_INV + 1;
+// ---- policy input registers ----
+/// One from the policy input's start row to the transaction's end.
+pub const R_POL: usize = C_GO_OPS + 1;
+/// One over the policy input's own rows (start to its `body_in1`).
+pub const R_PIN: usize = R_POL + 1;
+/// Policy inputs left: 0 or 1, from the transaction header.
+pub const R_POL_LEFT: usize = R_PIN + 1;
+/// `in_zero` and no policy input left: outputs may follow.
+pub const C_IN_DONE: usize = R_POL_LEFT + 1;
+/// Dispatch rows, with the covered-run detours folded in.
+pub const C_DISP: usize = C_IN_DONE + 1;
+/// The spending transaction's state number.
+pub const R_PSTATE: usize = C_DISP + 1;
+/// Outputs before the covered run, and covered outputs left.
+pub const R_CVB: usize = R_PSTATE + 1;
+pub const R_CVN: usize = R_CVB + 1;
+pub const C_CVB_ZERO: usize = R_CVN + 1;
+pub const C_CVB_INV: usize = C_CVB_ZERO + 1;
+pub const C_CVN_ZERO: usize = C_CVB_INV + 1;
+pub const C_CVN_INV: usize = C_CVN_ZERO + 1;
+/// The current output is in the covered run.
+pub const R_INRUN: usize = C_CVN_INV + 1;
+/// The spent output's creation height.
+pub const R_CREATED: usize = R_INRUN + 1;
+/// The message the signature fragment verifies: the body hash, or the
+/// rebindable message for a rebindable threshold.
+pub const R_SMSG: usize = R_CREATED + 1;
+/// The rebindable message the policy input's signatures are over.
+pub const R_RMSG: usize = R_SMSG + DIGEST;
+/// The leaf's index in the policy tree, as bits.
+pub const R_PIDX: usize = R_RMSG + DIGEST;
+/// The leaf's element count, and blocks absorbed so far.
+pub const R_LLEN: usize = R_PIDX + POLICY_DEPTH;
+pub const R_LCNT: usize = R_LLEN + 1;
+/// The leaf sponge.
+pub const R_LSP: usize = R_LCNT + 1;
+/// Conditions left, and the tags of the next conditions (the current
+/// first, shifted as conditions start).
+pub const R_NC: usize = R_LSP + WIDTH;
+pub const C_NC_ZERO: usize = R_NC + 1;
+pub const C_NC_INV: usize = C_NC_ZERO + 1;
+pub const R_TAG: usize = C_NC_INV + 1;
+/// Threshold: `m`, keys left to list, signatures left, and whether one
+/// was seen.
+pub const R_M: usize = R_TAG + LEAF_CONDS;
+pub const C_M_INV: usize = R_M + 1;
+pub const R_KREM: usize = C_M_INV + 1;
+pub const C_KLAST: usize = R_KREM + 1;
+pub const C_KLAST_INV: usize = C_KLAST + 1;
+pub const R_SREM: usize = C_KLAST_INV + 1;
+pub const C_SREM_ZERO: usize = R_SREM + 1;
+pub const C_SREM_INV: usize = C_SREM_ZERO + 1;
+pub const R_HADTHR: usize = C_SREM_INV + 1;
+/// Rebindable mode, and the channel.
+pub const R_REBIND: usize = R_HADTHR + 1;
+pub const R_CHAN: usize = R_REBIND + 1;
+/// A covenant was listed, with its covered digest; the covered run must
+/// end; it did.
+pub const R_HASCOV: usize = R_CHAN + DIGEST;
+pub const R_NEEDRUN: usize = R_HASCOV + 1;
+pub const R_RUNDONE: usize = R_NEEDRUN + 1;
+pub const R_COV: usize = R_RUNDONE + 1;
+/// The policy root, from the path.
+pub const R_PROOT: usize = R_COV + DIGEST;
+/// The selected keys and the signers sponges.
+pub const R_KSP: usize = R_PROOT + DIGEST;
+pub const R_SSP: usize = R_KSP + WIDTH;
+/// The covered-run sponge.
+pub const R_CSP: usize = R_SSP + WIDTH;
+/// The end of a condition (a next-row dependent flag).
+pub const C_CEND: usize = R_CSP + WIDTH;
+/// Plain inputs done and a policy input left.
+pub const C_GO_POL: usize = C_CEND + 1;
+pub const NUM_COLS: usize = C_GO_POL + 1;
 
 // ---- public values ----
 pub const PUB_ROOT_IN: usize = 0;
@@ -71,6 +304,131 @@ pub const CARRY_IN_LEFT: usize = CARRY_BSP + WIDTH;
 pub const CARRY_OUT_LEFT: usize = CARRY_IN_LEFT + 1;
 pub const CARRY_OPS_LEFT: usize = CARRY_OUT_LEFT + 1;
 pub const CARRY_LEN: usize = CARRY_OPS_LEFT + 1;
+
+/// Rows of one input (signature plus commitment, tree update and body).
+/// Rows of an input whose key has `height`: its signature, key hash,
+/// commitment, leaf and list rows, the removal, and the body rows.
+pub const fn input_rows(height: usize) -> usize {
+    xmss_fragment::rows(height) + 6 + 1 + 2 * DEPTH + 2
+}
+/// Rows of an input by the tallest key.
+pub const ROWS_PER_INPUT: usize = input_rows(crate::xmss::MAX_HEIGHT);
+/// Rows of one output.
+pub const ROWS_PER_OUTPUT: usize = 9 + 2 * DEPTH;
+/// Extra rows of an output in a policy input's covered run.
+pub const ROWS_PER_COVERED: usize = 2;
+/// Rows ending a covered run: the rebindable message.
+pub const ROWS_RUN_END: usize = 3;
+/// Rows of one name operation.
+pub const ROWS_PER_OP: usize = 2;
+
+/// Rows of a policy input: its start and covered-sponge rows, the leaf
+/// header, the conditions, the path, the signatures (each a fragment, the
+/// key hash and a signers row), the end row, then the commitment, leaf,
+/// list, removal and body rows as a plain input has.
+pub fn policy_rows(p: &PolicyInput) -> usize {
+    let conds: usize = p
+        .leaf
+        .conds
+        .iter()
+        .map(|c| match c {
+            Cond::Thresh { m, keys, .. } => 2 + keys.len() + *m as usize,
+            Cond::Hash(_) => 2,
+            _ => 1,
+        })
+        .sum();
+    let sigs: usize = p
+        .witness
+        .iter()
+        .filter_map(|w| match w {
+            CondWitness::Signatures(s) => {
+                Some(s.iter().map(|s| xmss_fragment::rows(s.pubkey.height()) + 3).sum::<usize>())
+            }
+            _ => None,
+        })
+        .sum();
+    3 + conds + POLICY_DEPTH + sigs + 1 + 6 + 1 + 2 * DEPTH + 2
+}
+
+/// Rows of each item of `tx`, in item order (plain inputs, the policy
+/// input, outputs, operations), and whether the transaction must stay
+/// whole in one segment (it has a policy input: the covered run and the
+/// policy's registers are not carried between segments).
+pub fn item_rows_of(tx: &Transaction) -> (Vec<usize>, bool) {
+    let mut rows: Vec<usize> = tx.inputs.iter().map(|i| input_rows(i.pubkey.height())).collect();
+    let (mut start, mut count) = (usize::MAX, 0);
+    if let Some(p) = tx.policy_inputs.first() {
+        rows.push(policy_rows(p));
+        start = p.covered.0 as usize;
+        count = p.covered.1 as usize;
+    }
+    for j in 0..tx.outputs.len() {
+        let covered = j >= start && j < start + count;
+        let last = covered && j + 1 == start + count;
+        rows.push(ROWS_PER_OUTPUT + usize::from(covered) * ROWS_PER_COVERED + usize::from(last) * ROWS_RUN_END);
+    }
+    rows.extend(std::iter::repeat_n(ROWS_PER_OP, tx.ops.len()));
+    (rows, !tx.policy_inputs.is_empty())
+}
+
+/// Body elements per input, output and operation (see
+/// `crate::transaction::body_elements`).
+const BODY_PER_INPUT: u32 = 16;
+const BODY_PER_OUTPUT: u32 = 24;
+const BODY_PER_OP: u32 = 8;
+
+/// Body sponge state after a transaction's header block.
+pub fn body_init(n_in: u32, n_out: u32, n_ops: u32, n_policy: u32) -> [Fp; WIDTH] {
+    let mut input = [Fp::ZERO; WIDTH];
+    input[0] = Fp::new(n_in);
+    input[1] = Fp::new(n_out);
+    input[2] = Fp::new(n_ops);
+    input[3] = Fp::new(n_policy);
+    let len = 8 + BODY_PER_INPUT * (n_in + n_policy) + BODY_PER_OUTPUT * n_out + BODY_PER_OP * n_ops;
+    input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_BODY, len));
+    permute(input)
+}
+
+/// Absorbs one policy input (its policy root, then the amount with the
+/// policy marker) into a body sponge.
+pub fn body_absorb_policy(state: &mut [Fp; WIDTH], policy: &Digest, amount: u64) {
+    absorb_block(state, policy);
+    let mut blk = [Fp::ZERO; RATE];
+    blk[PUB_SEED_LEN..PUB_SEED_LEN + 3].copy_from_slice(&amount_fps(amount));
+    blk[RATE - 1] = Fp::ONE;
+    absorb_block(state, &blk);
+}
+
+/// Absorbs one name operation's digest into a body sponge.
+pub fn body_absorb_op(state: &mut [Fp; WIDTH], digest: &Digest) {
+    absorb_block(state, digest);
+}
+
+pub fn body_absorb_input(state: &mut [Fp; WIDTH], pubkey: &PublicKey, amount: u64) {
+    absorb_block(state, &pubkey.root);
+    let mut blk = [Fp::ZERO; RATE];
+    blk[..PUB_SEED_LEN].copy_from_slice(&pubkey.pub_seed);
+    blk[PUB_SEED_LEN..PUB_SEED_LEN + 3].copy_from_slice(&amount_fps(amount));
+    absorb_block(state, &blk);
+}
+
+/// Absorbs one output (commitment, then amount) into a body sponge.
+pub fn body_absorb_output(state: &mut [Fp; WIDTH], output: &Output) {
+    absorb_block(state, &output.commitment);
+    absorb_block(state, &amt_block(output.amount));
+    absorb_block(state, &output.slot());
+}
+
+fn pow2<F: Field>(k: usize) -> F {
+    F::from_u32(1 << k)
+}
+
+fn cap_const<F: Field>(domain: u32, len: u32) -> [F; RATE] {
+    let mut c = [F::ZERO; RATE];
+    c[0] = F::from_u32(domain);
+    c[1] = F::from_u32(len);
+    c
+}
 
 // ---------------------------------------------------------------------------
 // The sponges
@@ -389,6 +747,2103 @@ pub fn pack(num_txs: usize, items: impl Fn(usize) -> (Vec<usize>, bool), max_row
     segments
 }
 
+// ---------------------------------------------------------------------------
+// Constraints
+// ---------------------------------------------------------------------------
+
+pub struct BlockAir;
+
+impl Air for BlockAir {
+    fn width(&self) -> usize {
+        NUM_COLS
+    }
+
+    fn max_constraint_degree(&self) -> usize {
+        3
+    }
+
+    #[allow(clippy::needless_range_loop)]
+    fn eval<F: Field>(&self, b: &mut Builder<'_, F>) {
+        eval_hash_machine(b);
+        let l = b.local();
+        let n = b.next();
+        let public = b.public();
+        let one = F::ONE;
+        let pubv = |i: usize| -> F { public[i] };
+
+        // ---------------- row types ----------------
+        b.mark("row types");
+        let types: [F; NUM_TYPES] = core::array::from_fn(|i| l[T_TX_START + i]);
+        for t in types {
+            b.assert_zero(t * t - t);
+        }
+        b.assert_eq(types.iter().fold(F::ZERO, |a, t| a + *t), one);
+        let tx_start = l[T_TX_START];
+        let tx_end = l[T_TX_END];
+        let msg_start = l[T_MSG_START];
+        let msg_abs = l[T_MSG_ABS];
+        let load = l[T_LOAD];
+        let step = l[T_STEP];
+        let leaf = l[T_LEAF];
+        let tree_start = l[T_TREE_START];
+        let tree_abs = l[T_TREE_ABS];
+        let pkh0 = l[T_PKH0];
+        let pkh1 = l[T_PKH1];
+        let cm0 = l[T_CM0];
+        let cm1 = l[T_CM1];
+        let ilist = l[T_ILIST];
+        let old_t = l[T_OLD];
+        let new_t = l[T_NEW];
+        let body_in0 = l[T_BODY_IN0];
+        let body_in1 = l[T_BODY_IN1];
+        let ocm0 = l[T_OCM0];
+        let ocm1 = l[T_OCM1];
+        let olist = l[T_OLIST];
+        let body_out0 = l[T_BODY_OUT0];
+        let body_out1 = l[T_BODY_OUT1];
+        let olist2 = l[T_OLIST2];
+        let body_out2 = l[T_BODY_OUT2];
+        let ileaf = l[T_ILEAF];
+        let oleaf = l[T_OLEAF];
+        let ileaf2 = l[T_ILEAF2];
+        let oleaf2 = l[T_OLEAF2];
+        let (pstart, cvs, lhdr, thr, chan, key, ksel) =
+            (l[T_PSTART], l[T_CVS], l[T_LHDR], l[T_THR], l[T_CHAN], l[T_KEY], l[T_KSEL]);
+        let (hl, hash_t, after, older, state_t, outs) =
+            (l[T_HL], l[T_HASH], l[T_AFTER], l[T_OLDER], l[T_STATE], l[T_OUTS]);
+        let (pp0, pp1, pp2, pp3, psig, pend) = (l[T_PP0], l[T_PP1], l[T_PP2], l[T_PP3], l[T_PSIG], l[T_PEND]);
+        let (cvc, cvm, rb0, rb1, rb2) = (l[T_CVC], l[T_CVM], l[T_RB0], l[T_RB1], l[T_RB2]);
+        let (pol, pin, pol_left, inrun) = (l[R_POL], l[R_PIN], l[R_POL_LEFT], l[R_INRUN]);
+        let (pstate, cvb, cvn, created) = (l[R_PSTATE], l[R_CVB], l[R_CVN], l[R_CREATED]);
+        let (cvb_zero, cvn_zero, nc_zero, srem_zero) = (l[C_CVB_ZERO], l[C_CVN_ZERO], l[C_NC_ZERO], l[C_SREM_ZERO]);
+        let (nc, m_reg, krem, klast, srem, hadthr) = (l[R_NC], l[R_M], l[R_KREM], l[C_KLAST], l[R_SREM], l[R_HADTHR]);
+        let (rebind, hascov, needrun, rundone, cend) =
+            (l[R_REBIND], l[R_HASCOV], l[R_NEEDRUN], l[R_RUNDONE], l[C_CEND]);
+        // Leaf-sponge absorb rows: a block added to the leaf sponge register.
+        let labs = thr + chan + key + hash_t + after + older + state_t + outs;
+        let labs_next =
+            |n: &[F]| n[T_THR] + n[T_CHAN] + n[T_KEY] + n[T_HASH] + n[T_AFTER] + n[T_OLDER] + n[T_STATE] + n[T_OUTS];
+        let op_body = l[T_OP_BODY];
+        let op_list = l[T_OP_LIST];
+        let done = l[T_DONE];
+        let resume = l[T_RESUME];
+        let active = l[XCOLS.active()];
+        let msg: [F; DIGEST] = core::array::from_fn(|i| l[R_MSG + i]);
+        let smsg: [F; DIGEST] = core::array::from_fn(|i| l[R_SMSG + i]);
+        xmss_fragment::eval(b, &XCOLS, &XTYPES, &smsg, n[T_PKH0]);
+
+        // machine op mapping
+        b.assert_eq(
+            l[COL_START],
+            tx_start
+                + msg_start
+                + leaf
+                + tree_start
+                + pkh0
+                + cm0
+                + ilist
+                + old_t
+                + new_t
+                + body_in0
+                + ocm0
+                + olist
+                + body_out0
+                + ileaf
+                + oleaf
+                + ileaf2
+                + oleaf2
+                + op_body
+                + op_list
+                + cvs
+                + lhdr
+                + labs
+                + ksel
+                + hl
+                + pp0
+                + pp1
+                + pp2
+                + pp3
+                + psig
+                + cvc
+                + cvm
+                + rb0,
+        );
+        b.assert_eq(
+            l[COL_ABSORB],
+            msg_abs + tree_abs + pkh1 + cm1 + body_in1 + ocm1 + olist2 + body_out1 + body_out2 + rb1 + rb2,
+        );
+        b.assert_eq(l[COL_LOAD], load);
+        b.assert_eq(l[COL_CHAIN], step * active);
+        b.assert_eq(l[COL_PASS], step * (one - active) + tx_end + done + resume + pstart + pend);
+        b.assert_zero(l[COL_COMPRESS]);
+        b.when_first_row(one - tx_start - resume);
+        b.when_last_row(one - done);
+
+        // ---------------- counters and gadgets ----------------
+        b.mark("counters");
+        // tree-update level gadget
+        let level = l[C_LEVEL];
+        let is_last = l[C_IS_LAST];
+        let last_level = F::from_u32((DEPTH - 1) as u32);
+        b.assert_zero(is_last * is_last - is_last);
+        b.assert_zero(is_last * (level - last_level));
+        b.assert_eq((level - last_level) * l[C_LEVEL_INV], one - is_last);
+        let smt_end = l[C_SMT_END];
+        b.assert_eq(smt_end, new_t * is_last);
+        let is_out = l[R_IS_OUT];
+        b.assert_zero(is_out * is_out - is_out);
+        let out_end = l[C_OUT_END];
+        b.assert_eq(out_end, smt_end * is_out);
+        // remaining-item counters and zero tests
+        let in_left = l[R_IN_LEFT];
+        let out_left = l[R_OUT_LEFT];
+        let in_zero = l[C_IN_ZERO];
+        let out_zero = l[C_OUT_ZERO];
+        b.assert_zero(in_zero * in_zero - in_zero);
+        b.assert_zero(out_zero * out_zero - out_zero);
+        b.assert_eq(in_left * l[C_IN_INV], one - in_zero);
+        b.assert_zero(in_zero * in_left);
+        b.assert_eq(out_left * l[C_OUT_INV], one - out_zero);
+        b.assert_zero(out_zero * out_left);
+        let ops_left = l[R_OPS_LEFT];
+        let ops_zero = l[C_OPS_ZERO];
+        b.assert_zero(ops_zero * ops_zero - ops_zero);
+        b.assert_eq(ops_left * l[C_OPS_INV], one - ops_zero);
+        b.assert_zero(ops_zero * ops_left);
+        let go_out = l[C_GO_OUT];
+        let go_ops = l[C_GO_OPS];
+        let go_end = l[C_GO_END];
+        let in_done = l[C_IN_DONE];
+        b.assert_eq(in_done, in_zero * (one - pol_left));
+        b.assert_eq(go_out, in_done * (one - out_zero));
+        b.assert_eq(go_ops, in_done * out_zero * (one - ops_zero));
+        b.assert_eq(go_end, in_done * out_zero * ops_zero);
+
+        // ---------------- schedule ----------------
+        b.mark("schedule");
+        let nt = |t: usize| n[t];
+        // dispatch after tx_start, after an input (body_in1), after an
+        // output (out_end), after an operation (op_list) and after a
+        // resume; or into the done rows, leaving the transaction open.
+        // A covered output continues into its covered rows, and the run's
+        // end into the rebindable message rows, before dispatching.
+        let disp = l[C_DISP];
+        b.assert_eq(
+            disp,
+            tx_start + body_in1 + out_end * (one - inrun) + op_list + resume + rb2 + cvm * (one - cvn_zero),
+        );
+        b.when_transition(disp * (one - in_zero) * (one - nt(T_MSG_START) - nt(T_DONE)));
+        let go_pol = l[C_GO_POL];
+        b.assert_eq(go_pol, in_zero * pol_left);
+        b.when_transition(disp * go_pol * (one - nt(T_PSTART) - nt(T_DONE)));
+        b.when_transition(disp * go_out * (one - nt(T_OCM0) - nt(T_DONE)));
+        b.when_transition(disp * go_ops * (one - nt(T_OP_BODY) - nt(T_DONE)));
+        b.when_transition(disp * go_end * (one - nt(T_TX_END) - nt(T_DONE)));
+        // operation
+        b.when_transition(op_body * (one - nt(T_OP_LIST)));
+        // A resume is only ever the first row.
+        b.when_transition(nt(T_RESUME));
+        b.when_first_row(resume - pubv(PUB_CARRY_IN + CARRY_OPEN));
+        // open: one from a start or resume until the row after the end
+        let open = l[R_OPEN];
+        b.assert_zero(open * open - open);
+        b.when_first_row(one - open);
+        b.when_transition(tx_end * (n[R_OPEN] - nt(T_TX_START)));
+        b.when_transition(nt(T_TX_START) * (one - n[R_OPEN]));
+        b.when_transition((one - tx_end - nt(T_TX_START)) * (n[R_OPEN] - open));
+        b.when_last_row(open - pubv(PUB_CARRY_OUT + CARRY_OPEN));
+        b.when_transition(tx_end * (one - nt(T_TX_START) - nt(T_DONE)));
+        b.when_transition(done * (one - nt(T_DONE)));
+        // input tail (the signature rows are the fragment's)
+        b.when_transition(pkh0 * (one - nt(T_PKH1)));
+        b.when_transition(pkh1 * (one - pin) * (one - nt(T_CM0)));
+        b.when_transition(pkh1 * pin * (one - nt(T_PSIG)));
+        b.when_transition(cm0 * (one - nt(T_CM1)));
+        b.when_transition(cm1 * (one - nt(T_ILEAF)));
+        b.when_transition(ileaf * (one - nt(T_ILEAF2)));
+        b.when_transition(ileaf2 * (one - nt(T_ILIST)));
+        b.when_transition(ilist * (one - nt(T_OLD)));
+        b.when_transition(ilist * n[C_LEVEL]);
+        b.when_transition(old_t * (one - nt(T_NEW)));
+        b.when_transition(old_t * (n[C_LEVEL] - level));
+        b.when_transition(new_t * (one - is_last) * (one - nt(T_OLD)));
+        b.when_transition(new_t * (one - is_last) * (n[C_LEVEL] - level - one));
+        b.when_transition(smt_end * (one - is_out) * (one - nt(T_BODY_IN0)));
+        b.when_transition(body_in0 * (one - nt(T_BODY_IN1)));
+        // output
+        b.when_transition(ocm0 * (one - nt(T_OCM1)));
+        b.when_transition(ocm1 * (one - nt(T_OLEAF)));
+        b.when_transition(oleaf * (one - nt(T_OLEAF2)));
+        b.when_transition(oleaf2 * (one - nt(T_OLIST)));
+        b.when_transition(olist * (one - nt(T_OLIST2)));
+        b.when_transition(olist2 * (one - nt(T_BODY_OUT0)));
+        b.when_transition(body_out0 * (one - nt(T_BODY_OUT1)));
+        b.when_transition(body_out1 * (one - nt(T_BODY_OUT2)));
+        b.when_transition(body_out2 * (one - nt(T_OLD)));
+        b.when_transition(body_out2 * n[C_LEVEL]);
+        // is_out: 1 from ocm0 until the output ends, 0 on inputs and tx start
+        b.assert_zero(ocm0 * (one - is_out));
+        b.assert_zero(msg_start * is_out);
+        b.assert_zero(tx_start * is_out);
+        b.when_transition((one - nt(T_OCM0) - nt(T_MSG_START) - nt(T_TX_START)) * (n[R_IS_OUT] - is_out));
+        // item counters
+        b.when_transition(nt(T_MSG_START) * (one - n[R_PIN]) * (n[R_IN_LEFT] - in_left + one));
+        b.when_transition((one - nt(T_MSG_START) * (one - n[R_PIN]) - nt(T_TX_START)) * (n[R_IN_LEFT] - in_left));
+        b.when_transition(nt(T_OCM0) * (n[R_OUT_LEFT] - out_left + one));
+        b.when_transition((one - nt(T_OCM0) - nt(T_TX_START)) * (n[R_OUT_LEFT] - out_left));
+        b.when_transition(nt(T_OP_BODY) * (n[R_OPS_LEFT] - ops_left + one));
+        b.when_transition((one - nt(T_OP_BODY) - nt(T_TX_START)) * (n[R_OPS_LEFT] - ops_left));
+        b.assert_zero(tx_end * in_left);
+        b.assert_zero(tx_end * out_left);
+        b.assert_zero(tx_end * ops_left);
+        b.assert_zero(tx_end * pol_left);
+        // Carries: the open transaction's state on the resume row and at
+        // the end (carried there through the done rows), zero when closed.
+        let carried = |c: usize| -> F {
+            match c {
+                CARRY_IN_LEFT => in_left,
+                CARRY_OUT_LEFT => out_left,
+                CARRY_OPS_LEFT => ops_left,
+                c if c < CARRY_BSP => l[R_MSG + c - CARRY_MSG],
+                c => l[R_BSP + c - CARRY_BSP],
+            }
+        };
+        for c in CARRY_MSG..CARRY_LEN {
+            b.when_first_row(resume * carried(c) - pubv(PUB_CARRY_IN + c));
+            b.when_last_row(open * carried(c) - pubv(PUB_CARRY_OUT + c));
+        }
+
+        // ---------------- registers: amount bits ----------------
+        b.mark("amount registers");
+        let pub_seed: [F; PUB_SEED_LEN] = core::array::from_fn(|i| l[XCOLS.pub_seed(i)]);
+        let abits: [F; AMOUNT_BITS] = core::array::from_fn(|i| l[R_ABITS + i]);
+        let (mut amt_lo, mut amt_mid, mut amt_hi) = (F::ZERO, F::ZERO, F::ZERO);
+        let mut l16 = [F::ZERO; LIMBS];
+        for (i, bit) in abits.iter().enumerate() {
+            b.assert_zero(*bit * *bit - *bit);
+            b.when_transition(
+                (one - nt(T_MSG_START) * (one - n[R_PIN]) - nt(T_OCM0) - nt(T_PSTART)) * (n[R_ABITS + i] - *bit),
+            );
+            if i < 30 {
+                amt_lo += *bit * pow2::<F>(i);
+            } else if i < 60 {
+                amt_mid += *bit * pow2::<F>(i - 30);
+            } else {
+                amt_hi += *bit * pow2::<F>(i - 60);
+            }
+            l16[i / 16] += *bit * pow2::<F>(i % 16);
+        }
+        b.assert_zero(oleaf2 * (l[COL_INPUT + RATE] - pubv(PUB_HEIGHT)));
+        for i in 0..DIGEST {
+            b.when_transition((one - nt(T_TX_START)) * (n[R_MSG + i] - msg[i]));
+            b.when_transition((one - nt(T_OCM0)) * (n[R_OCM + i] - l[R_OCM + i]));
+            b.when_transition(
+                (one - nt(T_OCM0) - nt(T_MSG_START) * (one - n[R_PIN]) - nt(T_PSTART))
+                    * (n[R_MEMO + i] - l[R_MEMO + i]),
+            );
+            // Leaves: the commitment just hashed and the memo, compressed,
+            // then that digest compressed with the creation height: the
+            // block's (public) for an output, a witness for an input, which
+            // the tree path authenticates.
+            b.when_transition(nt(T_ILEAF) * (n[COL_INPUT + i] - l[COL_ACC + i]));
+            b.assert_zero(ileaf * (l[COL_INPUT + RATE + i] - l[R_MEMO + i]));
+            b.assert_zero(oleaf * (l[COL_INPUT + i] - l[R_OCM + i]));
+            b.assert_zero(oleaf * (l[COL_INPUT + RATE + i] - l[R_MEMO + i]));
+            b.when_transition((nt(T_ILEAF2) + nt(T_OLEAF2)) * (n[COL_INPUT + i] - l[COL_ACC + i]));
+            if i > 0 {
+                b.assert_zero((ileaf2 + oleaf2) * l[COL_INPUT + RATE + i]);
+            }
+            b.when_transition(oleaf2 * (n[R_LEAF + i] - l[COL_ACC + i]));
+            b.when_transition((one - oleaf2) * (n[R_LEAF + i] - l[R_LEAF + i]));
+            // The operation digest is a witness entering its first row.
+            b.when_transition((one - nt(T_OP_BODY)) * (n[R_OPD + i] - l[R_OPD + i]));
+            b.assert_zero((olist2 + body_out2) * (l[COL_DATA + i] - l[R_MEMO + i]));
+            // pkroot: set entering pkh0 from the tree root, else copied
+            b.when_transition(nt(T_PKH0) * (n[R_PKROOT + i] - l[COL_ACC + i]));
+            b.when_transition((one - nt(T_PKH0)) * (n[R_PKROOT + i] - l[R_PKROOT + i]));
+        }
+
+        // ---------------- key hash and commitment ----------------
+        b.mark("key hash / commitment / amounts");
+        let cap_pk = cap_const::<F>(DOM_PUBKEY, (DIGEST + PUB_SEED_LEN + 1) as u32);
+        let cap_cm = cap_const::<F>(DOM_COMMITMENT, (DIGEST + 3) as u32);
+        for i in 0..RATE {
+            b.when_transition(nt(T_PKH0) * (n[COL_INPUT + i] - l[COL_ACC + i]));
+            b.when_transition(nt(T_CM0) * (one - n[R_PIN]) * (n[COL_INPUT + i] - l[COL_ACC + i]));
+            b.when_transition(nt(T_CM0) * n[R_PIN] * (n[COL_INPUT + i] - n[R_PROOT + i]));
+            b.assert_zero(pkh0 * (l[COL_INPUT + RATE + i] - cap_pk[i]));
+            b.assert_zero(cm0 * (l[COL_INPUT + RATE + i] - cap_cm[i]));
+            // An output's commitment is H(key_hash || amount) with the key
+            // hash a free witness, so the amount summed is the one it hides.
+            b.assert_zero(ocm0 * (l[COL_INPUT + RATE + i] - cap_cm[i]));
+            b.assert_zero(ocm1 * (l[COL_ACC + i] - l[R_OCM + i]));
+            // The key hash covers the tree height: the fragment's for now.
+            let pkh1_data = match i {
+                _ if i < PUB_SEED_LEN => pub_seed[i],
+                PUB_SEED_LEN => xmss_fragment::height_value(l, &XCOLS),
+                _ => F::ZERO,
+            };
+            b.assert_zero(pkh1 * (l[COL_DATA + i] - pkh1_data));
+            let amt_block = [amt_lo, amt_mid, amt_hi, F::ZERO, F::ZERO, F::ZERO, F::ZERO, F::ZERO];
+            b.assert_zero(cm1 * (l[COL_DATA + i] - amt_block[i]));
+            b.assert_zero(ocm1 * (l[COL_DATA + i] - amt_block[i]));
+            b.assert_zero(body_out1 * (l[COL_DATA + i] - amt_block[i]));
+            let body_in1_data = [pub_seed[0], pub_seed[1], pub_seed[2], pub_seed[3], amt_lo, amt_mid, amt_hi, F::ZERO];
+            let body_pol_data = [F::ZERO, F::ZERO, F::ZERO, F::ZERO, amt_lo, amt_mid, amt_hi, one];
+            b.assert_zero(body_in1 * (l[COL_DATA + i] - ((one - pin) * body_in1_data[i] + pin * body_pol_data[i])));
+        }
+        // The memo slot's last three elements are the amount's limbs: the
+        // amount a spent leaf holds and a block lists is the one the
+        // commitment hides and the sums count.
+        let limbs3 = [amt_lo, amt_mid, amt_hi];
+        for (k, limb) in limbs3.iter().enumerate() {
+            b.assert_zero((cm1 + ocm1) * (l[R_MEMO + MEMO_LEN + k] - *limb));
+        }
+        // amount sums: zero at the start of the segment, exported at the end
+        for j in 0..LIMBS {
+            b.when_transition(n[R_SUM_IN + j] - l[R_SUM_IN + j] - cm1 * l16[j]);
+            b.when_transition(n[R_SUM_OUT + j] - l[R_SUM_OUT + j] - olist * l16[j]);
+            b.when_first_row(l[R_SUM_IN + j]);
+            b.when_first_row(l[R_SUM_OUT + j]);
+            b.when_last_row(l[R_SUM_IN + j] - pubv(PUB_SUM_IN + j));
+            b.when_last_row(l[R_SUM_OUT + j] - pubv(PUB_SUM_OUT + j));
+        }
+
+        // ---------------- tree update registers ----------------
+        b.mark("tree update");
+        let pbits: [F; DEPTH] = core::array::from_fn(|i| l[R_PBITS + i]);
+        let (mut pos_lo, mut pos_hi) = (F::ZERO, F::ZERO);
+        let (mut npos_lo, mut npos_hi) = (F::ZERO, F::ZERO);
+        for (i, bit) in pbits.iter().enumerate() {
+            b.assert_zero(*bit * *bit - *bit);
+            if i < 30 {
+                pos_lo += *bit * pow2::<F>(i);
+                npos_lo += n[R_PBITS + i] * pow2::<F>(i);
+            } else {
+                pos_hi += *bit * pow2::<F>(i - 30);
+                npos_hi += n[R_PBITS + i] * pow2::<F>(i - 30);
+            }
+            let shifted = if i + 1 < DEPTH { pbits[i + 1] } else { F::ZERO };
+            b.when_transition(new_t * (one - is_last) * (n[R_PBITS + i] - shifted));
+            b.when_transition((one - new_t - nt(T_ILIST) - body_out2) * (n[R_PBITS + i] - *bit));
+        }
+        // output position: decomposed into the path bits entering the insert
+        b.when_transition(body_out2 * (npos_lo - l[R_OPOS_LO]));
+        b.when_transition(body_out2 * (npos_hi - l[R_OPOS_HI]));
+        let wrap = l[C_WRAP];
+        let lo_max = F::from_u32((1u32 << 30) - 1);
+        b.assert_zero(wrap * wrap - wrap);
+        b.assert_zero(wrap * (l[R_OPOS_LO] - lo_max));
+        b.assert_eq((l[R_OPOS_LO] - lo_max) * l[C_WRAP_INV], one - wrap);
+        b.when_transition(out_end * (n[R_OPOS_LO] - (one - wrap) * (l[R_OPOS_LO] + one)));
+        b.when_transition(out_end * (n[R_OPOS_HI] - l[R_OPOS_HI] - wrap));
+        b.when_transition((one - out_end) * (n[R_OPOS_LO] - l[R_OPOS_LO]));
+        b.when_transition((one - out_end) * (n[R_OPOS_HI] - l[R_OPOS_HI]));
+        b.when_first_row(l[R_OPOS_LO] - pubv(PUB_POS_IN));
+        b.when_first_row(l[R_OPOS_HI] - pubv(PUB_POS_IN + 1));
+        b.when_last_row(l[R_OPOS_LO] - pubv(PUB_POS_OUT));
+        b.when_last_row(l[R_OPOS_HI] - pubv(PUB_POS_OUT + 1));
+        let dir = l[COL_DIR];
+        b.assert_zero(old_t * (dir - pbits[0]));
+        b.when_transition(old_t * (n[COL_DIR] - dir));
+        for i in 0..DIGEST {
+            let (o, nw, sib, root, acc, out) =
+                (l[R_OLD + i], l[R_NEW + i], l[R_SIB + i], l[R_ROOT + i], l[COL_ACC + i], l[COL_OUTPUT + i]);
+            // old: commitment entering ilist, zero entering an output insert, output after old rows
+            b.when_transition(nt(T_ILIST) * (n[R_OLD + i] - acc));
+            b.when_transition(body_out2 * n[R_OLD + i]);
+            b.when_transition(old_t * (n[R_OLD + i] - out));
+            b.when_transition((one - old_t - nt(T_ILIST) - body_out2 - smt_end) * (n[R_OLD + i] - o));
+            // new: zero on ilist, the output commitment entering an insert, output after new rows
+            b.assert_zero(ilist * nw);
+            b.when_transition(body_out2 * (n[R_NEW + i] - l[R_LEAF + i]));
+            b.when_transition(new_t * (one - is_last) * (n[R_NEW + i] - out));
+            b.when_transition((one - new_t - body_out2 - nt(T_ILIST)) * (n[R_NEW + i] - nw));
+            // sibling: witness on old rows, copied to the new row
+            b.when_transition(old_t * (n[R_SIB + i] - sib));
+            // root
+            b.assert_zero(old_t * is_last * (acc - root));
+            b.when_transition(smt_end * (n[R_ROOT + i] - acc));
+            b.when_transition((one - smt_end) * (n[R_ROOT + i] - root));
+            b.when_first_row(root - pubv(PUB_ROOT_IN + i));
+            b.when_last_row(root - pubv(PUB_ROOT_OUT + i));
+            // compress inputs
+            let inp_lo = l[COL_INPUT + i];
+            let inp_hi = l[COL_INPUT + RATE + i];
+            b.assert_zero(old_t * (inp_lo - ((one - dir) * o + dir * sib)));
+            b.assert_zero(old_t * (inp_hi - ((one - dir) * sib + dir * o)));
+            b.assert_zero(new_t * (inp_lo - ((one - dir) * nw + dir * sib)));
+            b.assert_zero(new_t * (inp_hi - ((one - dir) * sib + dir * nw)));
+        }
+
+        // ---------------- policy input ----------------
+        b.mark("policy input");
+        let height = pubv(PUB_HEIGHT);
+        let hold = |b: &mut Builder<'_, F>, reg: usize, len: usize, except: F| {
+            for i in 0..len {
+                b.when_transition((one - except) * (n[reg + i] - l[reg + i]));
+            }
+        };
+        let zero_at_start = |b: &mut Builder<'_, F>, reg: usize, len: usize| {
+            for i in 0..len {
+                b.when_transition(nt(T_TX_START) * n[reg + i]);
+            }
+        };
+        let is_bool = |b: &mut Builder<'_, F>, v: F| b.assert_zero(v * v - v);
+        for v in
+            [pol, pin, pol_left, inrun, cvb_zero, cvn_zero, nc_zero, srem_zero, klast, hadthr, rebind, hascov, rundone]
+        {
+            is_bool(b, v);
+        }
+        // Zero tests.
+        b.assert_eq(cvb * l[C_CVB_INV], one - cvb_zero);
+        b.assert_zero(cvb_zero * cvb);
+        b.assert_eq(cvn * l[C_CVN_INV], one - cvn_zero);
+        b.assert_zero(cvn_zero * cvn);
+        b.assert_eq(nc * l[C_NC_INV], one - nc_zero);
+        b.assert_zero(nc_zero * nc);
+        b.assert_eq(srem * l[C_SREM_INV], one - srem_zero);
+        b.assert_zero(srem_zero * srem);
+        b.assert_eq(krem * l[C_KLAST_INV], one - klast);
+        b.assert_zero(klast * krem);
+        // Flags: `pol` from the start to the transaction's end, `pin` to the
+        // input's last body row; one policy input at most, never split
+        // between segments.
+        b.when_first_row(pol);
+        b.when_first_row(pin);
+        b.when_first_row(resume * pol_left);
+        b.when_last_row(open * pol);
+        b.when_last_row(open * pol_left);
+        b.when_transition(nt(T_PSTART) * (n[R_POL] - one));
+        b.when_transition(tx_end * n[R_POL]);
+        b.when_transition((one - nt(T_PSTART) - tx_end) * (n[R_POL] - pol));
+        b.when_transition(nt(T_PSTART) * (n[R_PIN] - one));
+        b.when_transition(body_in1 * n[R_PIN]);
+        b.when_transition((one - nt(T_PSTART) - body_in1) * (n[R_PIN] - pin));
+        b.when_transition(nt(T_PSTART) * (n[R_POL_LEFT] - pol_left + one));
+        b.when_transition((one - nt(T_TX_START) - nt(T_PSTART)) * (n[R_POL_LEFT] - pol_left));
+        // Registers the start row loads, held until the next policy input.
+        for (reg, len) in
+            [(R_PSTATE, 1), (R_CREATED, 1), (R_RMSG, DIGEST), (R_PIDX, POLICY_DEPTH), (R_LLEN, 1), (R_CHAN, DIGEST)]
+        {
+            hold(b, reg, len, nt(T_PSTART));
+        }
+        for i in 0..POLICY_DEPTH {
+            is_bool(b, l[R_PIDX + i]);
+        }
+        // The signing message: the body hash outside a policy input and for
+        // body-mode thresholds, the rebindable message otherwise.
+        hold(b, R_SMSG, DIGEST, nt(T_TX_START) + nt(T_PSTART) + body_in1);
+        // (`rebind` is only ever set within a policy input.)
+        for i in 0..DIGEST {
+            b.assert_zero((one - pin) * (smsg[i] - msg[i]));
+            b.assert_zero(msg_abs * (one - rebind) * (smsg[i] - msg[i]));
+            b.assert_zero(msg_abs * rebind * (smsg[i] - l[R_RMSG + i]));
+        }
+        // A rebindable signature's leaf index is the state number.
+        let idx = (0..crate::xmss::MAX_HEIGHT).fold(F::ZERO, |a, i| a + l[XCOLS.idx(i)] * pow2::<F>(i));
+        b.assert_zero(msg_start * rebind * (idx - pstate));
+        // The covered run: counters loaded at the start, zero for a
+        // transaction without a policy input, moving as outputs begin.
+        for reg in [R_CVB, R_CVN] {
+            hold(b, reg, 1, nt(T_PSTART) + nt(T_TX_START) + nt(T_OCM0));
+        }
+        zero_at_start(b, R_CVB, 1);
+        zero_at_start(b, R_CVN, 1);
+        b.when_transition(nt(T_OCM0) * (n[R_INRUN] - cvb_zero * (one - cvn_zero)));
+        b.when_transition(nt(T_OCM0) * (n[R_CVB] - cvb + (one - cvb_zero)));
+        b.when_transition(nt(T_OCM0) * (n[R_CVN] - cvn + n[R_INRUN]));
+        hold(b, R_INRUN, 1, nt(T_OCM0) + nt(T_TX_START));
+        zero_at_start(b, R_INRUN, 1);
+        // Threshold, covenant and run flags: free entering their rows, zero
+        // for a fresh transaction.
+        for reg in [R_REBIND, R_M, R_HADTHR, R_HASCOV, R_RUNDONE] {
+            zero_at_start(b, reg, 1);
+        }
+        hold(b, R_REBIND, 1, nt(T_THR) + nt(T_TX_START));
+        hold(b, R_M, 1, nt(T_THR) + nt(T_TX_START));
+        hold(b, R_KREM, 1, nt(T_THR) + nt(T_KEY));
+        hold(b, R_SREM, 1, nt(T_THR) + nt(T_PSIG) + nt(T_TX_START));
+        zero_at_start(b, R_SREM, 1);
+        hold(b, R_HADTHR, 1, nt(T_THR) + nt(T_TX_START));
+        b.when_transition(nt(T_THR) * (n[R_HADTHR] - one));
+        b.when_transition(nt(T_THR) * hadthr);
+        hold(b, R_HASCOV, 1, nt(T_OUTS) + nt(T_TX_START));
+        b.when_transition(nt(T_OUTS) * (n[R_HASCOV] - one));
+        b.when_transition(nt(T_OUTS) * hascov);
+        hold(b, R_COV, DIGEST, nt(T_OUTS));
+        hold(b, R_RUNDONE, 1, rb2 + nt(T_TX_START));
+        b.when_transition(rb2 * (n[R_RUNDONE] - one));
+        b.assert_eq(needrun, rebind + hascov - rebind * hascov);
+        b.assert_zero(tx_end * needrun * (one - rundone));
+        // Sponges: leaf, selected keys, signers, covered run.
+        for j in 0..WIDTH {
+            b.when_transition((lhdr + labs) * (n[R_LSP + j] - l[COL_OUTPUT + j]));
+            b.when_transition((one - lhdr - labs) * (n[R_LSP + j] - l[R_LSP + j]));
+            b.when_transition(ksel * (n[R_KSP + j] - l[COL_OUTPUT + j]));
+            b.when_transition((one - ksel - nt(T_THR)) * (n[R_KSP + j] - l[R_KSP + j]));
+            b.when_transition(psig * (n[R_SSP + j] - l[COL_OUTPUT + j]));
+            b.when_transition((one - psig - nt(T_THR)) * (n[R_SSP + j] - l[R_SSP + j]));
+            b.when_transition((cvs + cvc + cvm) * (n[R_CSP + j] - l[COL_OUTPUT + j]));
+            b.when_transition((one - cvs - cvc - cvm) * (n[R_CSP + j] - l[R_CSP + j]));
+        }
+        // Leaf: header, element count, conditions left and their tags.
+        hold(b, R_LCNT, 1, nt(T_LHDR) + labs_next(n));
+        b.when_transition(nt(T_LHDR) * (n[R_LCNT] - one));
+        b.when_transition(labs_next(n) * (n[R_LCNT] - l[R_LCNT] - one));
+        b.when_transition(nt(T_PP0) * (l[R_LCNT] * F::from_u32(DIGEST as u32) - l[R_LLEN]));
+        let cstart_next = nt(T_THR) + nt(T_HL) + nt(T_AFTER) + nt(T_OLDER) + nt(T_STATE) + nt(T_OUTS);
+        hold(b, R_NC, 1, cstart_next + nt(T_LHDR));
+        b.when_transition(cstart_next * (n[R_NC] - nc + one));
+        for k in 0..LEAF_CONDS {
+            let next_tag = if k + 1 < LEAF_CONDS { l[R_TAG + k + 1] } else { F::ZERO };
+            b.when_transition(cstart_next * (n[R_TAG + k] - next_tag));
+            b.when_transition((one - cstart_next - nt(T_LHDR)) * (n[R_TAG + k] - l[R_TAG + k]));
+            b.assert_zero(lhdr * (l[COL_INPUT + 1 + k] - l[R_TAG + k]));
+        }
+        b.assert_zero(lhdr * (l[COL_INPUT] - nc));
+        for i in 1 + LEAF_CONDS..RATE {
+            b.assert_zero(lhdr * l[COL_INPUT + i]);
+        }
+        let cap_leaf = [
+            F::from_u32(crate::hash::DOM_POLICY_LEAF),
+            l[R_LLEN],
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+        ];
+        let cap_hl = cap_const::<F>(crate::hash::DOM_HASHLOCK, DIGEST as u32);
+        let cap_cv = [
+            F::from_u32(crate::hash::DOM_COVERED),
+            F::from_u32(8) + cvn * F::from_u32(16),
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+        ];
+        let cap_rb = cap_const::<F>(crate::hash::DOM_REBIND, (2 * DIGEST + 1) as u32);
+        let cap_signers = [
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::from_u32(crate::hash::DOM_SIGNERS),
+            m_reg * F::from_u32(DIGEST as u32),
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+        ];
+        // The end of a condition: dispatch to the next or to the path.
+        b.when_transition(
+            cend - (lhdr + hash_t + after + older + state_t + outs + ksel * klast + key * klast * (one - nt(T_KSEL))),
+        );
+        b.when_last_row(cend);
+        b.when_transition(cend * nc_zero * (one - nt(T_PP0)));
+        b.when_transition(cend * (one - nc_zero) * (one - cstart_next));
+        let tag_next = nt(T_THR)
+            + nt(T_HL) * F::from_u32(2)
+            + nt(T_AFTER) * F::from_u32(3)
+            + nt(T_OLDER) * F::from_u32(4)
+            + nt(T_STATE) * F::from_u32(5)
+            + nt(T_OUTS) * F::from_u32(6);
+        b.when_transition(cend * (one - nc_zero) * (l[R_TAG] - tag_next));
+        // Schedule within the policy input.
+        b.when_transition(pstart * (one - nt(T_CVS)));
+        b.when_transition(cvs * (one - nt(T_LHDR)));
+        b.when_transition(thr * (one - nt(T_CHAN)));
+        b.when_transition(chan * (one - nt(T_KEY)));
+        b.when_transition(key * (one - klast) * (one - nt(T_KEY) - nt(T_KSEL)));
+        b.when_transition(ksel * (one - klast) * (one - nt(T_KEY)));
+        b.when_transition(nt(T_KSEL) * (one - key));
+        b.when_transition(hl * (one - nt(T_HASH)));
+        b.when_transition(nt(T_HASH) * (one - hl));
+        b.when_transition(pp0 * (one - nt(T_PP1)));
+        b.when_transition(pp1 * (one - nt(T_PP2)));
+        b.when_transition(pp2 * (one - nt(T_PP3)));
+        b.when_transition(pp3 * (one - srem_zero) * (one - nt(T_MSG_START)));
+        b.when_transition(pp3 * srem_zero * (one - nt(T_PEND)));
+        b.when_transition(psig * (one - srem_zero) * (one - nt(T_MSG_START)));
+        b.when_transition(psig * srem_zero * (one - nt(T_PEND)));
+        b.when_transition(nt(T_PSIG) * (one - pkh1));
+        b.when_transition(pend * (one - nt(T_CM0)));
+        b.when_transition(out_end * inrun * (one - nt(T_CVC)));
+        b.when_transition(cvc * (one - nt(T_CVM)));
+        b.when_transition(cvm * cvn_zero * (one - nt(T_RB0)));
+        b.when_transition(rb0 * (one - nt(T_RB1)));
+        b.when_transition(rb1 * (one - nt(T_RB2)));
+        // Counters moved by rows.
+        b.when_transition(nt(T_KEY) * (n[R_KREM] - krem + one));
+        b.when_transition(nt(T_PSIG) * (n[R_SREM] - srem + one));
+        // Policy root after the path; checks at the end of the signatures.
+        hold(b, R_PROOT, DIGEST, pp3);
+        b.assert_zero(pend * srem);
+        for j in 0..WIDTH {
+            b.assert_zero(pend * (l[R_KSP + j] - l[R_SSP + j]));
+            b.assert_zero(thr * (l[R_KSP + j] - cap_signers[j]));
+            b.assert_zero(thr * (l[R_SSP + j] - cap_signers[j]));
+        }
+        b.assert_zero(thr * (m_reg * l[C_M_INV] - one));
+        b.assert_zero(thr * (srem - m_reg));
+        b.assert_zero(ileaf2 * pin * (l[COL_INPUT + RATE] - created));
+        b.assert_zero(rb2 * hascov * cvn);
+        let bits_v = xmss_fragment::bits_value(l, &XCOLS);
+        for i in 0..RATE {
+            let blk = l[COL_INPUT + i] - l[R_LSP + i];
+            // Leaf rows continue the leaf sponge; the header starts it.
+            b.assert_zero(labs * (l[COL_INPUT + RATE + i] - l[R_LSP + RATE + i]));
+            b.assert_zero(lhdr * (l[COL_INPUT + RATE + i] - cap_leaf[i]));
+            // Threshold header: mode, m, n.
+            let thr_word = match i {
+                0 => rebind,
+                1 => m_reg,
+                2 => krem,
+                _ => F::ZERO,
+            };
+            b.assert_zero(thr * (blk - thr_word));
+            // Channel: the register's, zero in body mode.
+            b.assert_zero(chan * (blk - l[R_CHAN + i]));
+            b.assert_zero(chan * (one - rebind) * blk);
+            // A selected key: the key row's block, into the keys sponge.
+            b.when_transition(nt(T_KSEL) * (n[COL_INPUT + i] - n[R_KSP + i] - blk));
+            b.assert_zero(ksel * (l[COL_INPUT + RATE + i] - l[R_KSP + RATE + i]));
+            // Hash lock: the preimage's hash is the block.
+            b.assert_zero(hl * (l[COL_INPUT + RATE + i] - cap_hl[i]));
+            b.when_transition(nt(T_HASH) * (n[COL_INPUT + i] - n[R_LSP + i] - l[COL_ACC + i]));
+            // Timelocks and state: one word, non-negative differences.
+            let word = after + older + state_t;
+            if i == 0 {
+                b.assert_zero(after * (bits_v - (height - blk)));
+                b.assert_zero(older * (bits_v - (height - created - blk)));
+                b.assert_zero(state_t * (bits_v - (pstate - blk - one)));
+            } else {
+                b.assert_zero(word * blk);
+            }
+            // Covenant: the covered digest the register holds.
+            b.assert_zero(outs * (blk - l[R_COV + i]));
+            // Signers: the key hash just computed, into the signers sponge.
+            b.when_transition(nt(T_PSIG) * (n[COL_INPUT + i] - n[R_SSP + i] - l[COL_ACC + i]));
+            b.assert_zero(psig * (l[COL_INPUT + RATE + i] - l[R_SSP + RATE + i]));
+            // Policy path: compress the node with its sibling by the index
+            // bit, starting from the leaf sponge's digest (the last leaf row
+            // may be followed by a selected key's row).
+            for (k, pp_next) in [nt(T_PP0), nt(T_PP1), nt(T_PP2), nt(T_PP3)].into_iter().enumerate() {
+                let bit = n[R_PIDX + k];
+                let node = if k == 0 { n[R_LSP + i] } else { l[COL_ACC + i] };
+                b.when_transition(pp_next * (n[COL_INPUT + i] - ((one - bit) * node + bit * n[R_SIB + i])));
+                b.when_transition(pp_next * (n[COL_INPUT + RATE + i] - (bit * node + (one - bit) * n[R_SIB + i])));
+            }
+            b.when_transition(pp3 * (n[R_PROOT + i] - l[COL_ACC + i]));
+            // Covered run: its count, then each covered output's commitment and memo.
+            let cvs_word = if i == 0 { cvn } else { F::ZERO };
+            b.assert_zero(cvs * (l[COL_INPUT + i] - cvs_word));
+            b.assert_zero(cvs * (l[COL_INPUT + RATE + i] - cap_cv[i]));
+            b.assert_zero(cvc * (l[COL_INPUT + i] - l[R_CSP + i] - l[R_OCM + i]));
+            b.assert_zero(cvc * (l[COL_INPUT + RATE + i] - l[R_CSP + RATE + i]));
+            b.assert_zero(cvm * (l[COL_INPUT + i] - l[R_CSP + i] - l[R_MEMO + i]));
+            b.assert_zero(cvm * (l[COL_INPUT + RATE + i] - l[R_CSP + RATE + i]));
+            // The rebindable message: channel, state and the covered digest.
+            b.assert_zero(rb0 * (l[COL_INPUT + i] - l[R_CHAN + i]));
+            b.assert_zero(rb0 * (l[COL_INPUT + RATE + i] - cap_rb[i]));
+            let rb1_word = if i == 0 { pstate } else { l[R_CSP + i - 1] };
+            b.assert_zero(rb1 * (l[COL_DATA + i] - rb1_word));
+            let rb2_word = if i == 0 { l[R_CSP + RATE - 1] } else { F::ZERO };
+            b.assert_zero(rb2 * (l[COL_DATA + i] - rb2_word));
+            b.assert_zero(rb2 * rebind * (l[COL_ACC + i] - l[R_RMSG + i]));
+            b.assert_zero(rb2 * hascov * (l[R_CSP + i] - l[R_COV + i]));
+        }
+        // ---------------- register sponges: body, inputs, outputs, operations ----------------
+        b.mark("register sponges");
+        let body_len = F::from_u32(8)
+            + (in_left + pol_left) * F::from_u32(BODY_PER_INPUT)
+            + out_left * F::from_u32(BODY_PER_OUTPUT)
+            + ops_left * F::from_u32(BODY_PER_OP);
+        let bsp_rows = tx_start + body_in0 + body_in1 + body_out0 + body_out1 + body_out2 + op_body;
+        let osp_rows = olist + olist2;
+        for j in 0..WIDTH {
+            b.when_transition(bsp_rows * (n[R_BSP + j] - l[COL_OUTPUT + j]));
+            b.when_transition((one - bsp_rows) * (n[R_BSP + j] - l[R_BSP + j]));
+            b.when_transition(ilist * (n[R_ISP + j] - l[COL_OUTPUT + j]));
+            b.when_transition((one - ilist) * (n[R_ISP + j] - l[R_ISP + j]));
+            b.when_transition(osp_rows * (n[R_OSP + j] - l[COL_OUTPUT + j]));
+            b.when_transition((one - osp_rows) * (n[R_OSP + j] - l[R_OSP + j]));
+            b.when_transition(op_list * (n[R_NSP + j] - l[COL_OUTPUT + j]));
+            b.when_transition((one - op_list) * (n[R_NSP + j] - l[R_NSP + j]));
+            b.when_first_row(l[R_ISP + j] - pubv(PUB_ISP_IN + j));
+            b.when_first_row(l[R_OSP + j] - pubv(PUB_OSP_IN + j));
+            b.when_first_row(l[R_NSP + j] - pubv(PUB_NSP_IN + j));
+            b.when_last_row(l[R_ISP + j] - pubv(PUB_ISP_OUT + j));
+            b.when_last_row(l[R_OSP + j] - pubv(PUB_OSP_OUT + j));
+            b.when_last_row(l[R_NSP + j] - pubv(PUB_NSP_OUT + j));
+        }
+        for i in 0..RATE {
+            // tx_start: body header block with the body capacity
+            let header = match i {
+                0 => in_left,
+                1 => out_left,
+                2 => ops_left,
+                3 => pol_left,
+                _ => F::ZERO,
+            };
+            b.assert_zero(tx_start * (l[COL_INPUT + i] - header));
+            let cap_body = [F::from_u32(DOM_BODY), body_len, F::ZERO, F::ZERO, F::ZERO, F::ZERO, F::ZERO, F::ZERO];
+            b.assert_zero(tx_start * (l[COL_INPUT + RATE + i] - cap_body[i]));
+            // body_in0 / body_out0 / olist0 / ilist: start rows continuing a register sponge
+            b.assert_zero(
+                body_in0 * (l[COL_INPUT + i] - l[R_BSP + i] - ((one - pin) * l[R_PKROOT + i] + pin * l[R_PROOT + i])),
+            );
+            b.assert_zero(body_in0 * (l[COL_INPUT + RATE + i] - l[R_BSP + RATE + i]));
+            b.assert_zero(body_out0 * (l[COL_INPUT + i] - l[R_BSP + i] - l[R_OCM + i]));
+            b.assert_zero(body_out0 * (l[COL_INPUT + RATE + i] - l[R_BSP + RATE + i]));
+            b.assert_zero(olist * (l[COL_INPUT + i] - l[R_OSP + i] - l[R_OCM + i]));
+            b.assert_zero(olist * (l[COL_INPUT + RATE + i] - l[R_OSP + RATE + i]));
+            // operations: the digest into the body, then into the operations sponge
+            b.assert_zero(op_body * (l[COL_INPUT + i] - l[R_BSP + i] - l[R_OPD + i]));
+            b.assert_zero(op_body * (l[COL_INPUT + RATE + i] - l[R_BSP + RATE + i]));
+            b.assert_zero(op_list * (l[COL_INPUT + i] - l[R_NSP + i] - l[R_OPD + i]));
+            b.assert_zero(op_list * (l[COL_INPUT + RATE + i] - l[R_NSP + RATE + i]));
+            let ilist_block = if i == 0 {
+                pos_lo
+            } else if i == 1 {
+                pos_hi
+            } else {
+                F::ZERO
+            };
+            b.assert_zero(ilist * (l[COL_INPUT + i] - l[R_ISP + i] - ilist_block));
+            b.assert_zero(ilist * (l[COL_INPUT + RATE + i] - l[R_ISP + RATE + i]));
+            // tx_end: body digest equals the signed message
+            b.assert_zero(tx_end * (l[R_BSP + i] - msg[i]));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Witness
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputWitness {
+    pub pubkey: PublicKey,
+    pub amount: u64,
+    /// Memo slot (memo and amount) of the output being spent, part of its
+    /// leaf.
+    pub memo: Digest,
+    /// Creation height of the output being spent, part of its leaf.
+    pub height: u32,
+    pub signature: Sig,
+    pub position: u64,
+    pub siblings: [Digest; DEPTH],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputWitness {
+    pub output: Output,
+    pub siblings: [Digest; DEPTH],
+}
+
+/// A policy input (see [`crate::policy`]) with what the prover reads from
+/// the state: the spent output's memo and creation height, its tree path,
+/// and the rebindable message its signatures are over (zero when none).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicyWitness {
+    pub input: PolicyInput,
+    /// The spent output's memo slot.
+    pub memo: Digest,
+    pub created: u32,
+    pub siblings: [Digest; DEPTH],
+    pub rmsg: Digest,
+}
+
+impl PolicyWitness {
+    /// The threshold's mode: rebindable with its channel, if the leaf has
+    /// a threshold in that mode.
+    fn rebind_channel(&self) -> Option<Digest> {
+        self.input.leaf.conds.iter().find_map(|c| match c {
+            Cond::Thresh { mode: crate::policy::Mode::Rebindable { channel }, .. } => Some(*channel),
+            _ => None,
+        })
+    }
+}
+
+/// The part of one transaction that a segment proves: some of its items,
+/// in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TxWitness {
+    pub inputs: Vec<InputWitness>,
+    /// The policy input, in a part that holds the whole transaction.
+    pub policy: Option<PolicyWitness>,
+    pub outputs: Vec<OutputWitness>,
+    /// Digests of the name operations in this part.
+    pub ops: Vec<Digest>,
+    /// The transaction body hash, which every input signed.
+    pub message: Digest,
+    /// Inputs, outputs and operations of the transaction from this part
+    /// on: all of them when the part starts the transaction.
+    pub in_left: u32,
+    pub out_left: u32,
+    pub ops_left: u32,
+    /// Policy inputs of the transaction from this part on: 0 or 1.
+    pub pol_left: u32,
+    /// The body sponge state when this part resumes a transaction begun in
+    /// an earlier segment; `None` when it starts the transaction.
+    pub resume: Option<[Fp; WIDTH]>,
+    /// Whether the transaction ends in this part.
+    pub ends: bool,
+}
+
+impl TxWitness {
+    /// Trace rows of this part: a start or resume row, the items, and the
+    /// end row if it ends here.
+    pub fn num_rows(&self) -> usize {
+        let (start, count) =
+            self.policy.as_ref().map_or((usize::MAX, 0), |p| (p.input.covered.0 as usize, p.input.covered.1 as usize));
+        let outputs: usize = (0..self.outputs.len())
+            .map(|j| {
+                let covered = j >= start && j < start + count;
+                let last = covered && j + 1 == start + count;
+                ROWS_PER_OUTPUT + usize::from(covered) * ROWS_PER_COVERED + usize::from(last) * ROWS_RUN_END
+            })
+            .sum();
+        1 + self.inputs.iter().map(|i| input_rows(i.pubkey.height())).sum::<usize>()
+            + self.policy.as_ref().map_or(0, |p| policy_rows(&p.input))
+            + outputs
+            + self.ops.len() * ROWS_PER_OP
+            + usize::from(self.ends)
+    }
+}
+
+/// A transaction left open across a segment boundary: its signed message,
+/// body sponge state and items still to come. [`Carry::CLOSED`] when none
+/// is.
+/// Everything needed to prove one segment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SegmentWitness {
+    /// The block's height: the creation height of its outputs.
+    pub height: u32,
+    pub root_in: Digest,
+    pub isp_in: [Fp; WIDTH],
+    pub osp_in: [Fp; WIDTH],
+    pub nsp_in: [Fp; WIDTH],
+    pub pos_in: u64,
+    pub txs: Vec<TxWitness>,
+}
+
+/// A run of one transaction's items, `start..end` in input, output then
+/// operation order, placed in a segment.
+impl SegmentWitness {
+    /// The witnesses of `txs` at `height`, on the state `snap` holds,
+    /// in segments of at most `txs_per_segment` whole transactions. The
+    /// state is read, not changed. Signatures are not checked here.
+    pub fn collect<B: Backend + 'static>(
+        snap: &Snapshot<'_, B>,
+        txs: &[Transaction],
+        txs_per_segment: usize,
+        height: u32,
+    ) -> Result<Vec<SegmentWitness>, Error> {
+        assert!(txs_per_segment > 0);
+        let parts: Vec<Part> = txs
+            .iter()
+            .enumerate()
+            .map(|(t, tx)| Part {
+                tx: t,
+                start: 0,
+                end: tx.inputs.len() + tx.policy_inputs.len() + tx.outputs.len() + tx.ops.len(),
+            })
+            .collect();
+        Self::collect_parts(snap, txs, parts.chunks(txs_per_segment).map(|c| c.to_vec()).collect(), height)
+    }
+
+    /// As [`SegmentWitness::collect`], packed by [`pack`] into segments of
+    /// `max_rows` rows, transactions split between segments where needed.
+    pub fn collect_by_rows<B: Backend + 'static>(
+        snap: &Snapshot<'_, B>,
+        txs: &[Transaction],
+        max_rows: usize,
+        height: u32,
+    ) -> Result<Vec<SegmentWitness>, Error> {
+        let plan = pack(txs.len(), |t| item_rows_of(&txs[t]), max_rows);
+        Self::collect_parts(snap, txs, plan, height)
+    }
+
+    /// The witnesses of the parts of `txs` in order, one segment for
+    /// each entry of `segments`. A transaction's parts must be
+    /// consecutive and cover its items in order.
+    ///
+    /// The state shows each change against the tree as the changes
+    /// before left it. The store keeps no such states, so the paths of
+    /// everything the transactions touch are taken from the state as it
+    /// is, and changed in memory ([`Partial`]).
+    /// [`Error::NoSuchOutput`] if an input is not an unspent output, or
+    /// not the one the transaction says.
+    pub fn collect_parts<B: Backend + 'static>(
+        snap: &Snapshot<'_, B>,
+        txs: &[Transaction],
+        segments: Vec<Vec<Part>>,
+        height: u32,
+    ) -> Result<Vec<SegmentWitness>, Error> {
+        // Every leaf touched, with its path before the block: what is
+        // spent, and the positions the new outputs take.
+        let mut tree = Partial::<DEPTH>::new();
+        let first = snap.outputs().next;
+        let made: u64 = txs.iter().map(|tx| tx.outputs.len() as u64).sum();
+        let spent = txs
+            .iter()
+            .flat_map(|tx| tx.inputs.iter().map(|i| i.position).chain(tx.policy_inputs.iter().map(|p| p.position)));
+        for position in spent.chain(first..first + made) {
+            let (leaf, path) = snap.prove(position)?;
+            tree.load(position, &leaf, &path);
+        }
+        // With nothing touched the root is the state's.
+        let root_now = |tree: &Partial<DEPTH>| tree.root().unwrap_or_else(|| snap.root());
+        // The output at a position, if it is unspent: its commitment,
+        // its memo slot and the height it was made at.
+        let stored = |tree: &Partial<DEPTH>, position: u64| -> Result<Option<(Commitment, Digest, u32)>, Error> {
+            Ok(match snap.output(position)? {
+                Some((r, true)) if tree.leaf(position) != EMPTY => {
+                    Some((r.commitment, crate::output::memo_slot(&r.memo, r.amount), r.height))
+                }
+                _ => None,
+            })
+        };
+        let mut next = first;
+        let mut isp = initial_inputs_state();
+        let mut osp = initial_outputs_state();
+        let mut nsp = initial_names_state();
+        let mut bsp = [Fp::ZERO; WIDTH];
+        let mut out_segments = Vec::with_capacity(segments.len());
+        for parts in segments {
+            let root_in = root_now(&tree);
+            let pos_in = next;
+            let (isp_in, osp_in, nsp_in) = (isp, osp, nsp);
+            let mut out = Vec::with_capacity(parts.len());
+            for part in parts {
+                let tx = &txs[part.tx];
+                assert!(tx.policy_inputs.len() <= 1, "one policy input per transaction");
+                let (n_in, n_pol, n_out, n_ops) =
+                    (tx.inputs.len(), tx.policy_inputs.len(), tx.outputs.len(), tx.ops.len());
+                assert!(part.start <= part.end && part.end <= n_in + n_pol + n_out + n_ops, "part out of range");
+                assert!(
+                    n_pol == 0 || (part.start == 0 && part.end == n_in + n_pol + n_out + n_ops),
+                    "a policy spend stays whole"
+                );
+                let resume = if part.start == 0 {
+                    bsp = body_init(n_in as u32, n_out as u32, n_ops as u32, n_pol as u32);
+                    None
+                } else {
+                    Some(bsp)
+                };
+                let mut inputs = Vec::new();
+                let mut policy = None;
+                let mut outputs = Vec::new();
+                let mut ops = Vec::new();
+                for k in part.start..part.end {
+                    if k >= n_in && k < n_in + n_pol {
+                        let p = &tx.policy_inputs[k - n_in];
+                        let (memo, created) = match stored(&tree, p.position)? {
+                            Some((c, memo, created)) if c == p.commitment() => (memo, created),
+                            _ => return Err(Error::NoSuchOutput(p.position)),
+                        };
+                        // The siblings are not changed by the removal.
+                        let siblings = tree.path(p.position);
+                        tree.set(p.position, &EMPTY);
+                        absorb_position(&mut isp, p.position);
+                        body_absorb_policy(&mut bsp, &p.policy(), p.amount);
+                        let covered = p.covered_outputs(&tx.outputs).unwrap_or_default();
+                        let mut w = PolicyWitness { input: p.clone(), memo, created, siblings, rmsg: EMPTY };
+                        if let Some(channel) = w.rebind_channel() {
+                            w.rmsg = crate::policy::rebind_message(&channel, p.state, &covered);
+                        }
+                        policy = Some(w);
+                        continue;
+                    }
+                    let k = if k > n_in { k - n_pol } else { k };
+                    if k < n_in {
+                        let inp = &tx.inputs[k];
+                        let (commitment, position) = (inp.commitment(), inp.position);
+                        let (memo, created) = match stored(&tree, position)? {
+                            Some((c, memo, created)) if c == commitment => (memo, created),
+                            // Tests: a lenient generator (`stark::lenient`)
+                            // goes on with what a cheater would claim.
+                            Some((_, memo, created)) if crate::stark::lenient() => (memo, created),
+                            None if crate::stark::lenient() => (EMPTY, 0),
+                            _ => return Err(Error::NoSuchOutput(position)),
+                        };
+                        let siblings = tree.path(position);
+                        tree.set(position, &EMPTY);
+                        absorb_position(&mut isp, position);
+                        body_absorb_input(&mut bsp, &inp.pubkey, inp.amount);
+                        inputs.push(InputWitness {
+                            pubkey: inp.pubkey,
+                            amount: inp.amount,
+                            memo,
+                            height: created,
+                            signature: inp.signature.clone(),
+                            position,
+                            siblings,
+                        });
+                    } else if k < n_in + n_out {
+                        let o = &tx.outputs[k - n_in];
+                        let siblings = tree.path(next);
+                        tree.set(next, &crate::output::leaf(&o.commitment, &o.slot(), height));
+                        next += 1;
+                        absorb_output(&mut osp, &o.commitment, &o.slot());
+                        body_absorb_output(&mut bsp, o);
+                        outputs.push(OutputWitness { output: *o, siblings });
+                    } else {
+                        let digest = tx.ops[k - n_in - n_out].digest();
+                        absorb_op(&mut nsp, &digest);
+                        body_absorb_op(&mut bsp, &digest);
+                        ops.push(digest);
+                    }
+                }
+                out.push(TxWitness {
+                    inputs,
+                    policy,
+                    outputs,
+                    ops,
+                    message: tx.body_hash(),
+                    in_left: n_in.saturating_sub(part.start) as u32,
+                    out_left: n_out.saturating_sub(part.start.saturating_sub(n_in + n_pol)) as u32,
+                    ops_left: (n_ops - part.start.saturating_sub(n_in + n_pol + n_out)) as u32,
+                    pol_left: n_pol.saturating_sub(part.start.saturating_sub(n_in)) as u32,
+                    resume,
+                    ends: part.end == n_in + n_pol + n_out + n_ops,
+                });
+            }
+            out_segments.push(SegmentWitness { height, root_in, isp_in, osp_in, nsp_in, pos_in, txs: out });
+        }
+        Ok(out_segments)
+    }
+
+    pub fn positions(&self) -> Vec<u64> {
+        self.txs
+            .iter()
+            .flat_map(|t| t.inputs.iter().map(|i| i.position).chain(t.policy.iter().map(|p| p.input.position)))
+            .collect()
+    }
+
+    pub fn outputs(&self) -> Vec<Output> {
+        self.txs.iter().flat_map(|t| t.outputs.iter().map(|o| o.output)).collect()
+    }
+
+    /// The segment's output commitments, as they appear in the block.
+    pub fn commitments(&self) -> Vec<Commitment> {
+        self.txs.iter().flat_map(|t| t.outputs.iter().map(|o| o.output.commitment)).collect()
+    }
+
+    /// The outputs as a block lists them: commitment, memo and amount.
+    pub fn block_outputs(&self) -> Vec<BlockOutput> {
+        self.txs.iter().flat_map(|t| t.outputs.iter().map(|o| o.output.block_output())).collect()
+    }
+
+    /// Trace rows before padding; a trace needs at least one more.
+    pub fn num_rows(&self) -> usize {
+        self.txs.iter().map(TxWitness::num_rows).sum()
+    }
+}
+
+/// Trace rows a transaction occupies in a segment.
+pub fn tx_rows(tx: &Transaction) -> usize {
+    2 + item_rows_of(tx).0.iter().sum::<usize>()
+}
+
+// ---------------------------------------------------------------------------
+// Trace generation
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct Regs {
+    xmss: xmss_fragment::Regs,
+    level: u32,
+    pbits: [Fp; DEPTH],
+    root: Digest,
+    old: Digest,
+    new: Digest,
+    is_out: bool,
+    msg: Digest,
+    bsp: [Fp; WIDTH],
+    isp: [Fp; WIDTH],
+    osp: [Fp; WIDTH],
+    pkroot: Digest,
+    ocm: Digest,
+    amount: u64,
+    sum_in: [u32; LIMBS],
+    sum_out: [u32; LIMBS],
+    opos: u64,
+    in_left: u32,
+    out_left: u32,
+    open: bool,
+    /// The current item's memo slot.
+    memo: Digest,
+    leaf: Digest,
+    opd: Digest,
+    nsp: [Fp; WIDTH],
+    ops_left: u32,
+    // policy input
+    pol: bool,
+    pin: bool,
+    pol_left: u32,
+    pstate: u32,
+    cvb: u32,
+    cvn: u32,
+    inrun: bool,
+    created: u32,
+    smsg: Digest,
+    rmsg: Digest,
+    pidx: usize,
+    llen: u32,
+    lcnt: u32,
+    lsp: [Fp; WIDTH],
+    nc: u32,
+    tags: [u32; LEAF_CONDS],
+    m: u32,
+    krem: u32,
+    srem: u32,
+    hadthr: bool,
+    rebind: bool,
+    chan: Digest,
+    hascov: bool,
+    rundone: bool,
+    cov: Digest,
+    proot: Digest,
+    ksp: [Fp; WIDTH],
+    ssp: [Fp; WIDTH],
+    csp: [Fp; WIDTH],
+}
+
+impl Regs {
+    /// Clears the policy registers a transaction start resets; the rest
+    /// hold their last values until the rows that set them.
+    fn reset_policy(&mut self) {
+        self.pol = false;
+        self.pin = false;
+        self.pol_left = 0;
+        self.cvb = 0;
+        self.cvn = 0;
+        self.inrun = false;
+        self.rebind = false;
+        self.m = 0;
+        self.srem = 0;
+        self.hadthr = false;
+        self.hascov = false;
+        self.rundone = false;
+    }
+
+    fn write(&self, row: &mut [Fp]) {
+        self.xmss.write(row, &XCOLS);
+        self.write_rest(row);
+    }
+
+    /// Everything but the signature fragment's registers.
+    fn write_rest(&self, row: &mut [Fp]) {
+        row[C_LEVEL] = Fp::new(self.level);
+        let diff = Fp::new(self.level) - Fp::new((DEPTH - 1) as u32);
+        let is_last = diff.is_zero();
+        row[C_IS_LAST] = Fp::new(is_last as u32);
+        row[C_LEVEL_INV] = if is_last { Fp::ZERO } else { diff.inverse().unwrap() };
+        row[C_SMT_END] = Fp::new((is_last && row[T_NEW] == Fp::ONE) as u32);
+        row[R_PBITS..R_PBITS + DEPTH].copy_from_slice(&self.pbits);
+        row[R_ROOT..R_ROOT + DIGEST].copy_from_slice(&self.root);
+        row[R_OLD..R_OLD + DIGEST].copy_from_slice(&self.old);
+        row[R_NEW..R_NEW + DIGEST].copy_from_slice(&self.new);
+        row[R_IS_OUT] = Fp::new(self.is_out as u32);
+        row[C_OUT_END] = Fp::new((row[C_SMT_END] == Fp::ONE && self.is_out) as u32);
+        row[R_MSG..R_MSG + DIGEST].copy_from_slice(&self.msg);
+        row[R_BSP..R_BSP + WIDTH].copy_from_slice(&self.bsp);
+        row[R_ISP..R_ISP + WIDTH].copy_from_slice(&self.isp);
+        row[R_OSP..R_OSP + WIDTH].copy_from_slice(&self.osp);
+        row[R_PKROOT..R_PKROOT + DIGEST].copy_from_slice(&self.pkroot);
+        row[R_OCM..R_OCM + DIGEST].copy_from_slice(&self.ocm);
+        for i in 0..AMOUNT_BITS {
+            row[R_ABITS + i] = Fp::new(((self.amount >> i) & 1) as u32);
+        }
+        for j in 0..LIMBS {
+            row[R_SUM_IN + j] = Fp::new(self.sum_in[j]);
+            row[R_SUM_OUT + j] = Fp::new(self.sum_out[j]);
+        }
+        let lo = (self.opos & MASK30) as u32;
+        row[R_OPOS_LO] = Fp::new(lo);
+        row[R_OPOS_HI] = Fp::new((self.opos >> 30) as u32);
+        let diff = Fp::new(lo) - Fp::new((1 << 30) - 1);
+        let wrap = diff.is_zero();
+        row[C_WRAP] = Fp::new(wrap as u32);
+        row[C_WRAP_INV] = if wrap { Fp::ZERO } else { diff.inverse().unwrap() };
+        row[R_IN_LEFT] = Fp::new(self.in_left);
+        row[R_OUT_LEFT] = Fp::new(self.out_left);
+        let in_zero = self.in_left == 0;
+        let out_zero = self.out_left == 0;
+        row[C_IN_ZERO] = Fp::new(in_zero as u32);
+        row[C_IN_INV] = if in_zero { Fp::ZERO } else { Fp::new(self.in_left).inverse().unwrap() };
+        row[C_OUT_ZERO] = Fp::new(out_zero as u32);
+        row[C_OUT_INV] = if out_zero { Fp::ZERO } else { Fp::new(self.out_left).inverse().unwrap() };
+        let ops_zero = self.ops_left == 0;
+        row[R_OPS_LEFT] = Fp::new(self.ops_left);
+        row[C_OPS_ZERO] = Fp::new(ops_zero as u32);
+        row[C_OPS_INV] = if ops_zero { Fp::ZERO } else { Fp::new(self.ops_left).inverse().unwrap() };
+        let in_done = in_zero && self.pol_left == 0;
+        row[C_GO_OUT] = Fp::new((in_done && !out_zero) as u32);
+        row[C_GO_OPS] = Fp::new((in_done && out_zero && !ops_zero) as u32);
+        row[C_GO_END] = Fp::new((in_done && out_zero && ops_zero) as u32);
+        row[R_OPEN] = Fp::new(self.open as u32);
+        row[R_MEMO..R_MEMO + DIGEST].copy_from_slice(&self.memo);
+        row[R_LEAF..R_LEAF + DIGEST].copy_from_slice(&self.leaf);
+        row[R_OPD..R_OPD + DIGEST].copy_from_slice(&self.opd);
+        row[R_NSP..R_NSP + WIDTH].copy_from_slice(&self.nsp);
+        // policy input
+        let zero_test = |row: &mut [Fp], v: u32, zero_col: usize, inv_col: usize| {
+            row[zero_col] = Fp::new((v == 0) as u32);
+            row[inv_col] = if v == 0 { Fp::ZERO } else { Fp::new(v).inverse().unwrap() };
+        };
+        row[R_POL] = Fp::new(self.pol as u32);
+        row[R_PIN] = Fp::new(self.pin as u32);
+        row[R_POL_LEFT] = Fp::new(self.pol_left);
+        row[C_IN_DONE] = Fp::new((in_zero && self.pol_left == 0) as u32);
+        row[C_GO_POL] = Fp::new((in_zero && self.pol_left != 0) as u32);
+        row[R_PSTATE] = Fp::new(self.pstate);
+        row[R_CVB] = Fp::new(self.cvb);
+        row[R_CVN] = Fp::new(self.cvn);
+        zero_test(row, self.cvb, C_CVB_ZERO, C_CVB_INV);
+        zero_test(row, self.cvn, C_CVN_ZERO, C_CVN_INV);
+        row[R_INRUN] = Fp::new(self.inrun as u32);
+        row[R_CREATED] = Fp::new(self.created);
+        row[R_SMSG..R_SMSG + DIGEST].copy_from_slice(&self.smsg);
+        row[R_RMSG..R_RMSG + DIGEST].copy_from_slice(&self.rmsg);
+        for i in 0..POLICY_DEPTH {
+            row[R_PIDX + i] = Fp::new(((self.pidx >> i) & 1) as u32);
+        }
+        row[R_LLEN] = Fp::new(self.llen);
+        row[R_LCNT] = Fp::new(self.lcnt);
+        row[R_LSP..R_LSP + WIDTH].copy_from_slice(&self.lsp);
+        row[R_NC] = Fp::new(self.nc);
+        zero_test(row, self.nc, C_NC_ZERO, C_NC_INV);
+        for k in 0..LEAF_CONDS {
+            row[R_TAG + k] = Fp::new(self.tags[k]);
+        }
+        row[R_M] = Fp::new(self.m);
+        row[C_M_INV] = if self.m == 0 { Fp::ZERO } else { Fp::new(self.m).inverse().unwrap() };
+        row[R_KREM] = Fp::new(self.krem);
+        zero_test(row, self.krem, C_KLAST, C_KLAST_INV);
+        row[R_SREM] = Fp::new(self.srem);
+        zero_test(row, self.srem, C_SREM_ZERO, C_SREM_INV);
+        row[R_HADTHR] = Fp::new(self.hadthr as u32);
+        row[R_REBIND] = Fp::new(self.rebind as u32);
+        row[R_CHAN..R_CHAN + DIGEST].copy_from_slice(&self.chan);
+        row[R_HASCOV] = Fp::new(self.hascov as u32);
+        row[R_NEEDRUN] = Fp::new((self.rebind || self.hascov) as u32);
+        row[R_RUNDONE] = Fp::new(self.rundone as u32);
+        row[R_COV..R_COV + DIGEST].copy_from_slice(&self.cov);
+        row[R_PROOT..R_PROOT + DIGEST].copy_from_slice(&self.proot);
+        row[R_KSP..R_KSP + WIDTH].copy_from_slice(&self.ksp);
+        row[R_SSP..R_SSP + WIDTH].copy_from_slice(&self.ssp);
+        row[R_CSP..R_CSP + WIDTH].copy_from_slice(&self.csp);
+        // Dispatch rows: a covered output and the run's end detour first.
+        let out_end = row[C_OUT_END] == Fp::ONE;
+        let disp = row[T_TX_START] == Fp::ONE
+            || row[T_BODY_IN1] == Fp::ONE
+            || (out_end && !self.inrun)
+            || row[T_OP_LIST] == Fp::ONE
+            || row[T_RESUME] == Fp::ONE
+            || row[T_RB2] == Fp::ONE
+            || (row[T_CVM] == Fp::ONE && self.cvn != 0);
+        row[C_DISP] = Fp::new(disp as u32);
+        // Condition ends that do not depend on the next row; a key row's is
+        // set by the generator.
+        let cend = [T_LHDR, T_HASH, T_AFTER, T_OLDER, T_STATE, T_OUTS].iter().any(|&t| row[t] == Fp::ONE)
+            || (row[T_KSEL] == Fp::ONE && self.krem == 0);
+        row[C_CEND] = Fp::new(cend as u32);
+    }
+}
+
+fn compress_input(node: &Digest, sib: &Digest, right: bool) -> [Fp; WIDTH] {
+    let mut input = [Fp::ZERO; WIDTH];
+    let (a, c) = if right { (sib, node) } else { (node, sib) };
+    input[..DIGEST].copy_from_slice(a);
+    input[DIGEST..].copy_from_slice(c);
+    input
+}
+
+fn amt_block(amount: u64) -> [Fp; RATE] {
+    let mut blk = [Fp::ZERO; RATE];
+    blk[..3].copy_from_slice(&amount_fps(amount));
+    blk
+}
+
+struct Gen {
+    b: HashTraceBuilder,
+    regs: Regs,
+    /// The block's height: every output's creation height.
+    height: u32,
+}
+
+impl Gen {
+    /// Pushes a register-sponge start row: `input = sp + [block, 0]`.
+    fn sponge_start(&mut self, sp: [Fp; WIDTH], block: [Fp; RATE], ty: usize) -> [Fp; WIDTH] {
+        let mut input = sp;
+        for (s, x) in input.iter_mut().zip(&block) {
+            *s = s.add(x);
+        }
+        self.b.start(input);
+        let row = self.b.last_row_mut();
+        row[ty] = Fp::ONE;
+        self.regs.write(row);
+        self.b.state()
+    }
+
+    /// The leaf rows: the commitment and the memo register compressed
+    /// (`ty`), then that compressed with the creation height (`ty2`).
+    fn leaf_rows(&mut self, commitment: Digest, height: u32, ty: usize, ty2: usize) -> Digest {
+        let mut input = [Fp::ZERO; WIDTH];
+        input[..DIGEST].copy_from_slice(&commitment);
+        input[DIGEST..].copy_from_slice(&self.regs.memo);
+        self.b.start(input);
+        let row = self.b.last_row_mut();
+        row[ty] = Fp::ONE;
+        self.regs.write(row);
+        let inner = self.b.acc();
+        let mut input = [Fp::ZERO; WIDTH];
+        input[..DIGEST].copy_from_slice(&inner);
+        input[DIGEST..].copy_from_slice(&crate::output::height_digest(height));
+        self.b.start(input);
+        let row = self.b.last_row_mut();
+        row[ty2] = Fp::ONE;
+        self.regs.write(row);
+        let leaf = self.b.acc();
+        debug_assert_eq!(leaf, crate::output::leaf(&commitment, &self.regs.memo, height));
+        leaf
+    }
+
+    fn absorb(&mut self, block: [Fp; RATE], ty: usize) -> [Fp; WIDTH] {
+        self.b.absorb(block);
+        let row = self.b.last_row_mut();
+        row[ty] = Fp::ONE;
+        self.regs.write(row);
+        self.b.state()
+    }
+
+    fn smt_update(&mut self, position: u64, siblings: &[Digest; DEPTH]) {
+        // Caller has set regs.old / regs.new / regs.pbits / regs.level = 0.
+        let mut old_node = self.regs.old;
+        let mut new_node = self.regs.new;
+        for (level, sib) in siblings.iter().enumerate() {
+            let right = (position >> level) & 1 == 1;
+            self.regs.level = level as u32;
+            self.regs.xmss.sib = *sib;
+            self.b.start(compress_input(&old_node, &self.regs.xmss.sib, right));
+            {
+                let row = self.b.last_row_mut();
+                row[T_OLD] = Fp::ONE;
+                row[COL_DIR] = Fp::new(right as u32);
+                self.regs.write(row);
+            }
+            old_node = self.b.acc();
+            self.regs.old = old_node;
+            self.b.start(compress_input(&new_node, &self.regs.xmss.sib, right));
+            {
+                let row = self.b.last_row_mut();
+                row[T_NEW] = Fp::ONE;
+                row[COL_DIR] = Fp::new(right as u32);
+                self.regs.write(row);
+            }
+            new_node = self.b.acc();
+            if level + 1 < DEPTH {
+                self.regs.new = new_node;
+                for i in 0..DEPTH - 1 {
+                    self.regs.pbits[i] = self.regs.pbits[i + 1];
+                }
+                self.regs.pbits[DEPTH - 1] = Fp::ZERO;
+            }
+        }
+        crate::stark::refuse(old_node == self.regs.root, "old path does not reach the current root");
+        self.regs.root = new_node;
+    }
+
+    fn input(&mut self, w: &InputWitness) {
+        let ps = w.pubkey.pub_seed;
+        let r = &mut self.regs;
+        r.memo = w.memo;
+        r.amount = w.amount;
+        r.is_out = false;
+        r.in_left -= 1;
+        let msg = r.smsg;
+
+        // the signature
+        let mut xr = self.regs.xmss.clone();
+        let regs = &self.regs;
+        let root = xmss_fragment::generate(
+            &mut self.b,
+            &mut xr,
+            &XCOLS,
+            &XTYPES,
+            &msg,
+            &w.signature,
+            &w.pubkey,
+            &mut |row, _| regs.write_rest(row),
+        );
+        self.regs.xmss = xr;
+        self.regs.pkroot = root;
+
+        // key hash and commitment
+        let mut input = [Fp::ZERO; WIDTH];
+        input[..RATE].copy_from_slice(&root);
+        input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_PUBKEY, (DIGEST + PUB_SEED_LEN + 1) as u32));
+        self.b.start(input);
+        {
+            let row = self.b.last_row_mut();
+            row[T_PKH0] = Fp::ONE;
+            self.regs.write(row);
+        }
+        let mut seed_block = [Fp::ZERO; RATE];
+        seed_block[..PUB_SEED_LEN].copy_from_slice(&ps);
+        seed_block[PUB_SEED_LEN] = Fp::new(w.pubkey.height as u32);
+        self.absorb(seed_block, T_PKH1);
+        let pkh = self.b.acc();
+        let mut input = [Fp::ZERO; WIDTH];
+        input[..RATE].copy_from_slice(&pkh);
+        input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_COMMITMENT, (DIGEST + 3) as u32));
+        self.b.start(input);
+        {
+            let row = self.b.last_row_mut();
+            row[T_CM0] = Fp::ONE;
+            self.regs.write(row);
+        }
+        self.absorb(amt_block(w.amount), T_CM1);
+        let commitment = self.b.acc();
+        for (acc, limb) in self.regs.sum_in.iter_mut().zip(limbs16(w.amount)) {
+            *acc += limb.to_canonical();
+        }
+        let leaf = self.leaf_rows(commitment, w.height, T_ILEAF, T_ILEAF2);
+
+        // inputs list row, then the removal
+        self.regs.old = leaf;
+        self.regs.new = EMPTY;
+        self.regs.level = 0;
+        self.regs.pbits = core::array::from_fn(|i| Fp::new(((w.position >> i) & 1) as u32));
+        let mut blk = [Fp::ZERO; RATE];
+        blk[0] = Fp::new((w.position & MASK30) as u32);
+        blk[1] = Fp::new((w.position >> 30) as u32);
+        let isp = self.regs.isp;
+        let out = self.sponge_start(isp, blk, T_ILIST);
+        self.regs.isp = out;
+        self.smt_update(w.position, &w.siblings);
+
+        // body rows
+        let bsp = self.regs.bsp;
+        let out = self.sponge_start(bsp, root, T_BODY_IN0);
+        self.regs.bsp = out;
+        let mut blk = [Fp::ZERO; RATE];
+        blk[..PUB_SEED_LEN].copy_from_slice(&ps);
+        blk[PUB_SEED_LEN..PUB_SEED_LEN + 3].copy_from_slice(&amount_fps(w.amount));
+        let out = self.absorb(blk, T_BODY_IN1);
+        self.regs.bsp = out;
+    }
+
+    /// A leaf-sponge row: `block` added to the leaf sponge register.
+    fn leaf_absorb(&mut self, block: [Fp; RATE], ty: usize) {
+        let lsp = self.regs.lsp;
+        self.regs.lcnt += 1;
+        let out = self.sponge_start(lsp, block, ty);
+        self.regs.lsp = out;
+    }
+
+    /// The key hash rows after a signature: the fragment's root hashed with
+    /// the public seed and tree height. Returns the key hash.
+    fn key_hash_rows(&mut self, root: Digest, pk: &PublicKey) -> Digest {
+        let mut input = [Fp::ZERO; WIDTH];
+        input[..RATE].copy_from_slice(&root);
+        input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_PUBKEY, (DIGEST + PUB_SEED_LEN + 1) as u32));
+        self.b.start(input);
+        {
+            let row = self.b.last_row_mut();
+            row[T_PKH0] = Fp::ONE;
+            self.regs.write(row);
+        }
+        let mut seed_block = [Fp::ZERO; RATE];
+        seed_block[..PUB_SEED_LEN].copy_from_slice(&pk.pub_seed);
+        seed_block[PUB_SEED_LEN] = Fp::new(pk.height as u32);
+        self.absorb(seed_block, T_PKH1);
+        self.b.acc()
+    }
+
+    /// One signature's rows: the fragment, then the key hash rows.
+    fn signature_rows(&mut self, sig: &Sig, pk: &PublicKey) -> Digest {
+        let msg = self.regs.smsg;
+        let mut xr = self.regs.xmss.clone();
+        let regs = &self.regs;
+        let root = xmss_fragment::generate(&mut self.b, &mut xr, &XCOLS, &XTYPES, &msg, sig, pk, &mut |row, _| {
+            regs.write_rest(row)
+        });
+        self.regs.xmss = xr;
+        self.regs.pkroot = root;
+        self.key_hash_rows(root, pk)
+    }
+
+    fn policy(&mut self, w: &PolicyWitness) {
+        let p = &w.input;
+        let blocks = p.leaf.blocks();
+        let channel = w.rebind_channel();
+        let height = self.height;
+        {
+            let r = &mut self.regs;
+            r.pol = true;
+            r.pin = true;
+            r.pol_left -= 1;
+            r.memo = w.memo;
+            r.amount = p.amount;
+            r.is_out = false;
+            r.pstate = p.state;
+            r.cvb = p.covered.0 as u32;
+            r.cvn = p.covered.1 as u32;
+            r.created = w.created;
+            r.rmsg = w.rmsg;
+            r.pidx = p.index as usize;
+            r.llen = (blocks.len() * DIGEST) as u32;
+            r.chan = channel.unwrap_or(EMPTY);
+            r.smsg = if channel.is_some() { w.rmsg } else { r.msg };
+        }
+        // start
+        self.b.pass();
+        {
+            let row = self.b.last_row_mut();
+            row[T_PSTART] = Fp::ONE;
+            self.regs.write(row);
+        }
+        // the covered-run sponge: the count block
+        let cvn = self.regs.cvn;
+        let mut input = [Fp::ZERO; WIDTH];
+        input[0] = Fp::new(cvn);
+        input[RATE..].copy_from_slice(&cap_const::<Fp>(crate::hash::DOM_COVERED, 8 + 16 * cvn));
+        self.b.start(input);
+        {
+            let row = self.b.last_row_mut();
+            row[T_CVS] = Fp::ONE;
+            self.regs.write(row);
+        }
+        self.regs.csp = self.b.state();
+        // the leaf header
+        let header = blocks[0];
+        {
+            let r = &mut self.regs;
+            r.nc = p.leaf.conds.len() as u32;
+            for k in 0..LEAF_CONDS {
+                r.tags[k] = header[1 + k].to_canonical();
+            }
+            r.lcnt = 1;
+        }
+        let mut input = [Fp::ZERO; WIDTH];
+        input[..RATE].copy_from_slice(&header);
+        input[RATE..].copy_from_slice(&cap_const::<Fp>(crate::hash::DOM_POLICY_LEAF, self.regs.llen));
+        self.b.start(input);
+        {
+            let row = self.b.last_row_mut();
+            row[T_LHDR] = Fp::ONE;
+            self.regs.write(row);
+        }
+        self.regs.lsp = self.b.state();
+        // the conditions
+        let mut bi = 1;
+        for (cond, wit) in p.leaf.conds.iter().zip(&p.witness) {
+            {
+                let r = &mut self.regs;
+                r.nc -= 1;
+                for k in 0..LEAF_CONDS - 1 {
+                    r.tags[k] = r.tags[k + 1];
+                }
+                r.tags[LEAF_CONDS - 1] = 0;
+            }
+            match (cond, wit) {
+                (Cond::Thresh { mode, m, keys }, CondWitness::Signatures(signers)) => {
+                    let n = keys.len() as u32;
+                    {
+                        let r = &mut self.regs;
+                        r.rebind = matches!(mode, crate::policy::Mode::Rebindable { .. });
+                        r.m = *m as u32;
+                        r.krem = n;
+                        r.srem = *m as u32;
+                        r.hadthr = true;
+                        let mut init = [Fp::ZERO; WIDTH];
+                        init[RATE..]
+                            .copy_from_slice(&cap_const::<Fp>(crate::hash::DOM_SIGNERS, *m as u32 * DIGEST as u32));
+                        r.ksp = init;
+                        r.ssp = init;
+                    }
+                    self.leaf_absorb(blocks[bi], T_THR);
+                    bi += 1;
+                    self.leaf_absorb(blocks[bi], T_CHAN);
+                    bi += 1;
+                    for j in 0..keys.len() {
+                        let selected = signers.iter().any(|s| s.key as usize == j);
+                        self.regs.krem -= 1;
+                        self.leaf_absorb(blocks[bi], T_KEY);
+                        {
+                            let last = self.regs.krem == 0;
+                            let row = self.b.last_row_mut();
+                            row[C_CEND] = Fp::new((last && !selected) as u32);
+                        }
+                        if selected {
+                            let ksp = self.regs.ksp;
+                            let out = self.sponge_start(ksp, blocks[bi], T_KSEL);
+                            self.regs.ksp = out;
+                        }
+                        bi += 1;
+                    }
+                }
+                (Cond::Hash(_), CondWitness::Preimage(preimage)) => {
+                    let mut input = [Fp::ZERO; WIDTH];
+                    input[..RATE].copy_from_slice(preimage);
+                    input[RATE..].copy_from_slice(&cap_const::<Fp>(crate::hash::DOM_HASHLOCK, DIGEST as u32));
+                    self.b.start(input);
+                    {
+                        let row = self.b.last_row_mut();
+                        row[T_HL] = Fp::ONE;
+                        self.regs.write(row);
+                    }
+                    crate::stark::refuse(self.b.acc() == blocks[bi], "preimage does not open the hash lock");
+                    self.leaf_absorb(blocks[bi], T_HASH);
+                    bi += 1;
+                }
+                (Cond::After(v), CondWitness::None)
+                | (Cond::Older(v), CondWitness::None)
+                | (Cond::State(v), CondWitness::None) => {
+                    let (ty, value) = match cond {
+                        Cond::After(_) => (T_AFTER, height as i64 - *v as i64),
+                        Cond::Older(_) => (T_OLDER, height as i64 - self.regs.created as i64 - *v as i64),
+                        _ => (T_STATE, self.regs.pstate as i64 - *v as i64 - 1),
+                    };
+                    crate::stark::refuse((0..1 << 31).contains(&value), "a policy condition's lock has not passed");
+                    self.leaf_absorb(blocks[bi], ty);
+                    bi += 1;
+                    let ksel = self.regs.xmss.ksel;
+                    let row = self.b.last_row_mut();
+                    xmss_fragment::write_bits(row, &XCOLS, value as u32, ksel);
+                }
+                (Cond::Outputs(list), CondWitness::None) => {
+                    self.regs.cov = crate::policy::covered_digest(list);
+                    self.regs.hascov = true;
+                    self.leaf_absorb(blocks[bi], T_OUTS);
+                    bi += 1;
+                }
+                _ => panic!("a policy witness does not fit its condition"),
+            }
+        }
+        assert_eq!(bi, blocks.len());
+        assert_eq!(self.regs.lcnt as usize * DIGEST, self.regs.llen as usize);
+        // the path to the policy root, from the leaf sponge's digest
+        let mut node: Digest = self.regs.lsp[..DIGEST].try_into().unwrap();
+        debug_assert_eq!(node, p.leaf.hash(), "leaf sponge");
+        for (k, ty) in [T_PP0, T_PP1, T_PP2, T_PP3].into_iter().enumerate() {
+            let right = (p.index as usize >> k) & 1 == 1;
+            let sib = p.siblings[k];
+            self.regs.xmss.sib = sib;
+            self.b.start(compress_input(&node, &sib, right));
+            {
+                let row = self.b.last_row_mut();
+                row[ty] = Fp::ONE;
+                self.regs.write(row);
+            }
+            node = self.b.acc();
+        }
+        self.regs.proot = node;
+        crate::stark::refuse(node == p.policy(), "policy path does not reach the policy");
+        // the signatures, each into the signers sponge
+        for wit in &p.witness {
+            let CondWitness::Signatures(signers) = wit else { continue };
+            for signer in signers {
+                let pkh = self.signature_rows(&signer.signature, &signer.pubkey);
+                self.regs.srem -= 1;
+                let ssp = self.regs.ssp;
+                let out = self.sponge_start(ssp, pkh, T_PSIG);
+                self.regs.ssp = out;
+            }
+        }
+        crate::stark::refuse(self.regs.ksp == self.regs.ssp, "signers are not the selected keys");
+        self.b.pass();
+        {
+            let row = self.b.last_row_mut();
+            row[T_PEND] = Fp::ONE;
+            self.regs.write(row);
+        }
+        // the commitment from the policy root and amount
+        let mut input = [Fp::ZERO; WIDTH];
+        input[..RATE].copy_from_slice(&node);
+        input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_COMMITMENT, (DIGEST + 3) as u32));
+        self.b.start(input);
+        {
+            let row = self.b.last_row_mut();
+            row[T_CM0] = Fp::ONE;
+            self.regs.write(row);
+        }
+        self.absorb(amt_block(p.amount), T_CM1);
+        let commitment = self.b.acc();
+        crate::stark::refuse(commitment == p.commitment(), "policy input commitment");
+        for (acc, limb) in self.regs.sum_in.iter_mut().zip(limbs16(p.amount)) {
+            *acc += limb.to_canonical();
+        }
+        let leaf = self.leaf_rows(commitment, w.created, T_ILEAF, T_ILEAF2);
+        self.regs.old = leaf;
+        self.regs.new = EMPTY;
+        self.regs.level = 0;
+        self.regs.pbits = core::array::from_fn(|i| Fp::new(((p.position >> i) & 1) as u32));
+        let mut blk = [Fp::ZERO; RATE];
+        blk[0] = Fp::new((p.position & MASK30) as u32);
+        blk[1] = Fp::new((p.position >> 30) as u32);
+        let isp = self.regs.isp;
+        let out = self.sponge_start(isp, blk, T_ILIST);
+        self.regs.isp = out;
+        self.smt_update(p.position, &w.siblings);
+        // body: the policy root, then the amount with the policy marker
+        let bsp = self.regs.bsp;
+        let out = self.sponge_start(bsp, node, T_BODY_IN0);
+        self.regs.bsp = out;
+        let mut blk = [Fp::ZERO; RATE];
+        blk[PUB_SEED_LEN..PUB_SEED_LEN + 3].copy_from_slice(&amount_fps(p.amount));
+        blk[RATE - 1] = Fp::ONE;
+        let out = self.absorb(blk, T_BODY_IN1);
+        self.regs.bsp = out;
+        self.regs.pin = false;
+        self.regs.smsg = self.regs.msg;
+    }
+
+    /// The covered-run rows after an output in the run, and the run's end.
+    fn covered_rows(&mut self) {
+        if !self.regs.inrun {
+            return;
+        }
+        let csp = self.regs.csp;
+        let out = self.sponge_start(csp, self.regs.ocm, T_CVC);
+        self.regs.csp = out;
+        let csp = self.regs.csp;
+        let out = self.sponge_start(csp, self.regs.memo, T_CVM);
+        self.regs.csp = out;
+        if self.regs.cvn != 0 {
+            return;
+        }
+        let mut input = [Fp::ZERO; WIDTH];
+        input[..RATE].copy_from_slice(&self.regs.chan);
+        input[RATE..].copy_from_slice(&cap_const::<Fp>(crate::hash::DOM_REBIND, (2 * DIGEST + 1) as u32));
+        self.b.start(input);
+        {
+            let row = self.b.last_row_mut();
+            row[T_RB0] = Fp::ONE;
+            self.regs.write(row);
+        }
+        let mut blk = [Fp::ZERO; RATE];
+        blk[0] = Fp::new(self.regs.pstate);
+        blk[1..].copy_from_slice(&self.regs.csp[..RATE - 1]);
+        self.absorb(blk, T_RB1);
+        let mut blk = [Fp::ZERO; RATE];
+        blk[0] = self.regs.csp[RATE - 1];
+        self.absorb(blk, T_RB2);
+        if self.regs.rebind {
+            crate::stark::refuse(
+                self.b.acc() == self.regs.rmsg,
+                "rebindable message does not match the covered outputs",
+            );
+        }
+        if self.regs.hascov {
+            crate::stark::refuse(
+                self.regs.csp[..DIGEST] == self.regs.cov[..],
+                "covered outputs are not the covenant's",
+            );
+        }
+        self.regs.rundone = true;
+    }
+
+    fn output(&mut self, w: &OutputWitness) {
+        let o = &w.output;
+        let r = &mut self.regs;
+        if r.cvb > 0 {
+            r.cvb -= 1;
+            r.inrun = false;
+        } else if r.cvn > 0 {
+            r.cvn -= 1;
+            r.inrun = true;
+        } else {
+            r.inrun = false;
+        }
+        r.ocm = o.commitment;
+        r.memo = o.slot();
+        r.amount = o.amount;
+        r.is_out = true;
+        r.out_left -= 1;
+        let osp = r.osp;
+        let mut input = [Fp::ZERO; WIDTH];
+        input[..RATE].copy_from_slice(&o.key_hash);
+        input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_COMMITMENT, (DIGEST + 3) as u32));
+        self.b.start(input);
+        {
+            let row = self.b.last_row_mut();
+            row[T_OCM0] = Fp::ONE;
+            self.regs.write(row);
+        }
+        self.absorb(amt_block(o.amount), T_OCM1);
+        crate::stark::refuse(self.b.acc() == o.commitment, "output commitment does not match its key hash and amount");
+        let leaf = self.leaf_rows(o.commitment, self.height, T_OLEAF, T_OLEAF2);
+        self.regs.leaf = leaf;
+        let out = self.sponge_start(osp, o.commitment, T_OLIST);
+        self.regs.osp = out;
+        // The amount sum advances on the row after olist.
+        for (acc, limb) in self.regs.sum_out.iter_mut().zip(limbs16(o.amount)) {
+            *acc += limb.to_canonical();
+        }
+        let out = self.absorb(o.slot(), T_OLIST2);
+        self.regs.osp = out;
+        let bsp = self.regs.bsp;
+        let out = self.sponge_start(bsp, o.commitment, T_BODY_OUT0);
+        self.regs.bsp = out;
+        let out = self.absorb(amt_block(o.amount), T_BODY_OUT1);
+        self.regs.bsp = out;
+        let out = self.absorb(o.slot(), T_BODY_OUT2);
+        self.regs.bsp = out;
+        let position = self.regs.opos;
+        self.regs.old = EMPTY;
+        self.regs.new = self.regs.leaf;
+        self.regs.level = 0;
+        self.regs.pbits = core::array::from_fn(|i| Fp::new(((position >> i) & 1) as u32));
+        self.smt_update(position, &w.siblings);
+        self.regs.opos += 1;
+        self.covered_rows();
+    }
+
+    /// A name operation: its digest into the body, then into the
+    /// operations sponge.
+    fn op(&mut self, digest: &Digest) {
+        self.regs.opd = *digest;
+        self.regs.ops_left -= 1;
+        let bsp = self.regs.bsp;
+        let out = self.sponge_start(bsp, *digest, T_OP_BODY);
+        self.regs.bsp = out;
+        let nsp = self.regs.nsp;
+        let out = self.sponge_start(nsp, *digest, T_OP_LIST);
+        self.regs.nsp = out;
+    }
+}
+
+impl BlockAir {
+    /// Builds the trace for segment `w`; returns it with the segment's
+    /// public statement. Panics if the witness is inconsistent (a signature
+    /// that does not verify, a missing leaf, or a mismatched message).
+    pub fn generate_trace(w: &SegmentWitness) -> (Trace, SegmentPublic) {
+        Self::generate_trace_with(w, 2)
+    }
+
+    /// Trace padded to exactly `2^log_n` rows; panics if the segment needs
+    /// more.
+    pub fn generate_trace_padded(w: &SegmentWitness, log_n: usize) -> (Trace, SegmentPublic) {
+        assert!(w.num_rows() < 1 << log_n, "segment of {} rows does not fit 2^{log_n}", w.num_rows());
+        Self::generate_trace_with(w, 1 << log_n)
+    }
+
+    fn generate_trace_with(w: &SegmentWitness, min_rows: usize) -> (Trace, SegmentPublic) {
+        assert!(!w.txs.is_empty(), "a segment needs at least one transaction");
+        let regs = Regs {
+            xmss: xmss_fragment::Regs::default(),
+            level: 0,
+            pbits: [Fp::ZERO; DEPTH],
+            root: w.root_in,
+            old: EMPTY,
+            new: EMPTY,
+            is_out: false,
+            msg: EMPTY,
+            bsp: [Fp::ZERO; WIDTH],
+            isp: w.isp_in,
+            osp: w.osp_in,
+            pkroot: EMPTY,
+            ocm: EMPTY,
+            amount: 0,
+            sum_in: [0; LIMBS],
+            sum_out: [0; LIMBS],
+            opos: w.pos_in,
+            in_left: 0,
+            out_left: 0,
+            open: false,
+            memo: EMPTY,
+            leaf: EMPTY,
+            opd: EMPTY,
+            nsp: w.nsp_in,
+            ops_left: 0,
+            pol: false,
+            pin: false,
+            pol_left: 0,
+            pstate: 0,
+            cvb: 0,
+            cvn: 0,
+            inrun: false,
+            created: 0,
+            smsg: w.txs.first().map_or(EMPTY, |t| t.message),
+            rmsg: EMPTY,
+            pidx: 0,
+            llen: 0,
+            lcnt: 0,
+            lsp: [Fp::ZERO; WIDTH],
+            nc: 0,
+            tags: [0; LEAF_CONDS],
+            m: 0,
+            krem: 0,
+            srem: 0,
+            hadthr: false,
+            rebind: false,
+            chan: EMPTY,
+            hascov: false,
+            rundone: false,
+            cov: EMPTY,
+            proot: EMPTY,
+            ksp: [Fp::ZERO; WIDTH],
+            ssp: [Fp::ZERO; WIDTH],
+            csp: [Fp::ZERO; WIDTH],
+        };
+        let mut g = Gen { b: HashTraceBuilder::new(NUM_COLS), regs, height: w.height };
+        let mut carry_in = Carry::CLOSED;
+        let mut carry_out = Carry::CLOSED;
+        let parts = w.txs.len();
+        for (p, tx) in w.txs.iter().enumerate() {
+            let (n_in, n_out, n_ops) = (tx.inputs.len() as u32, tx.outputs.len() as u32, tx.ops.len() as u32);
+            crate::stark::refuse(
+                n_in <= tx.in_left && n_out <= tx.out_left && n_ops <= tx.ops_left,
+                "more items than the transaction has left",
+            );
+            crate::stark::refuse(n_out == 0 || n_in == tx.in_left, "outputs before the last input");
+            crate::stark::refuse(
+                tx.pol_left == 0 || tx.policy.is_some() || n_out == 0,
+                "outputs before the policy input",
+            );
+            crate::stark::refuse(
+                n_ops == 0 || (n_in == tx.in_left && n_out == tx.out_left),
+                "operations before the last output",
+            );
+            crate::stark::refuse(
+                !tx.ends || (n_in, n_out, n_ops) == (tx.in_left, tx.out_left, tx.ops_left),
+                "a part that ends has every item left",
+            );
+            crate::stark::refuse(
+                tx.pol_left <= 1 && (tx.policy.is_some() == (tx.pol_left == 1)),
+                "one policy input, whole",
+            );
+            crate::stark::refuse(
+                tx.policy.is_none() || (tx.resume.is_none() && tx.ends),
+                "a policy spend is never split",
+            );
+            g.regs.msg = tx.message;
+            g.regs.in_left = tx.in_left;
+            g.regs.out_left = tx.out_left;
+            g.regs.ops_left = tx.ops_left;
+            g.regs.is_out = false;
+            g.regs.open = true;
+            g.regs.reset_policy();
+            g.regs.pol_left = tx.pol_left;
+            g.regs.smsg = tx.message;
+            match tx.resume {
+                None => {
+                    let mut input = [Fp::ZERO; WIDTH];
+                    input[0] = Fp::new(tx.in_left);
+                    input[1] = Fp::new(tx.out_left);
+                    input[2] = Fp::new(tx.ops_left);
+                    input[3] = Fp::new(tx.pol_left);
+                    input[RATE..].copy_from_slice(&cap_const::<Fp>(
+                        DOM_BODY,
+                        8 + BODY_PER_INPUT * (tx.in_left + tx.pol_left)
+                            + BODY_PER_OUTPUT * tx.out_left
+                            + BODY_PER_OP * tx.ops_left,
+                    ));
+                    g.b.start(input);
+                    let row = g.b.last_row_mut();
+                    row[T_TX_START] = Fp::ONE;
+                    g.regs.write(row);
+                    g.regs.bsp = g.b.state();
+                }
+                Some(bsp) => {
+                    assert_eq!(p, 0, "only a segment's first part may resume a transaction");
+                    g.regs.bsp = bsp;
+                    g.b.pass();
+                    let row = g.b.last_row_mut();
+                    row[T_RESUME] = Fp::ONE;
+                    g.regs.write(row);
+                    carry_in = Carry {
+                        open: true,
+                        msg: tx.message,
+                        bsp,
+                        in_left: tx.in_left,
+                        out_left: tx.out_left,
+                        ops_left: tx.ops_left,
+                    };
+                }
+            }
+            for inp in &tx.inputs {
+                g.input(inp);
+            }
+            if let Some(p) = &tx.policy {
+                g.policy(p);
+            }
+            for out in &tx.outputs {
+                g.output(out);
+            }
+            for op in &tx.ops {
+                g.op(op);
+            }
+            if tx.ends {
+                crate::stark::refuse(
+                    g.regs.bsp[..DIGEST] == tx.message[..],
+                    "body digest does not match the signed message",
+                );
+                g.b.pass();
+                let row = g.b.last_row_mut();
+                row[T_TX_END] = Fp::ONE;
+                g.regs.write(row);
+                g.regs.open = false;
+                g.regs.pol = false;
+            } else {
+                assert_eq!(p + 1, parts, "only a segment's last part may leave a transaction open");
+                let r = &g.regs;
+                carry_out = Carry {
+                    open: true,
+                    msg: r.msg,
+                    bsp: r.bsp,
+                    in_left: r.in_left,
+                    out_left: r.out_left,
+                    ops_left: r.ops_left,
+                };
+            }
+        }
+        let public = SegmentPublic {
+            height: w.height,
+            root_in: w.root_in,
+            root_out: g.regs.root,
+            isp_in: w.isp_in,
+            isp_out: g.regs.isp,
+            osp_in: w.osp_in,
+            osp_out: g.regs.osp,
+            nsp_in: w.nsp_in,
+            nsp_out: g.regs.nsp,
+            pos_in: w.pos_in,
+            pos_out: g.regs.opos,
+            sum_in: g.regs.sum_in,
+            sum_out: g.regs.sum_out,
+            carry_in,
+            carry_out,
+        };
+        let n = (g.b.len() + 1).max(min_rows).next_power_of_two();
+        while g.b.len() < n {
+            g.b.pass();
+            let row = g.b.last_row_mut();
+            row[T_DONE] = Fp::ONE;
+            g.regs.write(row);
+        }
+        (g.b.finish(), public)
+    }
+}
+
+/// Commitment type re-export for callers.
+pub type Leaf = Commitment;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,6 +2994,147 @@ mod tests {
         let mut w = v;
         w[PUB_CARRY_IN + CARRY_OUT_LEFT] = Fp::ONE;
         assert_eq!(SegmentPublic::from_values(&w), None);
+    }
+
+    use crate::output::{Key, Output as Out};
+    use crate::stark::{check_constraints, measure_degree};
+    use crate::store::outputs::Record;
+    use crate::store::state::{BlockEdit, State};
+    use crate::store::testing::MemBackend;
+    use crate::transaction::UnsignedTransaction;
+
+    fn key(tag: u8) -> Key {
+        let mut s = [0u8; 32];
+        s[0] = tag;
+        Key::generate(&s)
+    }
+
+    fn records(outputs: &[Out], height: u32) -> Vec<Record> {
+        outputs.iter().map(|o| Record { commitment: o.commitment, memo: o.memo, amount: o.amount, height }).collect()
+    }
+
+    /// A state of three outputs made by block 1, and three transactions
+    /// of block 2 that spend them: the state, the transactions, and the
+    /// state's root after the block, as the store applies it.
+    fn scenario() -> (State<MemBackend>, Vec<Transaction>, Digest) {
+        let state = State::open(MemBackend::new(), 4).unwrap();
+        let (mut a, mut bk) = (key(1), key(2));
+        let (c, miner) = (key(3).public_key(), key(4).public_key());
+        let first = [Out::new(&a.public_key(), 100), Out::new(&bk.public_key(), 50), Out::new(&a.public_key(), 30)];
+        let edit = |height: u32, spends: &[u64], outputs: &[Record]| {
+            let block = [Fp::new(height); DIGEST];
+            let (names, commits, commits_spent, state_root) = (&[][..], &[][..], &[][..], None);
+            state.apply(&BlockEdit { height, block, spends, outputs, names, commits, commits_spent, state_root })
+        };
+        edit(1, &[], &records(&first, 1)).unwrap();
+
+        let mut tx1 = UnsignedTransaction::new(
+            vec![(a.public_key(), 100), (bk.public_key(), 50)],
+            vec![Out::new(&c, 120), Out::new(&a.public_key(), 25)],
+        )
+        .sign(|i, _, m| if i == 0 { a.sign(m) } else { bk.sign(m) })
+        .unwrap();
+        tx1.set_positions(&[0, 1]);
+        let reward =
+            UnsignedTransaction::new(vec![], vec![Out::new(&miner, 55)]).sign(|_, _, _| Err::<Sig, ()>(())).unwrap();
+        let mut tx3 = UnsignedTransaction::new(vec![(a.public_key(), 30)], vec![Out::new(&bk.public_key(), 30)])
+            .sign_with(&mut a)
+            .unwrap();
+        tx3.set_positions(&[2]);
+        assert!(tx1.verify_signatures() && tx3.verify_signatures());
+        let txs = vec![tx1, reward, tx3];
+        // The root after, by the store, on a copy: the state stays as
+        // the block finds it.
+        let copy =
+            State::open(MemBackend::from_image(state.file().backend().image(crate::store::testing::Lost::All)), 4)
+                .unwrap();
+        let outputs: Vec<Out> = txs.iter().flat_map(|t| t.outputs.clone()).collect();
+        let (names, commits, commits_spent, state_root) = (&[][..], &[][..], &[][..], None);
+        let after = copy
+            .apply(&BlockEdit {
+                height: 2,
+                block: [Fp::new(2); DIGEST],
+                spends: &[0, 1, 2],
+                outputs: &records(&outputs, 2),
+                names,
+                commits,
+                commits_spent,
+                state_root,
+            })
+            .unwrap();
+        (state, txs, after)
+    }
+
+    /// The circuit's shape, at forty-two levels.
+    #[test]
+    fn layout() {
+        assert_eq!(DEPTH, 42);
+        assert_eq!(ROWS_PER_OUTPUT, 9 + 2 * 42);
+        assert_eq!(BlockAir.width(), NUM_COLS);
+        assert_eq!(measure_degree(&BlockAir, NUM_PUBLIC), BlockAir.max_constraint_degree());
+    }
+
+    /// A block's transactions, their paths taken from the store, satisfy
+    /// the circuit in one segment, in three, and split by rows; the
+    /// segments chain, and the last ends at the root the store reaches
+    /// by applying the block.
+    #[test]
+    fn a_block_from_the_store_satisfies_the_circuit() {
+        let (state, txs, after) = scenario();
+        let snap = state.snapshot().unwrap();
+        for per_segment in [3, 1] {
+            let segments = SegmentWitness::collect(&snap, &txs, per_segment, 2).unwrap();
+            assert_eq!(segments.len(), 3 / per_segment);
+            let mut last: Option<SegmentPublic> = None;
+            for (k, seg) in segments.iter().enumerate() {
+                let (trace, public) = BlockAir::generate_trace(seg);
+                assert_eq!(check_constraints(&BlockAir, &trace, &public.to_values()), Ok(()), "segment {k}");
+                match last {
+                    None => {
+                        assert_eq!(public.root_in, snap.root());
+                        assert_eq!((public.pos_in, public.isp_in), (3, initial_inputs_state()));
+                    }
+                    Some(before) => {
+                        assert_eq!((public.root_in, public.pos_in), (before.root_out, before.pos_out));
+                        assert_eq!((public.isp_in, public.osp_in), (before.isp_out, before.osp_out));
+                        assert_eq!(public.carry_in, before.carry_out);
+                    }
+                }
+                assert_eq!(public.height, 2);
+                // Another root, or another position, is not this trace's.
+                let mut wrong = public;
+                wrong.root_out[0] += Fp::ONE;
+                assert!(check_constraints(&BlockAir, &trace, &wrong.to_values()).is_err());
+                let wrong = SegmentPublic { pos_out: public.pos_out + 1, ..public };
+                assert!(check_constraints(&BlockAir, &trace, &wrong.to_values()).is_err());
+                last = Some(public);
+            }
+            let end = last.unwrap();
+            assert_eq!(end.root_out, after, "the root the store reaches");
+            assert_eq!(end.pos_out, 7);
+            assert_eq!(end.isp_out, inputs_state([0, 1, 2]));
+            assert_eq!(end.osp_out, outputs_state(txs.iter().flat_map(|t| t.outputs.iter().map(|o| o.block_output()))));
+            assert_eq!(end.carry_out, Carry::CLOSED);
+        }
+        // By rows, a transaction split between segments: the sums of
+        // what was spent and made come out the same.
+        let segments = SegmentWitness::collect_by_rows(&snap, &txs, 1 << 12, 2).unwrap();
+        assert!(segments.len() >= 2, "{} segments", segments.len());
+        let (mut spent, mut made, mut root) = (0u128, 0u128, snap.root());
+        for seg in &segments {
+            let (trace, public) = BlockAir::generate_trace_padded(seg, 12);
+            assert_eq!(trace.height(), 1 << 12);
+            assert_eq!(check_constraints(&BlockAir, &trace, &public.to_values()), Ok(()));
+            assert_eq!(public.root_in, root);
+            root = public.root_out;
+            spent += SegmentPublic::total(&public.sum_in);
+            made += SegmentPublic::total(&public.sum_out);
+        }
+        assert_eq!((root, spent, made), (after, 180, 230));
+        // An input that is not there to spend.
+        let mut gone = txs.clone();
+        gone[2].set_positions(&[1 << 20]);
+        assert_eq!(SegmentWitness::collect(&snap, &gone, 3, 2).err(), Some(Error::NoSuchOutput(1 << 20)));
     }
 
     /// Transactions are packed into segments in order, split between
