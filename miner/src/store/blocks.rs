@@ -11,6 +11,8 @@
 //!   to it and a status the chain gives it. Every header a node keeps,
 //!   on the chain or beside it.
 //! - The **heights**: by height, the id of the chain's block there.
+//! - The **planned**: by height, the ids of a branch the chain means to
+//!   take, whose bodies are still to come.
 //! - The **bodies**: by height and id, a block's body and the leaves
 //!   its header's auxiliary bytes commit to. They are megabytes, kept as
 //!   chains of pages ([`super::blob`]), and dropped when the block is
@@ -254,12 +256,13 @@ impl Tree for FileTree {
     }
 }
 
-/// The blocks, as a root record holds them: the roots of the four tries
+/// The blocks, as a root record holds them: the roots of the five tries
 /// and the chain's bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Blocks {
     index: Child,
     heights: Child,
+    planned: Child,
     bodies: Child,
     files: Child,
     /// The chain's own: kept, not read.
@@ -290,16 +293,17 @@ impl Blocks {
     pub const EMPTY: Blocks = Blocks {
         index: Child::Empty,
         heights: Child::Empty,
+        planned: Child::Empty,
         bodies: Child::Empty,
         files: Child::Empty,
         chain: [0; CHAIN_BYTES],
     };
     /// Serialized size.
-    pub const BYTES: usize = 4 * FLAT_BYTES + CHAIN_BYTES;
+    pub const BYTES: usize = 5 * FLAT_BYTES + CHAIN_BYTES;
 
     pub fn to_bytes(&self) -> [u8; Self::BYTES] {
         let mut out = Vec::with_capacity(Self::BYTES);
-        for root in [self.index, self.heights, self.bodies, self.files] {
+        for root in [self.index, self.heights, self.bodies, self.files, self.planned] {
             trie::write_flat(&root, &mut out);
         }
         out.extend_from_slice(&self.chain);
@@ -317,7 +321,8 @@ impl Blocks {
             heights: root(1)?,
             bodies: root(2)?,
             files: root(3)?,
-            chain: b[4 * FLAT_BYTES..].try_into().unwrap(),
+            planned: root(4)?,
+            chain: b[5 * FLAT_BYTES..].try_into().unwrap(),
         })
     }
 
@@ -325,6 +330,7 @@ impl Blocks {
     pub fn mark<B: Backend>(&self, file: &PageFile<B>) -> io::Result<()> {
         trie::mark::<IndexTree, B>(file, self.index)?;
         trie::mark::<HeightTree, B>(file, self.heights)?;
+        trie::mark::<HeightTree, B>(file, self.planned)?;
         trie::mark::<BodyTree, B>(file, self.bodies)?;
         trie::mark::<FileTree, B>(file, self.files)?;
         let mut blobs = Vec::new();
@@ -378,6 +384,40 @@ impl Blocks {
             }
             None if there => remove::<HeightTree, B>(txn, &mut self.heights, &[height]),
             None => Ok(()),
+        }
+    }
+
+    /// The id of the planned branch's block at `height`.
+    pub fn planned_at(&self, pages: &impl ReadPages, height: u32) -> io::Result<Option<Digest>> {
+        Ok(trie::get::<HeightTree>(pages, self.planned, height as u128)?.map(|r| r.0))
+    }
+
+    /// The lowest height at or above `from` the planned branch has a
+    /// block at.
+    pub fn next_planned(&self, pages: &impl ReadPages, from: u32) -> io::Result<Option<u32>> {
+        Ok(trie::next_key::<HeightTree>(pages, self.planned, from as u128)?.map(|h| h as u32))
+    }
+
+    /// Says which block is the planned branch's at `height`.
+    pub fn set_planned<B: Backend>(&mut self, txn: &Txn<'_, B>, height: u32, id: Digest) -> Result<(), Error> {
+        let there = trie::get::<HeightTree>(txn, self.planned, height as u128)?.is_some();
+        let edits: Edits<'_, HeightTree> = Edits { puts: &[(height, id, there)], ..Edits::none() };
+        self.planned = trie::update_on(txn, self.planned, 0, edits, 1)?.0;
+        Ok(())
+    }
+
+    /// Takes the heights `from..to` out of the planned branch: found one
+    /// after another, so the cost is of those there are.
+    pub fn drop_planned<B: Backend>(&mut self, txn: &Txn<'_, B>, from: u32, to: u32) -> Result<(), Error> {
+        let (mut heights, mut at) = (Vec::new(), from);
+        while let Some(h) = self.next_planned(txn, at)?.filter(|h| *h < to) {
+            heights.push(h);
+            let Some(next) = h.checked_add(1) else { break };
+            at = next;
+        }
+        match heights.is_empty() {
+            true => Ok(()),
+            false => remove::<HeightTree, B>(txn, &mut self.planned, &heights),
         }
     }
 
@@ -639,6 +679,30 @@ mod tests {
         assert_eq!(blocks.at(&file, 2949).unwrap(), Some(branch[49].id));
         assert_eq!(blocks.at(&file, 2950).unwrap(), None);
         assert_eq!(blocks.entry(&file, &branch[99].id).unwrap(), None);
+
+        // A branch planned, beside the chain: its own heights, taken
+        // out from either end.
+        with(&file, &mut blocks, |txn, blocks| {
+            for e in &branch[10..60] {
+                blocks.set_planned(txn, height_of(e), e.id).unwrap();
+            }
+            blocks.set_planned(txn, 2915, chain[2915].id).unwrap();
+        });
+        assert_eq!(blocks.planned_at(&file, 2915).unwrap(), Some(chain[2915].id));
+        assert_eq!(blocks.planned_at(&file, 2930).unwrap(), Some(branch[30].id));
+        assert_eq!((blocks.planned_at(&file, 2909).unwrap(), blocks.planned_at(&file, 2960).unwrap()), (None, None));
+        assert_eq!(blocks.next_planned(&file, 0).unwrap(), Some(2910));
+        assert_eq!(blocks.next_planned(&file, 2960).unwrap(), None);
+        with(&file, &mut blocks, |txn, blocks| {
+            blocks.drop_planned(txn, 0, 2920).unwrap();
+            blocks.drop_planned(txn, 2950, u32::MAX).unwrap();
+            blocks.drop_planned(txn, 5000, 6000).unwrap();
+        });
+        assert_eq!(
+            (blocks.next_planned(&file, 0).unwrap(), blocks.next_planned(&file, 2950).unwrap()),
+            (Some(2920), None)
+        );
+        assert_eq!(blocks.at(&file, 2930).unwrap(), Some(branch[30].id), "the chain's heights are its own");
 
         // An id with another's first bits is not taken for it.
         let mut twin = chain[5];

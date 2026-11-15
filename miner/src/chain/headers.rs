@@ -31,6 +31,14 @@
 //! those no proof will vouch for. Every header's work is checked one way
 //! or the other before its block is part of the chain.
 //!
+//! # What to fetch
+//!
+//! The best header's branch, from where it leaves the chain, is kept by
+//! height beside the chain's own ([`crate::store::blocks`]): the plan.
+//! Which bodies to fetch next is then a walk up it from the bottom
+//! ([`Chain::missing_bodies`]), with no branch held in memory, however
+//! far ahead of its blocks a node's headers are.
+//!
 //! # What is read
 //!
 //! A header's median time and its target follow from the headers before
@@ -45,7 +53,7 @@ use crate::hash::Digest;
 use crate::poseidon2::{digest_from_bytes, digest_to_bytes};
 use crate::store::backend::Backend;
 use crate::store::blocks::{Blocks, Entry};
-use crate::store::pagefile::ReadPages;
+use crate::store::pagefile::{ReadPages, Txn};
 use crate::u256::U256;
 
 use super::Chain;
@@ -451,7 +459,7 @@ impl<B: Backend + 'static, V: Sync> Chain<B, V> {
         let (mut new, mut stop) = (0, None);
         self.state.write_blocks(|txn, blocks| {
             let tip = self.tip_in(txn, blocks, tip_height)?;
-            let mut best = self.best_in(txn, blocks, &tip)?;
+            let (mut best, mut moved) = (self.best_in(txn, blocks, &tip)?, false);
             // The header before in the run, as it is kept now.
             let mut last: Option<Known> = None;
             for (i, h) in headers.iter().enumerate() {
@@ -490,8 +498,12 @@ impl<B: Backend + 'static, V: Sync> Chain<B, V> {
                 if known.work > best.work {
                     set_best(blocks, Some(&id));
                     best = known;
+                    moved = true;
                 }
                 last = Some(known);
+            }
+            if moved {
+                self.plan(txn, blocks, &best.header)?;
             }
             Ok(())
         })?;
@@ -562,6 +574,7 @@ impl<B: Backend + 'static, V: Sync> Chain<B, V> {
                     }
                 }
                 set_best(blocks, None);
+                blocks.drop_planned(txn, 0, u32::MAX)?;
             }
             Ok(())
         })?;
@@ -570,6 +583,79 @@ impl<B: Backend + 'static, V: Sync> Chain<B, V> {
 }
 
 impl<B: Backend + 'static, V> Chain<B, V> {
+    /// Makes the planned branch `best`'s: its blocks from the first off
+    /// the chain up to it, by height. What the plan has of the same
+    /// branch already stands, so a header that extends the best costs
+    /// one entry.
+    fn plan(&self, txn: &Txn<'_, B>, blocks: &mut Blocks, best: &Header) -> Result<(), Error> {
+        blocks.drop_planned(txn, best.height.saturating_add(1), u32::MAX)?;
+        let mut h = *best;
+        // Down to where the plan already has the branch, or the chain.
+        let lowest = loop {
+            if self.is_main_in(txn, blocks, &h)? {
+                break h.height + 1;
+            }
+            if blocks.planned_at(txn, h.height)? == Some(h.hash()) {
+                // The rest of the plan below is this branch's too.
+                return Ok(());
+            }
+            blocks.set_planned(txn, h.height, h.hash())?;
+            h = self.header_in(txn, blocks, &h.prev_hash)?.ok_or_else(|| corrupt("a header's ancestor is missing"))?;
+        };
+        // Another branch's, from lower down, is the plan no more.
+        blocks.drop_planned(txn, 0, lowest)
+    }
+
+    /// The headers of the blocks whose bodies are still needed to reach
+    /// the best header, oldest first, into `out`: those of its branch
+    /// off the chain that are kept as headers alone. Returns how many.
+    ///
+    /// If the branch runs through a block found invalid, the headers
+    /// after it are marked as it is, the best header is the tip again
+    /// until another is offered, and there is nothing to fetch.
+    pub fn missing_bodies(&self, out: &mut [Header]) -> Result<usize, Error> {
+        let snap = self.state.snapshot()?;
+        let (pages, blocks) = (snap.pages(), snap.blocks());
+        let (mut n, mut at) = (0, 0u32);
+        while n < out.len() {
+            let Some(height) = blocks.next_planned(pages, at)? else { break };
+            let id = blocks.planned_at(pages, height)?.ok_or_else(|| corrupt("the plan lacks a height it has"))?;
+            let known = self.known_in(pages, blocks, &id)?.ok_or_else(|| corrupt("a planned block has no header"))?;
+            if known.invalid() {
+                drop(snap);
+                self.unplan_from(height, known.status)?;
+                return Ok(0);
+            }
+            // One that is of the chain by now needs nothing.
+            if known.header_only() && !self.is_main_in(pages, blocks, &known.header)? {
+                out[n] = known.header;
+                n += 1;
+            }
+            let Some(next) = height.checked_add(1) else { break };
+            at = next;
+        }
+        Ok(n)
+    }
+
+    /// The planned branch runs through a block that will never connect,
+    /// at `height`: what is planned above it goes the same way, so that
+    /// a peer offering those headers again cannot make them the best.
+    fn unplan_from(&self, height: u32, status: Status) -> Result<(), Error> {
+        self.state.write_blocks(|txn, blocks| {
+            let mut at = height.saturating_add(1);
+            while let Some(h) = blocks.next_planned(txn, at)? {
+                let id = blocks.planned_at(txn, h)?.ok_or_else(|| corrupt("the plan lacks a height it has"))?;
+                if let Some(known) = self.known_in(txn, blocks, &id)? {
+                    blocks.put_entry(txn, &Known { work: U256::ZERO, status, ..known }.entry())?;
+                }
+                let Some(next) = h.checked_add(1) else { break };
+                at = next;
+            }
+            set_best(blocks, None);
+            blocks.drop_planned(txn, 0, u32::MAX)
+        })
+    }
+
     /// The ancestor at `height` of the kept header `from`.
     pub fn ancestor(&self, from: &Header, height: u32) -> Result<Option<Header>, Error> {
         if height > from.height {
@@ -926,6 +1012,9 @@ mod tests {
         assert_eq!(chain.accept_headers(&branch[..8], NOW, true), (8, None));
         assert_eq!(chain.accept_headers(&branch[8..], NOW, false), (4, None));
         assert_eq!(chain.best_header().unwrap().header, branch[11]);
+        let mut out = [genesis; 40];
+        assert_eq!(chain.missing_bodies(&mut out).unwrap(), 16);
+        assert_eq!((&out[..4], &out[4..16]), (&headers[..4], &branch[..]));
         let found = chain.confirm_work(&branch[11], 1).unwrap();
         assert_eq!(found, Err((branch[5].height, branch[5].hash())));
         for (i, h) in branch.iter().enumerate() {
@@ -936,12 +1025,38 @@ mod tests {
         // The best is the tip again until a header is offered; the
         // forgery and what descends from it stay refused.
         assert_eq!(chain.best_header().unwrap().header, genesis);
+        assert_eq!(chain.missing_bodies(&mut out).unwrap(), 0);
         assert_eq!(chain.accept_header(&branch[5], NOW), Err(Error::KnownInvalid));
         let child = mine(&branch[11], branch[11].timestamp + 300, &target(&branch[11]), 3);
         assert_eq!(chain.accept_header(&child, NOW), Err(Error::InvalidParent));
         assert_eq!(chain.confirm_work(&branch[11], 1).err(), Some(Error::KnownInvalid));
         assert_eq!(chain.accept_headers(&headers[11..], NOW, false), (0, None));
         assert_eq!(chain.best_header().unwrap().header, headers[11]);
+        assert_eq!(chain.missing_bodies(&mut out).unwrap(), 12);
+        assert_eq!(out[..12], headers[..]);
+
+        // A block of the plan found invalid some other way (its body,
+        // when it came): what is planned above it goes with it.
+        let bad = chain.known(&headers[6].hash()).unwrap().unwrap();
+        let marked = Known { work: U256::ZERO, status: Status::Aside, ..bad };
+        chain.state().write_blocks(|txn, blocks| blocks.put_entry(txn, &marked.entry())).unwrap();
+        assert_eq!(chain.missing_bodies(&mut out).unwrap(), 0);
+        assert_eq!(chain.best_header().unwrap().header, genesis);
+        for (i, h) in headers.iter().enumerate() {
+            // Below it they are as they were: the first four confirmed
+            // with the branch that left them, two never.
+            let want = match i {
+                6.. => Status::Aside,
+                4 | 5 => Status::WorkPending,
+                _ => Status::HeaderOnly,
+            };
+            assert_eq!(chain.known(&h.hash()).unwrap().unwrap().status, want, "header {i}");
+        }
+        assert_eq!(chain.accept_header(&headers[9], NOW), Err(Error::SetAside));
+        // What is below it is still good, and is the best when offered.
+        assert_eq!(chain.accept_headers(&headers[..6], NOW, false), (0, None));
+        assert_eq!(chain.best_header().unwrap().header, headers[5]);
+        assert_eq!(chain.missing_bodies(&mut out).unwrap(), 6);
     }
 
     /// Between branches the best header is the one with the most work,
@@ -956,12 +1071,31 @@ mod tests {
         assert_eq!(chain.accept_headers(&b[..3], NOW, false), (3, None));
         // As long, and no more work: the first stays.
         assert_eq!(chain.best_header().unwrap().header, a[4]);
+        let mut out = [genesis; 20];
+        assert_eq!(chain.missing_bodies(&mut out).unwrap(), 5);
+        assert_eq!(out[..5], a[..]);
         assert_eq!(chain.accept_headers(&b, NOW, false), (3, None));
         assert_eq!(chain.best_header().unwrap().header, b[5]);
+        assert_eq!(chain.missing_bodies(&mut out).unwrap(), 8);
+        assert_eq!((&out[..2], &out[2..8]), (&a[..2], &b[..]));
         assert_eq!(chain.ancestor(&b[5], 2).unwrap(), Some(a[1]));
         let more = run(&chain, &a[4], 4, 1);
         assert_eq!(chain.accept_headers(&more, NOW, false), (4, None));
         assert_eq!(chain.best_header().unwrap().header, more[3]);
+
+        // What is to be fetched follows the best: the first branch, then
+        // the second from where it leaves the first, then the first again.
+        let fetch = |chain: &TestChain| {
+            let mut out = [genesis; 20];
+            let n = chain.missing_bodies(&mut out).unwrap();
+            out[..n].to_vec()
+        };
+        let mut all = a.clone();
+        all.extend(&more);
+        assert_eq!(fetch(&chain), all);
+        let mut few = [genesis; 3];
+        assert_eq!(chain.missing_bodies(&mut few).unwrap(), 3);
+        assert_eq!(few[..], a[..3]);
 
         let mut ids = [genesis.hash(); LOCATOR];
         assert_eq!(chain.locator(&mut ids).unwrap(), 1);
