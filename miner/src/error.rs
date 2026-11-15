@@ -131,6 +131,29 @@ pub enum Error {
     /// The block to undo is older than the window of blocks whose
     /// records are kept.
     NoUndoRecord,
+
+    // -- The chain
+    /// The header's parent is not known: it is to be fetched first.
+    UnknownParent,
+    /// The header's parent is a block found invalid.
+    InvalidParent,
+    /// The block is one this node can never connect, though it may be
+    /// valid: its branch leaves the chain below what can be undone.
+    SetAside,
+    /// The header is one found invalid before.
+    KnownInvalid,
+    /// The header's height is not its parent's and one.
+    BadHeight { expected: u32, got: u32 },
+    /// The header is above the last block the chain can have.
+    ChainEnded,
+    /// The header's time is not after the median of the blocks before.
+    TimestampTooOld { median: u64, got: u64 },
+    /// The header's time is further ahead of the clock than is allowed.
+    TimestampTooNew { limit: u64, got: u64 },
+    /// The header's work does not meet its target, or is not its work.
+    BadProofOfWork,
+    /// The store holds the chain of another genesis.
+    WrongGenesis,
     /// The operating system failed a read or a write of the store, or
     /// what was read is not what was written (`InvalidData`). Only the
     /// kind is kept: this type holds no heap.
@@ -192,6 +215,16 @@ impl fmt::Display for Error {
             Error::PartRoot => f.write_str("a part of the state received is not what its root says"),
             Error::PartsMissing => f.write_str("the state received is not whole yet"),
             Error::NoUndoRecord => f.write_str("no record is kept to undo the block with"),
+            Error::UnknownParent => f.write_str("the header's parent is not known"),
+            Error::InvalidParent => f.write_str("the header's parent is invalid"),
+            Error::SetAside => f.write_str("the block's branch cannot be connected here"),
+            Error::KnownInvalid => f.write_str("the header was found invalid before"),
+            Error::BadHeight { expected, got } => write!(f, "height {got} where {expected} follows the parent"),
+            Error::ChainEnded => f.write_str("the chain has ended"),
+            Error::TimestampTooOld { median, got } => write!(f, "time {got} is not after the median {median}"),
+            Error::TimestampTooNew { limit, got } => write!(f, "time {got} is past the limit {limit}"),
+            Error::BadProofOfWork => f.write_str("the proof of work does not hold"),
+            Error::WrongGenesis => f.write_str("the store holds another network's chain"),
             Error::Io(kind) => write!(f, "the store failed: {kind}"),
         }
     }
@@ -250,6 +283,16 @@ mod tests {
             Error::PartRoot,
             Error::PartsMissing,
             Error::NoUndoRecord,
+            Error::UnknownParent,
+            Error::InvalidParent,
+            Error::SetAside,
+            Error::KnownInvalid,
+            Error::BadHeight { expected: 2, got: 3 },
+            Error::ChainEnded,
+            Error::TimestampTooOld { median: 5, got: 4 },
+            Error::TimestampTooNew { limit: 5, got: 6 },
+            Error::BadProofOfWork,
+            Error::WrongGenesis,
             Error::Io(std::io::ErrorKind::InvalidData),
         ];
         let words: Vec<String> = all.iter().map(|e| e.to_string()).collect();
