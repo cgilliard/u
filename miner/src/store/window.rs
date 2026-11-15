@@ -6,7 +6,13 @@
 //! block is which positions it spent and where its own outputs began:
 //! a few bytes a spend. Names are not spent but replaced, so for those a
 //! block's record holds the records it replaced, and the keys of the
-//! names it registered. That is a block's record here, kept for the
+//! names it registered.
+//!
+//! A record also keeps what takes the state's parts back to the block
+//! before: the root of every part of the outputs the block changed, as it
+//! was, and the names' root as it was. With those and the spent
+//! positions, the state as of any block of the window can be handed to
+//! another node part by part ([`super::state`]). That is a block's record here, kept for the
 //! window's length of blocks and then dropped.
 //!
 //! The records are pages of the state's file like any others, written in
@@ -20,6 +26,8 @@
 //!                | first new position (8) | spends (4) | distance (varint) ...
 //!                | names registered (2) | key (15) ...
 //!                | names replaced (2) | the record replaced ...
+//!                | names' root before (32)
+//!                | parts changed (4) | (index (4) | was there (1) | root before (32)) ...
 //! list page   := blocks (2) | (height (4) | first page (6)) ...
 //! ```
 
@@ -73,6 +81,11 @@ pub struct BlockRecord {
     pub registered: Vec<Key>,
     /// The records it replaced, as they were, ascending by key.
     pub replaced: Vec<NameRecord>,
+    /// The root of the names' tree before it.
+    pub names_before: Digest,
+    /// The root of each part of the outputs it changed, as it was before
+    /// (`None` if the part was empty), ascending by index.
+    pub parts_before: Vec<(u64, Option<Digest>)>,
 }
 
 impl BlockRecord {
@@ -102,6 +115,13 @@ impl BlockRecord {
             let at = out.len();
             out.resize(at + r.size(), 0);
             r.write_bytes(&mut out[at..]);
+        }
+        out.extend_from_slice(&digest_to_bytes(&self.names_before));
+        out.extend_from_slice(&(self.parts_before.len() as u32).to_le_bytes());
+        for (index, before) in &self.parts_before {
+            out.extend_from_slice(&(*index as u32).to_le_bytes());
+            out.push(before.is_some() as u8);
+            out.extend_from_slice(&digest_to_bytes(&before.unwrap_or([crate::poseidon2::Fp::ZERO; 8])));
         }
         out
     }
@@ -155,10 +175,31 @@ impl BlockRecord {
             replaced.push(r);
             b = rest;
         }
-        if !b.is_empty() {
+        let (names_before, rest) = b.split_at_checked(32).ok_or_else(bad)?;
+        let names_before = digest_from_bytes(names_before).ok_or_else(bad)?;
+        let (parts, mut b) = rest.split_at_checked(4).ok_or_else(bad)?;
+        let parts = u32::from_le_bytes(parts.try_into().unwrap()) as usize;
+        if b.len() != parts * 37 {
             return Err(bad());
         }
+        let mut parts_before = Vec::with_capacity(parts);
+        for _ in 0..parts {
+            let (entry, rest) = b.split_at(37);
+            let index = u32::from_le_bytes(entry[..4].try_into().unwrap()) as u64;
+            let hash = digest_from_bytes(&entry[5..]).ok_or_else(bad)?;
+            // Parts ascend, and one that was not there has no root.
+            if entry[4] > 1
+                || parts_before.last().is_some_and(|p: &(u64, Option<Digest>)| p.0 >= index)
+                || (entry[4] == 0 && hash != [crate::poseidon2::Fp::ZERO; 8])
+            {
+                return Err(bad());
+            }
+            parts_before.push((index, (entry[4] == 1).then_some(hash)));
+            b = rest;
+        }
         Ok(BlockRecord {
+            names_before,
+            parts_before,
             registered,
             replaced,
             height: u32::from_le_bytes(head[..4].try_into().unwrap()),
@@ -373,6 +414,10 @@ mod tests {
                     NameRecord::new(&b"abcdefghij"[..1 + i as usize], d(height), d(7), d(9)).unwrap()
                 })
                 .collect(),
+            names_before: [Fp::new(height + 5); 8],
+            parts_before: (0..height as u64 % 5)
+                .map(|i| (i * 3, (i % 2 == 0).then_some([Fp::new(i as u32 + 1); 8])))
+                .collect(),
         }
     }
 
@@ -386,9 +431,7 @@ mod tests {
             // About three bytes a spend.
             assert!(bytes.len() <= 80 + 3 * spends + 500, "{} bytes for {spends} spends", bytes.len());
             for cut in [0, 79, bytes.len().saturating_sub(1)] {
-                if cut < bytes.len() {
-                    assert!(BlockRecord::from_bytes(&bytes[..cut]).is_err());
-                }
+                assert!(BlockRecord::from_bytes(&bytes[..cut]).is_err());
             }
             let mut longer = bytes.clone();
             longer.push(1);

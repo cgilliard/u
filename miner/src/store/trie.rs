@@ -597,11 +597,43 @@ struct Pass<'t, 'f, T: Tree, B: Backend> {
     count: i64,
     slots: Vec<Slot<T::Record>>,
     out: Vec<u8>,
+    /// The level whose subtrees' parts are kept as they were before the
+    /// pass changed them, if any is.
+    capture: Option<u32>,
+    /// Those parts, by index at that level: `None` where there was
+    /// nothing.
+    before: Vec<(u128, Option<Part>)>,
 }
 
 impl<'t, 'f, T: Tree, B: Backend> Pass<'t, 'f, T, B> {
-    fn new(txn: &'t Txn<'f, B>, height: u32) -> Self {
-        Pass { txn, height, count: 0, slots: Vec::new(), out: Vec::new() }
+    fn new(txn: &'t Txn<'f, B>, height: u32, capture: Option<u32>) -> Self {
+        Pass { txn, height, count: 0, slots: Vec::new(), out: Vec::new(), capture, before: Vec::new() }
+    }
+
+    /// Keeps the parts at the captured level that `edits` reach in a
+    /// leaf (or an empty subtree) of `covers` levels from `at`, whose
+    /// records are `slots`, as they are before the edits. `whole` is the
+    /// leaf's own part, which is the answer when it is one such subtree.
+    fn keep_before(&mut self, slots: &[Slot<T::Record>], covers: u32, whole: Option<Part>, edits: Edits<'_, T>) {
+        let Some(level) = self.capture.filter(|l| covers >= *l) else { return };
+        // The subtrees the edits fall in, ascending.
+        let mut touched: Vec<u128> = edits.flips.iter().chain(edits.removes).map(|k| (*k).into() >> level).collect();
+        touched.extend(edits.puts.iter().map(|p| p.0.into() >> level));
+        if !edits.run.is_empty() {
+            touched.extend(edits.run_from >> level..=(edits.run_from + edits.run.len() as u128 - 1) >> level);
+        }
+        touched.sort_unstable();
+        touched.dedup();
+        for index in touched {
+            let part = if covers == level {
+                whole
+            } else {
+                let from = slots.partition_point(|s| s.key >> level < index);
+                let to = slots.partition_point(|s| s.key >> level <= index);
+                leaf_part::<T>(&slots[from..to], level)
+            };
+            self.before.push((index, part));
+        }
     }
 
     /// The subtree `child` (of `height` levels from `base`) after `edits`,
@@ -668,15 +700,17 @@ impl<'t, 'f, T: Tree, B: Backend> Pass<'t, 'f, T, B> {
             let next = std::sync::atomic::AtomicUsize::new(0);
             let (txn, height_now, kids) = (self.txn, self.height, &*children);
             type Done = Vec<(usize, u32, Result<([Child; FANOUT], bool), Error>)>;
-            let done: Vec<(i64, Done)> = std::thread::scope(|scope| {
+            type Before = Vec<(u128, Option<Part>)>;
+            let capture = self.capture;
+            let done: Vec<(i64, Before, Done)> = std::thread::scope(|scope| {
                 let handles: Vec<_> = (0..workers)
                     .map(|_| {
                         scope.spawn(|| {
-                            let mut pass = Pass::<T, B>::new(txn, height_now);
+                            let mut pass = Pass::<T, B>::new(txn, height_now, capture);
                             let mut made: Done = Vec::new();
                             loop {
                                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                let Some(&(k, span)) = groups.get(i) else { return (pass.count, made) };
+                                let Some(&(k, span)) = groups.get(i) else { return (pass.count, pass.before, made) };
                                 let mut mine = *kids;
                                 let did = pass.update_group(&mut mine, k, span, height, base, edits, threads / workers);
                                 made.push((k, span, did.map(|t| (mine, t))));
@@ -689,8 +723,9 @@ impl<'t, 'f, T: Tree, B: Backend> Pass<'t, 'f, T, B> {
             // The first fault in key order is the one reported, as when
             // one thread does it all.
             let mut made: Done = Vec::with_capacity(n);
-            for (count, part) in done {
+            for (count, before, part) in done {
                 self.count += count;
+                self.before.extend(before);
                 made.extend(part);
             }
             made.sort_by_key(|m| m.0);
@@ -725,12 +760,16 @@ impl<'t, 'f, T: Tree, B: Backend> Pass<'t, 'f, T, B> {
         let (at, covers) = (base + ((k as u128) << low), low + span);
         let edits = edits.within(at, covers);
         if let Child::Node { .. } = children[k] {
+            if self.capture == Some(low) {
+                self.before.push((at >> low, children[k].part()));
+            }
             children[k] = self.update(children[k], low, at, edits, threads)?;
             return Ok(true);
         }
         let mut slots = std::mem::take(&mut self.slots);
         let done = (|| {
             let old = self.gather(children[k], covers, at, &mut slots)?;
+            self.keep_before(&slots, covers, children[k].part(), edits);
             let (rewrite, last_spend) = self.edit(&mut slots, old.map_or(0, |o| o.1), edits)?;
             if let (Some((page, _)), false) = (old, rewrite) {
                 // Only the bits changed: the page stands.
@@ -792,6 +831,7 @@ impl<'t, 'f, T: Tree, B: Backend> Pass<'t, 'f, T, B> {
         let mut slots = std::mem::take(&mut self.slots);
         let done = (|| {
             let old = self.gather(child, height, base, &mut slots)?;
+            self.keep_before(&slots, height, child.part(), edits);
             let (rewrite, last_spend) = self.edit(&mut slots, old.map_or(0, |o| o.1), edits)?;
             if let (Some((page, _)), false) = (old, rewrite) {
                 return Ok(Child::Leaf {
@@ -962,7 +1002,7 @@ impl<'t, 'f, T: Tree, B: Backend> Pass<'t, 'f, T, B> {
                 let handles: Vec<_> = (0..workers)
                     .map(|_| {
                         scope.spawn(|| {
-                            let mut pass = Pass::<T, B>::new(txn, height_now);
+                            let mut pass = Pass::<T, B>::new(txn, height_now, None);
                             let mut made = Vec::new();
                             loop {
                                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1214,9 +1254,32 @@ pub fn update_on<T: Tree, B: Backend>(
     edits: Edits<'_, T>,
     threads: usize,
 ) -> Result<(Child, i64), Error> {
-    let mut pass = Pass::<T, B>::new(txn, height);
+    let mut pass = Pass::<T, B>::new(txn, height, None);
     let root = pass.update(root, T::HEIGHT, 0, edits.within(0, T::HEIGHT), threads)?;
     Ok((root, pass.count))
+}
+
+/// The parts of the subtrees at one level that a pass changed, as they
+/// were before it: `(index, part)`, ascending, `None` where nothing was.
+pub type Before = Vec<(u128, Option<Part>)>;
+
+/// [`update`], which also returns the part of every subtree at `level`
+/// the edits reach, as it was before them: what takes a tree's parts
+/// back to an earlier state. `level` is one at which nodes' slots lie.
+pub fn update_keeping<T: Tree, B: Backend>(
+    txn: &Txn<'_, B>,
+    root: Child,
+    height: u32,
+    edits: Edits<'_, T>,
+    level: u32,
+) -> Result<(Child, i64, Before), Error> {
+    debug_assert!(level <= T::HEIGHT && (T::HEIGHT - level).is_multiple_of(BITS));
+    debug_assert!(edits.truncate == u128::MAX, "a pass that removes a tail keeps nothing");
+    let mut pass = Pass::<T, B>::new(txn, height, Some(level));
+    let root = pass.update(root, T::HEIGHT, 0, edits.within(0, T::HEIGHT), crate::parallel::threads())?;
+    let mut before = pass.before;
+    before.sort_unstable_by_key(|b| b.0);
+    Ok((root, pass.count, before))
 }
 
 /// Sweeps part of the trie: from key `from`, looks at leaves holding up
@@ -1231,7 +1294,7 @@ pub fn sweep<T: Tree, B: Backend>(
     budget: usize,
     horizon: u32,
 ) -> Result<(Child, u128), Error> {
-    let mut pass = Pass::<T, B>::new(txn, 0);
+    let mut pass = Pass::<T, B>::new(txn, 0, None);
     let mut state = Sweep { from, budget, horizon };
     let swept = pass.sweep(root, T::HEIGHT, 0, &mut state)?;
     debug_assert_eq!(swept.part(), root.part(), "a sweep changes no hash");
@@ -1356,28 +1419,105 @@ pub fn for_each<T: Tree>(
     root: Child,
     f: &mut dyn FnMut(u128, &T::Record, bool),
 ) -> io::Result<()> {
+    for_each_under::<T>(pages, root, T::HEIGHT, 0, f)
+}
+
+/// [`for_each`] of the subtree `child`, of `height` levels from `base`.
+fn for_each_under<T: Tree>(
+    pages: &impl ReadPages,
+    child: Child,
+    height: u32,
+    base: u128,
+    f: &mut dyn FnMut(u128, &T::Record, bool),
+) -> io::Result<()> {
+    match child {
+        Child::Empty => Ok(()),
+        Child::Leaf { .. } => {
+            load_leaf::<T>(pages, child, height, base)?.iter().for_each(|s| f(s.key, &s.record, s.live));
+            Ok(())
+        }
+        Child::Node { page, .. } => {
+            let children = load_node(pages, page, height)?;
+            let low = below(height);
+            for (k, c) in children.iter().enumerate() {
+                for_each_under::<T>(pages, *c, low + span_of(*c), base + ((k as u128) << low), f)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Calls `f` with the part of every nonempty subtree at `level`, in key
+/// order: its index there and its part. Reads the nodes above the level,
+/// and the leaves that cover more than one such subtree.
+pub fn parts_at<T: Tree>(
+    pages: &impl ReadPages,
+    root: Child,
+    level: u32,
+    f: &mut dyn FnMut(u128, Part),
+) -> io::Result<()> {
     fn walk<T: Tree>(
         pages: &impl ReadPages,
         child: Child,
         height: u32,
         base: u128,
-        f: &mut dyn FnMut(u128, &T::Record, bool),
+        level: u32,
+        f: &mut dyn FnMut(u128, Part),
     ) -> io::Result<()> {
         match child {
             Child::Empty => Ok(()),
+            _ if height == level => {
+                if let Some(part) = child.part() {
+                    f(base >> level, part);
+                }
+                Ok(())
+            }
+            // A leaf over several of them: each from its own records.
             Child::Leaf { .. } => {
-                load_leaf::<T>(pages, child, height, base)?.iter().for_each(|s| f(s.key, &s.record, s.live));
+                let slots = load_leaf::<T>(pages, child, height, base)?;
+                for group in slots.chunk_by(|a, b| a.key >> level == b.key >> level) {
+                    if let Some(part) = leaf_part::<T>(group, level) {
+                        f(group[0].key >> level, part);
+                    }
+                }
                 Ok(())
             }
             Child::Node { page, .. } => {
                 let children = load_node(pages, page, height)?;
                 let low = below(height);
                 for (k, c) in children.iter().enumerate() {
-                    walk::<T>(pages, *c, low + span_of(*c), base + ((k as u128) << low), f)?;
+                    walk::<T>(pages, *c, low + span_of(*c), base + ((k as u128) << low), level, f)?;
                 }
                 Ok(())
             }
         }
     }
-    walk::<T>(pages, root, T::HEIGHT, 0, f)
+    debug_assert!(level <= T::HEIGHT && (T::HEIGHT - level).is_multiple_of(BITS));
+    walk::<T>(pages, root, T::HEIGHT, 0, level, f)
+}
+
+/// Calls `f` with every record kept in the subtree of index `index` at
+/// `level`, in key order: its key, the record and whether it is live.
+pub fn for_each_in<T: Tree>(
+    pages: &impl ReadPages,
+    root: Child,
+    level: u32,
+    index: u128,
+    f: &mut dyn FnMut(u128, &T::Record, bool),
+) -> io::Result<()> {
+    let (from, to) = (index << level, (index + 1) << level);
+    let (mut child, mut height, mut base) = (root, T::HEIGHT, 0u128);
+    // Down to the child that holds the subtree, or is it.
+    while height > level {
+        let Child::Node { page, .. } = child else { break };
+        let children = load_node(pages, page, height)?;
+        let low = below(height);
+        let (k, span) = group_of(&children, height, ((from - base) >> low) as usize);
+        (child, height, base) = (children[k], low + span, base + ((k as u128) << low));
+    }
+    for_each_under::<T>(pages, child, height, base, &mut |key, record, live| {
+        if (from..to).contains(&key) {
+            f(key, record, live);
+        }
+    })
 }

@@ -44,6 +44,9 @@ use crate::poseidon2::{BATCH_FROM, LANES, compress_batch, digest_from_bytes, dig
 
 /// Height of the outputs' tree: positions are below `2^HEIGHT`.
 pub const HEIGHT: u32 = 41;
+/// The level of the subtrees the outputs are handed to another node in,
+/// when it takes the state from this one: parts of 131,072 positions.
+pub const PART_LEVEL: u32 = 17;
 /// Serialized size of a [`Record`].
 pub const RECORD_BYTES: usize = 32 + MEMO_BYTES + 8 + 4;
 
@@ -176,6 +179,21 @@ impl Tree for OutputTree {
     }
 }
 
+/// The root of the outputs' tree whose nonempty subtrees at `level` have
+/// the roots `parts` (ascending by index): what a node that is given a
+/// state's parts checks against the state's root.
+pub fn parts_root(level: u32, parts: &[(u64, Digest)]) -> Digest {
+    root(level as usize, HEIGHT as usize, &mut parts.to_vec())
+}
+
+/// The root of the subtree at `level` whose unspent outputs are
+/// `outputs` (ascending by position): what a part received is checked
+/// against, among the roots of the parts.
+pub fn part_root(level: u32, outputs: &[(u64, Record)]) -> Digest {
+    let mut leaves: Vec<(u64, Digest)> = outputs.iter().map(|(p, r)| (*p, r.leaf())).collect();
+    root(0, level as usize, &mut leaves)
+}
+
 /// The hash of a subtree of `height` levels with this part.
 fn hash_of(part: Option<Part>, height: u32) -> Digest {
     part.map_or(*empty(height as usize), |p| p.hash)
@@ -261,6 +279,49 @@ impl Outputs {
         }
         let edits = Edits { flips: spends, run: outputs, run_from: self.next as u128, ..Edits::none() };
         self.pass(txn, height, edits, next)
+    }
+
+    /// [`Outputs::apply`], which also returns the root of every subtree
+    /// at `level` the block changes, as it was before the block (`None`
+    /// where there was nothing): what takes the roots of the set's parts
+    /// back to the block before.
+    pub fn apply_keeping<B: Backend>(
+        &self,
+        txn: &mut Txn<'_, B>,
+        height: u32,
+        spends: &[u64],
+        outputs: &[Record],
+        level: u32,
+    ) -> Result<(Outputs, Vec<(u64, Option<Digest>)>), Error> {
+        let next = self.next + outputs.len() as u64;
+        assert!(next <= 1 << HEIGHT, "more outputs than the tree has positions");
+        if let Some(p) = spends.iter().find(|p| **p >= self.next) {
+            return Err(Error::NoSuchOutput(*p));
+        }
+        let edits: Edits<'_, OutputTree> =
+            Edits { flips: spends, run: outputs, run_from: self.next as u128, ..Edits::none() };
+        let (root, change, before) = trie::update_keeping(txn, self.root, height, edits, level)?;
+        let count = self.count.checked_add_signed(change).ok_or_else(|| corrupt("the count of outputs is wrong"))?;
+        let before = before.into_iter().map(|(i, part)| (i as u64, part.map(|p| p.hash))).collect();
+        Ok((Outputs { root, next, count }, before))
+    }
+
+    /// The root of every nonempty subtree at `level`, ascending by index:
+    /// the set's parts. They hash to the set's root ([`parts_root`]).
+    pub fn parts(&self, pages: &impl ReadPages, level: u32) -> io::Result<Vec<(u64, Digest)>> {
+        let mut out = Vec::new();
+        trie::parts_at::<OutputTree>(pages, self.root, level, &mut |index, part| out.push((index as u64, part.hash)))?;
+        Ok(out)
+    }
+
+    /// Every output kept in the subtree of index `index` at `level`, in
+    /// position order, and whether it is unspent.
+    pub fn part(&self, pages: &impl ReadPages, level: u32, index: u64) -> io::Result<Vec<(u64, Record, bool)>> {
+        let mut out = Vec::new();
+        trie::for_each_in::<OutputTree>(pages, self.root, level, index as u128, &mut |key, record, live| {
+            out.push((key as u64, *record, live))
+        })?;
+        Ok(out)
     }
 
     /// The set with `outputs` put in, each at its position (ascending,

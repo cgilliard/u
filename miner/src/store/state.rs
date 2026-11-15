@@ -22,6 +22,24 @@
 //!
 //! A [`Snapshot`] is the state after some block, held while later blocks
 //! are applied: whoever reads through it sees that state, whole.
+//!
+//! # The state as of an earlier block
+//!
+//! A node that joins takes the state from the nodes there are, and takes
+//! long enough that the chain moves on meanwhile: so what it asks for is
+//! the state as of one block, and any block of the window will do
+//! ([`State::past`]). No block is marked for it beforehand and nothing
+//! is stored for it but what the window keeps to undo blocks with:
+//!
+//! - An output made after that block has a position past the block's
+//!   last, so the outputs unspent as of the block are those unspent now
+//!   below that position, and those spent since, whose records the set
+//!   still holds.
+//! - The outputs are handed over in parts, the subtrees of
+//!   [`PART_LEVEL`]. The roots of the parts as of the block are their
+//!   roots now, with those any block since changed put back as its
+//!   record has them. They hash to the outputs' root as of the block, so
+//!   each part that arrives is checked alone, against its root.
 
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -29,7 +47,7 @@ use std::thread::JoinHandle;
 
 use super::backend::Backend;
 use super::names::{NameProof, Names};
-use super::outputs::{Outputs, Record};
+use super::outputs::{Outputs, PART_LEVEL, Record};
 use super::pagefile::{PageFile, Pin, Root};
 use super::sparse::STATE_HEIGHT;
 use super::window::{BlockRecord, Window};
@@ -120,6 +138,19 @@ impl Meta {
         out.try_into().unwrap()
     }
 
+    /// Everything a root record says, the window's list read from its
+    /// page.
+    fn read(pages: &impl super::pagefile::ReadPages, root: &Root) -> io::Result<Meta> {
+        if root.payload().is_empty() && root.seq == 0 {
+            return Ok(Meta::empty());
+        }
+        let (height, tip, outputs, names) = Meta::head(root)?;
+        let rest = &root.payload()[RECORD - Window::BYTES - 8..];
+        let window = Window::read(pages, &rest[..Window::BYTES])?;
+        let sweep = u64::from_le_bytes(rest[Window::BYTES..].try_into().unwrap());
+        Ok(Meta { height, tip, outputs, names, window, sweep })
+    }
+
     /// The tip, the outputs and the names of a root record: what a
     /// reader needs.
     fn head(root: &Root) -> io::Result<(u32, Digest, Outputs, Names)> {
@@ -165,6 +196,8 @@ pub struct State<B: Backend + 'static> {
     meta: Mutex<Meta>,
     /// Blocks whose records the window keeps.
     keep: usize,
+    /// The level of the outputs' parts.
+    part_level: u32,
     /// The thread that rebuilds the file's map of free space, until it
     /// has been waited for.
     marking: Mutex<Option<JoinHandle<Result<(), io::ErrorKind>>>>,
@@ -198,20 +231,12 @@ impl<B: Backend + 'static> State<B> {
     /// when [`State::mark_now`] is called.
     fn open_idle(backend: B, keep: usize) -> io::Result<State<B>> {
         let file = PageFile::open_or_create(backend)?;
-        let root = file.root();
-        let meta = if root.payload().is_empty() && root.seq == 0 {
-            Meta::empty()
-        } else {
-            let (height, tip, outputs, names) = Meta::head(&root)?;
-            let rest = &root.payload()[RECORD - Window::BYTES - 8..];
-            let window = Window::read(&file, &rest[..Window::BYTES])?;
-            let sweep = u64::from_le_bytes(rest[Window::BYTES..].try_into().unwrap());
-            Meta { height, tip, outputs, names, window, sweep }
-        };
+        let meta = Meta::read(&file, &file.root())?;
         Ok(State {
             file: Arc::new(file),
             meta: Mutex::new(meta),
             keep,
+            part_level: PART_LEVEL,
             marking: Mutex::new(None),
             #[cfg(test)]
             times: Mutex::new([std::time::Duration::ZERO; 4]),
@@ -268,6 +293,57 @@ impl<B: Backend + 'static> State<B> {
         Ok(Snapshot { pin, height, tip, outputs, names })
     }
 
+    /// The state as of the block at `height`, to hand to another node:
+    /// any block from the one before the oldest that can be undone to
+    /// the tip. [`Error::NoUndoRecord`] for one older.
+    ///
+    /// Making it reads the record of every block since, so it is to be
+    /// made once and asked for many parts.
+    pub fn past(&self, height: u32) -> Result<Past<'_, B>, Error> {
+        // The state now, and everything read from the root record that
+        // is held: a block applied meanwhile changes neither.
+        let pin = self.file.pin();
+        let meta = Meta::read(&pin, pin.root())?;
+        let oldest = meta.window.oldest().unwrap_or(meta.height + 1);
+        if height > meta.height || height + 1 < oldest {
+            return Err(Error::NoUndoRecord);
+        }
+        let level = self.part_level;
+        let mut parts: std::collections::BTreeMap<u64, Digest> = meta.outputs.parts(&pin, level)?.into_iter().collect();
+        let (mut block, mut next, mut names_root) = (meta.tip, meta.outputs.next, meta.names.hash());
+        // How many outputs each part has had spent since, then which.
+        let mut spent: std::collections::BTreeMap<u64, Vec<u32>> = std::collections::BTreeMap::new();
+        for h in (height + 1..=meta.height).rev() {
+            let record = meta.window.get(&pin, h)?.ok_or_else(|| corrupt("a block of the window has no record"))?;
+            for (index, before) in &record.parts_before {
+                match before {
+                    Some(root) => parts.insert(*index, *root),
+                    None => parts.remove(index),
+                };
+            }
+            for p in &record.spends {
+                spent.entry(p >> level).or_default().push((p & ((1 << level) - 1)) as u32);
+            }
+            (block, next, names_root) = (record.before, record.first_new, record.names_before);
+        }
+        // What was spent since but made since too was never in that state.
+        for (index, offsets) in &mut spent {
+            offsets.retain(|o| (index << level | *o as u64) < next);
+            offsets.sort_unstable();
+        }
+        Ok(Past {
+            pin,
+            outputs: meta.outputs,
+            level,
+            height,
+            block,
+            next,
+            names_root,
+            parts: parts.into_iter().collect(),
+            spent,
+        })
+    }
+
     /// Applies the next block, and returns the state's root after it.
     /// Refused, with the state as it was: a block that spends what is not
     /// there ([`Error::NoSuchOutput`]), registers a name that is taken
@@ -281,7 +357,10 @@ impl<B: Backend + 'static> State<B> {
         let first_new = meta.outputs.next;
         #[cfg(test)]
         let (clock, mut times) = (std::time::Instant::now(), [std::time::Duration::ZERO; 4]);
-        meta.outputs = meta.outputs.apply(&mut txn, block.height, block.spends, block.outputs)?;
+        let names_before = meta.names.hash();
+        let (outputs, parts_before) =
+            meta.outputs.apply_keeping(&mut txn, block.height, block.spends, block.outputs, self.part_level)?;
+        meta.outputs = outputs;
         #[cfg(test)]
         {
             times[0] = clock.elapsed();
@@ -304,6 +383,8 @@ impl<B: Backend + 'static> State<B> {
             spends: block.spends.to_vec(),
             registered: block.names.iter().filter(|n| !n.2).map(|n| n.0).collect(),
             replaced,
+            names_before,
+            parts_before,
         };
         meta.window.push(&mut txn, &record, self.keep)?;
         // What was spent before the oldest block of the window is dead
@@ -348,6 +429,70 @@ impl<B: Backend + 'static> State<B> {
         let tip = (meta.height, meta.tip);
         *self.meta() = meta;
         Ok(tip)
+    }
+}
+
+/// The state as of an earlier block ([`State::past`]), to be handed to
+/// another node in parts. While it is held the pages it reads are not
+/// reused.
+pub struct Past<'a, B: Backend + 'static> {
+    pin: Pin<'a, B>,
+    /// The outputs as they are now.
+    outputs: Outputs,
+    level: u32,
+    height: u32,
+    block: Digest,
+    next: u64,
+    names_root: Digest,
+    parts: Vec<(u64, Digest)>,
+    /// The outputs spent since, by part: each its place within the part.
+    spent: std::collections::BTreeMap<u64, Vec<u32>>,
+}
+
+impl<B: Backend + 'static> Past<'_, B> {
+    /// The block it is the state after: its height and id.
+    pub fn tip(&self) -> (u32, Digest) {
+        (self.height, self.block)
+    }
+
+    /// The position the next output would have taken.
+    pub fn next(&self) -> u64 {
+        self.next
+    }
+
+    /// The level of the outputs' parts.
+    pub fn level(&self) -> u32 {
+        self.level
+    }
+
+    /// The root of each part of the outputs, ascending by index.
+    pub fn parts(&self) -> &[(u64, Digest)] {
+        &self.parts
+    }
+
+    /// The root of the names' tree.
+    pub fn names_root(&self) -> Digest {
+        self.names_root
+    }
+
+    /// The state's root: the one the block's header commits to.
+    pub fn root(&self) -> Digest {
+        compress(&super::outputs::parts_root(self.level, &self.parts), &self.names_root)
+    }
+
+    /// The unspent outputs of the part of index `index`, ascending by
+    /// position: those unspent now, and those spent since, less those
+    /// made since.
+    pub fn part(&self, index: u64) -> io::Result<Vec<(u64, Record)>> {
+        let since = self.spent.get(&index).map_or(&[][..], |s| &s[..]);
+        let offset = |p: u64| (p & ((1 << self.level) - 1)) as u32;
+        Ok(self
+            .outputs
+            .part(&self.pin, self.level, index)?
+            .into_iter()
+            .filter(|(p, _, live)| *p < self.next && (*live || since.binary_search(&offset(*p)).is_ok()))
+            .map(|(p, record, _)| (p, record))
+            .collect())
     }
 }
 
@@ -916,6 +1061,134 @@ mod tests {
         assert!(damaged.wait_ready().is_ok());
     }
 
+    /// The outputs unspent after the first `blocks` blocks of a chain,
+    /// by doing what they say.
+    fn replay(chain: &Chain, blocks: usize) -> std::collections::BTreeMap<u64, Record> {
+        let mut unspent = std::collections::BTreeMap::new();
+        let mut next = 0u64;
+        for (_, spends, outputs, _) in &chain.blocks[..blocks] {
+            for p in spends {
+                unspent.remove(p).expect("a block spends what is unspent");
+            }
+            for r in outputs {
+                unspent.insert(next, *r);
+                next += 1;
+            }
+        }
+        unspent
+    }
+
+    /// What another node does with a state it is handed: every part
+    /// checked against its root, the parts' roots against the state's,
+    /// and the outputs gathered.
+    fn receive(past: &Past<'_, MemBackend>) -> std::collections::BTreeMap<u64, Record> {
+        use crate::store::outputs::{part_root, parts_root};
+        let level = past.level();
+        assert_eq!(compress(&parts_root(level, past.parts()), &past.names_root()), past.root());
+        let mut all = std::collections::BTreeMap::new();
+        for (index, root) in past.parts() {
+            let part = past.part(*index).unwrap();
+            assert!(!part.is_empty() && part.iter().all(|(p, _)| p >> level == *index && *p < past.next()));
+            assert_eq!(part_root(level, &part), *root, "part {index}");
+            // One output left out, or one changed: not that part.
+            assert_ne!(part_root(level, &part[1..]), *root);
+            all.extend(part);
+        }
+        // A part with no root holds nothing.
+        let absent = past.parts().last().map_or(0, |p| p.0 + 1);
+        assert!(past.part(absent).unwrap().is_empty());
+        all
+    }
+
+    /// The state as of any block of the window is handed over whole and
+    /// checked: after blocks, after a reorganisation, after the file is
+    /// opened again, and while later blocks are applied.
+    #[test]
+    fn the_state_as_of_any_block_of_the_window() {
+        let keep = 6usize;
+        let mut chain = Chain::new(0x9a57);
+        let mut state = State::open(MemBackend::new(), keep).unwrap();
+        // Parts of 512 positions, so that a few thousand outputs are many.
+        state.part_level = 9;
+        let check = |state: &State<MemBackend>, chain: &Chain| {
+            let tip = chain.blocks.len();
+            for height in tip.saturating_sub(keep)..=tip {
+                let past = state.past(height as u32).unwrap();
+                let (id, root) = match height {
+                    0 => ([Fp::ZERO; DIGEST], *empty(STATE_HEIGHT)),
+                    h => (chain.blocks[h - 1].0, chain.blocks[h - 1].3),
+                };
+                assert_eq!((past.tip(), past.root()), ((height as u32, id), root), "as of block {height} at {tip}");
+                let want = replay(chain, height);
+                assert_eq!(past.next(), chain.blocks[..height].iter().map(|b| b.2.len() as u64).sum::<u64>());
+                assert_eq!(receive(&past), want, "as of block {height} at {tip}");
+            }
+            if tip > keep {
+                assert_eq!(state.past((tip - keep - 1) as u32).err(), Some(Error::NoUndoRecord));
+            }
+            assert_eq!(state.past(tip as u32 + 1).err(), Some(Error::NoUndoRecord));
+        };
+        check(&state, &chain);
+        for (spends, adds) in
+            [(0, 700), (100, 300), (300, 20), (0, 0), (250, 900), (400, 100), (50, 0), (300, 600), (200, 200)]
+        {
+            chain.extend(&state, spends, adds, 0).unwrap();
+            check(&state, &chain);
+        }
+        assert!(state.past(9).unwrap().parts().len() >= 4, "several parts");
+
+        // A state held while the chain goes on, and back: it is still
+        // the state it was made of.
+        let held = state.past(6).unwrap();
+        let (root, outputs) = (held.root(), receive(&held));
+        state.undo().unwrap();
+        state.undo().unwrap();
+        chain.forget();
+        chain.forget();
+        for _ in 0..3 {
+            chain.extend(&state, 150, 250, 1).unwrap();
+        }
+        assert_eq!((held.root(), receive(&held)), (root, outputs));
+        drop(held);
+        check(&state, &chain);
+
+        // Opened again: the records are the file's.
+        let mut again = State::open(MemBackend::from_image(state.file().backend().image(Lost::All)), keep).unwrap();
+        again.part_level = 9;
+        check(&again, &chain);
+        chain.extend(&again, 100, 100, 1).unwrap();
+        check(&again, &chain);
+    }
+
+    /// The names' root as of an earlier block goes with its state.
+    #[test]
+    fn the_names_root_goes_back_with_the_state() {
+        let mut rng = Rng::new(0x4a57);
+        let state = State::open(MemBackend::new(), 4).unwrap();
+        let d = |rng: &mut Rng| -> Digest { core::array::from_fn(|_| rng.fp()) };
+        let mut roots = vec![state.root()];
+        for (height, name) in [(1u32, "alice"), (2, "bob"), (3, "carol")] {
+            let named = NameRecord::new(name.as_bytes(), d(&mut rng), d(&mut rng), d(&mut rng)).unwrap();
+            let outputs = [record(&mut rng, height)];
+            let names = [(named.key(), named, false)];
+            let block = BlockEdit {
+                height,
+                block: id(height, 0),
+                spends: &[],
+                outputs: &outputs,
+                names: &names,
+                state_root: None,
+            };
+            roots.push(state.apply(&block).unwrap());
+        }
+        for height in 0..=3u32 {
+            let past = state.past(height).unwrap();
+            assert_eq!(past.root(), roots[height as usize], "as of block {height}");
+            assert_eq!(past.next(), height as u64);
+        }
+        assert_ne!(state.past(1).unwrap().names_root(), state.past(2).unwrap().names_root());
+    }
+
     /// On a real file, closed and opened.
     #[test]
     fn on_a_real_file() {
@@ -1046,6 +1319,7 @@ mod tests {
             );
         }
         let start = state.tip().0;
+        let unspent_end = state.snapshot().unwrap().outputs().next;
 
         // The sample may hold a position twice over: each is spent once.
         sample.sort_unstable();
@@ -1090,6 +1364,34 @@ mod tests {
         println!("the last block undone in {:.2?}", t.elapsed());
         state.wait_ready().unwrap();
         println!("the map of free space whole {:.1?} after opening", opening.elapsed());
+
+        // The state as of the block the run began at, for another node:
+        // made, then some of its parts taken and checked.
+        let t = std::time::Instant::now();
+        let past = state.past(start).unwrap();
+        let made = t.elapsed();
+        let t = std::time::Instant::now();
+        let (mut outputs, mut bytes) = (0usize, 0usize);
+        let step = (past.parts().len() / 64).max(1);
+        let taken: Vec<&(u64, Digest)> = past.parts().iter().step_by(step).collect();
+        for (index, root) in &taken {
+            let part = past.part(*index).unwrap();
+            assert_eq!(crate::store::outputs::part_root(past.level(), &part), *root);
+            outputs += part.len();
+            bytes += part.len() * (8 + crate::store::outputs::RECORD_BYTES);
+        }
+        println!(
+            "the state as of block {start}, {} blocks back: made in {made:.2?} ({} parts); {} parts of it read and checked in {:.2?}, {} outputs and {} KB a part; memory held {} MB",
+            state.tip().0 - start,
+            past.parts().len(),
+            taken.len(),
+            t.elapsed(),
+            outputs / taken.len().max(1),
+            bytes / taken.len().max(1) / 1024,
+            peak_memory()
+        );
+        assert_eq!(past.next(), unspent_end);
+        drop(past);
         // Undone to where it began, so that a kept file is as it was.
         while state.tip().0 > start {
             state.undo().unwrap();
