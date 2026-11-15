@@ -1,3 +1,4 @@
+pub mod aggregate;
 pub mod block;
 pub mod block_air;
 pub mod block_proof;
