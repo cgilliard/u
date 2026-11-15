@@ -30,8 +30,20 @@
 //!
 //! The 31-bit decomposition columns ([`Cols::bits`]) are constrained to a
 //! canonical field element on every row and bound to a value only on load
-//! rows, so an enclosing circuit may use them for its own range checks on
-//! other rows through [`bits_value`].
+//! rows, so an enclosing circuit may use them on other rows through
+//! [`bits_value`]. What that gives it is a decomposition, not a bound:
+//! every field element has one. A circuit that means a value to be small
+//! (an age, a count of blocks that must not be negative) must itself
+//! require the high bits to be zero on the rows where it reads them; a
+//! difference that went below zero is a field element near the modulus,
+//! whose high bits are set.
+//!
+//! The checksum's own bound, twelve bits, holds on the rows that load it
+//! and on no others. (It once held on every row while the element
+//! selector stood at the checksum, which it does from the end of one
+//! signature to the start of the next: an enclosing circuit's values
+//! were then cut to twelve bits after a signature and to nothing before
+//! the first.)
 
 use crate::field::Field;
 use crate::hash_machine::{COL_ACC, COL_DATA, COL_DIR, HashTraceBuilder};
@@ -343,7 +355,9 @@ pub fn eval<F: Field>(b: &mut Builder<'_, F>, c: &Cols, t: &Types, msg: &[F; DIG
     }
     elem += esel[DIGEST] * l[c.csum()];
     b.assert_zero(load * (value - elem));
-    b.assert_zero(esel[DIGEST] * high12);
+    // The checksum is twelve bits: where it is loaded, and nowhere else.
+    // On every other row the bits are the enclosing circuit's.
+    b.assert_zero(load * esel[DIGEST] * high12);
     let mut d = F::ZERO;
     for k in 0..DIGITS_PER_ELEMENT {
         let mut nib = F::ZERO;

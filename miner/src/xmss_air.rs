@@ -327,6 +327,37 @@ mod tests {
         assert_eq!(seen.into_iter().collect::<Vec<_>>(), ["bits", "data", "dir", "rem", "rem_inv", "sib"]);
     }
 
+    /// Off the rows that load a value, the bit columns are the enclosing
+    /// circuit's: any canonical value can stand in them, before a
+    /// signature's loads and after them. On the row that loads the
+    /// checksum they are twelve bits and no more.
+    #[test]
+    fn the_bits_are_free_off_the_load_rows() {
+        let m = msg(8);
+        let (pk, sig) = signed(2, 4, 3, &m);
+        let trace = XmssAir::generate_trace(&pk, &m, &sig);
+        let public = XmssAir::public_values(&pk, &m);
+        let is = |row: usize, t: usize| trace.row(row)[t] == Fp::ONE;
+        let digit_of = |row: usize| (0..crate::xmss::DIGITS_PER_ELEMENT).find(|k| is(row, COLS.ksel(*k))).unwrap();
+        let w = trace.width;
+        let loads: Vec<usize> = (0..trace.height()).filter(|r| is(*r, T_LOAD)).collect();
+        let (first, last) = (loads[0], *loads.last().unwrap());
+        // A value of thirty-one bits, below the modulus.
+        let wide = (1 << 30) | (1 << 20) | 5;
+        for row in [0, first - 1, last + 1, last + 7, trace.height() - 1] {
+            assert!(!is(row, T_LOAD));
+            let mut t = trace.clone();
+            let digit = digit_of(row);
+            xmss_fragment::write_bits(&mut t.values[row * w..(row + 1) * w], &COLS, wide, digit);
+            assert_eq!(check_constraints(&XmssAir, &t, &public), Ok(()), "row {row}");
+        }
+        // The checksum's load: a bit above the twelfth is refused there.
+        let csum = *loads.iter().rev().find(|r| is(**r, COLS.esel(DIGEST))).unwrap();
+        let mut t = trace.clone();
+        t.values[csum * w + COLS.bits(12)] = Fp::ONE;
+        assert!(check_constraints(&XmssAir, &t, &public).is_err());
+    }
+
     #[test]
     fn forged_witness_fails_constraints() {
         let m = msg(5);
