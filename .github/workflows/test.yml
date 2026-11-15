@@ -35,6 +35,19 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      # Windows cannot hold a file named for one of its devices (aux, con,
+      # nul, prn, com1...), whatever its extension, nor some characters,
+      # nor a name ending in a dot or a space, nor two names that differ
+      # only by case: with one such file the repository cannot be checked
+      # out there at all. Linux holds them all, so it is checked here.
+      - name: Check that Windows can hold every file
+        working-directory: .
+        run: |
+          bad=$(git ls-files | grep -iE '(^|/)(con|prn|aux|nul|com[0-9]|lpt[0-9])(\.[^/]*)?$' || true)
+          bad="$bad$(git ls-files | grep -E '[<>:"|?*\\]|[ .]$' || true)"
+          bad="$bad$(git ls-files | tr 'A-Z' 'a-z' | sort | uniq -d)"
+          if [ -n "$bad" ]; then echo "names Windows cannot hold:"; echo "$bad"; exit 1; fi
+
   test:
     name: test (${{ matrix.os }}, debug)
     runs-on: ${{ matrix.os }}
@@ -93,6 +106,52 @@ jobs:
 
       - name: Test
         run: cargo test --locked --release --features dev
+
+      # Every test marked #[ignore] is run somewhere: by the benchmarks,
+      # or by a job of its own below.
+      - name: Check that no ignored test is forgotten
+        run: ./tools/ignored.sh
+
+  # The slow tests: those marked #[ignore] that are not benchmarks, a job
+  # each, in a release build. The audits of the circuits take the longest.
+  slow:
+    name: slow (${{ matrix.test }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          # slow-tests:begin
+          - block_air::circuit_tests::a_replaced_permutation_is_caught_where_it_is_used
+          - block_air::circuit_tests::the_block_circuit_has_no_unintended_freedom
+          - block_air::circuit_tests::the_circuit_agrees_with_the_chain_on_random_blocks
+          - name_air::tests::has_no_unintended_freedom
+          - pow::tests::write_dev_dataset
+          - pow_air::tests::mainnet_attacks
+          - pow_air::tests::mainnet_constraints_hold
+          - pow_air::tests::mainnet_folds
+          # slow-tests:end
+    defaults:
+      run:
+        working-directory: miner
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+
+      - name: Test
+        run: cargo test --locked --release --features dev --lib -- --ignored --exact --nocapture ${{ matrix.test }}
+
+      # One of them writes a file of the repository, from the seed text:
+      # the file kept must be the one it writes.
+      - name: Check that nothing kept was changed
+        working-directory: .
+        run: git diff --exit-code
 
   # Code coverage of the tests, with the toolchain's own LLVM tools
   # (miner/tools/coverage.sh, which runs the same locally). The table is

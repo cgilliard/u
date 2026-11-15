@@ -7,7 +7,9 @@
 #   summary.md   the same in a code block, for the CI run's page
 #
 # A timing test is added to BENCHES below by name: other ignored tests
-# (slow ones, say) are not benchmarks and are not run here.
+# (slow ones, say) are not benchmarks and are not run here; each of
+# those has a job of its own in .github/workflows/test.yml, and
+# tools/ignored.sh sees that no ignored test is in neither.
 #
 # On x86-64 they run twice: built for this CPU (as .cargo/config.toml
 # builds by default; AVX2 where the CPU has it) and built for the
@@ -24,6 +26,8 @@ BENCHES=(
     poseidon2::speed::compress_speed
     pow::tests::mainnet_timing
     pow_air::tests::cost
+    store::outputs::tests::cost
+    store::state::tests::cost_at_scale
 )
 
 out=target/bench
