@@ -29,6 +29,7 @@
 //!                | names' root before (32)
 //!                | names' parts changed (2) | (index (4) | kind (1) | hash before (32)) ...
 //!                | parts changed (4) | (index (4) | was there (1) | root before (32)) ...
+//!                | commits spent (2) | (position (8) | hash (32) | height (4)) ...
 //! list page   := blocks (2) | (height (4) | first page (6)) ...
 //! ```
 
@@ -36,6 +37,7 @@ use std::collections::VecDeque;
 use std::io;
 
 use super::backend::Backend;
+use super::commits::Commit;
 use super::pagefile::{Extent, MAX_UNITS, PageFile, ReadPages, Txn, UNIT};
 use super::trie::Part;
 use crate::hash::Digest;
@@ -91,6 +93,9 @@ pub struct BlockRecord {
     /// The root of each part of the outputs it changed, as it was before
     /// (`None` if the part was empty), ascending by index.
     pub parts_before: Vec<(u64, Option<Digest>)>,
+    /// The commits its reveals and sweeps spent, that the table of
+    /// commits had: their positions and what they were.
+    pub commits_spent: Vec<(u64, Commit)>,
 }
 
 impl BlockRecord {
@@ -134,6 +139,11 @@ impl BlockRecord {
             out.extend_from_slice(&(*index as u32).to_le_bytes());
             out.push(before.is_some() as u8);
             out.extend_from_slice(&digest_to_bytes(&before.unwrap_or([crate::poseidon2::Fp::ZERO; 8])));
+        }
+        out.extend_from_slice(&(self.commits_spent.len() as u16).to_le_bytes());
+        for (position, commit) in &self.commits_spent {
+            out.extend_from_slice(&position.to_le_bytes());
+            commit.put(&mut out);
         }
         out
     }
@@ -205,7 +215,7 @@ impl BlockRecord {
         }
         let (parts, mut b) = b.split_at_checked(4).ok_or_else(bad)?;
         let parts = u32::from_le_bytes(parts.try_into().unwrap()) as usize;
-        if b.len() != parts * 37 {
+        if b.len() < parts * 37 {
             return Err(bad());
         }
         let mut parts_before = Vec::with_capacity(parts);
@@ -223,7 +233,17 @@ impl BlockRecord {
             parts_before.push((index, (entry[4] == 1).then_some(hash)));
             b = rest;
         }
+        let spent = count(&mut b)?;
+        if b.len() != spent * 44 {
+            return Err(bad());
+        }
+        let commits_spent = b
+            .chunks_exact(44)
+            .map(|e| Some((u64::from_le_bytes(e[..8].try_into().unwrap()), Commit::get(&e[8..])?)))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(bad)?;
         Ok(BlockRecord {
+            commits_spent,
             names_before,
             names_parts_before,
             parts_before,
@@ -449,6 +469,9 @@ mod tests {
                     NameRecord::new(&b"abcdefghij"[..1 + i as usize], d(height), d(7), d(9)).unwrap()
                 })
                 .collect(),
+            commits_spent: (0..height as u64 % 4)
+                .map(|i| (i * 1000 + 3, Commit { hash: [Fp::new(i as u32 + 9); 8], height: height - 1 }))
+                .collect(),
             names_before: [Fp::new(height + 5); 8],
             names_parts_before: (0..height % 3)
                 .map(|i| (i * 7, (i != 1).then_some(Part { hash: [Fp::new(i + 40); 8], single: i == 2 })))
@@ -467,7 +490,7 @@ mod tests {
             let bytes = r.to_bytes();
             assert_eq!(BlockRecord::from_bytes(&bytes).unwrap(), r);
             // About three bytes a spend.
-            assert!(bytes.len() <= 80 + 3 * spends + 500, "{} bytes for {spends} spends", bytes.len());
+            assert!(bytes.len() <= 80 + 3 * spends + 700, "{} bytes for {spends} spends", bytes.len());
             for cut in [0, 79, bytes.len().saturating_sub(1)] {
                 assert!(BlockRecord::from_bytes(&bytes[..cut]).is_err());
             }

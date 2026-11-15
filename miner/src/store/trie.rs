@@ -253,6 +253,41 @@ impl Child {
     }
 }
 
+/// Bytes of the root of a tree that hashes nothing, in a root record.
+pub const FLAT_BYTES: usize = CHILD_BYTES - 32;
+
+/// Writes the root of a tree that hashes nothing: a child less its hash,
+/// which is zero, in [`FLAT_BYTES`].
+pub fn write_flat(root: &Child, out: &mut Vec<u8>) {
+    let mut full = Vec::with_capacity(CHILD_BYTES);
+    root.write(&mut full);
+    let end = out.len() + FLAT_BYTES;
+    out.push(full[0]);
+    if full.len() > 1 {
+        debug_assert!(full[1..33].iter().all(|b| *b == 0), "the tree hashes nothing");
+        out.extend_from_slice(&full[33..]);
+    }
+    out.resize(end, 0);
+}
+
+/// Reads what [`write_flat`] wrote.
+pub fn read_flat(b: &[u8]) -> io::Result<Child> {
+    let bad = || corrupt("a tree's root is not one");
+    if b.len() != FLAT_BYTES {
+        return Err(bad());
+    }
+    let mut full = vec![b[0]];
+    if b[0] != 0 {
+        full.extend_from_slice(&[0; 32]);
+    }
+    full.extend_from_slice(&b[1..]);
+    let (root, rest) = Child::read(&full)?;
+    match rest.iter().all(|x| *x == 0) {
+        true => Ok(root),
+        false => Err(bad()),
+    }
+}
+
 /// A node's children, read from its page.
 pub fn read_node(payload: &[u8], height: u32) -> io::Result<[Child; FANOUT]> {
     let bad = || corrupt("a node's page is not one");

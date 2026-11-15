@@ -46,6 +46,7 @@
 //! - [`blob`]: bytes too many for a page, as a chain of pages.
 //! - [`blocks`]: the headers, the bodies kept and the chain by height,
 //!   in tries of the same file.
+//! - [`commits`]: which outputs are commits of names, and of what.
 //! - [`state`]: the two under one root record, with the block they are
 //!   the state after: what a node applies blocks to.
 //! - [`receive`]: a state taken from other nodes part by part, each
@@ -58,6 +59,7 @@
 pub mod backend;
 pub mod blob;
 pub mod blocks;
+pub mod commits;
 pub mod crc32c;
 pub mod freemap;
 pub mod names;

@@ -51,6 +51,7 @@ use std::thread::JoinHandle;
 
 use super::backend::Backend;
 use super::blocks::Blocks;
+use super::commits::{Commit, Commits};
 use super::names::{NameProof, Names, PART_LEVEL as NAME_PART_LEVEL};
 use super::outputs::{Outputs, PART_LEVEL, Record};
 use super::pagefile::{PageFile, Pin, Root, Txn};
@@ -66,7 +67,8 @@ const VERSION: u8 = 1;
 /// What a root record begins with while its state is still being
 /// received from other nodes ([`super::receive`]): not a state to open.
 pub(super) const RECEIVING: u8 = 2;
-const RECORD: usize = BLOCKS_AT + Blocks::BYTES;
+const RECORD: usize = COMMITS_AT + Commits::BYTES;
+const COMMITS_AT: usize = BLOCKS_AT + Blocks::BYTES;
 const NAMES_AT: usize = 37 + Outputs::BYTES;
 const WINDOW_AT: usize = NAMES_AT + Names::BYTES;
 const BLOCKS_AT: usize = WINDOW_AT + Window::BYTES + 8;
@@ -91,7 +93,8 @@ fn mark_all<B: Backend>(file: &PageFile<B>, opened: &Meta) -> Result<(), io::Err
         .mark(file)
         .and_then(|()| opened.names.mark(file))
         .and_then(|()| opened.window.mark(file))
-        .and_then(|()| opened.blocks.mark(file));
+        .and_then(|()| opened.blocks.mark(file))
+        .and_then(|()| opened.commits.mark(file));
     match marked {
         Ok(()) => {
             file.seal();
@@ -130,6 +133,8 @@ pub(super) struct Meta {
     pub(super) sweep: u64,
     /// The blocks known of.
     pub(super) blocks: Blocks,
+    /// Which outputs are commits of names.
+    pub(super) commits: Commits,
 }
 
 impl Meta {
@@ -142,6 +147,7 @@ impl Meta {
             window: Window::default(),
             sweep: 0,
             blocks: Blocks::EMPTY,
+            commits: Commits::EMPTY,
         }
     }
 
@@ -155,6 +161,7 @@ impl Meta {
         out.extend_from_slice(&self.window.to_bytes());
         out.extend_from_slice(&self.sweep.to_le_bytes());
         out.extend_from_slice(&self.blocks.to_bytes());
+        out.extend_from_slice(&self.commits.to_bytes());
         out.try_into().unwrap()
     }
 
@@ -168,14 +175,17 @@ impl Meta {
         let rest = &root.payload()[WINDOW_AT..];
         let window = Window::read(pages, &rest[..Window::BYTES])?;
         let sweep = u64::from_le_bytes(rest[Window::BYTES..Window::BYTES + 8].try_into().unwrap());
-        Ok(Meta { height, tip, outputs, names, window, sweep, blocks: Meta::blocks(root)? })
+        let (blocks, commits) = Meta::blocks(root)?;
+        Ok(Meta { height, tip, outputs, names, window, sweep, blocks, commits })
     }
 
-    /// The blocks of a root record.
-    fn blocks(root: &Root) -> io::Result<Blocks> {
+    /// The blocks and the commits of a root record.
+    fn blocks(root: &Root) -> io::Result<(Blocks, Commits)> {
         match root.payload() {
-            b if b.len() == RECORD => Blocks::from_bytes(&b[BLOCKS_AT..]),
-            _ => Ok(Blocks::EMPTY),
+            b if b.len() == RECORD => {
+                Ok((Blocks::from_bytes(&b[BLOCKS_AT..COMMITS_AT])?, Commits::from_bytes(&b[COMMITS_AT..])?))
+            }
+            _ => Ok((Blocks::EMPTY, Commits::EMPTY)),
         }
     }
 
@@ -216,6 +226,12 @@ pub struct BlockEdit<'a> {
     /// The names it registers (`false`) and the records it puts in place
     /// of those registered (`true`), ascending by key.
     pub names: &'a [(Key, NameRecord, bool)],
+    /// The hashes of the commits of names it makes: they are the last
+    /// of `outputs`, in this order, each an output whose commitment is
+    /// the commit's leaf at this height ([`crate::name::commit_leaf`]).
+    pub commits: &'a [Digest],
+    /// Those of `spends` that its reveals and sweeps spend: commits.
+    pub commits_spent: &'a [u64],
     /// The state root its header commits to. If given and the state after
     /// the block is another, the block is refused.
     pub state_root: Option<Digest>,
@@ -348,8 +364,8 @@ impl<B: Backend + 'static> State<B> {
     pub fn snapshot(&self) -> io::Result<Snapshot<'_, B>> {
         let pin = self.file.pin();
         let (height, tip, outputs, names) = Meta::head(pin.root())?;
-        let blocks = Meta::blocks(pin.root())?;
-        Ok(Snapshot { pin, height, tip, outputs, names, blocks })
+        let (blocks, commits) = Meta::blocks(pin.root())?;
+        Ok(Snapshot { pin, height, tip, outputs, names, blocks, commits })
     }
 
     /// The state as of the block at `height`, to hand to another node:
@@ -375,6 +391,8 @@ impl<B: Backend + 'static> State<B> {
             meta.names.parts(&pin, name_level)?.into_iter().collect();
         // The names changed since: each as it was, or that it was not.
         let mut names_then: std::collections::BTreeMap<Key, Option<NameRecord>> = std::collections::BTreeMap::new();
+        // The commits spent since: commits then.
+        let mut commits_then: std::collections::BTreeMap<u64, Commit> = std::collections::BTreeMap::new();
         // How many outputs each part has had spent since, then which.
         let mut spent: std::collections::BTreeMap<u64, Vec<u32>> = std::collections::BTreeMap::new();
         for h in (height + 1..=meta.height).rev() {
@@ -398,6 +416,7 @@ impl<B: Backend + 'static> State<B> {
             for old in &record.replaced {
                 names_then.insert(old.key(), Some(*old));
             }
+            commits_then.extend(record.commits_spent.iter().copied());
             for p in &record.spends {
                 spent.entry(p >> level).or_default().push((p & ((1 << level) - 1)) as u32);
             }
@@ -422,6 +441,8 @@ impl<B: Backend + 'static> State<B> {
             name_level,
             name_parts: name_parts.into_iter().collect(),
             names_then,
+            commits: meta.commits,
+            commits_then,
         })
     }
 
@@ -492,6 +513,24 @@ impl<B: Backend + 'static> State<B> {
         if block.state_root.is_some_and(|want| want != root) {
             return Err(Error::StateRoot);
         }
+        // The table of commits: those spent leave it, those made enter.
+        // One spent that it has not is no fault: the table is an index.
+        let mut commits_spent = Vec::new();
+        for position in block.commits_spent {
+            debug_assert!(block.spends.binary_search(position).is_ok(), "a commit spent is among the spends");
+            if let Some(commit) = meta.commits.remove(&txn, *position)? {
+                commits_spent.push((*position, commit));
+            }
+        }
+        let made = block.outputs.len().checked_sub(block.commits.len()).expect("the commits are among the outputs");
+        for (i, hash) in block.commits.iter().enumerate() {
+            let output = &block.outputs[made + i];
+            assert!(
+                output.commitment == crate::name::commit_leaf(hash, block.height) && output.height == block.height,
+                "a commit's output is its leaf"
+            );
+            meta.commits.add(&txn, first_new + (made + i) as u64, Commit { hash: *hash, height: block.height })?;
+        }
         let record = BlockRecord {
             height: block.height,
             block: block.block,
@@ -503,6 +542,7 @@ impl<B: Backend + 'static> State<B> {
             names_before,
             names_parts_before,
             parts_before,
+            commits_spent,
         };
         meta.window.push(&mut txn, &record, self.keep)?;
         // What was spent before the oldest block of the window is dead
@@ -552,6 +592,10 @@ impl<B: Backend + 'static> State<B> {
         meta.outputs = meta.outputs.undo(&mut txn, record.height - 1, &record.spends, record.first_new)?;
         let restore: Vec<(Key, NameRecord, bool)> = record.replaced.iter().map(|r| (r.key(), *r, true)).collect();
         meta.names = meta.names.undo(&mut txn, &restore, &record.registered)?;
+        meta.commits.remove_between(&txn, record.first_new, u64::MAX)?;
+        for (position, commit) in &record.commits_spent {
+            meta.commits.add(&txn, *position, *commit)?;
+        }
         (meta.height, meta.tip) = (record.height - 1, record.before);
         also(&txn, &mut meta.blocks)?;
         txn.commit(&meta.to_bytes())?;
@@ -582,6 +626,9 @@ pub struct Past<'a, B: Backend + 'static> {
     name_parts: Vec<(u32, Part)>,
     /// The names changed since: each as it was, or that it was not.
     names_then: std::collections::BTreeMap<Key, Option<NameRecord>>,
+    /// The table of commits as it is now, and those spent since.
+    commits: Commits,
+    commits_then: std::collections::BTreeMap<u64, Commit>,
 }
 
 impl<B: Backend + 'static> Past<'_, B> {
@@ -603,6 +650,18 @@ impl<B: Backend + 'static> Past<'_, B> {
     /// The root of each part of the outputs, ascending by index.
     pub fn parts(&self) -> &[(u64, Digest)] {
         &self.parts
+    }
+
+    /// Which of the outputs of the part of index `index` are commits of
+    /// names, as this node's table has them: position and hash,
+    /// ascending. They go with the part, and are checked against its
+    /// outputs by whoever takes them ([`super::receive`]).
+    pub fn commits(&self, index: u64) -> io::Result<Vec<(u64, Digest)>> {
+        let (from, to) = (index << self.level, ((index + 1) << self.level).min(self.next));
+        let mut all: std::collections::BTreeMap<u64, Digest> =
+            self.commits.between(&self.pin, from, to)?.into_iter().map(|(p, c)| (p, c.hash)).collect();
+        all.extend(self.commits_then.range(from..to.max(from)).map(|(p, c)| (*p, c.hash)));
+        Ok(all.into_iter().collect())
     }
 
     /// The root of the names' tree.
@@ -672,6 +731,7 @@ pub struct Snapshot<'a, B: Backend + 'static> {
     outputs: Outputs,
     names: Names,
     blocks: Blocks,
+    commits: Commits,
 }
 
 impl<'a, B: Backend + 'static> Snapshot<'a, B> {
@@ -679,6 +739,11 @@ impl<'a, B: Backend + 'static> Snapshot<'a, B> {
     /// them: `snapshot.blocks().entry(snapshot.pages(), &id)`.
     pub fn blocks(&self) -> &Blocks {
         &self.blocks
+    }
+
+    /// Which outputs are commits of names: read as the blocks are.
+    pub fn commits(&self) -> &Commits {
+        &self.commits
     }
 
     /// The pages of the snapshot's state.
@@ -796,6 +861,8 @@ mod tests {
                 spends: &picked,
                 outputs: &outputs,
                 names: &[],
+                commits: &[],
+                commits_spent: &[],
                 state_root: None,
             };
             let root = state.apply(&block)?;
@@ -905,6 +972,8 @@ mod tests {
             spends,
             outputs: &outputs,
             names: &[],
+            commits: &[],
+            commits_spent: &[],
             state_root,
         };
         let gone: &'static [u64] = Box::leak(vec![spent].into_boxed_slice());
@@ -1035,6 +1104,8 @@ mod tests {
                     spends: &[],
                     outputs: &outputs,
                     names: &[],
+                    commits: &[],
+                    commits_spent: &[],
                     state_root: None,
                 };
                 again.apply(&block).unwrap();
@@ -1108,6 +1179,8 @@ mod tests {
                 spends: &[],
                 outputs: &outputs,
                 names,
+                commits: &[],
+                commits_spent: &[],
                 state_root: None,
             })
         };
@@ -1357,6 +1430,8 @@ mod tests {
                 spends: &[],
                 outputs: &outputs,
                 names: &names,
+                commits: &[],
+                commits_spent: &[],
                 state_root: None,
             };
             roots.push(state.apply(&block).unwrap());
@@ -1444,6 +1519,8 @@ mod tests {
                     spends: &[],
                     outputs: &outputs,
                     names: &puts,
+                    commits: &[],
+                    commits_spent: &[],
                     state_root: None,
                 };
                 let root = state.apply(&block).unwrap();
@@ -1492,6 +1569,8 @@ mod tests {
                 spends: &spends,
                 outputs: &outputs,
                 names: &[],
+                commits: &[],
+                commits_spent: &[],
                 state_root: None,
             };
             state.file().backend().crash_at(crash);
@@ -1588,6 +1667,98 @@ mod tests {
         assert_eq!(now.blocks().file(now.pages(), &[9; 32]).unwrap(), Some(vec![1; 70_000]));
         assert_eq!(now.blocks().chain[0], 7);
         assert_eq!(now.blocks().entry(now.pages(), &headers[19].id).unwrap(), Some(headers[19]));
+    }
+
+    /// The table of commits follows the blocks: a commit enters with
+    /// the block that makes it and leaves with the one that reveals or
+    /// sweeps it, a block undone puts back what it took and takes out
+    /// what it put, and a block that spends a commit the table has not
+    /// is applied all the same.
+    #[test]
+    fn commits_follow_the_blocks() {
+        use crate::name::commit_leaf;
+        let mut rng = Rng::new(0xc0a7);
+        let state = State::open(MemBackend::new(), 4).unwrap();
+        let d = |rng: &mut Rng| -> Digest { core::array::from_fn(|_| rng.fp()) };
+        let hashes: Vec<Digest> = (0..8).map(|_| d(&mut rng)).collect();
+        // Block h: nine outputs and then the commit `hashes[h]`, at
+        // position 10 h - 1; and whatever it spends.
+        let apply = |state: &State<MemBackend>, height: u32, spent: &[u64], commits: bool| {
+            let mut outputs: Vec<Record> = (0..9).map(|_| record(&mut Rng::new(height as u64), height)).collect();
+            let commit = hashes[height as usize];
+            outputs.push(Record { commitment: commit_leaf(&commit, height), amount: 0, ..outputs[0] });
+            state.apply(&BlockEdit {
+                height,
+                block: id(height, 0),
+                spends: spent,
+                outputs: &outputs,
+                names: &[],
+                commits: &[commit],
+                commits_spent: if commits { spent } else { &[] },
+                state_root: None,
+            })
+        };
+        let table = |state: &State<MemBackend>| {
+            let snap = state.snapshot().unwrap();
+            let all = snap.commits().up_to(snap.pages(), u32::MAX).unwrap();
+            assert_eq!(all.len() as u64, snap.commits().count);
+            for (position, commit) in &all {
+                assert_eq!(snap.commits().position_of(snap.pages(), &commit.hash).unwrap(), Some(*position));
+                assert_eq!(
+                    snap.output(*position).unwrap().unwrap().0.commitment,
+                    commit_leaf(&commit.hash, commit.height)
+                );
+            }
+            all.into_iter().map(|(p, c)| (p, c.height)).collect::<Vec<_>>()
+        };
+        apply(&state, 1, &[], true).unwrap();
+        apply(&state, 2, &[], true).unwrap();
+        assert_eq!(table(&state), vec![(9, 1), (19, 2)]);
+        // The first is revealed, and an output that is no commit spent.
+        apply(&state, 3, &[3, 9], true).unwrap();
+        assert_eq!(table(&state), vec![(9, 1), (19, 2), (29, 3)][1..]);
+        // Undone: the commit is back, the one the block made is gone.
+        state.undo().unwrap();
+        assert_eq!(table(&state), vec![(9, 1), (19, 2)]);
+        apply(&state, 3, &[9], true).unwrap();
+        // The state as of each block has the commits of then.
+        for (height, want) in [(1u32, vec![9u64]), (2, vec![9, 19]), (3, vec![19, 29])] {
+            let past = state.past(height).unwrap();
+            let got: Vec<u64> = past.commits(0).unwrap().into_iter().map(|c| c.0).collect();
+            assert_eq!(got, want, "as of block {height}");
+        }
+        // Opened again, the table is the file's.
+        let again = State::open(MemBackend::from_image(state.file().backend().image(Lost::All)), 4).unwrap();
+        again.wait_ready().unwrap();
+        assert_eq!(again.file().space().0, state.file().space().0);
+        assert_eq!(table(&again), vec![(19, 2), (29, 3)]);
+
+        // A table that lacks a commit: the block that spends it is
+        // applied, and undone, as by a node that has it.
+        let lacking = State::open(MemBackend::new(), 4).unwrap();
+        let whole = State::open(MemBackend::new(), 4).unwrap();
+        for height in 1..=2 {
+            let mut outputs: Vec<Record> = (0..9).map(|_| record(&mut Rng::new(height as u64), height)).collect();
+            outputs.push(Record { commitment: commit_leaf(&hashes[height as usize], height), amount: 0, ..outputs[0] });
+            let block = BlockEdit {
+                height,
+                block: id(height, 0),
+                spends: &[],
+                outputs: &outputs,
+                names: &[],
+                commits: &[],
+                commits_spent: &[],
+                state_root: None,
+            };
+            lacking.apply(&block).unwrap();
+            apply(&whole, height, &[], true).unwrap();
+        }
+        assert_eq!((table(&lacking), lacking.root()), (vec![], whole.root()));
+        assert_eq!(apply(&lacking, 3, &[9], true).unwrap(), apply(&whole, 3, &[9], true).unwrap());
+        assert_eq!(table(&lacking), vec![(29, 3)]);
+        assert_eq!(lacking.undo().unwrap(), whole.undo().unwrap());
+        assert_eq!((table(&lacking), lacking.root()), (vec![], whole.root()));
+        assert_eq!(table(&whole), vec![(9, 1), (19, 2)]);
     }
 
     /// On a real file, closed and opened.
@@ -1740,6 +1911,8 @@ mod tests {
                 spends: &spends,
                 outputs: &new,
                 names: &[],
+                commits: &[],
+                commits_spent: &[],
                 state_root: None,
             };
             let t = std::time::Instant::now();

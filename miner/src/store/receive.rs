@@ -44,6 +44,7 @@ use std::sync::Arc;
 
 use super::backend::Backend;
 use super::blocks::Blocks;
+use super::commits::{Commit, Commits};
 use super::names::{self, Names, PART_LEVEL as NAME_PART_LEVEL};
 use super::outputs::{self, HEIGHT, Outputs, PART_LEVEL, Record};
 use super::pagefile::{PageFile, Txn};
@@ -58,7 +59,8 @@ use crate::poseidon2::{compress, digest_from_bytes, digest_to_bytes};
 /// The root record while receiving: what it begins with, the block's
 /// height and id, the tries so far, the blocks known of, the state root
 /// wanted and the position after the last output.
-const RECORD: usize = BLOCKS_AT + Blocks::BYTES + 32 + 8;
+const RECORD: usize = COMMITS_AT + Commits::BYTES + 32 + 8;
+const COMMITS_AT: usize = BLOCKS_AT + Blocks::BYTES;
 const BLOCKS_AT: usize = 37 + Outputs::BYTES + Names::BYTES;
 const _: () = assert!(RECORD <= super::pagefile::ROOT_MAX);
 
@@ -86,6 +88,7 @@ pub struct Receiving<B: Backend + 'static> {
     outputs: Outputs,
     names: Names,
     blocks: Blocks,
+    commits: Commits,
     level: u32,
     name_level: u32,
     /// The root of each part of the outputs as of the block, and of each
@@ -126,17 +129,18 @@ impl<B: Backend + 'static> Receiving<B> {
     ) -> Result<Receiving<B>, Error> {
         Self::check(&target, parts, name_parts, level, name_level)?;
         let file = PageFile::open_or_create(backend)?;
-        let (outputs, names, blocks) = {
+        let (outputs, names, blocks, commits) = {
             let root = file.root();
             let b = root.payload();
             if b.is_empty() && root.seq == 0 {
-                (Outputs::EMPTY, Names::EMPTY, Blocks::EMPTY)
+                (Outputs::EMPTY, Names::EMPTY, Blocks::EMPTY, Commits::EMPTY)
             } else if b.len() == RECORD && b[0] == RECEIVING {
                 let names_at = 37 + Outputs::BYTES;
                 (
                     Outputs::from_bytes(&b[37..names_at])?,
                     Names::from_bytes(&b[names_at..BLOCKS_AT])?,
-                    Blocks::from_bytes(&b[BLOCKS_AT..BLOCKS_AT + Blocks::BYTES])?,
+                    Blocks::from_bytes(&b[BLOCKS_AT..COMMITS_AT])?,
+                    Commits::from_bytes(&b[COMMITS_AT..COMMITS_AT + Commits::BYTES])?,
                 )
             } else {
                 return Err(io::Error::new(io::ErrorKind::AlreadyExists, "the file holds a state").into());
@@ -148,9 +152,10 @@ impl<B: Backend + 'static> Receiving<B> {
             outputs.mark(&file)?;
             names.mark(&file)?;
             blocks.mark(&file)?;
+            commits.mark(&file)?;
             file.seal();
         }
-        Receiving::begin(Arc::new(file), target, parts, name_parts, level, name_level, outputs, names, blocks)
+        Receiving::begin(Arc::new(file), target, parts, name_parts, level, name_level, outputs, names, blocks, commits)
     }
 
     /// Receives the state as of `target` in place of the state `state`
@@ -182,6 +187,7 @@ impl<B: Backend + 'static> Receiving<B> {
         let mut txn = file.begin()?;
         meta.outputs.free(&txn)?;
         meta.names.free(&txn)?;
+        meta.commits.free(&txn)?;
         meta.window.clear(&mut txn)?;
         let mut this = Receiving {
             file: file.clone(),
@@ -189,6 +195,7 @@ impl<B: Backend + 'static> Receiving<B> {
             outputs: Outputs::EMPTY,
             names: Names::EMPTY,
             blocks: meta.blocks,
+            commits: Commits::EMPTY,
             level,
             name_level,
             want: BTreeMap::new(),
@@ -236,6 +243,7 @@ impl<B: Backend + 'static> Receiving<B> {
         outputs: Outputs,
         names: Names,
         blocks: Blocks,
+        commits: Commits,
     ) -> Result<Receiving<B>, Error> {
         let mut this = Receiving {
             have: outputs.parts(&*file, level)?.into_iter().collect(),
@@ -247,13 +255,14 @@ impl<B: Backend + 'static> Receiving<B> {
             outputs,
             names,
             blocks,
+            commits,
             level,
             name_level,
         };
         // Parts held for another block that this one's state has not.
         let gone: Vec<u64> = this.have.keys().filter(|i| !this.want.contains_key(i)).copied().collect();
         for index in gone {
-            this.exchange(index, &[])?;
+            this.exchange(index, &[], &[])?;
         }
         let gone: Vec<u32> = this.have_names.keys().filter(|i| !this.want_names.contains_key(i)).copied().collect();
         for index in gone {
@@ -305,6 +314,28 @@ impl<B: Backend + 'static> Receiving<B> {
     /// [`Error::PartRoot`], with nothing changed, if they are not that
     /// part.
     pub fn put(&mut self, index: u64, outputs: &[(u64, Record)]) -> Result<(), Error> {
+        self.put_with(index, outputs, &[])
+    }
+
+    /// [`Receiving::put`], with which of the outputs are commits of
+    /// names, as the other node has them
+    /// ([`super::state::Past::commits`]): position and hash, ascending.
+    /// Each must be the commit of its output, or the part is refused;
+    /// that none is left out cannot be known, and need not be
+    /// ([`super::commits`]).
+    pub fn put_with(&mut self, index: u64, outputs: &[(u64, Record)], commits: &[(u64, Digest)]) -> Result<(), Error> {
+        let is_commit = |(position, hash): &(u64, Digest)| {
+            outputs.binary_search_by_key(position, |o| o.0).is_ok_and(|i| {
+                let record = &outputs[i].1;
+                record.amount == 0 && record.commitment == crate::name::commit_leaf(hash, record.height)
+            })
+        };
+        if !commits.windows(2).all(|w| w[0].0 < w[1].0) || !outputs.windows(2).all(|w| w[0].0 < w[1].0) {
+            return Err(Error::PartRoot);
+        }
+        if !commits.iter().all(is_commit) {
+            return Err(Error::PartRoot);
+        }
         let Some(want) = self.want.get(&index) else { return Err(Error::PartRoot) };
         let sound = outputs.windows(2).all(|w| w[0].0 < w[1].0)
             && outputs.iter().all(|o| o.0 >> self.level == index && o.0 < self.target.next);
@@ -314,7 +345,7 @@ impl<B: Backend + 'static> Receiving<B> {
         if self.have.get(&index) == Some(want) {
             return Ok(());
         }
-        self.exchange(index, outputs)
+        self.exchange(index, outputs, commits)
     }
 
     /// Puts the part of the names of index `index`: its names' records
@@ -353,6 +384,7 @@ impl<B: Backend + 'static> Receiving<B> {
             window: Window::default(),
             sweep: 0,
             blocks: self.blocks,
+            commits: self.commits,
         };
         let txn = self.file.begin()?;
         txn.commit(&meta.to_bytes())?;
@@ -367,6 +399,7 @@ impl<B: Backend + 'static> Receiving<B> {
         out.extend_from_slice(&self.outputs.to_bytes());
         out.extend_from_slice(&self.names.to_bytes());
         out.extend_from_slice(&self.blocks.to_bytes());
+        out.extend_from_slice(&self.commits.to_bytes());
         out.extend_from_slice(&digest_to_bytes(&self.target.state_root));
         out.extend_from_slice(&self.target.next.to_le_bytes());
         out.try_into().unwrap()
@@ -374,7 +407,7 @@ impl<B: Backend + 'static> Receiving<B> {
 
     /// Puts `outputs` in place of what the part of index `index` holds:
     /// what is in both stays, since a position's output never changes.
-    fn exchange(&mut self, index: u64, outputs: &[(u64, Record)]) -> Result<(), Error> {
+    fn exchange(&mut self, index: u64, outputs: &[(u64, Record)], commits: &[(u64, Digest)]) -> Result<(), Error> {
         let held = match self.have.contains_key(&index) {
             true => self.outputs.part(&*self.file, self.level, index)?,
             false => Vec::new(),
@@ -388,6 +421,20 @@ impl<B: Backend + 'static> Receiving<B> {
             .collect();
         let mut txn = self.file.begin()?;
         self.outputs = self.outputs.exchange(&mut txn, &removes, &puts, self.target.next)?;
+        // The part's commits with it: those of what it held go.
+        let before = self.commits;
+        let done = (|| {
+            self.commits.remove_between(&txn, index << self.level, (index + 1) << self.level)?;
+            for (position, hash) in commits {
+                let height = outputs[outputs.binary_search_by_key(position, |o| o.0).unwrap()].1.height;
+                self.commits.add(&txn, *position, Commit { hash: *hash, height })?;
+            }
+            Ok::<(), Error>(())
+        })();
+        if let Err(e) = done {
+            self.commits = before;
+            return Err(e);
+        }
         txn.commit(&self.record())?;
         match self.want.get(&index).filter(|_| !outputs.is_empty()) {
             Some(root) => self.have.insert(index, *root),
@@ -456,6 +503,8 @@ mod tests {
         spends: Vec<u64>,
         outputs: Vec<Record>,
         names: Vec<(Key, NameRecord, bool)>,
+        commits: Vec<Digest>,
+        commits_spent: Vec<u64>,
         root: Digest,
         next: u64,
     }
@@ -468,6 +517,8 @@ mod tests {
                 spends: &self.spends,
                 outputs: &self.outputs,
                 names: &self.names,
+                commits: &self.commits,
+                commits_spent: &self.commits_spent,
                 state_root: Some(self.root),
             }
         }
@@ -481,6 +532,8 @@ mod tests {
         let mut state = State::open(MemBackend::new(), KEEP).unwrap();
         state.set_levels(LEVEL, NAME_LEVEL);
         let (mut live, mut next, mut known): (Vec<u64>, u64, Vec<NameRecord>) = (Vec::new(), 0, Vec::new());
+        // The commits made: the height and the position of each.
+        let mut made: Vec<(u32, u64)> = Vec::new();
         let mut chain = Vec::new();
         for height in 1..=blocks {
             let mut spends: Vec<u64> = (0..(live.len() / 3).min(15))
@@ -489,8 +542,12 @@ mod tests {
                     live.swap_remove(i)
                 })
                 .collect();
+            // The commit of two blocks back is spent, by every other block.
+            let commits_spent: Vec<u64> =
+                made.iter().filter(|m| m.0 + 2 == height && height % 2 == 1).map(|m| m.1).collect();
+            spends.extend(&commits_spent);
             spends.sort_unstable();
-            let outputs: Vec<Record> = (0..300 + rng.next_u64() % 400)
+            let mut outputs: Vec<Record> = (0..300 + rng.next_u64() % 400)
                 .map(|_| Record {
                     commitment: d(&mut rng),
                     memo: core::array::from_fn(|_| rng.fp()),
@@ -513,9 +570,19 @@ mod tests {
             let names: Vec<(Key, NameRecord, bool)> =
                 puts.into_iter().map(|(k, (r, replaces))| (k, r, replaces)).collect();
             let id: Digest = core::array::from_fn(|i| Fp::new(height * 100 + i as u32));
-            let mut block = Block { id, spends, outputs, names, root: [Fp::ZERO; 8], next: 0 };
+            // One commit a block, the last of its outputs.
+            let commit = d(&mut rng);
+            outputs.push(Record {
+                commitment: crate::name::commit_leaf(&commit, height),
+                memo: core::array::from_fn(|_| rng.fp()),
+                amount: 0,
+                height,
+            });
+            made.push((height, next + outputs.len() as u64 - 1));
+            let commits = vec![commit];
+            let mut block = Block { id, spends, outputs, names, commits, commits_spent, root: [Fp::ZERO; 8], next: 0 };
             block.root = state.apply(&BlockEdit { state_root: None, ..block.edit(height) }).unwrap();
-            live.extend(next..next + block.outputs.len() as u64);
+            live.extend(next..next + block.outputs.len() as u64 - 1);
             next += block.outputs.len() as u64;
             block.next = next;
             chain.push(block);
@@ -539,7 +606,7 @@ mod tests {
         while !parts.is_empty() || !names.is_empty() {
             if !parts.is_empty() && (names.is_empty() || rng.next_u64() % 4 > 0) {
                 let index = parts.swap_remove(rng.next_u64() as usize % parts.len());
-                receiving.put(index, &past.part(index).unwrap()).unwrap();
+                receiving.put_with(index, &past.part(index).unwrap(), &past.commits(index).unwrap()).unwrap();
             } else {
                 let index = names.swap_remove(rng.next_u64() as usize % names.len());
                 receiving.put_names(index, &past.names_part(index).unwrap()).unwrap();
@@ -565,6 +632,15 @@ mod tests {
         }
         for (index, _) in theirs.name_parts() {
             assert_eq!(ours.names_part(*index).unwrap(), theirs.names_part(*index).unwrap());
+        }
+        drop((ours, theirs));
+        // And has the same commits waiting.
+        let (ours, theirs) = (state.snapshot().unwrap(), source.snapshot().unwrap());
+        let waiting = theirs.commits().up_to(theirs.pages(), u32::MAX).unwrap();
+        assert!(waiting.len() >= 2 && (waiting.len() as u64) == theirs.commits().count);
+        assert_eq!(ours.commits().up_to(ours.pages(), u32::MAX).unwrap(), waiting);
+        for (position, commit) in &waiting {
+            assert_eq!(ours.commits().position_of(ours.pages(), &commit.hash).unwrap(), Some(*position));
         }
         drop((ours, theirs));
         // It serves in its turn, as of the blocks it applied itself.
@@ -599,7 +675,7 @@ mod tests {
             // A part put twice changes nothing.
             let first = past.parts()[0].0;
             let used = receiving.file.space().0;
-            receiving.put(first, &past.part(first).unwrap()).unwrap();
+            receiving.put_with(first, &past.part(first).unwrap(), &past.commits(first).unwrap()).unwrap();
             assert_eq!(receiving.file.space().0, used);
             let state = receiving.finish(KEEP).unwrap();
             assert_eq!(pending(&state.file()).unwrap(), None);
@@ -659,6 +735,15 @@ mod tests {
         assert_eq!(receiving.put(parts[0].0, &part), Err(Error::PartRoot));
         assert_eq!(receiving.put(1 << 30, &part), Err(Error::PartRoot));
         assert_eq!(receiving.put(index, &[]), Err(Error::PartRoot));
+        // A commit that is not its output's: another hash, an output
+        // that is no commit, a position the part has not.
+        let with = parts.iter().map(|p| p.0).find(|i| !past.commits(*i).unwrap().is_empty()).unwrap();
+        let (part, commits) = (past.part(with).unwrap(), past.commits(with).unwrap());
+        let other = [(commits[0].0, part[0].1.commitment)];
+        assert_eq!(receiving.put_with(with, &part, &other), Err(Error::PartRoot));
+        let plain = part.iter().find(|o| o.1.amount != 0).unwrap().0;
+        assert_eq!(receiving.put_with(with, &part, &[(plain, commits[0].1)]), Err(Error::PartRoot));
+        assert_eq!(receiving.put_with(with, &part, &[(1 << 40, commits[0].1)]), Err(Error::PartRoot));
         // The same of the names.
         let index = names[1].0;
         let part = past.names_part(index).unwrap();
@@ -672,7 +757,7 @@ mod tests {
         assert_eq!(receiving.missing().len(), parts.len());
 
         // Not whole, it is not a state: neither finished nor opened.
-        receiving.put(parts[0].0, &past.part(parts[0].0).unwrap()).unwrap();
+        receiving.put_with(parts[0].0, &past.part(parts[0].0).unwrap(), &past.commits(parts[0].0).unwrap()).unwrap();
         let image = receiving.file.backend().image(Lost::All);
         assert_eq!(
             State::open(MemBackend::from_image(image), KEEP).err().map(|e| e.kind()),
@@ -697,14 +782,16 @@ mod tests {
             // Some parts put, then the power lost in the middle of one more.
             let (parts, names) = (receiving.missing(), receiving.missing_names());
             for index in parts.iter().step_by(2) {
-                receiving.put(*index, &past.part(*index).unwrap()).unwrap();
+                receiving.put_with(*index, &past.part(*index).unwrap(), &past.commits(*index).unwrap()).unwrap();
             }
             for index in names.iter().skip(1).step_by(3) {
                 receiving.put_names(*index, &past.names_part(*index).unwrap()).unwrap();
             }
             let put = parts.len().div_ceil(2) + (names.len() - 1).div_ceil(3);
             receiving.file.backend().crash_at(1 + round as u64);
-            assert!(receiving.put(parts[1], &past.part(parts[1]).unwrap()).is_err());
+            assert!(
+                receiving.put_with(parts[1], &past.part(parts[1]).unwrap(), &past.commits(parts[1]).unwrap()).is_err()
+            );
             let image = receiving.file.backend().image(lost);
 
             let file = PageFile::open(MemBackend::from_image(image.clone())).unwrap();
@@ -729,7 +816,7 @@ mod tests {
             let mut receiving = open(MemBackend::new(), target(&chain, first), &past).unwrap();
             // Most of it, not all.
             for index in receiving.missing().into_iter().skip(1) {
-                receiving.put(index, &past.part(index).unwrap()).unwrap();
+                receiving.put_with(index, &past.part(index).unwrap(), &past.commits(index).unwrap()).unwrap();
             }
             for index in receiving.missing_names().into_iter().skip(1) {
                 receiving.put_names(index, &past.names_part(index).unwrap()).unwrap();
@@ -806,7 +893,7 @@ mod tests {
         assert_eq!(receiving.missing().len(), past.parts().len());
         // Some parts, a header and a body meanwhile, and a stop.
         for index in receiving.missing().into_iter().step_by(3) {
-            receiving.put(index, &past.part(index).unwrap()).unwrap();
+            receiving.put_with(index, &past.part(index).unwrap(), &past.commits(index).unwrap()).unwrap();
         }
         receiving
             .write_blocks(|txn, blocks| {
@@ -847,8 +934,16 @@ mod tests {
     #[test]
     fn nothing_is_received() {
         let state = State::open(MemBackend::new(), KEEP).unwrap();
-        let block =
-            BlockEdit { height: 1, block: [Fp::ONE; 8], spends: &[], outputs: &[], names: &[], state_root: None };
+        let block = BlockEdit {
+            height: 1,
+            block: [Fp::ONE; 8],
+            spends: &[],
+            outputs: &[],
+            names: &[],
+            commits: &[],
+            commits_spent: &[],
+            state_root: None,
+        };
         let root = state.apply(&block).unwrap();
         let past = state.past(1).unwrap();
         let t = Target { height: 1, block: [Fp::ONE; 8], state_root: root, next: 0 };

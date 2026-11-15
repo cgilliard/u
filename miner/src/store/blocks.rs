@@ -30,7 +30,7 @@ use super::backend::Backend;
 use super::blob::Blob;
 use super::pagefile::{PageFile, ReadPages, Txn};
 use super::sparse::EMPTY;
-use super::trie::{self, CHILD_BYTES, Child, Edits, Fault, Part, Tree};
+use super::trie::{self, Child, Edits, FLAT_BYTES, Fault, Part, Tree};
 use crate::block::HEADER_SIZE;
 use crate::error::Error;
 use crate::hash::Digest;
@@ -48,7 +48,7 @@ fn corrupt(what: &'static str) -> io::Error {
 }
 
 /// A step up a tree that hashes nothing: the parents of the parts.
-fn lift_flat(parts: &mut [(u128, Part)]) -> usize {
+pub(super) fn lift_flat(parts: &mut [(u128, Part)]) -> usize {
     let mut w = 0;
     for r in 0..parts.len() {
         let up = parts[r].0 >> 1;
@@ -295,13 +295,12 @@ impl Blocks {
         chain: [0; CHAIN_BYTES],
     };
     /// Serialized size.
-    pub const BYTES: usize = 4 * CHILD_BYTES + CHAIN_BYTES;
+    pub const BYTES: usize = 4 * FLAT_BYTES + CHAIN_BYTES;
 
     pub fn to_bytes(&self) -> [u8; Self::BYTES] {
         let mut out = Vec::with_capacity(Self::BYTES);
-        for (i, root) in [self.index, self.heights, self.bodies, self.files].into_iter().enumerate() {
-            root.write(&mut out);
-            out.resize((i + 1) * CHILD_BYTES, 0);
+        for root in [self.index, self.heights, self.bodies, self.files] {
+            trie::write_flat(&root, &mut out);
         }
         out.extend_from_slice(&self.chain);
         out.try_into().unwrap()
@@ -312,19 +311,13 @@ impl Blocks {
         if b.len() != Self::BYTES {
             return Err(bad());
         }
-        let root = |i: usize| -> io::Result<Child> {
-            let (root, rest) = Child::read(&b[i * CHILD_BYTES..(i + 1) * CHILD_BYTES])?;
-            match rest.iter().all(|x| *x == 0) {
-                true => Ok(root),
-                false => Err(bad()),
-            }
-        };
+        let root = |i: usize| trie::read_flat(&b[i * FLAT_BYTES..(i + 1) * FLAT_BYTES]);
         Ok(Blocks {
             index: root(0)?,
             heights: root(1)?,
             bodies: root(2)?,
             files: root(3)?,
-            chain: b[4 * CHILD_BYTES..].try_into().unwrap(),
+            chain: b[4 * FLAT_BYTES..].try_into().unwrap(),
         })
     }
 
