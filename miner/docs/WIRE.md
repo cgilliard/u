@@ -280,7 +280,7 @@ magic (4) | type (1) | body
 - The transport's chunk is 1,220 bytes at most and leaves 12 of the
   1,232; this uses 5.
 - Rules 1 to 3 of 1.2 are kept as they are.
-- IPv4 only, as the reference. (Open question 1.)
+- IPv4 only, as the reference: decided, to keep things simple for now.
 
 ## 2.3 The messages
 
@@ -321,7 +321,8 @@ A `Get` names its object in up to 64 bytes: a kind byte, then fields.
 | 1 Block | block id | The block's body | 2 MB (the chain's limit) | The header's body commitment |
 | 2 Lite | block id | The body without its proof | under that | The fam node's own check |
 | 3 Headers | first height (4), count (2), a block id (32) | `count` headers from that height on the chain that block is on | 512 headers, 104 KB | Each header's proof of work and link to the one before |
-| 4 Manifest | block id | The state's parts after that block (2.5) | see 2.5 | The block's state root |
+| 4 Manifest | block id | The top of the state's parts after that block (2.5) | about 150 KB | The block's state root |
+| 10 Roots | block id, index (4) | The roots of the parts in one range of 2^25 positions (2.5) | 139 KB | Its root in the manifest |
 | 5 Part | block id, index (8) | The unspent outputs in one range of 8,192 positions, and which are commits | under 1 MB | Its root in the manifest |
 | 6 Names | block id, index (4) | The name records under one 12-bit key prefix | under 1 MB | Its root in the manifest |
 | 7 Proof | block id, position (8) | The output at that position and its Merkle path | 1.4 KB | The block's state root |
@@ -337,22 +338,34 @@ answers `Gone`.
 ## 2.5 The manifest
 
 What a joining node needs first, to know which parts to ask for and to
-check each as it comes:
+check each as it comes. It is fetched by the transport like everything
+else; the question it raises is size, because whatever is fetched is
+checked only once it is whole.
 
-```
-next position (8)
-count of output parts (4), then for each: index (8), root (32)
-names root (32)
-count of name parts (2), then for each: index (2), root (32), single (1)
-```
+**How big it could be as one object.** One entry of 40 bytes for every
+range of 8,192 positions that holds anything unspent. Positions are
+handed out in order and never reused, so the number of ranges is at
+most the outputs ever made, over 8,192:
 
-It is checked whole: the output parts' roots must hash to the outputs'
-root, the name parts' to the names' root, and the two to the state root
-in the block's header.
+| Outputs ever made | Ranges at most | As one object |
+|---|---|---|
+| 100 million | 12,000 | 0.5 MB |
+| 1 billion | 122,000 | 4.9 MB |
+| 10 billion | 1.2 million | 49 MB |
 
-**It can be bigger than a block.** One entry per 8,192 positions holding
-anything unspent: about 40 KB per thousand parts, so some megabytes for
-a state of hundreds of millions of outputs. (Open question 2.)
+That grows without limit and passes a block's size early. So it is cut
+in two levels, each piece checked on arrival against the level above:
+
+| Object | Content | Largest | Checked against |
+|---|---|---|---|
+| Manifest | next position (8); for each range of 2^25 positions holding anything, its index (4) and root (32); the names' root (32); for each name part, its index (2), root (32) and whether it holds one record (1) | 144 KB for the names, and 36 bytes per 33 million positions ever used: 11 KB at 10 billion outputs | The block's state root |
+| Roots | for one range of 2^25 positions: for each of its 4,096 parts holding anything, its index (2) and root (32) | 139 KB | That range's root in the manifest |
+
+Nothing fetched is then bigger than a block, whatever the chain grows
+to, and a node that serves a wrong piece is found out by that piece.
+
+The store gives parts' roots at level 13 today; it has to give the
+roots at level 25 as well, which the trie already keeps.
 
 ## 2.6 Status
 
@@ -405,21 +418,77 @@ does not begin with a guessed retry time.
 Nothing unasked is answered with more than it weighs, and nothing large
 goes to an address that has not shown it is there.
 
-## 2.9 Open questions
+## 2.9 Configuration
 
-1. **IPv6.** The reference refuses it to keep the per-network limits
-   meaningful. Keep that, or take IPv6 with limits per /32 or /48?
-2. **A large manifest.** Leave it one object of a few megabytes, or cut
-   it in two levels (a short top list, then pieces of at most a few
-   thousand part roots, each checked against the top list) so that
-   nothing fetched is ever bigger than a block? The second needs a
-   little more in the store.
-3. **How many headers an object holds.** 512 is a guess: large enough
-   that a long sync is few objects, small enough to be a few seconds on
-   a slow line.
-4. **Limits.** The reference's numbers (64 peers, 8 per /16, 24 blocks
-   at once, 32 parts at once, pings every 30 s) are carried over until
-   there is a reason to change them. Any you want to revisit?
-5. **`Lite` blocks and `Proof`** exist for the fam node and light
-   clients. Build them with the rest, or after the node syncs?
-6. **Private messaging.** Codes reserved, nothing designed.
+Every limit and time below is a setting with a default, not a constant.
+The defaults are the reference's unless noted.
+
+### Peers
+
+| Setting | Default |
+|---|---|
+| Peers kept | 64 |
+| Live peers below which more are looked for | 8 |
+| Peers per host (all ports) | 4 |
+| Peers per /16 network | 8 |
+| Addresses in one `Peers` | 32 |
+| Pings to unproven addresses per tick | 8 |
+| Ping interval | 30 s |
+| First re-ping of a peer not yet answering | 2 s, doubling |
+| Silence before a peer is not counted live | 65 s |
+| Silence before it is dropped | 180 s |
+| Silence before a host's place goes to a new port of it | 60 s |
+| Strikes before a ban | 5 |
+| Strikes forgotten after | 10 min |
+| Ban | 1 hour |
+| Seeds | the network's built-in names |
+| Port | 3737 |
+
+### Sync
+
+| Setting | Default |
+|---|---|
+| Headers in one object | 512 (new) |
+| Header objects fetched at once, each from a different peer | 16 |
+| Wait for a header we lack before a peer's claim is doubted | 15 s |
+| How long a peer that failed us is passed over | 10 min |
+| Least time between header requests to one peer | 2 s |
+| Blocks fetched at once | 24 |
+| Blocks fetched at once from one peer | 8 |
+| How far past the first missing block to fetch | 32 |
+| Sync point: blocks below the best header a snapshot is taken at | 144 |
+| Parts fetched at once | 32 |
+| Snapshot attempts before validating from genesis | 4 |
+| Aux leaves: time between requests, and requests before giving up | 2 s, 16 |
+
+### Serving and transfer
+
+| Setting | Default |
+|---|---|
+| Chunks sent a second, in all | 8,192 (about 10 MB/s) |
+| Requests waiting, in all and for one address | 64, 8 |
+| Chunks waiting for one address | 4,096 |
+| How often the token secret changes | 10 min (new) |
+
+The transport's own numbers (window bounds, retry bounds, how many
+places count as overtaken) stay constants: they are how the mechanism
+works, and a node that set them badly would hurt its peers as well as
+itself.
+
+A few things are not settings because the two ends must agree on them:
+the datagram size, the chunk size, the part sizes, and the most headers
+an object may hold.
+
+## 2.10 Decided, and still open
+
+Decided:
+
+- IPv4 only for now.
+- The manifest is cut in two levels (2.5).
+- 512 headers an object.
+- Limits and times are settings (2.9).
+- Sync first. `Lite` blocks, `Proof` objects and `Tx` come after.
+
+Open:
+
+- **Private messaging.** Codes reserved, nothing designed.
