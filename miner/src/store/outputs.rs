@@ -33,8 +33,8 @@ use std::io;
 
 use super::backend::Backend;
 use super::pagefile::{PageFile, ReadPages, Txn};
-use super::sparse::{EMPTY, empty, root, root_with_path};
-use super::trie::{self, BITS, CHILD_BYTES, Child, Edits, FANOUT, Fault, LEAF_RECORDS, Part, Slot, Step, Tree};
+use super::sparse::{EMPTY, empty, level_up, root, root_with_path};
+use super::trie::{self, CHILD_BYTES, Child, Edits, Fault, LEAF_RECORDS, Part, Slot, Step, Tree};
 use crate::error::Error;
 use crate::hash::Digest;
 use crate::output::{
@@ -139,7 +139,22 @@ impl Tree for OutputTree {
         }
     }
 
-    /// The sparse tree's root over the parts ([`super::sparse::root`]).
+    /// The sparse tree's step: a part with no sibling is paired with the
+    /// empty subtree's hash ([`super::sparse::level_up`]).
+    fn lift(level: u32, parts: &mut [(u128, Part)]) -> usize {
+        let mut nodes = [(0u64, EMPTY); LEAF_RECORDS];
+        for (node, part) in nodes.iter_mut().zip(parts.iter()) {
+            *node = (part.0 as u64, part.1.hash);
+        }
+        let n = level_up(level as usize, &mut nodes[..parts.len()]);
+        for (part, node) in parts.iter_mut().zip(&nodes[..n]) {
+            *part = (node.0 as u128, Part { hash: node.1, single: false });
+        }
+        n
+    }
+
+    /// Every level at once, with the parts turned to the sparse tree's
+    /// nodes and back once and not at each level.
     fn combine(level: u32, top: u32, parts: &mut [(u128, Part)]) -> Option<Part> {
         if parts.is_empty() {
             return None;
@@ -276,8 +291,8 @@ impl Outputs {
         self.pass(txn, height, edits, next)
     }
 
-    /// Sweeps part of the trie: from position `from`, looks at up to
-    /// `budget` leaves and drops what is dead in them and spent before
+    /// Sweeps part of the trie: from position `from`, looks at leaves
+    /// holding up to `budget` records and drops what is dead in them and spent before
     /// `horizon` (the height of the oldest block that may still be
     /// undone). Returns the set, whose tree and counts are as they were,
     /// and the position to sweep from next: 0 once the end is reached.
@@ -313,18 +328,17 @@ impl Outputs {
                     *s = *empty(l);
                 }
             }
+            // The siblings from the level of the child the position is
+            // under up to the node's own: below that they are the child's.
             Step::Node { height, base, children } => {
-                let below = height.saturating_sub(BITS);
-                let mut nodes = [(0u64, EMPTY); FANOUT];
-                let mut n = 0;
-                for (k, c) in children.iter().enumerate() {
-                    if let Some(part) = c.part() {
-                        nodes[n] = ((base >> below) as u64 + k as u64, part.hash);
-                        n += 1;
-                    }
+                let low = trie::below(height);
+                let levels = trie::levels::<OutputTree>(children, height, base);
+                let (_, span) = trie::group_of(children, height, ((position as u128 - base) >> low) as usize);
+                for up in span..height - low {
+                    let level = low + up;
+                    let sibling = (position as u128 >> level) ^ 1;
+                    path[level as usize] = levels.find(up, sibling).map_or(*empty(level as usize), |p| p.hash);
                 }
-                let siblings = &mut path[below as usize..height as usize];
-                root_with_path(below as usize, height as usize, &mut nodes[..n], Some((position >> below, siblings)));
             }
             Step::Leaf { height, slots, .. } => {
                 let mut nodes = [(0u64, EMPTY); LEAF_RECORDS];
@@ -360,7 +374,7 @@ mod tests {
     use super::*;
     use crate::store::sparse::root_of_path;
     use crate::store::testing::{Lost, MemBackend};
-    use crate::store::trie::{read_leaf, read_node, write_leaf, write_node};
+    use crate::store::trie::{BITS, read_leaf, read_node, span_of, write_leaf, write_node};
     use crate::test_util::Rng;
     use std::collections::BTreeMap;
 
@@ -683,9 +697,9 @@ mod tests {
         let mut base = 0u128;
         while let Child::Node { page, .. } = child {
             let kids = read_node(w.file.read(page, &mut buf).unwrap(), height).unwrap();
-            height -= BITS;
+            let low = height - BITS;
             let k = kids.iter().position(|c| *c != Child::Empty).unwrap();
-            (child, base) = (kids[k], base + ((k as u128) << height));
+            (child, base, height) = (kids[k], base + ((k as u128) << low), low + span_of(kids[k]));
         }
         let Child::Leaf { page, records, live, .. } = child else { panic!("a leaf") };
         let leaf = w.file.read(page, &mut buf).unwrap().to_vec();

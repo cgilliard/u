@@ -72,54 +72,63 @@ pub fn root_with_path(
             };
             *index >>= 1;
         }
-        // The nodes of this level are read from `r` and their parents
-        // written from `w`, never ahead of what is still to be read: a
-        // parent takes at least one node. Up to eight wait to be hashed
-        // together.
-        let (mut r, mut w) = (0, 0);
-        let mut pending: [(u64, Digest, Digest); LANES] = [(0, EMPTY, EMPTY); LANES];
-        let mut waiting = 0;
-        while r < n {
-            let (i, d) = nodes[r];
-            let (left, right) = if i & 1 == 1 {
-                (*empty(l), d)
-            } else if r + 1 < n && nodes[r + 1].0 == i + 1 {
-                r += 1;
-                (d, nodes[r].1)
-            } else {
-                (d, *empty(l))
-            };
-            r += 1;
-            pending[waiting] = (i >> 1, left, right);
-            waiting += 1;
-            if waiting == LANES {
-                let out = compress_batch(core::array::from_fn(|k| (&pending[k].1, &pending[k].2)));
-                for (k, d) in out.into_iter().enumerate() {
-                    nodes[w + k] = (pending[k].0, d);
-                }
-                w += LANES;
-                waiting = 0;
-            }
-        }
-        if waiting >= BATCH_FROM {
-            // A batch not full: the lanes left over repeat the first.
-            let out = compress_batch(core::array::from_fn(|k| {
-                let p = &pending[if k < waiting { k } else { 0 }];
-                (&p.1, &p.2)
-            }));
-            for (k, d) in out.into_iter().take(waiting).enumerate() {
-                nodes[w + k] = (pending[k].0, d);
-            }
-            w += waiting;
-        } else {
-            for p in &pending[..waiting] {
-                nodes[w] = (p.0, compress(&p.1, &p.2));
-                w += 1;
-            }
-        }
-        n = w;
+        n = level_up(l, &mut nodes[..n]);
     }
     if n == 0 { *empty(top) } else { nodes[0].1 }
+}
+
+/// One level up: the nonempty nodes of level `l` (ascending) are
+/// replaced, in place, by their parents at the level above, a node with
+/// no sibling paired with the empty subtree's hash. Returns how many
+/// parents there are.
+pub fn level_up(l: usize, nodes: &mut [(u64, Digest)]) -> usize {
+    let n = nodes.len();
+    // The nodes of this level are read from `r` and their parents
+    // written from `w`, never ahead of what is still to be read: a
+    // parent takes at least one node. Up to eight wait to be hashed
+    // together.
+    let (mut r, mut w) = (0, 0);
+    let mut pending: [(u64, Digest, Digest); LANES] = [(0, EMPTY, EMPTY); LANES];
+    let mut waiting = 0;
+    while r < n {
+        let (i, d) = nodes[r];
+        let (left, right) = if i & 1 == 1 {
+            (*empty(l), d)
+        } else if r + 1 < n && nodes[r + 1].0 == i + 1 {
+            r += 1;
+            (d, nodes[r].1)
+        } else {
+            (d, *empty(l))
+        };
+        r += 1;
+        pending[waiting] = (i >> 1, left, right);
+        waiting += 1;
+        if waiting == LANES {
+            let out = compress_batch(core::array::from_fn(|k| (&pending[k].1, &pending[k].2)));
+            for (k, d) in out.into_iter().enumerate() {
+                nodes[w + k] = (pending[k].0, d);
+            }
+            w += LANES;
+            waiting = 0;
+        }
+    }
+    if waiting >= BATCH_FROM {
+        // A batch not full: the lanes left over repeat the first.
+        let out = compress_batch(core::array::from_fn(|k| {
+            let p = &pending[if k < waiting { k } else { 0 }];
+            (&p.1, &p.2)
+        }));
+        for (k, d) in out.into_iter().take(waiting).enumerate() {
+            nodes[w + k] = (pending[k].0, d);
+        }
+        w += waiting;
+    } else {
+        for p in &pending[..waiting] {
+            nodes[w] = (p.0, compress(&p.1, &p.2));
+            w += 1;
+        }
+    }
+    w
 }
 
 /// The root a path leads to: the node of index `index` at the path's

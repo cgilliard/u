@@ -10,16 +10,19 @@
 //!
 //! # Shape
 //!
-//! A node covers the keys with one prefix and has [`FANOUT`] children,
-//! each covering those with [`BITS`] more bits fixed. A child is empty,
-//! another node, or a leaf: a page of the records under it, when they fit
-//! one. Beside each child the node keeps the child's part in the Merkle
-//! tree, so a node's own part follows from its page alone, and a key's
-//! path from the pages on the way down to it.
+//! A node covers the keys with one prefix and has [`FANOUT`] slots, each
+//! covering those with [`BITS`] more bits fixed. A slot is empty, holds
+//! another node, or is under a leaf: a page of records. A leaf covers
+//! one slot or a run of two, four or eight of them that is one subtree
+//! of the tree (its `span`), whichever holds as many records as fit a
+//! page: so pages are mostly more than half full however thinly or
+//! thickly the keys lie. Beside each child the node keeps the child's
+//! part in the Merkle tree, so a node's own part follows from its page
+//! alone, and a key's path from the pages on the way down to it.
 //!
 //! ```text
 //! node page := height (1) | children (1) | child ...
-//! child     := slot (1) | kind (1) | hash (32) | page (6) | leaf's
+//! child     := slot (1) | kind and span (1) | hash (32) | page (6) | leaf's
 //! leaf's    := records (1) | live (8) | last spend (4)
 //! leaf page := records (1) | record ...
 //! record    := distance from the key before (varint) | the tree's record
@@ -120,11 +123,20 @@ pub trait Tree {
         }
         n
     }
+    /// One level up: the nonempty parts at `level` (a record is level
+    /// 0; the part of index `i` covers the keys from `i << level`),
+    /// ascending, are replaced in place by those of their parents at the
+    /// level above. Returns how many parents there are.
+    fn lift(level: u32, parts: &mut [(u128, Part)]) -> usize;
     /// The part of the node at level `top`, from its nonempty parts at
-    /// `level` (a record is level 0): `(index, part)`, ascending, where
-    /// the part of index `i` covers the keys from `i << level`. `None`
-    /// if there are none. The slice is scratch.
-    fn combine(level: u32, top: u32, parts: &mut [(u128, Part)]) -> Option<Part>;
+    /// `level`; `None` if there are none. The slice is scratch.
+    fn combine(level: u32, top: u32, parts: &mut [(u128, Part)]) -> Option<Part> {
+        let mut n = parts.len();
+        for l in level..top {
+            n = Self::lift(l, &mut parts[..n]);
+        }
+        (n > 0).then(|| parts[0].1)
+    }
     /// What a change that cannot be made is refused with.
     fn refuse(key: u128, fault: Fault) -> Error;
 }
@@ -146,6 +158,8 @@ pub enum Child {
         live: u64,
         /// The height of the latest of them to die, 0 if none.
         last_spend: u32,
+        /// It covers `2^span` of its node's slots, from its own.
+        span: u8,
     },
 }
 
@@ -154,6 +168,7 @@ pub const CHILD_BYTES: usize = 1 + 32 + 6 + 13;
 const KIND: u8 = 0x0f;
 const SINGLE: u8 = 0x80;
 const VOID: u8 = 0x40;
+const SPAN: u8 = 0x30;
 
 fn put_extent(out: &mut Vec<u8>, e: Extent) {
     debug_assert!(e.start < 1 << 40 && e.units < 256);
@@ -180,7 +195,7 @@ impl Child {
         let (kind, page, part) = match self {
             Child::Empty => return out.push(0),
             Child::Node { page, part } => (1, page, part),
-            Child::Leaf { page, part, .. } => (2, page, part),
+            Child::Leaf { page, part, span, .. } => (2 | span << 4, page, part),
         };
         let flags = match part {
             None => VOID,
@@ -204,7 +219,7 @@ impl Child {
         if tag == 0 {
             return Ok((Child::Empty, b));
         }
-        let (kind, flags) = (tag & KIND, tag & !KIND);
+        let (kind, span, flags) = (tag & KIND, (tag & SPAN) >> 4, tag & !(KIND | SPAN));
         let (head, b) = b.split_at_checked(38).ok_or_else(bad)?;
         let hash = digest_from_bytes(&head[..32]).ok_or_else(bad)?;
         let part = match flags {
@@ -218,7 +233,7 @@ impl Child {
             return Err(bad());
         }
         match kind {
-            1 => Ok((Child::Node { page, part }, b)),
+            1 if span == 0 => Ok((Child::Node { page, part }, b)),
             2 => {
                 let (tail, b) = b.split_at_checked(13).ok_or_else(bad)?;
                 let records = tail[0];
@@ -231,7 +246,7 @@ impl Child {
                     return Err(bad());
                 }
                 let last_spend = u32::from_le_bytes(tail[9..].try_into().unwrap());
-                Ok((Child::Leaf { page, part, records, live, last_spend }, b))
+                Ok((Child::Leaf { page, part, records, live, last_spend, span }, b))
             }
             _ => Err(bad()),
         }
@@ -246,21 +261,26 @@ pub fn read_node(payload: &[u8], height: u32) -> io::Result<[Child; FANOUT]> {
         return Err(bad());
     }
     let mut children = [Child::Empty; FANOUT];
-    let mut last = None;
+    let slots = 1usize << (height - below(height));
+    // The first slot no child given so far covers.
+    let mut free = 0;
     for _ in 0..head[1] {
         let (&slot, rest) = b.split_first().ok_or_else(bad)?;
-        // Slots ascend, and none is given as empty.
-        if slot as usize >= FANOUT || last.is_some_and(|l| slot <= l) {
-            return Err(bad());
-        }
         let (child, rest) = Child::read(rest)?;
-        if child == Child::Empty {
+        let span = span_of(child);
+        // Slots ascend past what is covered, none is given as empty, and
+        // a leaf's run of slots is one subtree, short of the whole node.
+        if (slot as usize) < free
+            || child == Child::Empty
+            || (span > 0 && (1usize << span >= slots || slot as usize % (1 << span) != 0))
+            || slot as usize + (1 << span) > slots
+        {
             return Err(bad());
         }
         children[slot as usize] = child;
-        (last, b) = (Some(slot), rest);
+        (free, b) = (slot as usize + (1 << span), rest);
     }
-    if !b.is_empty() || last.is_none() {
+    if !b.is_empty() || free == 0 {
         return Err(bad());
     }
     Ok(children)
@@ -278,29 +298,81 @@ pub fn write_node(children: &[Child; FANOUT], height: u32, out: &mut Vec<u8>) {
     }
 }
 
-/// The height of a node's children: [`BITS`] below it, or what is left
-/// of the key.
-const fn below(height: u32) -> u32 {
+/// The height of a node's slots: [`BITS`] below it, or what is left of
+/// the key.
+pub const fn below(height: u32) -> u32 {
     height.saturating_sub(BITS)
 }
 
-/// The parts of a node's children, as [`Tree::combine`] takes them.
-pub fn child_parts(children: &[Child; FANOUT], height: u32, base: u128, out: &mut [(u128, Part); FANOUT]) -> usize {
-    let low = below(height);
-    let mut n = 0;
-    for (k, c) in children.iter().enumerate() {
-        if let Some(part) = c.part() {
-            out[n] = ((base >> low) + k as u128, part);
-            n += 1;
+/// How many of its node's slots a child covers, as a power of two.
+pub fn span_of(child: Child) -> u32 {
+    match child {
+        Child::Leaf { span, .. } => span as u32,
+        _ => 0,
+    }
+}
+
+/// The child that covers `slot` of a node of `height` levels: where it
+/// starts and its span. (An empty slot is its own, of span 0.)
+pub fn group_of(children: &[Child; FANOUT], height: u32, slot: usize) -> (usize, u32) {
+    for span in (1..height - below(height)).rev() {
+        let start = slot & !((1 << span) - 1);
+        if span_of(children[start]) == span {
+            return (start, span);
         }
     }
-    n
+    (slot, 0)
+}
+
+/// The nonempty parts under a node at each level from its slots' up to
+/// its own: `at(0)` those at the slots' level, `at(1)` the level above,
+/// to the node's one part (or none) at `at(height - below)`.
+pub struct Levels {
+    parts: [[(u128, Part); FANOUT]; BITS as usize + 1],
+    len: [usize; BITS as usize + 1],
+}
+
+impl Levels {
+    /// The parts at `up` levels above the slots', ascending by index.
+    pub fn at(&self, up: u32) -> &[(u128, Part)] {
+        &self.parts[up as usize][..self.len[up as usize]]
+    }
+
+    /// The part of index `index` at `up` levels above the slots', if any.
+    pub fn find(&self, up: u32, index: u128) -> Option<Part> {
+        self.at(up).iter().find(|p| p.0 == index).map(|p| p.1)
+    }
+}
+
+/// The parts under the node of `children`, of `height` levels from
+/// `base`, level by level: each child's part enters at the level of the
+/// subtree it covers, and each level is lifted to the next.
+pub fn levels<T: Tree>(children: &[Child; FANOUT], height: u32, base: u128) -> Levels {
+    let low = below(height);
+    let top = height - low;
+    let none = (0u128, Part { hash: [Fp::ZERO; DIGEST], single: false });
+    let mut out = Levels { parts: [[none; FANOUT]; BITS as usize + 1], len: [0; BITS as usize + 1] };
+    let mut cur = [none; FANOUT];
+    let mut n = 0;
+    for up in 0..=top {
+        for (k, c) in children.iter().enumerate().take(1 << top) {
+            if let Some(part) = c.part().filter(|_| span_of(*c) == up) {
+                cur[n] = ((base >> (low + up)) + (k as u128 >> up), part);
+                n += 1;
+            }
+        }
+        cur[..n].sort_unstable_by_key(|p| p.0);
+        out.parts[up as usize][..n].copy_from_slice(&cur[..n]);
+        out.len[up as usize] = n;
+        if up < top {
+            n = T::lift(low + up, &mut cur[..n]);
+        }
+    }
+    out
 }
 
 fn node_part<T: Tree>(children: &[Child; FANOUT], height: u32, base: u128) -> Option<Part> {
-    let mut parts = [(0u128, Part { hash: [Fp::ZERO; DIGEST], single: false }); FANOUT];
-    let n = child_parts(children, height, base, &mut parts);
-    T::combine(below(height), height, &mut parts[..n])
+    levels::<T>(children, height, base).at(height - below(height)).first().map(|p| p.1)
 }
 
 /// A record of a leaf, with its key and whether it is live.
@@ -493,11 +565,26 @@ impl<'a, T: Tree> Edits<'a, T> {
 struct Sweep {
     /// The key it has reached.
     from: u128,
-    /// Leaves it may still look at.
+    /// Records it may still look at.
     budget: usize,
     /// A leaf whose last spend is below this height has nothing dead
     /// that could still be wanted back.
     horizon: u32,
+}
+
+/// Leaves whose records together number no more than this are made one
+/// when a pass is by: well under a full page, so that the one leaf does
+/// not at once become several again.
+const MERGE: usize = LEAF_RECORDS * 3 / 4;
+
+/// What becomes of a run of a node's slots when records are placed in
+/// it: a leaf over the whole run, or (of a single slot) a node below.
+struct Placed {
+    slot: usize,
+    span: u32,
+    /// The records, as a range of those placed.
+    from: usize,
+    to: usize,
 }
 
 /// One pass over the trie, inside a transaction.
@@ -512,7 +599,11 @@ struct Pass<'t, 'f, T: Tree, B: Backend> {
     out: Vec<u8>,
 }
 
-impl<T: Tree, B: Backend> Pass<'_, '_, T, B> {
+impl<'t, 'f, T: Tree, B: Backend> Pass<'t, 'f, T, B> {
+    fn new(txn: &'t Txn<'f, B>, height: u32) -> Self {
+        Pass { txn, height, count: 0, slots: Vec::new(), out: Vec::new() }
+    }
+
     /// The subtree `child` (of `height` levels from `base`) after `edits`,
     /// on up to `threads` threads.
     fn update(
@@ -527,34 +618,68 @@ impl<T: Tree, B: Backend> Pass<'_, '_, T, B> {
             return Ok(child);
         }
         let Child::Node { page, .. } = child else { return self.update_leaf(child, height, base, edits, threads) };
-        let mut buf = [0u8; PAGE];
-        let mut children = read_node(self.txn.read(page, &mut buf)?, height)?;
+        let mut children = load_node(self.txn, page, height)?;
+        let touched = self.update_children(&mut children, height, base, edits, threads)?;
+        self.txn.free(page);
+        // Where pages were written, leaves that have become few are made one.
+        if let Some(leaf) = self.compact(&mut children, 0, height - below(height), touched, height, base)? {
+            return Ok(leaf);
+        }
+        if children.iter().all(|c| *c == Child::Empty) {
+            return Ok(Child::Empty);
+        }
+        self.write_node(&children, height, base)
+    }
+
+    /// Updates each child of a node that `edits` reaches. Returns which
+    /// slots had pages written (a bit each).
+    fn update_children(
+        &mut self,
+        children: &mut [Child; FANOUT],
+        height: u32,
+        base: u128,
+        edits: Edits<'_, T>,
+        threads: usize,
+    ) -> Result<u32, Error> {
         let low = below(height);
         let slots = 1usize << (height - low);
-        let at = |k: usize| base + ((k as u128) << low);
-        let busy = (0..slots).filter(|k| !edits.within(at(*k), low).idle(children[*k], at(*k), low)).count();
-        if threads >= 2 && busy >= 2 && edits.weight() >= SPLIT {
+        // The children there are, each with what of the edits is its.
+        let mut groups: [(usize, u32); FANOUT] = [(0, 0); FANOUT];
+        let mut n = 0;
+        let mut k = 0;
+        while k < slots {
+            let span = span_of(children[k]);
+            let at = base + ((k as u128) << low);
+            if !edits.within(at, low + span).idle(children[k], at, low + span) {
+                groups[n] = (k, span);
+                n += 1;
+            }
+            k += 1 << span;
+        }
+        let groups = &groups[..n];
+        let mut touched = 0u32;
+        // Split where the node branches widely, so that every thread has
+        // a child to itself: where it does not, the children are taken
+        // in turn and the split is left to the nodes below.
+        if threads >= 2 && n >= threads.min(FANOUT / 2) && edits.weight() >= SPLIT {
             // Each worker takes the next child not yet taken, and is a
             // pass of its own; the threads are shared out below it.
-            let workers = threads.min(busy);
+            let workers = threads.min(n);
             let next = std::sync::atomic::AtomicUsize::new(0);
-            let (txn, height_now, kids) = (self.txn, self.height, &children);
-            let done: Vec<(i64, Vec<(usize, Result<Child, Error>)>)> = std::thread::scope(|scope| {
+            let (txn, height_now, kids) = (self.txn, self.height, &*children);
+            type Done = Vec<(usize, u32, Result<([Child; FANOUT], bool), Error>)>;
+            let done: Vec<(i64, Done)> = std::thread::scope(|scope| {
                 let handles: Vec<_> = (0..workers)
                     .map(|_| {
                         scope.spawn(|| {
-                            let mut pass =
-                                Pass::<T, B> { txn, height: height_now, count: 0, slots: Vec::new(), out: Vec::new() };
-                            let mut made = Vec::new();
+                            let mut pass = Pass::<T, B>::new(txn, height_now);
+                            let mut made: Done = Vec::new();
                             loop {
-                                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if k >= slots {
-                                    return (pass.count, made);
-                                }
-                                made.push((
-                                    k,
-                                    pass.update(kids[k], low, at(k), edits.within(at(k), low), threads / workers),
-                                ));
+                                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let Some(&(k, span)) = groups.get(i) else { return (pass.count, made) };
+                                let mut mine = *kids;
+                                let did = pass.update_group(&mut mine, k, span, height, base, edits, threads / workers);
+                                made.push((k, span, did.map(|t| (mine, t))));
                             }
                         })
                     })
@@ -563,25 +688,88 @@ impl<T: Tree, B: Backend> Pass<'_, '_, T, B> {
             });
             // The first fault in key order is the one reported, as when
             // one thread does it all.
-            let mut made: Vec<(usize, Result<Child, Error>)> = Vec::with_capacity(slots);
+            let mut made: Done = Vec::with_capacity(n);
             for (count, part) in done {
                 self.count += count;
                 made.extend(part);
             }
             made.sort_by_key(|m| m.0);
-            for (k, child) in made {
-                children[k] = child?;
+            for (k, span, did) in made {
+                let (mine, wrote) = did?;
+                children[k..k + (1 << span)].copy_from_slice(&mine[k..k + (1 << span)]);
+                touched |= (wrote as u32) << k;
             }
         } else {
-            for (k, c) in children.iter_mut().enumerate().take(slots) {
-                *c = self.update(*c, low, at(k), edits.within(at(k), low), threads)?;
+            for &(k, span) in groups {
+                touched |= (self.update_group(children, k, span, height, base, edits, threads)? as u32) << k;
             }
         }
-        self.txn.free(page);
-        if children.iter().all(|c| *c == Child::Empty) {
-            return Ok(Child::Empty);
+        Ok(touched)
+    }
+
+    /// Updates the child at slot `k` of a node (of `height` levels from
+    /// `base`), which covers `2^span` slots: only those slots of
+    /// `children` are changed. Returns whether a page was written there.
+    #[allow(clippy::too_many_arguments)]
+    fn update_group(
+        &mut self,
+        children: &mut [Child; FANOUT],
+        k: usize,
+        span: u32,
+        height: u32,
+        base: u128,
+        edits: Edits<'_, T>,
+        threads: usize,
+    ) -> Result<bool, Error> {
+        let low = below(height);
+        let (at, covers) = (base + ((k as u128) << low), low + span);
+        let edits = edits.within(at, covers);
+        if let Child::Node { .. } = children[k] {
+            children[k] = self.update(children[k], low, at, edits, threads)?;
+            return Ok(true);
         }
-        self.write_node(&children, height, base)
+        let mut slots = std::mem::take(&mut self.slots);
+        let done = (|| {
+            let old = self.gather(children[k], covers, at, &mut slots)?;
+            let (rewrite, last_spend) = self.edit(&mut slots, old.map_or(0, |o| o.1), edits)?;
+            if let (Some((page, _)), false) = (old, rewrite) {
+                // Only the bits changed: the page stands.
+                children[k] = Child::Leaf {
+                    page,
+                    part: leaf_part::<T>(&slots, covers),
+                    records: slots.len() as u8,
+                    live: live_bits(&slots),
+                    last_spend,
+                    span: span as u8,
+                };
+                return Ok(false);
+            }
+            if let Some((page, _)) = old {
+                self.txn.free(page);
+            }
+            children[k] = Child::Empty;
+            self.place(children, k, span, &slots, height, base, last_spend, threads)?;
+            Ok(true)
+        })();
+        self.slots = slots;
+        done
+    }
+
+    /// The records of the leaf `child` (of `height` levels from `base`)
+    /// into `slots`, which is emptied first; its page and last spend, if
+    /// it is a leaf.
+    fn gather(
+        &mut self,
+        child: Child,
+        height: u32,
+        base: u128,
+        slots: &mut Vec<Slot<T::Record>>,
+    ) -> Result<Option<(Extent, u32)>, Error> {
+        slots.clear();
+        let Child::Leaf { page, records, live, last_spend, .. } = child else { return Ok(None) };
+        let mut buf = [0u8; PAGE];
+        read_leaf::<T>(self.txn.read(page, &mut buf)?, base, height, records, live, slots)?;
+        Ok(Some((page, last_spend)))
     }
 
     fn write_node(&mut self, children: &[Child; FANOUT], height: u32, base: u128) -> Result<Child, Error> {
@@ -590,7 +778,9 @@ impl<T: Tree, B: Backend> Pass<'_, '_, T, B> {
         Ok(Child::Node { page, part: node_part::<T>(children, height, base) })
     }
 
-    /// A leaf, or an empty subtree, after `edits`.
+    /// A leaf that is the whole of its subtree (the root's, or one a
+    /// pass reaches with no node above), or an empty subtree, after
+    /// `edits`.
     fn update_leaf(
         &mut self,
         child: Child,
@@ -600,28 +790,37 @@ impl<T: Tree, B: Backend> Pass<'_, '_, T, B> {
         threads: usize,
     ) -> Result<Child, Error> {
         let mut slots = std::mem::take(&mut self.slots);
-        slots.clear();
-        let mut old = None;
-        if let Child::Leaf { page, records, live, last_spend, .. } = child {
-            let mut buf = [0u8; PAGE];
-            read_leaf::<T>(self.txn.read(page, &mut buf)?, base, height, records, live, &mut slots)?;
-            old = Some((page, last_spend));
-        }
-        let done = self.edit(&mut slots, old, height, base, edits, threads);
+        let done = (|| {
+            let old = self.gather(child, height, base, &mut slots)?;
+            let (rewrite, last_spend) = self.edit(&mut slots, old.map_or(0, |o| o.1), edits)?;
+            if let (Some((page, _)), false) = (old, rewrite) {
+                return Ok(Child::Leaf {
+                    page,
+                    part: leaf_part::<T>(&slots, height),
+                    records: slots.len() as u8,
+                    live: live_bits(&slots),
+                    last_spend,
+                    span: 0,
+                });
+            }
+            if let Some((page, _)) = old {
+                self.txn.free(page);
+            }
+            self.build(&slots, height, base, last_spend, threads)
+        })();
         self.slots = slots;
         done
     }
 
+    /// Makes `edits` to the records of one leaf. Returns whether its page
+    /// must be written anew (anything but bits changed), and its last
+    /// spend after them.
     fn edit(
         &mut self,
         slots: &mut Vec<Slot<T::Record>>,
-        old: Option<(Extent, u32)>,
-        height: u32,
-        base: u128,
+        mut last_spend: u32,
         edits: Edits<'_, T>,
-        threads: usize,
-    ) -> Result<Child, Error> {
-        let mut last_spend = old.map_or(0, |o| o.1);
+    ) -> Result<(bool, u32), Error> {
         for k in edits.flips {
             let key: u128 = (*k).into();
             match slots.binary_search_by_key(&key, |s| s.key).ok().map(|i| &mut slots[i]) {
@@ -635,7 +834,6 @@ impl<T: Tree, B: Backend> Pass<'_, '_, T, B> {
         if !edits.flips.is_empty() {
             last_spend = if edits.revive { last_spend.min(self.height) } else { self.height };
         }
-        // If only the bits changed, the page stands.
         let mut rewrite = false;
         let keep = slots.partition_point(|s| s.key < edits.truncate);
         if keep < slots.len() {
@@ -674,21 +872,220 @@ impl<T: Tree, B: Backend> Pass<'_, '_, T, B> {
             self.count += edits.run.len() as i64;
             rewrite = true;
         }
-        match old {
-            Some((page, _)) if !rewrite => Ok(Child::Leaf {
-                page,
-                part: leaf_part::<T>(slots, height),
-                records: slots.len() as u8,
-                live: live_bits(slots),
-                last_spend,
-            }),
-            _ => {
-                if let Some((page, _)) = old {
-                    self.txn.free(page);
-                }
-                self.build(slots, height, base, last_spend, threads)
+        Ok((rewrite, last_spend))
+    }
+
+    /// Writes a leaf of `slots`, which fit one, covering `2^span` slots.
+    fn write_leaf(
+        &mut self,
+        slots: &[Slot<T::Record>],
+        height: u32,
+        base: u128,
+        last_spend: u32,
+        span: u32,
+    ) -> Result<Child, Error> {
+        write_leaf::<T>(slots, base, &mut self.out);
+        let page = self.txn.write(&self.out)?;
+        // Only a leaf with something dead has a last spend.
+        let last_spend = if slots.iter().all(|s| s.live) { 0 } else { last_spend };
+        Ok(Child::Leaf {
+            page,
+            part: leaf_part::<T>(slots, height),
+            records: slots.len() as u8,
+            live: live_bits(slots),
+            last_spend,
+            span: span as u8,
+        })
+    }
+
+    /// How `slots` (all under the `2^span` slots from `slot` of a node
+    /// of `height` levels from `base`) are to lie there: as one leaf over
+    /// the run if they fit, else halved and halved again, down to a node
+    /// below a single slot. `offset` is where `slots` begin among the
+    /// records being placed.
+    #[allow(clippy::too_many_arguments)]
+    fn plan(
+        slots: &[Slot<T::Record>],
+        offset: usize,
+        slot: usize,
+        span: u32,
+        height: u32,
+        base: u128,
+        out: &mut Vec<Placed>,
+    ) {
+        if slots.is_empty() {
+            return;
+        }
+        let low = below(height);
+        let at = base + ((slot as u128) << low);
+        if span == 0 || fits::<T>(slots, at) {
+            return out.push(Placed { slot, span, from: offset, to: offset + slots.len() });
+        }
+        let half = slot + (1 << (span - 1));
+        let mid = slots.partition_point(|s| s.key < base + ((half as u128) << low));
+        Self::plan(&slots[..mid], offset, slot, span - 1, height, base, out);
+        Self::plan(&slots[mid..], offset + mid, half, span - 1, height, base, out);
+    }
+
+    /// Places `slots` in the `2^span` slots from `slot` of a node, which
+    /// are empty: as few leaves as hold them, and nodes below where one
+    /// slot's records are more than a leaf's. Many records (a state being
+    /// installed) are placed on up to `threads` threads.
+    #[allow(clippy::too_many_arguments)]
+    fn place(
+        &mut self,
+        children: &mut [Child; FANOUT],
+        slot: usize,
+        span: u32,
+        slots: &[Slot<T::Record>],
+        height: u32,
+        base: u128,
+        last_spend: u32,
+        threads: usize,
+    ) -> Result<(), Error> {
+        let mut plan = Vec::new();
+        Self::plan(slots, 0, slot, span, height, base, &mut plan);
+        let low = below(height);
+        let make = |pass: &mut Self, p: &Placed, threads: usize| -> Result<Child, Error> {
+            let (part, at) = (&slots[p.from..p.to], base + ((p.slot as u128) << low));
+            if fits::<T>(part, at) {
+                pass.write_leaf(part, low + p.span, at, last_spend, p.span)
+            } else {
+                pass.build(part, low, at, last_spend, threads)
+            }
+        };
+        if threads >= 2 && plan.len() >= 2 && slots.len() >= 8 * SPLIT {
+            let workers = threads.min(plan.len());
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let (txn, height_now, plan) = (self.txn, self.height, &plan);
+            let made: Vec<Vec<(usize, Result<Child, Error>)>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..workers)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            let mut pass = Pass::<T, B>::new(txn, height_now);
+                            let mut made = Vec::new();
+                            loop {
+                                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let Some(p) = plan.get(i) else { return made };
+                                made.push((p.slot, make(&mut pass, p, threads / workers)));
+                            }
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().expect("a pass does not panic")).collect()
+            });
+            for (k, child) in made.into_iter().flatten() {
+                children[k] = child?;
+            }
+        } else {
+            for p in &plan {
+                children[p.slot] = make(self, p, threads)?;
             }
         }
+        Ok(())
+    }
+
+    /// The subtree of `height` levels from `base` holding `slots`, all
+    /// of it written anew: a leaf if they fit one, else a node.
+    fn build(
+        &mut self,
+        slots: &[Slot<T::Record>],
+        height: u32,
+        base: u128,
+        last_spend: u32,
+        threads: usize,
+    ) -> Result<Child, Error> {
+        if slots.is_empty() {
+            return Ok(Child::Empty);
+        }
+        if fits::<T>(slots, base) {
+            return self.write_leaf(slots, height, base, last_spend, 0);
+        }
+        // Keys differ, so a subtree of one key always fits.
+        assert!(height > 0, "records of one key do not fit a page");
+        let low = below(height);
+        let top = height - low;
+        let mut children = [Child::Empty; FANOUT];
+        // The two halves of the node, each placed as it fits.
+        let half = 1usize << (top - 1);
+        let mid = slots.partition_point(|s| s.key < base + ((half as u128) << low));
+        if top == 1 {
+            // A node of two slots: each is a node or a leaf of its own.
+            children[0] = self.build(&slots[..mid], low, base, last_spend, threads)?;
+            children[1] = self.build(&slots[mid..], low, base + (1u128 << low), last_spend, threads)?;
+        } else {
+            self.place(&mut children, 0, top - 1, &slots[..mid], height, base, last_spend, threads)?;
+            self.place(&mut children, half, top - 1, &slots[mid..], height, base, last_spend, threads)?;
+        }
+        self.write_node(&children, height, base)
+    }
+
+    /// Makes one leaf of the leaves in the `2^span` slots from `slot`,
+    /// where a slot in `touched` is among them and their records are few
+    /// enough; else looks at each half. If the whole node (`span` its
+    /// every slot) becomes one leaf, that leaf is returned, to stand in
+    /// the node's place; else the slots are changed.
+    fn compact(
+        &mut self,
+        children: &mut [Child; FANOUT],
+        slot: usize,
+        span: u32,
+        touched: u32,
+        height: u32,
+        base: u128,
+    ) -> Result<Option<Child>, Error> {
+        let run = slot..slot + (1 << span);
+        if touched >> slot & ((1u32 << (1 << span)) - 1) == 0 {
+            return Ok(None);
+        }
+        let (mut leaves, mut records, mut blocked) = (0, 0usize, false);
+        for c in &children[run.clone()] {
+            match c {
+                Child::Empty => {}
+                Child::Leaf { records: n, .. } => {
+                    leaves += 1;
+                    records += *n as usize;
+                }
+                Child::Node { .. } => blocked = true,
+            }
+        }
+        let low = below(height);
+        let top = height - low;
+        let at = base + ((slot as u128) << low);
+        if !blocked && records <= MERGE && (leaves >= 2 || (leaves == 1 && span == top)) {
+            // Their records, in key order.
+            let mut all: Vec<Slot<T::Record>> = Vec::with_capacity(records);
+            let mut last_spend = 0;
+            let mut buf = [0u8; PAGE];
+            let mut k = slot;
+            while k < run.end {
+                let child = children[k];
+                if let Child::Leaf { page, records, live, last_spend: spent, span: s, .. } = child {
+                    let leaf_at = base + ((k as u128) << low);
+                    read_leaf::<T>(self.txn.read(page, &mut buf)?, leaf_at, low + s as u32, records, live, &mut all)?;
+                    last_spend = last_spend.max(spent);
+                }
+                k += 1 << span_of(child);
+            }
+            if fits::<T>(&all, at) {
+                for c in &mut children[run] {
+                    if let Child::Leaf { page, .. } = *c {
+                        self.txn.free(page);
+                    }
+                    *c = Child::Empty;
+                }
+                if span == top {
+                    return self.write_leaf(&all, height, base, last_spend, 0).map(Some);
+                }
+                children[slot] = self.write_leaf(&all, low + span, at, last_spend, span)?;
+                return Ok(None);
+            }
+        }
+        if span > 0 {
+            self.compact(children, slot, span - 1, touched, height, base)?;
+            self.compact(children, slot + (1 << (span - 1)), span - 1, touched, height, base)?;
+        }
+        Ok(None)
     }
 
     /// Sweeps the subtree `child` from key `sweep.from` on, while the
@@ -703,47 +1100,53 @@ impl<T: Tree, B: Backend> Pass<'_, '_, T, B> {
                 sweep.from = end;
                 Ok(child)
             }
-            Child::Leaf { page, records, live, last_spend, .. } => {
-                sweep.budget -= 1;
-                sweep.from = end;
-                let dead = records as u32 - live.count_ones();
-                // Everything dead here died before the horizon, and
-                // there is enough of it to be worth a page.
-                if dead == 0 || last_spend >= sweep.horizon || (live != 0 && dead * 4 < records as u32) {
-                    return Ok(child);
+            // A leaf with no node above it.
+            Child::Leaf { .. } => match self.sweep_leaf(child, height, base, sweep)? {
+                Some(slots) => {
+                    let built = self.build(&slots, height, base, 0, 1);
+                    self.slots = slots;
+                    built
                 }
-                self.txn.free(page);
-                if live == 0 {
-                    return Ok(Child::Empty);
-                }
-                let mut slots = std::mem::take(&mut self.slots);
-                slots.clear();
-                let mut buf = [0u8; PAGE];
-                read_leaf::<T>(self.txn.read(page, &mut buf)?, base, height, records, live, &mut slots)?;
-                slots.retain(|s| s.live);
-                let built = self.build(&slots, height, base, 0, 1);
-                self.slots = slots;
-                built
-            }
+                None => Ok(child),
+            },
             Child::Node { page, .. } => {
-                let mut buf = [0u8; PAGE];
-                let mut children = read_node(self.txn.read(page, &mut buf)?, height)?;
+                let mut children = load_node(self.txn, page, height)?;
                 let low = below(height);
-                let mut changed = false;
-                for (k, c) in children.iter_mut().enumerate().take(1 << (height - low)) {
-                    let swept = self.sweep(*c, low, base + ((k as u128) << low), sweep)?;
-                    changed |= swept != *c;
-                    *c = swept;
+                let top = height - low;
+                let mut touched = 0u32;
+                let mut k = 0;
+                while k < 1 << top {
+                    let (c, span) = (children[k], span_of(children[k]));
+                    let at = base + ((k as u128) << low);
+                    match c {
+                        Child::Leaf { .. } => {
+                            if let Some(slots) = self.sweep_leaf(c, low + span, at, sweep)? {
+                                children[k] = Child::Empty;
+                                let placed = self.place(&mut children, k, span, &slots, height, base, 0, 1);
+                                self.slots = slots;
+                                placed?;
+                                touched |= 1 << k;
+                            }
+                        }
+                        _ => {
+                            let swept = self.sweep(c, low, at, sweep)?;
+                            touched |= ((swept != c) as u32) << k;
+                            children[k] = swept;
+                        }
+                    }
+                    k += 1 << span;
                 }
-                // Swept to its end, a node that has thinned to a page's
-                // worth of live records becomes that page.
-                if sweep.from >= end
-                    && let Some(leaf) = self.collapse(&children, height, base)?
-                {
-                    self.txn.free(page);
-                    return Ok(leaf);
+                // Swept to its end, a node's leaves that have thinned are
+                // made fewer, and a node thinned to one page becomes it.
+                if sweep.from >= end {
+                    let before = children;
+                    if let Some(leaf) = self.compact(&mut children, 0, top, u32::MAX, height, base)? {
+                        self.txn.free(page);
+                        return Ok(leaf);
+                    }
+                    touched |= (before != children) as u32;
                 }
-                if !changed {
+                if touched == 0 {
                     return Ok(child);
                 }
                 self.txn.free(page);
@@ -755,117 +1158,39 @@ impl<T: Tree, B: Backend> Pass<'_, '_, T, B> {
         }
     }
 
-    /// The one leaf that holds all of a node's records, if its children
-    /// are leaves with nothing dead in them and few enough records; the
-    /// children's pages are then freed.
-    fn collapse(&mut self, children: &[Child; FANOUT], height: u32, base: u128) -> Result<Option<Child>, Error> {
-        let mut total = 0usize;
-        for c in children {
-            match c {
-                Child::Empty => {}
-                Child::Leaf { records, live, .. } if live.count_ones() == *records as u32 => total += *records as usize,
-                _ => return Ok(None),
-            }
-        }
-        // Well under a full page, so that the leaf does not at once
-        // become a node again.
-        if total == 0 || total > LEAF_RECORDS * 3 / 4 {
-            return Ok(None);
-        }
-        let mut slots = Vec::with_capacity(total);
-        let low = below(height);
-        let mut buf = [0u8; PAGE];
-        for (k, c) in children.iter().enumerate() {
-            if let Child::Leaf { page, records, live, .. } = c {
-                let at = base + ((k as u128) << low);
-                read_leaf::<T>(self.txn.read(*page, &mut buf)?, at, low, *records, *live, &mut slots)?;
-            }
-        }
-        if !fits::<T>(&slots, base) {
-            return Ok(None);
-        }
-        for c in children {
-            if let Child::Leaf { page, .. } = c {
-                self.txn.free(*page);
-            }
-        }
-        self.build(&slots, height, base, 0, 1).map(Some)
-    }
-
-    /// The subtree of `height` levels from `base` holding `slots`, all
-    /// of it written anew: a leaf if they fit one, else a node over the
-    /// sixteen parts of them. Many records (a state being installed) are
-    /// built on up to `threads` threads.
-    fn build(
+    /// Looks at one leaf (of `height` levels from `base`) for the sweep.
+    /// If what is dead in it is to be dropped, its page is freed and its
+    /// live records are returned (none, if nothing in it is live), to be
+    /// written anew by the caller; else `None`, and the leaf stands.
+    fn sweep_leaf(
         &mut self,
-        slots: &[Slot<T::Record>],
+        child: Child,
         height: u32,
         base: u128,
-        last_spend: u32,
-        threads: usize,
-    ) -> Result<Child, Error> {
-        if slots.is_empty() {
-            return Ok(Child::Empty);
+        sweep: &mut Sweep,
+    ) -> Result<Option<Vec<Slot<T::Record>>>, Error> {
+        let Child::Leaf { page, records, live, last_spend, .. } = child else { return Ok(None) };
+        let end = base + (1u128 << height);
+        if end <= sweep.from || sweep.budget == 0 {
+            return Ok(None);
         }
-        if fits::<T>(slots, base) {
-            write_leaf::<T>(slots, base, &mut self.out);
-            let page = self.txn.write(&self.out)?;
-            // Only a leaf with something dead has a last spend.
-            let last_spend = if slots.iter().all(|s| s.live) { 0 } else { last_spend };
-            return Ok(Child::Leaf {
-                page,
-                part: leaf_part::<T>(slots, height),
-                records: slots.len() as u8,
-                live: live_bits(slots),
-                last_spend,
-            });
+        sweep.budget = sweep.budget.saturating_sub(records as usize);
+        sweep.from = end;
+        let dead = records as u32 - live.count_ones();
+        // Everything dead here died before the horizon, and there is
+        // enough of it to be worth a page.
+        if dead == 0 || last_spend >= sweep.horizon || (live != 0 && dead * 4 < records as u32) {
+            return Ok(None);
         }
-        // Keys differ, so a subtree of one key always fits.
-        assert!(height > 0, "records of one key do not fit a page");
-        let low = below(height);
-        let count = 1usize << (height - low);
-        // Where each child's records lie.
-        let mut cuts = [0usize; FANOUT + 1];
-        for k in 0..count {
-            let end = base + ((k as u128 + 1) << low);
-            cuts[k + 1] = cuts[k] + slots[cuts[k]..].partition_point(|s| s.key < end);
+        let mut slots = std::mem::take(&mut self.slots);
+        slots.clear();
+        if live != 0 {
+            let mut buf = [0u8; PAGE];
+            read_leaf::<T>(self.txn.read(page, &mut buf)?, base, height, records, live, &mut slots)?;
+            slots.retain(|s| s.live);
         }
-        let part = |k: usize| &slots[cuts[k]..cuts[k + 1]];
-        let at = |k: usize| base + ((k as u128) << low);
-        let mut children = [Child::Empty; FANOUT];
-        let busy = (0..count).filter(|k| !part(*k).is_empty()).count();
-        if threads >= 2 && busy >= 2 && slots.len() >= 8 * SPLIT {
-            let workers = threads.min(busy);
-            let next = std::sync::atomic::AtomicUsize::new(0);
-            let (txn, height_now) = (self.txn, self.height);
-            let made: Vec<Vec<(usize, Result<Child, Error>)>> = std::thread::scope(|scope| {
-                let handles: Vec<_> = (0..workers)
-                    .map(|_| {
-                        scope.spawn(|| {
-                            let mut pass =
-                                Pass::<T, B> { txn, height: height_now, count: 0, slots: Vec::new(), out: Vec::new() };
-                            let mut made = Vec::new();
-                            loop {
-                                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if k >= count {
-                                    return made;
-                                }
-                                made.push((k, pass.build(part(k), low, at(k), last_spend, threads / workers)));
-                            }
-                        })
-                    })
-                    .collect();
-                handles.into_iter().map(|h| h.join().expect("a pass does not panic")).collect()
-            });
-            for (k, child) in made.into_iter().flatten() {
-                children[k] = child?;
-            }
-        } else {
-            for (k, c) in children.iter_mut().enumerate().take(count) {
-                *c = self.build(part(k), low, at(k), last_spend, threads)?;
-            }
-        }
-        self.write_node(&children, height, base)
+        self.txn.free(page);
+        Ok(Some(slots))
     }
 }
 
@@ -889,15 +1214,16 @@ pub fn update_on<T: Tree, B: Backend>(
     edits: Edits<'_, T>,
     threads: usize,
 ) -> Result<(Child, i64), Error> {
-    let mut pass = Pass::<T, B> { txn, height, count: 0, slots: Vec::new(), out: Vec::new() };
+    let mut pass = Pass::<T, B>::new(txn, height);
     let root = pass.update(root, T::HEIGHT, 0, edits.within(0, T::HEIGHT), threads)?;
     Ok((root, pass.count))
 }
 
-/// Sweeps part of the trie: from key `from`, looks at up to `budget`
-/// leaves and drops what is dead in them if all of it died before
-/// `horizon` and it is a quarter of the leaf or more. Returns the root,
-/// whose part is as it was, and the key the sweep reached.
+/// Sweeps part of the trie: from key `from`, looks at leaves holding up
+/// to `budget` records and drops what is dead in them if all of it died before
+/// `horizon` and it is a quarter of the leaf or more; and where leaves
+/// have thinned, makes fewer of them. Returns the root, whose part is as
+/// it was, and the key the sweep reached.
 pub fn sweep<T: Tree, B: Backend>(
     txn: &Txn<'_, B>,
     root: Child,
@@ -905,7 +1231,7 @@ pub fn sweep<T: Tree, B: Backend>(
     budget: usize,
     horizon: u32,
 ) -> Result<(Child, u128), Error> {
-    let mut pass = Pass::<T, B> { txn, height: 0, count: 0, slots: Vec::new(), out: Vec::new() };
+    let mut pass = Pass::<T, B>::new(txn, 0);
     let mut state = Sweep { from, budget, horizon };
     let swept = pass.sweep(root, T::HEIGHT, 0, &mut state)?;
     debug_assert_eq!(swept.part(), root.part(), "a sweep changes no hash");
@@ -937,7 +1263,8 @@ pub fn load_leaf<T: Tree>(
 pub enum Step<'a, T: Tree> {
     /// A node of `height` levels from `base`, and its children.
     Node { height: u32, base: u128, children: &'a [Child; FANOUT] },
-    /// The leaf the way ends in, and its records.
+    /// The leaf the way ends in, of `height` levels from `base`, and its
+    /// records.
     Leaf { height: u32, base: u128, slots: &'a [Slot<T::Record>] },
     /// The empty subtree the way ends in.
     Empty { height: u32, base: u128 },
@@ -951,7 +1278,6 @@ pub fn walk_to<T: Tree>(
     f: &mut dyn FnMut(Step<'_, T>),
 ) -> io::Result<()> {
     let (mut child, mut height, mut base) = (root, T::HEIGHT, 0u128);
-    let mut buf = [0u8; PAGE];
     loop {
         match child {
             Child::Empty => {
@@ -959,17 +1285,16 @@ pub fn walk_to<T: Tree>(
                 return Ok(());
             }
             Child::Node { page, .. } => {
-                let children = read_node(pages.read_page(page, &mut buf)?, height)?;
+                let children = load_node(pages, page, height)?;
                 f(Step::Node { height, base, children: &children });
                 let low = below(height);
-                let k = (key - base) >> low;
-                child = children[k as usize];
-                base += k << low;
-                height = low;
+                let (k, span) = group_of(&children, height, ((key - base) >> low) as usize);
+                child = children[k];
+                base += (k as u128) << low;
+                height = low + span;
             }
-            Child::Leaf { page, records, live, .. } => {
-                let mut slots = Vec::with_capacity(records as usize);
-                read_leaf::<T>(pages.read_page(page, &mut buf)?, base, height, records, live, &mut slots)?;
+            Child::Leaf { .. } => {
+                let slots = load_leaf::<T>(pages, child, height, base)?;
                 f(Step::Leaf { height, base, slots: &slots });
                 return Ok(());
             }
@@ -1038,20 +1363,17 @@ pub fn for_each<T: Tree>(
         base: u128,
         f: &mut dyn FnMut(u128, &T::Record, bool),
     ) -> io::Result<()> {
-        let mut buf = [0u8; PAGE];
         match child {
             Child::Empty => Ok(()),
-            Child::Leaf { page, records, live, .. } => {
-                let mut slots = Vec::with_capacity(records as usize);
-                read_leaf::<T>(pages.read_page(page, &mut buf)?, base, height, records, live, &mut slots)?;
-                slots.iter().for_each(|s| f(s.key, &s.record, s.live));
+            Child::Leaf { .. } => {
+                load_leaf::<T>(pages, child, height, base)?.iter().for_each(|s| f(s.key, &s.record, s.live));
                 Ok(())
             }
             Child::Node { page, .. } => {
-                let children = read_node(pages.read_page(page, &mut buf)?, height)?;
+                let children = load_node(pages, page, height)?;
                 let low = below(height);
                 for (k, c) in children.iter().enumerate() {
-                    walk::<T>(pages, *c, low, base + ((k as u128) << low), f)?;
+                    walk::<T>(pages, *c, low + span_of(*c), base + ((k as u128) << low), f)?;
                 }
                 Ok(())
             }

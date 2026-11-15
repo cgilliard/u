@@ -451,15 +451,32 @@ pub struct Txn<'a, B: Backend> {
     committed: bool,
 }
 
-/// What a transaction holds until it commits.
+/// Pages encoded and not yet in the file, with where each lies.
 #[derive(Default)]
-struct Pending {
-    /// Pages encoded and not yet handed to the backend, end to end.
+struct Batch {
+    /// The pages, end to end.
     buffer: Vec<u8>,
     /// Where each of them goes, in the order they lie in the buffer.
     queued: Vec<Extent>,
     /// Their place in the buffer, by first unit.
     index: HashMap<u64, usize>,
+}
+
+impl Batch {
+    fn page(&self, e: Extent) -> Option<&[u8]> {
+        self.index.get(&e.start).map(|at| &self.buffer[*at..*at + e.bytes()])
+    }
+}
+
+/// What a transaction holds until it commits.
+#[derive(Default)]
+struct Pending {
+    /// The pages being gathered.
+    open: Batch,
+    /// Batches on their way to the file, each written by the thread that
+    /// filled it, with the lock let go: their pages are still read here
+    /// until they are there.
+    leaving: Vec<std::sync::Arc<Batch>>,
     /// Every page this transaction has taken.
     allocated: Vec<Extent>,
     /// Every page it replaces.
@@ -476,20 +493,36 @@ impl<B: Backend> Txn<'_, B> {
     pub fn write(&self, payload: &[u8]) -> io::Result<Extent> {
         let units = Extent::units_for(payload.len());
         assert!(units <= MAX_UNITS, "a page of {} bytes is too long", payload.len());
-        let mut p = self.inner();
-        // Taken and placed under the one lock: pages lie in the buffer in
-        // the order they lie in the file.
-        let start = self.file.state().map.alloc(units);
-        let e = Extent { start, units };
-        p.allocated.push(e);
-        let at = p.buffer.len();
-        p.buffer.resize(at + e.bytes(), 0);
-        e.encode(payload, &mut p.buffer[at..]);
-        p.index.insert(start, at);
-        p.queued.push(e);
-        if p.buffer.len() >= WRITE_BUFFER {
-            self.flush(&mut p)?;
-        }
+        let e = Extent { start: self.file.state().map.alloc(units), units };
+        // Encoded with no lock held: the lock is for placing it.
+        let mut page = [0u8; 4096];
+        let mut long = Vec::new();
+        let bytes: &mut [u8] = if e.bytes() <= page.len() {
+            &mut page[..e.bytes()]
+        } else {
+            long.resize(e.bytes(), 0);
+            &mut long
+        };
+        e.encode(payload, bytes);
+        let full = {
+            let mut p = self.inner();
+            p.allocated.push(e);
+            let at = p.open.buffer.len();
+            p.open.buffer.extend_from_slice(bytes);
+            p.open.index.insert(e.start, at);
+            p.open.queued.push(e);
+            if p.open.buffer.len() >= WRITE_BUFFER {
+                let batch = std::sync::Arc::new(std::mem::take(&mut p.open));
+                p.leaving.push(batch.clone());
+                Some(batch)
+            } else {
+                None
+            }
+        };
+        match full {
+            Some(batch) => self.flush(&batch),
+            None => Ok(()),
+        }?;
         Ok(e)
     }
 
@@ -506,10 +539,11 @@ impl<B: Backend> Txn<'_, B> {
     pub fn read<'b>(&self, e: Extent, buf: &'b mut [u8]) -> io::Result<&'b [u8]> {
         {
             let p = self.inner();
-            if let Some(&at) = p.index.get(&e.start) {
+            let waiting = p.open.page(e).or_else(|| p.leaving.iter().find_map(|b| b.page(e)));
+            if let Some(page) = waiting {
                 let buf =
                     buf.get_mut(..e.bytes()).ok_or_else(|| corrupt("a page's buffer is shorter than the page"))?;
-                buf.copy_from_slice(&p.buffer[at..at + e.bytes()]);
+                buf.copy_from_slice(page);
                 return e.payload(buf);
             }
         }
@@ -519,33 +553,54 @@ impl<B: Backend> Txn<'_, B> {
     /// Bytes of pages written so far, those still waiting among them.
     pub fn written(&self) -> u64 {
         let p = self.inner();
-        p.written + p.buffer.len() as u64
+        p.written + (p.open.buffer.len() + p.leaving.iter().map(|b| b.buffer.len()).sum::<usize>()) as u64
     }
 
-    /// Hands the waiting pages to the backend: pages that lie one after
-    /// another in the file, as those taken together mostly do, go as one
-    /// write.
-    fn flush(&self, p: &mut Pending) -> io::Result<()> {
-        let mut writes: Vec<WriteReq<'_>> = Vec::new();
-        let (mut at, mut run_start, mut run_offset, mut next_offset) = (0usize, 0usize, 0u64, u64::MAX);
-        for e in &p.queued {
-            if e.offset() != next_offset {
-                if at > run_start {
-                    writes.push(WriteReq { offset: run_offset, data: &p.buffer[run_start..at] });
-                }
-                (run_start, run_offset) = (at, e.offset());
+    /// Hands a batch's pages to the backend, with no lock held: pages
+    /// that lie one after another in the file go as one write.
+    fn flush(&self, batch: &std::sync::Arc<Batch>) -> io::Result<()> {
+        // In the file's order, whatever order the threads took them in.
+        let mut at = 0;
+        let mut pages: Vec<(Extent, usize)> = batch
+            .queued
+            .iter()
+            .map(|e| {
+                at += e.bytes();
+                (*e, at - e.bytes())
+            })
+            .collect();
+        pages.sort_unstable_by_key(|p| p.0.start);
+        let mut runs: Vec<Vec<u8>> = Vec::new();
+        let mut writes: Vec<(u64, usize)> = Vec::new();
+        let mut direct: Vec<WriteReq<'_>> = Vec::new();
+        let mut i = 0;
+        while i < pages.len() {
+            // A run of pages one after another in the file.
+            let mut j = i + 1;
+            while j < pages.len() && pages[j].0.offset() == pages[j - 1].0.offset() + pages[j - 1].0.bytes() as u64 {
+                j += 1;
             }
-            at += e.bytes();
-            next_offset = e.offset() + e.bytes() as u64;
+            let in_buffer = (i + 1..j).all(|k| pages[k].1 == pages[k - 1].1 + pages[k - 1].0.bytes());
+            if in_buffer {
+                let end = pages[j - 1].1 + pages[j - 1].0.bytes();
+                direct.push(WriteReq { offset: pages[i].0.offset(), data: &batch.buffer[pages[i].1..end] });
+            } else {
+                // Neighbours in the file that are not neighbours in the
+                // buffer are brought together.
+                let mut run = Vec::new();
+                for (e, at) in &pages[i..j] {
+                    run.extend_from_slice(&batch.buffer[*at..*at + e.bytes()]);
+                }
+                writes.push((pages[i].0.offset(), runs.len()));
+                runs.push(run);
+            }
+            i = j;
         }
-        if at > run_start {
-            writes.push(WriteReq { offset: run_offset, data: &p.buffer[run_start..at] });
-        }
-        self.file.backend.write_many(&writes)?;
-        p.written += p.buffer.len() as u64;
-        p.buffer.clear();
-        p.queued.clear();
-        p.index.clear();
+        direct.extend(writes.iter().map(|(offset, k)| WriteReq { offset: *offset, data: &runs[*k] }));
+        self.file.backend.write_many(&direct)?;
+        let mut p = self.inner();
+        p.written += batch.buffer.len() as u64;
+        p.leaving.retain(|b| !std::sync::Arc::ptr_eq(b, batch));
         Ok(())
     }
 
@@ -557,10 +612,14 @@ impl<B: Backend> Txn<'_, B> {
     /// written or made durable, whether it took is not known: the file
     /// refuses further transactions until it is reopened.
     pub fn commit(mut self, payload: &[u8]) -> io::Result<u64> {
-        {
+        let last = {
             let mut p = self.inner();
-            self.flush(&mut p)?;
-        }
+            debug_assert!(p.leaving.is_empty(), "every thread of the pass is done");
+            let batch = std::sync::Arc::new(std::mem::take(&mut p.open));
+            p.leaving.push(batch.clone());
+            batch
+        };
+        self.flush(&last)?;
         self.file.backend.sync()?;
         let root = Root::new(self.file.root().seq + 1, payload);
         let recorded =

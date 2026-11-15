@@ -92,8 +92,29 @@ impl Tree for NameTree {
         leaf_hash(key, &r.leaf_value())
     }
 
-    fn combine(level: u32, top: u32, parts: &mut [(u128, Part)]) -> Option<Part> {
-        canonical(level, top, parts)
+    /// The names' step: a part with a sibling is compressed with it; one
+    /// name alone goes up as it is; more than one with no sibling are
+    /// compressed with nothing.
+    fn lift(_: u32, parts: &mut [(u128, Part)]) -> usize {
+        let (mut r, mut w) = (0, 0);
+        while r < parts.len() {
+            let (i, part) = parts[r];
+            let pair = i & 1 == 0 && parts.get(r + 1).is_some_and(|next| next.0 == i + 1);
+            let up = if pair {
+                r += 1;
+                Part { hash: compress(&part.hash, &parts[r].1.hash), single: false }
+            } else if part.single {
+                part
+            } else if i & 1 == 0 {
+                Part { hash: compress(&part.hash, &EMPTY), single: false }
+            } else {
+                Part { hash: compress(&EMPTY, &part.hash), single: false }
+            };
+            r += 1;
+            parts[w] = (i >> 1, up);
+            w += 1;
+        }
+        w
     }
 
     fn refuse(_: u128, fault: Fault) -> Error {
@@ -170,14 +191,35 @@ impl NameProof {
     }
 }
 
-/// How a key's way through one node ends.
+/// How a key's way through one node, or one leaf, ends.
 enum Way {
-    /// At an empty subtree, at this level.
+    /// At an empty subtree.
     Empty,
-    /// At a subtree with one name: the part of this index holds it.
-    Single(u128),
-    /// It goes on below, under the part of the key's own index.
+    /// At a subtree with one name: in a leaf, the name of this key; in a
+    /// node, the one under the part of this index, this many levels
+    /// above the node's slots.
+    Single(u128, u32),
+    /// It goes on below, in the child the key is under.
     On,
+}
+
+/// The way of `key` through a node of `height` levels, from its own part
+/// down to the child the key is under, which covers `2^span` slots:
+/// appends the sibling at each depth passed, top first.
+fn way_through(levels: &trie::Levels, height: u32, span: u32, key: u128, siblings: &mut Vec<Digest>) -> Way {
+    let low = trie::below(height);
+    let mut up = height - low;
+    loop {
+        let mine = key >> (low + up);
+        match levels.find(up, mine) {
+            None => return Way::Empty,
+            Some(part) if part.single => return Way::Single(mine, up),
+            Some(_) if up == span => return Way::On,
+            Some(_) => {}
+        }
+        up -= 1;
+        siblings.push(levels.find(up, (key >> (low + up)) ^ 1).map_or(EMPTY, |p| p.hash));
+    }
 }
 
 /// The way of `key` from the node at `top` down through its parts at
@@ -185,7 +227,7 @@ enum Way {
 fn way(level: u32, top: u32, parts: &[(u128, Part)], key: u128, siblings: &mut Vec<Digest>) -> Way {
     match parts {
         [] => Way::Empty,
-        [(i, part)] if part.single => Way::Single(*i),
+        [(i, part)] if part.single => Way::Single(*i, 0),
         _ if top == level => Way::On,
         _ => {
             let bit = top - 1 - level;
@@ -288,26 +330,31 @@ impl Names {
                         .collect();
                     break match way(0, height, &parts, key, &mut siblings) {
                         Way::Empty => Terminal::Empty,
-                        Way::Single(k) => slots.iter().find(|s| s.key == k).map_or(Terminal::Empty, leaf_of),
+                        Way::Single(k, _) => slots.iter().find(|s| s.key == k).map_or(Terminal::Empty, leaf_of),
                         Way::On => slots.iter().find(|s| s.key == key).map_or(Terminal::Empty, leaf_of),
                     };
                 }
                 Child::Node { page, .. } => {
                     let children = trie::load_node(pages, page, height)?;
-                    let mut parts = [(0u128, Part { hash: EMPTY, single: false }); trie::FANOUT];
-                    let n = trie::child_parts(&children, height, base, &mut parts);
-                    let low = height.saturating_sub(trie::BITS);
-                    let slot = match way(low, height, &parts[..n], key, &mut siblings) {
+                    let low = trie::below(height);
+                    let levels = trie::levels::<NameTree>(&children, height, base);
+                    let (slot, span) = trie::group_of(&children, height, ((key - base) >> low) as usize);
+                    match way_through(&levels, height, span, key, &mut siblings) {
                         Way::Empty => break Terminal::Empty,
                         // The one name of a subtree lies somewhere under
-                        // it, past no more siblings.
-                        Way::Single(index) => {
-                            let k = index - (base >> low);
-                            break Self::only(pages, children[k as usize], low, base + (k << low))?;
+                        // it, past no more siblings: under the one child
+                        // there that is not empty.
+                        Way::Single(index, up) => {
+                            let first = ((index << (low + up)) - base) >> low;
+                            let k = (first as usize..first as usize + (1 << up))
+                                .find(|k| children[*k] != Child::Empty)
+                                .ok_or_else(|| corrupt("a subtree said to hold one name holds none"))?;
+                            let under = low + trie::span_of(children[k]);
+                            break Self::only(pages, children[k], under, base + ((k as u128) << low))?;
                         }
-                        Way::On => (key - base) >> low,
-                    };
-                    (child, height, base) = (children[slot as usize], low, base + (slot << low));
+                        Way::On => {}
+                    }
+                    (child, height, base) = (children[slot], low + span, base + ((slot as u128) << low));
                 }
             }
         };
@@ -328,8 +375,9 @@ impl Names {
                 Child::Node { page, .. } => {
                     let children = trie::load_node(pages, page, height)?;
                     let k = children.iter().position(|c| *c != Child::Empty).unwrap_or(0);
-                    height = height.saturating_sub(trie::BITS);
-                    (child, base) = (children[k], base + ((k as u128) << height));
+                    let low = trie::below(height);
+                    (child, base, height) =
+                        (children[k], base + ((k as u128) << low), low + trie::span_of(children[k]));
                 }
             }
         }

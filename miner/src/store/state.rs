@@ -16,9 +16,9 @@
 //! ```
 //!
 //! With every block the sweep of the outputs goes a little further round
-//! ([`super::outputs`]): twice as many leaves as the block spent outputs,
-//! so that records of spent outputs are dropped as fast as they are made,
-//! once the blocks that spent them have left the window.
+//! ([`super::outputs`]): past sixteen records for each output the block
+//! spent, so that records of spent outputs are dropped faster than they
+//! are made, once the blocks that spent them have left the window.
 //!
 //! A [`Snapshot`] is the state after some block, held while later blocks
 //! are applied: whoever reads through it sees that state, whole.
@@ -40,8 +40,10 @@ use crate::poseidon2::{DIGEST, Fp, compress, digest_from_bytes, digest_to_bytes}
 const VERSION: u8 = 1;
 const RECORD: usize = 1 + 4 + 32 + Outputs::BYTES + Names::BYTES + Window::BYTES + 8;
 const NAMES_AT: usize = 37 + Outputs::BYTES;
-/// Leaves the sweep looks at with a block, at least.
-const SWEEP_MIN: usize = 64;
+/// Records the sweep goes past with a block, at least.
+const SWEEP_MIN: usize = 2048;
+/// And for each output the block spends.
+const SWEEP_RATE: usize = 16;
 /// The window's length unless another is asked for: a week of blocks.
 pub const DEFAULT_WINDOW: usize = 7 * 144;
 
@@ -241,7 +243,7 @@ impl<B: Backend> State<B> {
         // What was spent before the oldest block of the window is dead
         // for good.
         let horizon = (block.height + 1).saturating_sub(self.keep as u32);
-        let budget = SWEEP_MIN.max(2 * block.spends.len());
+        let budget = SWEEP_MIN.max(SWEEP_RATE * block.spends.len());
         #[cfg(test)]
         {
             times[1] = clock.elapsed();
@@ -683,7 +685,7 @@ mod tests {
         assert_eq!(state.snapshot().unwrap().outputs().count, 3000);
         let (early, late) = (sizes[15], *sizes.last().unwrap());
         assert!(late < early + early / 3, "{early} units after 16 blocks, {late} after 60");
-        assert!(late * 512 < 3000 * 66 * 4, "{late} units for 3,000 unspent outputs and a window of five blocks");
+        assert!(late * 512 < 3000 * 66 * 5, "{late} units for 3,000 unspent outputs and a window of five blocks");
         // Opened again, every unit in use is reached.
         let again = State::open(MemBackend::from_image(state.file().backend().image(Lost::All)), keep).unwrap();
         assert_eq!(again.file().space().0, state.file().space().0);
