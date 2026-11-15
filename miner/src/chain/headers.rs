@@ -758,7 +758,7 @@ impl<B: Backend + 'static, V> Chain<B, V> {
 pub const LOCATOR: usize = 32;
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::chain::verify::AcceptAllProofs;
     use crate::difficulty::Schedule;
@@ -767,12 +767,12 @@ pub(super) mod tests {
 
     type TestChain = Chain<MemBackend, AcceptAllProofs>;
 
-    pub(in crate::chain) const T0: u64 = 1_800_000_000;
+    pub(crate) const T0: u64 = 1_800_000_000;
     /// Far enough ahead that no header is too new.
-    pub(in crate::chain) const NOW: u64 = T0 + 1_000_000;
+    pub(crate) const NOW: u64 = T0 + 1_000_000;
 
     /// A network whose every header meets its target, on the dev table.
-    pub(in crate::chain) fn easy() -> ChainParams {
+    pub(crate) fn easy() -> ChainParams {
         ChainParams {
             pow: PowParams::DEV,
             genesis_timestamp: T0,
@@ -787,14 +787,14 @@ pub(super) mod tests {
         ChainParams { genesis_target: U256([0, 0, 0, 1 << 54]), ..easy() }
     }
 
-    pub(in crate::chain) fn seed() -> SeedText<'static> {
+    pub(crate) fn seed() -> SeedText<'static> {
         SeedText::new(PowParams::DEV)
     }
 
     /// The dev table, made once: headers are mined from it, and the
     /// chains check against it, a thousand times faster than from the
     /// seed text.
-    pub(in crate::chain) fn table() -> std::sync::Arc<Dataset<'static>> {
+    pub(crate) fn table() -> std::sync::Arc<Dataset<'static>> {
         static TABLE: std::sync::OnceLock<std::sync::Arc<Dataset<'static>>> = std::sync::OnceLock::new();
         TABLE.get_or_init(|| std::sync::Arc::new(Dataset::generate(&seed(), 10))).clone()
     }
