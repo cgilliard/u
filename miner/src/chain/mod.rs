@@ -13,14 +13,14 @@
 //!   ahead of the blocks it has.
 //! - [`apply`]: the rules of a block, and the chain going from one
 //!   branch to another.
-//! - [`aux`]: what a header's auxiliary bytes commit to, the votes
+//! - [`leaves`]: what a header's auxiliary bytes commit to, the votes
 //!   they cast and the files voted for.
 //!
 //! A [`Chain`] is a store with a network's rules over it.
 
 pub mod apply;
-pub mod aux;
 pub mod headers;
+pub mod leaves;
 pub mod params;
 pub mod verify;
 

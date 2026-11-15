@@ -2,7 +2,7 @@
 //!
 //! The message layer of the network is run by a file its miners agree
 //! on. A miner that favours a file sets leaf 0 of the leaves its
-//! header's auxiliary bytes commit to ([`crate::chain::aux`]) to the
+//! header's auxiliary bytes commit to ([`crate::chain::leaves`]) to the
 //! file's SHA-256: a vote. A node that follows the chain counts the
 //! votes over the last [`WINDOW`] blocks of the chain and fetches the
 //! files they name, the most voted first.
