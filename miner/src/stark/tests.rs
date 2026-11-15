@@ -5,13 +5,13 @@ use super::air::{Air, Builder, DynAir, Trace, measure_degree};
 use super::audit::{freedom_audit, mutation_audit};
 use super::check::{check_constraints, check_tables};
 use super::config::{StarkConfig, ZK_COLS, grinding_of, log_quotient_degree};
-use super::proof::{Proof, VerifyError};
+use super::proof::Proof;
 use super::prove::{TableInput, prove, prove_tables};
 use super::verify::{TableSpec, verify, verify_bytes, verify_tables};
 use crate::challenger::Challenger;
+use crate::error::Error;
 use crate::ext::Fp4;
 use crate::field::Field;
-use crate::fri::FriError;
 use crate::poseidon2::Fp;
 
 /// Fibonacci: columns (a, b); next = (b, a + b); a_0 = 0, b_0 = 1;
@@ -163,7 +163,7 @@ fn fibonacci_roundtrip() {
         assert_eq!(verify(&CONFIG, &Fibonacci, &public, &proof, &mut transcript()), Ok(()), "log_n={log_n}");
         // Wrong public value fails the constraint identity.
         let bad = vec![public[0] + Fp::ONE];
-        assert_eq!(verify(&CONFIG, &Fibonacci, &bad, &proof, &mut transcript()), Err(VerifyError::ConstraintIdentity));
+        assert_eq!(verify(&CONFIG, &Fibonacci, &bad, &proof, &mut transcript()), Err(Error::ConstraintIdentity));
     }
 }
 
@@ -207,11 +207,11 @@ fn proof_bytes_roundtrip() {
     // decodes.
     let mut moved = proof.clone();
     moved.query_indices[0] ^= 1;
-    assert_eq!(verify(&CONFIG, &Fibonacci, &public, &moved, &mut transcript()), Err(VerifyError::Shape));
-    assert!(Proof::from_bytes(&bytes[..bytes.len() - 1]).is_none());
+    assert_eq!(verify(&CONFIG, &Fibonacci, &public, &moved, &mut transcript()), Err(Error::ProofShape));
+    assert!(Proof::from_bytes(&bytes[..bytes.len() - 1]).is_err());
     let mut extra = bytes.clone();
     extra.push(0);
-    assert!(Proof::from_bytes(&extra).is_none());
+    assert!(Proof::from_bytes(&extra).is_err());
 }
 
 /// A proof of no queries whose header still claims FRI rounds once
@@ -232,8 +232,8 @@ fn a_proof_without_queries_is_refused() {
     for _ in 0..4 * nt + 1 {
         forged.extend(0u32.to_le_bytes()); // heights
     }
-    assert!(Proof::from_bytes(&forged).is_none());
-    assert!(Proof::from_bytes(&bytes).is_none());
+    assert!(Proof::from_bytes(&forged).is_err());
+    assert!(Proof::from_bytes(&bytes).is_err());
 }
 
 #[test]
@@ -250,17 +250,17 @@ fn tampered_proofs_are_rejected() {
     p.openings[2][0].trace_row[1] += Fp::ONE;
     assert_eq!(
         verify(&CONFIG, &Fibonacci, &public, &p, &mut transcript()),
-        Err(VerifyError::InvalidTraceOpening { table: 0 })
+        Err(Error::InvalidTraceOpening { table: 0 })
     );
     let mut p = proof.clone();
     p.openings[5][0].quotient_row[0] += Fp::ONE;
     assert_eq!(
         verify(&CONFIG, &Fibonacci, &public, &p, &mut transcript()),
-        Err(VerifyError::InvalidQuotientOpening { table: 0 })
+        Err(Error::InvalidQuotientOpening { table: 0 })
     );
     let mut p = proof.clone();
     p.openings.pop();
-    assert_eq!(verify(&CONFIG, &Fibonacci, &public, &p, &mut transcript()), Err(VerifyError::Shape));
+    assert_eq!(verify(&CONFIG, &Fibonacci, &public, &p, &mut transcript()), Err(Error::ProofShape));
     let mut p = proof.clone();
     p.tables[0].trace_root[0] += Fp::ONE;
     assert!(verify(&CONFIG, &Fibonacci, &public, &p, &mut transcript()).is_err());
@@ -340,7 +340,7 @@ fn rom_lookup_roundtrip() {
     assert!(verify(&CONFIG, &RomAir, &[], &p, &mut transcript()).is_err());
     let mut p = proof.clone();
     p.openings[0][0].aux_row[0] += Fp::ONE;
-    assert_eq!(verify(&CONFIG, &RomAir, &[], &p, &mut transcript()), Err(VerifyError::InvalidAuxOpening { table: 0 }));
+    assert_eq!(verify(&CONFIG, &RomAir, &[], &p, &mut transcript()), Err(Error::InvalidAuxOpening { table: 0 }));
 }
 
 /// [`RomAir`] with its two lookup terms summed in one column.
@@ -459,13 +459,13 @@ fn tables_of_different_heights() {
     // Tables in another order, or one missing.
     let swapped = [specs[0], specs[2], specs[1]];
     assert!(verify_tables(&CONFIG, &swapped, &[], &proof, &mut transcript()).is_err());
-    assert_eq!(verify_tables(&CONFIG, &specs[..2], &[], &proof, &mut transcript()), Err(VerifyError::Shape));
+    assert_eq!(verify_tables(&CONFIG, &specs[..2], &[], &proof, &mut transcript()), Err(Error::ProofShape));
     // Openings of a smaller table are checked.
     let mut p = proof.clone();
     p.openings[3][2].trace_row[2] += Fp::ONE;
     assert_eq!(
         verify_tables(&CONFIG, &specs, &[], &p, &mut transcript()),
-        Err(VerifyError::InvalidTraceOpening { table: 2 })
+        Err(Error::InvalidTraceOpening { table: 2 })
     );
     let mut p = proof.clone();
     p.tables[2].trace_at_zeta_next[3] += Fp4::ONE;
@@ -478,7 +478,7 @@ fn tables_of_different_heights() {
     assert!(verify_tables(&CONFIG, &specs, &[], &p, &mut transcript()).is_err());
     let mut p = proof.clone();
     p.tables[1].lookup_sum += Fp4::ONE;
-    assert_eq!(verify_tables(&CONFIG, &specs, &[], &p, &mut transcript()), Err(VerifyError::LookupSum));
+    assert_eq!(verify_tables(&CONFIG, &specs, &[], &p, &mut transcript()), Err(Error::LookupSum));
 
     // Messages that do not balance.
     let (tall, short, recv) = exchange([5, 5, 4, 5]);
@@ -492,7 +492,7 @@ fn tables_of_different_heights() {
             TableInput { air: &Receiver, trace: &recv, pre: None },
         ];
         let proof = prove_tables(&CONFIG, &tables, &[], &mut transcript());
-        assert_eq!(verify_tables(&CONFIG, &specs, &[], &proof, &mut transcript()), Err(VerifyError::LookupSum));
+        assert_eq!(verify_tables(&CONFIG, &specs, &[], &proof, &mut transcript()), Err(Error::LookupSum));
     }
 }
 
@@ -567,23 +567,20 @@ fn zero_knowledge_tables() {
     // Tampering is caught.
     let mut p = proof.clone();
     p.tables[1].quotient_at_zeta_q[3] += Fp4::ONE;
-    assert_eq!(verify_tables(&ZK, &specs, &[], &p, &mut transcript()), Err(VerifyError::ConstraintIdentity));
+    assert_eq!(verify_tables(&ZK, &specs, &[], &p, &mut transcript()), Err(Error::ConstraintIdentity));
     let mut p = proof.clone();
     p.tables[0].trace_at_zeta[1] += Fp4::ONE;
-    assert_eq!(verify_tables(&ZK, &specs, &[], &p, &mut transcript()), Err(VerifyError::ConstraintIdentity));
+    assert_eq!(verify_tables(&ZK, &specs, &[], &p, &mut transcript()), Err(Error::ConstraintIdentity));
     let mut p = proof.clone();
     p.tables[0].lookup_sum += Fp4::ONE;
     p.tables[1].lookup_sum -= Fp4::ONE;
     assert!(verify_tables(&ZK, &specs, &[], &p, &mut transcript()).is_err());
     let mut p = proof.clone();
     p.openings[1][1].aux_row[0] += Fp::ONE;
-    assert_eq!(
-        verify_tables(&ZK, &specs, &[], &p, &mut transcript()),
-        Err(VerifyError::InvalidAuxOpening { table: 1 })
-    );
+    assert_eq!(verify_tables(&ZK, &specs, &[], &p, &mut transcript()), Err(Error::InvalidAuxOpening { table: 1 }));
     // A proof is only accepted under the configuration it was made in.
     let plain = StarkConfig { zk: false, ..ZK };
-    assert_eq!(verify_tables(&plain, &specs, &[], &proof, &mut transcript()), Err(VerifyError::Shape));
+    assert_eq!(verify_tables(&plain, &specs, &[], &proof, &mut transcript()), Err(Error::ProofShape));
 
     // Unbalanced messages before the blinding rows are rejected.
     if !cfg!(debug_assertions) {
@@ -593,7 +590,7 @@ fn zero_knowledge_tables() {
             TableInput { air: &Receiver, trace: &recv, pre: None },
         ];
         let proof = prove_tables(&ZK, &tables, &[], &mut transcript());
-        assert_eq!(verify_tables(&ZK, &specs, &[], &proof, &mut transcript()), Err(VerifyError::LookupSum));
+        assert_eq!(verify_tables(&ZK, &specs, &[], &proof, &mut transcript()), Err(Error::LookupSum));
     }
 }
 
@@ -623,14 +620,11 @@ fn commit_phase_grinding() {
     for k in 0..4 {
         let mut p = proof.clone();
         p.grinding[k] += Fp::ONE;
-        assert_eq!(verify_tables(&config, &specs, &[], &p, &mut transcript()), Err(VerifyError::ProofOfWork));
+        assert_eq!(verify_tables(&config, &specs, &[], &p, &mut transcript()), Err(Error::Grinding));
     }
     let mut p = proof.clone();
     p.fri.fold_witnesses[0] += Fp::ONE;
-    assert_eq!(
-        verify_tables(&config, &specs, &[], &p, &mut transcript()),
-        Err(VerifyError::Fri(FriError::ProofOfWork))
-    );
+    assert_eq!(verify_tables(&config, &specs, &[], &p, &mut transcript()), Err(Error::FriGrinding));
     // A proof made without the grinding does not pass.
     let plain = prove_tables(&CONFIG, &tables, &[], &mut transcript());
     assert!(verify_tables(&config, &specs, &[], &plain, &mut transcript()).is_err());
@@ -737,15 +731,15 @@ fn the_byte_verifier_accepts_a_proof_and_nothing_near_it() {
         assert_eq!(check(&bytes), Ok(()), "{name}");
         // The owned form says the same, and decodes from the same bytes.
         assert_eq!(verify_tables(config, specs, public, proof, &mut transcript()), Ok(()));
-        assert_eq!(Proof::from_bytes(&bytes).as_ref(), Some(proof));
-        assert_eq!(check(&[]), Err(VerifyError::Malformed));
-        assert_eq!(check(&[&bytes[..], &[0]].concat()), Err(VerifyError::Malformed), "{name}: a byte more");
+        assert_eq!(Proof::from_bytes(&bytes).as_ref(), Ok(proof));
+        assert_eq!(check(&[]), Err(Error::Malformed("proof")));
+        assert_eq!(check(&[&bytes[..], &[0]].concat()), Err(Error::Malformed("proof")), "{name}: a byte more");
         for cut in (0..bytes.len()).step_by(1 + bytes.len() / 300).chain([bytes.len() - 1, bytes.len() - 32]) {
             assert!(check(&bytes[..cut]).is_err(), "{name}: cut to {cut} bytes");
         }
         // Every structural field, set to each value at its bounds.
         let (fields, panicked, accepted) = crate::codec::sweep_fields(&bytes, |b| match check(b) {
-            Err(VerifyError::Malformed) => None,
+            Err(Error::Malformed("proof")) => None,
             verdict => Some(verdict.is_ok()),
         });
         assert!(fields > 20 + 16 * (specs.len() * 4 + 2), "{name}: {fields} structural fields found");
@@ -768,10 +762,7 @@ fn the_byte_verifier_accepts_a_proof_and_nothing_near_it() {
         let mut bad = bytes.clone();
         *bad.last_mut().unwrap() ^= 1;
         assert!(
-            matches!(
-                check(&bad),
-                Err(VerifyError::InvalidFriOpening { .. } | VerifyError::InvalidQuotientOpening { .. })
-            ),
+            matches!(check(&bad), Err(Error::InvalidFriOpening { .. } | Error::InvalidQuotientOpening { .. })),
             "{name}: {:?}",
             check(&bad)
         );
@@ -784,14 +775,17 @@ fn the_byte_verifier_accepts_a_proof_and_nothing_near_it() {
     let mut p = proof.clone();
     p.fri.final_value += Fp4::ONE;
     let verdict = verify_bytes(config, specs, public, &p.to_bytes(), &mut transcript());
-    assert!(matches!(verdict, Err(VerifyError::Fri(_))), "{name}: {verdict:?}");
+    assert!(
+        matches!(verdict, Err(Error::FriGrinding | Error::FoldMismatch { .. } | Error::FinalMismatch { .. })),
+        "{name}: {verdict:?}"
+    );
     // A row that is not its tree's is reported as that, though its fold
     // fails too.
     let mut p = proof.clone();
     p.openings[1][0].trace_row[0] += Fp::ONE;
     assert_eq!(
         verify_bytes(config, specs, public, &p.to_bytes(), &mut transcript()),
-        Err(VerifyError::InvalidTraceOpening { table: 0 })
+        Err(Error::InvalidTraceOpening { table: 0 })
     );
     // An owned proof the encoding cannot hold has the wrong shape.
     for break_it in [
@@ -805,23 +799,8 @@ fn the_byte_verifier_accepts_a_proof_and_nothing_near_it() {
     ] {
         let mut p = proof.clone();
         break_it(&mut p);
-        assert_eq!(p.try_to_bytes(), None);
-        assert_eq!(verify_tables(config, specs, public, &p, &mut transcript()), Err(VerifyError::Shape));
+        assert!(p.try_to_bytes().is_err());
+        assert_eq!(verify_tables(config, specs, public, &p, &mut transcript()), Err(Error::ProofShape));
         assert!(std::panic::catch_unwind(|| p.to_bytes()).is_err());
-    }
-    for e in [
-        VerifyError::Malformed,
-        VerifyError::Shape,
-        VerifyError::ProofOfWork,
-        VerifyError::ConstraintIdentity,
-        VerifyError::LookupSum,
-        VerifyError::Fri(FriError::Shape),
-        VerifyError::InvalidTraceOpening { table: 1 },
-        VerifyError::InvalidAuxOpening { table: 1 },
-        VerifyError::InvalidPreprocessedOpening { table: 1 },
-        VerifyError::InvalidQuotientOpening { table: 1 },
-        VerifyError::InvalidFriOpening { round: 1 },
-    ] {
-        assert!(!e.to_string().is_empty());
     }
 }

@@ -7,9 +7,10 @@ use super::config::{
 };
 use super::deep::{Deep, observe_setup, sample_coefficients, table_shift};
 use super::lookup::{LookupArgs, LookupChallenges, combine, ext_from_base_openings, powers};
-use super::proof::{Proof, ProofHead, VerifyError};
+use super::proof::{Proof, ProofHead};
 use crate::challenger::Challenger;
 use crate::codec::Reader;
+use crate::error::Error;
 use crate::ext::{DEGREE, Fp4, as_fp4};
 use crate::field::Field;
 use crate::fri::{self};
@@ -24,7 +25,7 @@ pub fn verify<A: Air>(
     public: &[Fp],
     proof: &Proof,
     challenger: &mut Challenger,
-) -> Result<(), VerifyError> {
+) -> Result<(), Error> {
     verify_with(config, air, None, public, proof, challenger)
 }
 
@@ -36,7 +37,7 @@ pub fn verify_with<A: Air>(
     public: &[Fp],
     proof: &Proof,
     challenger: &mut Challenger,
-) -> Result<(), VerifyError> {
+) -> Result<(), Error> {
     verify_tables(config, &[TableSpec { air, pre_root }], public, proof, challenger)
 }
 
@@ -70,11 +71,8 @@ pub fn verify_tables(
     public: &[Fp],
     proof: &Proof,
     challenger: &mut Challenger,
-) -> Result<(), VerifyError> {
-    match proof.try_to_bytes() {
-        Some(bytes) => verify_bytes(config, specs, public, &bytes, challenger),
-        None => Err(VerifyError::Shape),
-    }
+) -> Result<(), Error> {
+    verify_bytes(config, specs, public, &proof.try_to_bytes()?, challenger)
 }
 
 /// Verifies the bytes of a proof of [`prove_tables`] for the given tables,
@@ -94,16 +92,16 @@ pub fn verify_bytes(
     public: &[Fp],
     bytes: &[u8],
     challenger: &mut Challenger,
-) -> Result<(), VerifyError> {
-    let head = ProofHead::read(bytes).ok_or(VerifyError::Malformed)?;
+) -> Result<(), Error> {
+    let head = ProofHead::read(bytes)?;
     let proof = &head;
     let log_blowup = config.log_blowup;
     if specs.is_empty() || proof.tables.len() != specs.len() || proof.num_queries != config.num_queries {
-        return Err(VerifyError::Shape);
+        return Err(Error::ProofShape);
     }
     let log_ns: Vec<usize> = proof.tables.iter().map(|t| t.log_n).collect();
     if log_ns.windows(2).any(|w| w[0] < w[1]) {
-        return Err(VerifyError::Shape);
+        return Err(Error::ProofShape);
     }
     let mut shapes = Vec::with_capacity(specs.len());
     for (spec, t) in specs.iter().zip(&proof.tables) {
@@ -140,15 +138,15 @@ pub fn verify_bytes(
             || t.pre_at_zeta_next.len() != s.pre_w
             || t.quotient_at_zeta_q.len() != s.chunks
         {
-            return Err(VerifyError::Shape);
+            return Err(Error::ProofShape);
         }
         shapes.push(s);
     }
     let log_big = log_ns[0] + log_blowup;
     let grinding =
         grinding_of(config, &specs.iter().map(|s| s.air).zip(log_ns.iter().copied()).collect::<Vec<_>>(), public);
-    let ground = |challenger: &mut Challenger, bits: usize, w: Fp| -> Result<(), VerifyError> {
-        if fri::check_pow(challenger, bits, w) { Ok(()) } else { Err(VerifyError::ProofOfWork) }
+    let ground = |challenger: &mut Challenger, bits: usize, w: Fp| -> Result<(), Error> {
+        if fri::check_pow(challenger, bits, w) { Ok(()) } else { Err(Error::Grinding) }
     };
 
     observe_setup(challenger, &log_ns, public);
@@ -172,12 +170,12 @@ pub fn verify_bytes(
         Some(ch)
     } else {
         if proof.grinding[0] != Fp::ZERO {
-            return Err(VerifyError::ProofOfWork);
+            return Err(Error::Grinding);
         }
         None
     };
     if !proof.tables.iter().fold(Fp4::ZERO, |a, t| a + t.lookup_sum).is_zero() {
-        return Err(VerifyError::LookupSum);
+        return Err(Error::LookupSum);
     }
     ground(challenger, grinding.alpha, proof.grinding[1])?;
     let alpha = challenger.sample_ext();
@@ -200,10 +198,9 @@ pub fn verify_bytes(
         let rows = Constrained { log_n: t.log_n, blind: config.blind_rows() };
         let p_last = Fp4::from_base(rows.last_point());
         // Z of the constrained rows at zeta.
-        let z_r =
-            (zeta.exp(1u64 << t.log_n) - Fp4::ONE) * rows.z_blind(zeta).inv().ok_or(VerifyError::ConstraintIdentity)?;
-        let first = z_r * (zeta - Fp4::ONE).inv().ok_or(VerifyError::ConstraintIdentity)?;
-        let last = z_r * (zeta - p_last).inv().ok_or(VerifyError::ConstraintIdentity)?;
+        let z_r = (zeta.exp(1u64 << t.log_n) - Fp4::ONE) * rows.z_blind(zeta).inv().ok_or(Error::ConstraintIdentity)?;
+        let first = z_r * (zeta - Fp4::ONE).inv().ok_or(Error::ConstraintIdentity)?;
+        let last = z_r * (zeta - p_last).inv().ok_or(Error::ConstraintIdentity)?;
         let transition = zeta - p_last;
         let w = spec.air.air_width();
         let (constraints, terms) = evaluate(
@@ -215,7 +212,7 @@ pub fn verify_bytes(
             (first, last, transition),
         );
         if config.zk && terms.iter().any(|t| t.values.len() >= BLIND_TAG) {
-            return Err(VerifyError::Shape);
+            return Err(Error::ProofShape);
         }
         let aux_l = ext_from_base_openings(&t.aux_at_zeta);
         let aux_n = ext_from_base_openings(&t.aux_at_zeta_next);
@@ -237,7 +234,7 @@ pub fn verify_bytes(
             zeta_pow *= step;
         }
         if q_zeta * z_r != c_zeta {
-            return Err(VerifyError::ConstraintIdentity);
+            return Err(Error::ConstraintIdentity);
         }
     }
 
@@ -268,7 +265,7 @@ pub fn verify_bytes(
     let schedule = *fri_verifier.schedule();
     let rounds = schedule.rounds();
     if proof.rounds != rounds {
-        return Err(VerifyError::Shape);
+        return Err(Error::ProofShape);
     }
 
     // What each table's openings are read with: the same for every query.
@@ -316,16 +313,16 @@ pub fn verify_bytes(
             _ => Some((&t.quotient_root, log_m)),
         }
     };
-    let not_the_trees = |k: usize| -> VerifyError {
+    let not_the_trees = |k: usize| -> Error {
         if k >= 4 * nt {
-            return VerifyError::InvalidFriOpening { round: k - 4 * nt };
+            return Error::InvalidFriOpening { round: k - 4 * nt };
         }
         let table = k / 4;
         match k % 4 {
-            0 => VerifyError::InvalidTraceOpening { table },
-            1 => VerifyError::InvalidAuxOpening { table },
-            2 => VerifyError::InvalidPreprocessedOpening { table },
-            _ => VerifyError::InvalidQuotientOpening { table },
+            0 => Error::InvalidTraceOpening { table },
+            1 => Error::InvalidAuxOpening { table },
+            2 => Error::InvalidPreprocessedOpening { table },
+            _ => Error::InvalidQuotientOpening { table },
         }
     };
 
@@ -338,17 +335,17 @@ pub fn verify_bytes(
     let mut inputs = [Fp4::ZERO; fri::MAX_ROUNDS];
     let mut fold_error = None;
     let mut r = Reader(proof.rest);
-    let malformed = VerifyError::Malformed;
+    let malformed = Error::Malformed("proof");
     for q in 0..nq {
         let index = fri_verifier.sample_index(challenger);
         if r.u32().ok_or(malformed)? as usize != index {
-            return Err(VerifyError::Shape);
+            return Err(Error::ProofShape);
         }
         indices[q] = index;
         for rd in 0..rounds {
             let arity = 1usize << schedule.log_arity(rd);
             if r.u32().ok_or(malformed)? as usize != arity {
-                return Err(VerifyError::Shape);
+                return Err(Error::ProofShape);
             }
             for v in &mut steps[4 * rd..4 * rd + arity] {
                 *v = r.fp4().ok_or(malformed)?;
@@ -361,7 +358,7 @@ pub fn verify_bytes(
             let mut ends = [0usize; 5];
             for (k, &len) in at.lens.iter().enumerate() {
                 if r.u32().ok_or(malformed)? as usize != len {
-                    return Err(VerifyError::Shape);
+                    return Err(Error::ProofShape);
                 }
                 let part = &mut row[ends[k]..ends[k] + len];
                 for x in part.iter_mut() {
@@ -376,7 +373,7 @@ pub fn verify_bytes(
             // Zeta is drawn from the transcript, so a zero here is a 2^-90
             // chance; still an error, not a panic.
             let (Some(inv0), Some(inv1)) = (((x - zeta) * (x - at.zeta_next)).inv(), (x - at.zeta_q).inv()) else {
-                return Err(VerifyError::InvalidQuotientOpening { table: t });
+                return Err(Error::InvalidQuotientOpening { table: t });
             };
             let rows =
                 (&row[..ends[1]], &row[ends[1]..ends[2]], &row[ends[2]..ends[3]], as_fp4(&row[ends[3]..ends[4]]));
@@ -401,7 +398,7 @@ pub fn verify_bytes(
         );
         match folds {
             Ok(()) => {}
-            Err(fri::FriError::Shape) => return Err(VerifyError::Shape),
+            Err(Error::ProofShape) => return Err(Error::ProofShape),
             Err(e) => {
                 fold_error.get_or_insert(e);
             }

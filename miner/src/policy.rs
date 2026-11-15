@@ -94,6 +94,7 @@
 use core::fmt;
 
 use crate::codec::{DIGEST_BYTES, read_digest, read_u32, read_u64};
+use crate::error::Error;
 use crate::hash::{DOM_COVERED, DOM_HASHLOCK, DOM_POLICY_LEAF, DOM_REBIND};
 use crate::hash::{DomainHasher, EMPTY, hash_domain};
 use crate::output::{Commitment, Memo, Output, OutputList, key_commitment, pubkey_hash};
@@ -131,44 +132,6 @@ pub enum Mode {
     /// covered outputs, never the position spent.
     Rebindable { channel: Digest },
 }
-
-/// Why a policy input does not satisfy its leaf.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PolicyError {
-    /// The leaf or a condition is out of bounds or malformed.
-    Malformed,
-    /// A witness does not match its condition's kind, or is missing.
-    Witness,
-    /// Fewer valid signatures than the threshold, a key not listed, a key
-    /// listed twice, or a wrong leaf index for a rebindable signature.
-    Signatures,
-    Preimage,
-    /// A timelock has not passed.
-    Locked,
-    /// The state number does not exceed the output's.
-    State,
-    /// The covered outputs are not the covenant's.
-    Covenant,
-    /// The covered outputs run past the transaction's outputs.
-    Covered,
-}
-
-impl fmt::Display for PolicyError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            PolicyError::Malformed => "malformed policy leaf",
-            PolicyError::Witness => "witness does not fit the condition",
-            PolicyError::Signatures => "threshold signatures do not verify",
-            PolicyError::Preimage => "wrong hash lock preimage",
-            PolicyError::Locked => "timelock has not passed",
-            PolicyError::State => "state number does not exceed the output's",
-            PolicyError::Covenant => "covered outputs are not the covenant's",
-            PolicyError::Covered => "covered outputs run past the transaction's",
-        })
-    }
-}
-
-impl std::error::Error for PolicyError {}
 
 // ---------------------------------------------------------------------------
 // Hashes
@@ -625,7 +588,11 @@ impl ExactSizeIterator for Leaves<'_> {}
 impl<'a> PolicyRef<'a> {
     /// Reads a policy that is the whole of `bytes`: one to [`MAX_LEAVES`]
     /// leaves and nothing after them.
-    pub fn from_bytes(bytes: &'a [u8]) -> Option<PolicyRef<'a>> {
+    pub fn from_bytes(bytes: &'a [u8]) -> Result<PolicyRef<'a>, Error> {
+        Self::decode(bytes).ok_or(Error::Malformed("spend policy"))
+    }
+
+    fn decode(bytes: &'a [u8]) -> Option<PolicyRef<'a>> {
         let (&n, mut rest) = bytes.split_first()?;
         if n == 0 || n as usize > MAX_LEAVES {
             return None;
@@ -708,9 +675,9 @@ impl<'a> Signers<'a> {
     fn one(bytes: &'a [u8]) -> Option<(Signer, &'a [u8])> {
         let (&key, rest) = bytes.split_first()?;
         let (pk, rest) = rest.split_at_checked(PublicKey::SIZE)?;
-        let pubkey = PublicKey::from_bytes(pk)?;
+        let pubkey = PublicKey::from_bytes(pk).ok()?;
         let (sig, rest) = rest.split_at_checked(Signature::size(pubkey.height()))?;
-        let signature = Signature::from_bytes(sig, pubkey.height())?;
+        let signature = Signature::from_bytes(sig, pubkey.height()).ok()?;
         Some((Signer { key, pubkey, signature }, rest))
     }
 
@@ -951,11 +918,11 @@ impl<'a> PolicyInputRef<'a> {
         outputs: &(impl OutputList + ?Sized),
         height: u32,
         created: u32,
-    ) -> Result<(), PolicyError> {
+    ) -> Result<(), Error> {
         if !self.leaf.valid() {
-            return Err(PolicyError::Malformed);
+            return Err(Error::Malformed("spend policy"));
         }
-        let run = covered_run(self.covered, outputs).ok_or(PolicyError::Covered)?;
+        let run = covered_run(self.covered, outputs).ok_or(Error::PolicyCovered)?;
         let covered = || run.clone().map(|i| outputs.pair(i));
         for (cond, witness) in self.witnesses() {
             match (cond, witness) {
@@ -971,48 +938,48 @@ impl<'a> PolicyInputRef<'a> {
                     for s in signers {
                         let k = s.key as usize;
                         if k >= keys.len() || seen[k] || pubkey_hash(&s.pubkey) != keys.get(k) {
-                            return Err(PolicyError::Signatures);
+                            return Err(Error::PolicySignatures);
                         }
                         if matches!(mode, Mode::Rebindable { .. }) && s.signature.index != self.state as u64 {
-                            return Err(PolicyError::Signatures);
+                            return Err(Error::PolicySignatures);
                         }
                         if !s.pubkey.verify(&msg, &s.signature) {
-                            return Err(PolicyError::Signatures);
+                            return Err(Error::PolicySignatures);
                         }
                         seen[k] = true;
                         good += 1;
                     }
                     if good < m as usize {
-                        return Err(PolicyError::Signatures);
+                        return Err(Error::PolicySignatures);
                     }
                 }
                 (CondRef::Hash(h), WitnessRef::Preimage(p)) => {
                     if hash_lock(&p) != h {
-                        return Err(PolicyError::Preimage);
+                        return Err(Error::PolicyPreimage);
                     }
                 }
                 (CondRef::After(h), WitnessRef::None) => {
                     if height < h {
-                        return Err(PolicyError::Locked);
+                        return Err(Error::PolicyLocked);
                     }
                 }
                 (CondRef::Older(d), WitnessRef::None) => {
                     if (height as u64) < created as u64 + d as u64 {
-                        return Err(PolicyError::Locked);
+                        return Err(Error::PolicyLocked);
                     }
                 }
                 (CondRef::State(n), WitnessRef::None) => {
                     if self.state > MAX_STATE || self.state <= n {
-                        return Err(PolicyError::State);
+                        return Err(Error::PolicyState);
                     }
                 }
                 (CondRef::Outputs(list), WitnessRef::None) => {
                     let same = list.len() == run.len() && list.iter().eq(covered());
                     if !same {
-                        return Err(PolicyError::Covenant);
+                        return Err(Error::PolicyCovenant);
                     }
                 }
-                _ => return Err(PolicyError::Witness),
+                _ => return Err(Error::PolicyWitness),
             }
         }
         Ok(())
@@ -1297,8 +1264,8 @@ impl Policy {
         out
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Option<Policy> {
-        Some(PolicyRef::from_bytes(bytes)?.to_policy())
+    pub fn from_bytes(bytes: &[u8]) -> Result<Policy, Error> {
+        Ok(PolicyRef::from_bytes(bytes)?.to_policy())
     }
 
     /// An output paying `amount` under this policy.
@@ -1367,19 +1334,19 @@ impl PolicyInput {
 
     /// Whether the leaf is satisfied ([`PolicyInputRef::check`], which
     /// this encodes the input for). An input with no encoding is
-    /// [`PolicyError::Malformed`]; one whose witnesses are not of their
-    /// conditions' kinds is [`PolicyError::Witness`].
-    pub fn check(&self, body: &Digest, outputs: &[Output], height: u32, created: u32) -> Result<(), PolicyError> {
+    /// [`Error::Malformed("spend policy")`]; one whose witnesses are not of their
+    /// conditions' kinds is [`Error::PolicyWitness`].
+    pub fn check(&self, body: &Digest, outputs: &[Output], height: u32, created: u32) -> Result<(), Error> {
         if !self.leaf.valid() || (self.index as usize) >= MAX_LEAVES || self.witness.len() != self.leaf.conds.len() {
-            return Err(PolicyError::Malformed);
+            return Err(Error::Malformed("spend policy"));
         }
         if !self.witness_fits() {
-            return Err(PolicyError::Witness);
+            return Err(Error::PolicyWitness);
         }
         let bytes = self.to_bytes();
         match PolicyInputRef::read(&bytes) {
             Some((view, rest)) if rest.is_empty() => view.check(body, outputs, height, created),
-            _ => Err(PolicyError::Malformed),
+            _ => Err(Error::Malformed("spend policy")),
         }
     }
 
@@ -1471,7 +1438,7 @@ mod tests {
         // The policy decoder, fuzzed: no panic, one encoding.
         let policy = Policy::new(vec![leaf.clone(), Leaf::new(vec![Cond::After(100)])]);
         crate::test_util::fuzz_decoder("Policy::from_bytes", &[policy.to_bytes()], 20_000, |b| {
-            Policy::from_bytes(b).map(|p| Some(p.to_bytes()))
+            Policy::from_bytes(b).ok().map(|p| Some(p.to_bytes()))
         });
         let mut bytes = Vec::new();
         leaf.write(&mut bytes);
@@ -1557,7 +1524,7 @@ mod tests {
         // 2-of-3 body mode.
         let mut spend = policy.spend(0, amount, 7);
         assert_eq!(spend.commitment(), key_commitment(&policy.root(), amount));
-        assert_eq!(spend.check(&body, &outputs, 1, 0), Err(PolicyError::Signatures));
+        assert_eq!(spend.check(&body, &outputs, 1, 0), Err(Error::PolicySignatures));
         let sa = Signer { key: 0, pubkey: a.public_key(), signature: a.sign(&body).unwrap() };
         let sc = Signer { key: 2, pubkey: c.public_key(), signature: c.sign(&body).unwrap() };
         spend.witness[0] = CondWitness::Signatures(vec![sa.clone(), sc.clone()]);
@@ -1565,10 +1532,10 @@ mod tests {
         assert_eq!(spend.signatures(), 2);
         // The same key twice does not count twice; a wrong key is refused.
         spend.witness[0] = CondWitness::Signatures(vec![sa.clone(), sa.clone()]);
-        assert_eq!(spend.check(&body, &outputs, 1, 0), Err(PolicyError::Signatures));
+        assert_eq!(spend.check(&body, &outputs, 1, 0), Err(Error::PolicySignatures));
         let wrong = Signer { key: 1, ..sa.clone() };
         spend.witness[0] = CondWitness::Signatures(vec![wrong, sc.clone()]);
-        assert_eq!(spend.check(&body, &outputs, 1, 0), Err(PolicyError::Signatures));
+        assert_eq!(spend.check(&body, &outputs, 1, 0), Err(Error::PolicySignatures));
         // Encoding round trip, with signatures.
         spend.witness[0] = CondWitness::Signatures(vec![sa, sc]);
         let bytes = spend.to_bytes();
@@ -1584,11 +1551,11 @@ mod tests {
             CondWitness::Signatures(vec![Signer { key: 0, pubkey: b.public_key(), signature: b.sign(&body).unwrap() }]);
         assert_eq!(claim.check(&body, &outputs, 1, 0), Ok(()));
         claim.witness[0] = CondWitness::Preimage(d(78));
-        assert_eq!(claim.check(&body, &outputs, 1, 0), Err(PolicyError::Preimage));
+        assert_eq!(claim.check(&body, &outputs, 1, 0), Err(Error::PolicyPreimage));
         let mut refund = policy.spend(2, amount, 7);
         refund.witness[1] =
             CondWitness::Signatures(vec![Signer { key: 0, pubkey: a.public_key(), signature: a.sign(&body).unwrap() }]);
-        assert_eq!(refund.check(&body, &outputs, 99, 0), Err(PolicyError::Locked));
+        assert_eq!(refund.check(&body, &outputs, 99, 0), Err(Error::PolicyLocked));
         assert_eq!(refund.check(&body, &outputs, 100, 0), Ok(()));
 
         // Eltoo update: rebindable signatures with leaf index = state over
@@ -1612,7 +1579,7 @@ mod tests {
         assert_eq!(update.check(&other_body, &outputs, 1, 0), Ok(()));
         // But not a lower state, nor with a leaf index other than the state.
         update.state = 3;
-        assert_eq!(update.check(&body, &outputs, 1, 0), Err(PolicyError::Signatures));
+        assert_eq!(update.check(&body, &outputs, 1, 0), Err(Error::PolicySignatures));
         update.state = 4;
         let mut a5 = key(1);
         a5.set_next_index(5);
@@ -1620,7 +1587,7 @@ mod tests {
             Signer { key: 0, pubkey: a5.public_key(), signature: a5.sign(&msg).unwrap() },
             Signer { key: 1, pubkey: b4.public_key(), signature: b4.sign(&msg).unwrap() },
         ]);
-        assert_eq!(update.check(&body, &outputs, 1, 0), Err(PolicyError::Signatures));
+        assert_eq!(update.check(&body, &outputs, 1, 0), Err(Error::PolicySignatures));
         // State 3 would fail the ordering even with valid signatures.
         let mut stale = policy.spend(3, amount, 7);
         stale.state = 3;
@@ -1634,23 +1601,23 @@ mod tests {
             Signer { key: 0, pubkey: a3.public_key(), signature: a3.sign(&msg3).unwrap() },
             Signer { key: 1, pubkey: b3.public_key(), signature: b3.sign(&msg3).unwrap() },
         ]);
-        assert_eq!(stale.check(&body, &outputs, 1, 0), Err(PolicyError::State));
+        assert_eq!(stale.check(&body, &outputs, 1, 0), Err(Error::PolicyState));
 
         // Settlement: no signature, after the delay, into the named outputs,
         // which the spend points at as its covered run.
         let mut settle_spend = policy.spend(4, amount, 7);
         settle_spend.covered = (1, 2);
         assert_eq!(settle_spend.signatures(), 0);
-        assert_eq!(settle_spend.check(&body, &outputs, 150, 10), Err(PolicyError::Locked));
+        assert_eq!(settle_spend.check(&body, &outputs, 150, 10), Err(Error::PolicyLocked));
         assert_eq!(settle_spend.check(&body, &outputs, 154, 10), Ok(()));
         let without = &outputs[..1];
-        assert_eq!(settle_spend.check(&body, without, 154, 10), Err(PolicyError::Covered));
+        assert_eq!(settle_spend.check(&body, without, 154, 10), Err(Error::PolicyCovered));
         let mut wrong_run = settle_spend.clone();
         wrong_run.covered = (0, 2);
-        assert_eq!(wrong_run.check(&body, &outputs, 154, 10), Err(PolicyError::Covenant));
+        assert_eq!(wrong_run.check(&body, &outputs, 154, 10), Err(Error::PolicyCovenant));
         let mut off = settle_spend.clone();
         off.covered = (2, 5);
-        assert_eq!(off.check(&body, &outputs, 154, 10), Err(PolicyError::Covered));
+        assert_eq!(off.check(&body, &outputs, 154, 10), Err(Error::PolicyCovered));
         let _ = (&mut a, &mut b, &mut c);
     }
 
@@ -1828,32 +1795,32 @@ mod tests {
             assert_eq!((again.as_bytes(), rest), (&bytes[..], &[1u8, 2, 3][..]));
         }
         // Every kind of verdict the sample can give was seen.
-        for want in [Ok(()), Err(PolicyError::Signatures), Err(PolicyError::Locked), Err(PolicyError::Covenant)] {
+        for want in [Ok(()), Err(Error::PolicySignatures), Err(Error::PolicyLocked), Err(Error::PolicyCovenant)] {
             assert!(verdicts.contains(&want), "{want:?} never seen");
         }
         // The update's own failures: a state no newer, a run past the outputs.
         let mut update = s.spends(&body)[3].clone();
         update.covered = (2, 5);
         let bytes = update.to_bytes();
-        assert_eq!(PolicyInputRef::read(&bytes).unwrap().0.check(&body, &s.outputs, 1, 0), Err(PolicyError::Covered));
+        assert_eq!(PolicyInputRef::read(&bytes).unwrap().0.check(&body, &s.outputs, 1, 0), Err(Error::PolicyCovered));
         let mut stale = s.policy.spend(3, AMOUNT, 7);
         stale.state = 3;
         stale.covered = (1, 2);
         let msg = rebind_message(&s.channel, 3, &stale.covered_outputs(&s.outputs).unwrap());
         stale.witness[0] = CondWitness::Signatures(vec![s.signer(0, 0, 3, &msg), s.signer(1, 1, 3, &msg)]);
         let bytes = stale.to_bytes();
-        assert_eq!(PolicyInputRef::read(&bytes).unwrap().0.check(&body, &s.outputs, 1, 0), Err(PolicyError::State));
+        assert_eq!(PolicyInputRef::read(&bytes).unwrap().0.check(&body, &s.outputs, 1, 0), Err(Error::PolicyState));
         // A wrong preimage.
         let mut claim = s.spends(&body)[1].clone();
         claim.witness[0] = CondWitness::Preimage(d(78));
         let bytes = claim.to_bytes();
-        assert_eq!(PolicyInputRef::read(&bytes).unwrap().0.check(&body, &s.outputs, 1, 0), Err(PolicyError::Preimage));
+        assert_eq!(PolicyInputRef::read(&bytes).unwrap().0.check(&body, &s.outputs, 1, 0), Err(Error::PolicyPreimage));
         // A leaf that reads but makes no sense (a threshold of none of its keys).
         let hollow = Policy::new(vec![Leaf::new(vec![Cond::Thresh { mode: Mode::Body, m: 0, keys: vec![d(1)] }])]);
         let bytes = hollow.spend(0, 5, 1).to_bytes();
         let (view, _) = PolicyInputRef::read(&bytes).unwrap();
         assert!(!view.leaf().valid());
-        assert_eq!(view.check(&body, &s.outputs, 1, 0), Err(PolicyError::Malformed));
+        assert_eq!(view.check(&body, &s.outputs, 1, 0), Err(Error::Malformed("spend policy")));
     }
 
     /// Encodings that are not a leaf, a policy or a spend are refused when
@@ -1926,13 +1893,13 @@ mod tests {
 
         // Policies: no leaves, too many, bytes after the last.
         let policy = s.policy.to_bytes();
-        assert!(PolicyRef::from_bytes(&policy).is_some());
-        assert!(PolicyRef::from_bytes(&[]).is_none());
-        assert!(PolicyRef::from_bytes(&[0]).is_none());
-        assert!(PolicyRef::from_bytes(&[policy.as_slice(), &[0]].concat()).is_none());
-        assert!(PolicyRef::from_bytes(&policy[..policy.len() - 1]).is_none());
+        assert!(PolicyRef::from_bytes(&policy).is_ok());
+        assert!(PolicyRef::from_bytes(&[]).is_err());
+        assert!(PolicyRef::from_bytes(&[0]).is_err());
+        assert!(PolicyRef::from_bytes(&[policy.as_slice(), &[0]].concat()).is_err());
+        assert!(PolicyRef::from_bytes(&policy[..policy.len() - 1]).is_err());
         let seventeen = Policy::new(vec![Leaf::new(vec![Cond::After(1)]); MAX_LEAVES + 1]).to_bytes();
-        assert!(PolicyRef::from_bytes(&seventeen).is_none());
+        assert!(PolicyRef::from_bytes(&seventeen).is_err());
         let sixteen = Policy::new(vec![Leaf::new(vec![Cond::After(1)]); MAX_LEAVES]).to_bytes();
         assert_eq!(PolicyRef::from_bytes(&sixteen).unwrap().leaves().len(), MAX_LEAVES);
 
@@ -1988,7 +1955,7 @@ mod tests {
             })
         });
         crate::test_util::fuzz_decoder("PolicyRef::from_bytes", &[s.policy.to_bytes()], 20_000, |b| {
-            PolicyRef::from_bytes(b).map(|view| {
+            PolicyRef::from_bytes(b).ok().map(|view| {
                 assert_eq!(view.to_policy().to_bytes(), view.as_bytes());
                 let _ = (view.root(), view.valid(), view.siblings(view.leaves().len() - 1));
                 Some(view.as_bytes().to_vec())
@@ -2018,7 +1985,7 @@ mod tests {
             assert!(std::panic::catch_unwind(|| policy.root()).is_err());
             let mut spend = s.spends(&body)[0].clone();
             spend.leaf = leaf;
-            assert_eq!(spend.check(&body, &s.outputs, 1, 0), Err(PolicyError::Malformed));
+            assert_eq!(spend.check(&body, &s.outputs, 1, 0), Err(Error::Malformed("spend policy")));
         }
         let crowded = Policy::new(vec![Leaf::new(vec![Cond::After(1)]); MAX_LEAVES + 1]);
         assert!(!crowded.valid());
@@ -2041,16 +2008,16 @@ mod tests {
         assert_eq!(good.check(&body, &s.outputs, 1, 0), Ok(()));
         let mut swapped = good.clone();
         swapped.witness.swap(0, 1);
-        assert_eq!(swapped.check(&body, &s.outputs, 1, 0), Err(PolicyError::Witness));
+        assert_eq!(swapped.check(&body, &s.outputs, 1, 0), Err(Error::PolicyWitness));
         let mut none = good.clone();
         none.witness[0] = CondWitness::None;
-        assert_eq!(none.check(&body, &s.outputs, 1, 0), Err(PolicyError::Witness));
+        assert_eq!(none.check(&body, &s.outputs, 1, 0), Err(Error::PolicyWitness));
         let mut missing = good.clone();
         missing.witness.pop();
-        assert_eq!(missing.check(&body, &s.outputs, 1, 0), Err(PolicyError::Malformed));
+        assert_eq!(missing.check(&body, &s.outputs, 1, 0), Err(Error::Malformed("spend policy")));
         let mut off = good.clone();
         off.index = MAX_LEAVES as u8;
-        assert_eq!(off.check(&body, &s.outputs, 1, 0), Err(PolicyError::Malformed));
-        assert!(PolicyError::Covenant.to_string().contains("covenant"));
+        assert_eq!(off.check(&body, &s.outputs, 1, 0), Err(Error::Malformed("spend policy")));
+        assert!(Error::PolicyCovenant.to_string().contains("covenant"));
     }
 }

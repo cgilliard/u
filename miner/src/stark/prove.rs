@@ -9,6 +9,7 @@ use super::deep::{Deep, coset_points, observe_setup, sample_coefficients, table_
 use super::lookup::{LookupArgs, LookupChallenges, combine, eval_ext_poly_at, powers};
 use super::proof::{Proof, QueryOpening, TableProof};
 use crate::challenger::Challenger;
+use crate::error::Error;
 use crate::ext::{DEGREE, Fp4, as_fp4};
 use crate::field::{Field, batch_inverse, batch_inverse_into};
 use crate::fri::{self};
@@ -218,10 +219,6 @@ pub(super) fn par_batch_inverse<F: Field + Send + Sync>(xs: &[F]) -> Vec<F> {
 /// Asked by a prover between phases; `true` abandons the proof.
 pub type Cancel<'a> = &'a (dyn Fn() -> bool + Sync);
 
-/// The prover's `cancel` fired; no proof was produced.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Cancelled;
-
 /// Phase boundary: times the phase when `TABMINER_TIMING` is set, and
 /// checks for cancellation.
 pub(super) struct Timer<'a> {
@@ -235,12 +232,12 @@ impl<'a> Timer<'a> {
         Timer { on: std::env::var_os("TABMINER_TIMING").is_some(), last: std::time::Instant::now(), cancel }
     }
 
-    fn lap(&mut self, what: &str) -> Result<(), Cancelled> {
+    fn lap(&mut self, what: &str) -> Result<(), Error> {
         if self.on {
             eprintln!("  {what}: {:?}", self.last.elapsed());
             self.last = std::time::Instant::now();
         }
-        if self.cancel.is_some_and(|c| c()) { Err(Cancelled) } else { Ok(()) }
+        if self.cancel.is_some_and(|c| c()) { Err(Error::Cancelled) } else { Ok(()) }
     }
 }
 
@@ -461,7 +458,7 @@ pub(super) fn commit_quotient(
     alpha_powers: &[Fp4],
     rng: Option<(&Rng, u32)>,
     timer: &mut Timer<'_>,
-) -> Result<Quotient, Cancelled> {
+) -> Result<Quotient, Error> {
     let log_blowup = config.log_blowup;
     let air = t.input.air;
     let w = air.air_width();
@@ -614,7 +611,7 @@ pub fn prove_tables(
     try_prove_tables(config, tables, public, challenger, None).expect("no cancellation")
 }
 
-/// [`prove_tables`] that gives up with [`Cancelled`] once `cancel` returns
+/// [`prove_tables`] that gives up with [`Error::Cancelled`] once `cancel` returns
 /// `true`, checked between phases (a few seconds apart at most).
 pub fn try_prove_tables(
     config: &StarkConfig,
@@ -622,7 +619,7 @@ pub fn try_prove_tables(
     public: &[Fp],
     challenger: &mut Challenger,
     cancel: Option<Cancel<'_>>,
-) -> Result<Proof, Cancelled> {
+) -> Result<Proof, Error> {
     assert!(!tables.is_empty(), "no tables");
     let log_blowup = config.log_blowup;
     let log_ns: Vec<usize> = tables.iter().map(|t| log2_strict(t.trace.height())).collect();
@@ -757,7 +754,7 @@ pub fn try_prove_tables(
             challenger.observe_digest(&q.committed.tree.root());
             Ok(q)
         })
-        .collect::<Result<_, Cancelled>>()?;
+        .collect::<Result<_, Error>>()?;
 
     // 4. Out-of-domain openings.
     witnesses[2] = fri::grind(challenger, grinding.zeta);

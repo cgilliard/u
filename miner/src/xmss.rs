@@ -44,6 +44,7 @@ use core::ops::{Deref, DerefMut};
 
 pub use crate::codec::DIGEST_BYTES;
 use crate::codec::{FP_BYTES, pack3, read_fps, write_fps};
+use crate::error::Error;
 pub use crate::hash::Digest;
 use crate::poseidon2::{DIGEST, Fp, WIDTH, permute_in_place};
 
@@ -268,18 +269,6 @@ fn tree_node(
 // Keys and signatures
 // ---------------------------------------------------------------------------
 
-/// Returned by [`SecretKey::sign`] once all of a key's leaves have been used.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KeyExhausted;
-
-impl fmt::Display for KeyExhausted {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("XMSS key exhausted: all one-time leaves have been used")
-    }
-}
-
-impl std::error::Error for KeyExhausted {}
-
 /// XMSS public key: Merkle root, public seed and tree height. The height
 /// is part of the key (and so of its hash): the root alone does not fix
 /// how tall the tree is.
@@ -382,7 +371,11 @@ impl PublicKey {
     }
 
     /// Parses a key; its height must be 1 to [`MAX_HEIGHT`].
-    pub fn from_bytes(bytes: &[u8]) -> Option<PublicKey> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<PublicKey, Error> {
+        Self::decode(bytes).ok_or(Error::Malformed("public key"))
+    }
+
+    fn decode(bytes: &[u8]) -> Option<PublicKey> {
         if bytes.len() != Self::SIZE {
             return None;
         }
@@ -474,7 +467,11 @@ impl Signature {
     }
 
     /// Parses a signature of a tree of `height` (the signer's key says).
-    pub fn from_bytes(bytes: &[u8], height: usize) -> Option<Signature> {
+    pub fn from_bytes(bytes: &[u8], height: usize) -> Result<Signature, Error> {
+        Self::decode(bytes, height).ok_or(Error::Malformed("signature"))
+    }
+
+    fn decode(bytes: &[u8], height: usize) -> Option<Signature> {
         if height == 0 || height > MAX_HEIGHT || bytes.len() != Self::size(height) {
             return None;
         }
@@ -576,13 +573,13 @@ impl SecretKey {
 
     /// Signs a message of field elements with the next unused leaf and
     /// advances the index.
-    pub fn sign(&mut self, msg: &[Fp]) -> Result<Signature, KeyExhausted> {
+    pub fn sign(&mut self, msg: &[Fp]) -> Result<Signature, Error> {
         self.sign_with(|pub_seed, index, randomizer| message_digest(pub_seed, index, randomizer, msg))
     }
 
     /// Signs a byte string: the message of its length and its bytes packed
     /// three per element, as [`PublicKey::verify_bytes`] takes it.
-    pub fn sign_bytes(&mut self, msg: &[u8]) -> Result<Signature, KeyExhausted> {
+    pub fn sign_bytes(&mut self, msg: &[u8]) -> Result<Signature, Error> {
         self.sign_with(|pub_seed, index, randomizer| message_digest_bytes(pub_seed, index, randomizer, msg))
     }
 
@@ -591,9 +588,9 @@ impl SecretKey {
     fn sign_with(
         &mut self,
         digest: impl FnOnce(&[Fp; PUB_SEED_LEN], u64, &Digest) -> Digest,
-    ) -> Result<Signature, KeyExhausted> {
+    ) -> Result<Signature, Error> {
         if self.next_index >= self.leaves() {
-            return Err(KeyExhausted);
+            return Err(Error::KeyExhausted);
         }
         let index = self.next_index;
         self.next_index += 1;
@@ -626,7 +623,11 @@ impl SecretKey {
     }
 
     /// Restores a key from [`SecretKey::to_bytes`], rebuilding the tree.
-    pub fn from_bytes(bytes: &[u8]) -> Option<SecretKey> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<SecretKey, Error> {
+        Self::decode(bytes).ok_or(Error::Malformed("secret key"))
+    }
+
+    fn decode(bytes: &[u8]) -> Option<SecretKey> {
         if bytes.len() != Self::SIZE {
             return None;
         }
@@ -757,7 +758,7 @@ mod tests {
             assert!(!pk.verify_bytes(b"message number 99", &sig));
         }
         assert_eq!(sk.remaining(), 0);
-        assert_eq!(sk.sign_bytes(b"one more"), Err(KeyExhausted));
+        assert_eq!(sk.sign_bytes(b"one more"), Err(Error::KeyExhausted));
     }
 
     #[test]
@@ -860,30 +861,30 @@ mod tests {
         const H: usize = 2;
         let bytes = SecretKey::generate_with_height(&SEED, H).to_bytes();
         let (index_at, height_at) = (SECRET_KEY_SIZE - 9, SECRET_KEY_SIZE - 1);
-        assert!(SecretKey::from_bytes(&bytes).is_some());
-        assert!(SecretKey::from_bytes(&bytes[1..]).is_none());
-        assert!(SecretKey::from_bytes(&[bytes.as_slice(), &[0]].concat()).is_none());
-        assert!(SecretKey::from_bytes(&[]).is_none());
+        assert!(SecretKey::from_bytes(&bytes).is_ok());
+        assert!(SecretKey::from_bytes(&bytes[1..]).is_err());
+        assert!(SecretKey::from_bytes(&[bytes.as_slice(), &[0]].concat()).is_err());
+        assert!(SecretKey::from_bytes(&[]).is_err());
         for height in [0u8, MAX_HEIGHT as u8 + 1, 255] {
             let mut bad = bytes;
             bad[height_at] = height;
-            assert!(SecretKey::from_bytes(&bad).is_none(), "height {height}");
+            assert!(SecretKey::from_bytes(&bad).is_err(), "height {height}");
         }
         for (index, ok) in [(0u64, true), (3, true), (4, true), (5, false), (u64::MAX, false)] {
             let mut b = bytes;
             b[index_at..index_at + 8].copy_from_slice(&index.to_le_bytes());
-            assert_eq!(SecretKey::from_bytes(&b).is_some(), ok, "next leaf {index}");
+            assert_eq!(SecretKey::from_bytes(&b).is_ok(), ok, "next leaf {index}");
         }
         let mut used = bytes;
         used[index_at..index_at + 8].copy_from_slice(&(1u64 << H).to_le_bytes());
         let mut used = SecretKey::from_bytes(&used).unwrap();
         assert_eq!(used.remaining(), 0);
-        assert_eq!(used.sign_bytes(b"x").unwrap_err(), KeyExhausted);
+        assert_eq!(used.sign_bytes(b"x").unwrap_err(), Error::KeyExhausted);
         // An element equal to the modulus, in the secret seed and in the public one.
         for at in [0, DIGEST - 1, DIGEST, DIGEST + PUB_SEED_LEN - 1] {
             let mut bad = bytes;
             bad[4 * at..4 * at + 4].copy_from_slice(&P.to_le_bytes());
-            assert!(SecretKey::from_bytes(&bad).is_none(), "element {at}");
+            assert!(SecretKey::from_bytes(&bad).is_err(), "element {at}");
         }
     }
 
@@ -903,7 +904,7 @@ mod tests {
         let sig = sk.sign_bytes(b"m").unwrap();
         assert_eq!(format!("{:?}", sig.auth_path), format!("{:?}", &sig.auth_path[..]));
         assert_eq!(AuthPath::default(), AuthPath::new());
-        assert!(KeyExhausted.to_string().contains("exhausted"));
+        assert!(Error::KeyExhausted.to_string().contains("exhausted"));
     }
 
     #[test]
@@ -913,27 +914,27 @@ mod tests {
         let pk = sk.public_key();
         let sig0 = sk.sign_bytes(b"first").unwrap();
         crate::test_util::fuzz_decoder("xmss PublicKey::from_bytes", &[pk.to_bytes().to_vec()], 20_000, |b| {
-            PublicKey::from_bytes(b).map(|x| Some(x.to_bytes().to_vec()))
+            PublicKey::from_bytes(b).ok().map(|x| Some(x.to_bytes().to_vec()))
         });
         crate::test_util::fuzz_decoder("xmss Signature::from_bytes", &[sig0.to_bytes()], 20_000, |b| {
-            Signature::from_bytes(b, H).map(|x| Some(x.to_bytes()))
+            Signature::from_bytes(b, H).ok().map(|x| Some(x.to_bytes()))
         });
 
         let pk_bytes = pk.to_bytes();
         assert_eq!(pk_bytes.len(), PublicKey::SIZE);
-        assert_eq!(PublicKey::from_bytes(&pk_bytes), Some(pk));
-        assert!(PublicKey::from_bytes(&pk_bytes[1..]).is_none());
+        assert_eq!(PublicKey::from_bytes(&pk_bytes), Ok(pk));
+        assert!(PublicKey::from_bytes(&pk_bytes[1..]).is_err());
         let mut bad = pk_bytes;
         bad[..4].copy_from_slice(&0x7800_0001u32.to_le_bytes()); // == p, non-canonical
-        assert!(PublicKey::from_bytes(&bad).is_none());
+        assert!(PublicKey::from_bytes(&bad).is_err());
 
         let sig_bytes = sig0.to_bytes();
         assert_eq!(sig_bytes.len(), Signature::size(H));
         let back = Signature::from_bytes(&sig_bytes, H).unwrap();
         assert_eq!(back, sig0);
         assert!(pk.verify_bytes(b"first", &back));
-        assert!(Signature::from_bytes(&sig_bytes[..sig_bytes.len() - 1], H).is_none());
-        assert!(Signature::from_bytes(&sig_bytes, H + 1).is_none());
+        assert!(Signature::from_bytes(&sig_bytes[..sig_bytes.len() - 1], H).is_err());
+        assert!(Signature::from_bytes(&sig_bytes, H + 1).is_err());
 
         let sk_bytes = sk.to_bytes();
         assert_eq!(sk_bytes.len(), SecretKey::SIZE);
@@ -949,7 +950,7 @@ mod tests {
         // An index past the end is rejected.
         let mut bad = sk_bytes;
         bad[48..56].copy_from_slice(&((1u64 << H) + 1).to_le_bytes());
-        assert!(SecretKey::from_bytes(&bad).is_none());
+        assert!(SecretKey::from_bytes(&bad).is_err());
     }
 
     #[test]

@@ -1,8 +1,9 @@
 //! A proof, its encoding, and why a verifier refuses one.
 
 use crate::codec::{Reader, Writer};
+use crate::error::Error;
 use crate::ext::Fp4;
-use crate::fri::{FriError, FriProof, QueryStep, leaf_row};
+use crate::fri::{FriProof, QueryStep, leaf_row};
 use crate::merkle::Digest;
 use crate::poseidon2::Fp;
 
@@ -182,7 +183,11 @@ impl Proof {
     /// hold: queries, openings and indices that are not one for one,
     /// paths of one tree that differ in length, or a lookup total where
     /// there are no lookups. A prover makes none such.
-    pub fn try_to_bytes(&self) -> Option<Vec<u8>> {
+    pub fn try_to_bytes(&self) -> Result<Vec<u8>, Error> {
+        self.encode().ok_or(Error::ProofShape)
+    }
+
+    fn encode(&self) -> Option<Vec<u8>> {
         let mut w = Writer::with_capacity(1 << 16);
         w.u32(self.tables.len() as u32);
         for t in &self.tables {
@@ -241,7 +246,11 @@ impl Proof {
     /// prover's, and the recursion's, which lay a proof out as a witness.
     /// A verifier reads the bytes as they are ([`super::verify_bytes`]).
     /// The whole slice must be consumed.
-    pub fn from_bytes(bytes: &[u8]) -> Option<Proof> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Proof, Error> {
+        Self::decode(bytes).ok_or(Error::Malformed("proof"))
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Proof> {
         let ProofHead {
             tables,
             commitments,
@@ -252,7 +261,7 @@ impl Proof {
             num_queries,
             rounds,
             rest,
-        } = ProofHead::read(bytes)?;
+        } = ProofHead::decode(bytes)?;
         let (nt, nq) = (tables.len(), num_queries);
         let mut r = Reader(rest);
         // Capacity from the untrusted count, but not beyond any real proof's.
@@ -360,7 +369,11 @@ pub struct ProofHead<'a> {
 }
 
 impl<'a> ProofHead<'a> {
-    pub fn read(bytes: &'a [u8]) -> Option<ProofHead<'a>> {
+    pub fn read(bytes: &'a [u8]) -> Result<ProofHead<'a>, Error> {
+        Self::decode(bytes).ok_or(Error::Malformed("proof"))
+    }
+
+    fn decode(bytes: &'a [u8]) -> Option<ProofHead<'a>> {
         let mut r = Reader(bytes);
         let nt = r.len(64)?;
         if nt == 0 {
@@ -391,71 +404,5 @@ impl<'a> ProofHead<'a> {
             rounds,
             rest: r.0,
         })
-    }
-}
-
-/// Why a verifier refuses a proof. An opening that is not its tree's is
-/// reported by tree: the openings of one tree travel and are checked
-/// together.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VerifyError {
-    /// The bytes are not the encoding of a proof.
-    Malformed,
-    Shape,
-    /// A proof-of-work witness before a commit-phase challenge is wrong.
-    ProofOfWork,
-    ConstraintIdentity,
-    /// The tables' lookup totals do not cancel.
-    LookupSum,
-    Fri(FriError),
-    InvalidTraceOpening {
-        table: usize,
-    },
-    InvalidAuxOpening {
-        table: usize,
-    },
-    InvalidPreprocessedOpening {
-        table: usize,
-    },
-    InvalidQuotientOpening {
-        table: usize,
-    },
-    /// An opening of a FRI round's tree is not the tree's.
-    InvalidFriOpening {
-        round: usize,
-    },
-}
-
-impl core::fmt::Display for VerifyError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            VerifyError::Malformed => f.write_str("not the encoding of a stark proof"),
-            VerifyError::Shape => f.write_str("stark proof has the wrong shape"),
-            VerifyError::ProofOfWork => f.write_str("wrong proof of work before a challenge"),
-            VerifyError::ConstraintIdentity => f.write_str("constraints do not hold at the out-of-domain point"),
-            VerifyError::LookupSum => f.write_str("lookup totals of the tables do not cancel"),
-            VerifyError::Fri(e) => write!(f, "{e}"),
-            VerifyError::InvalidFriOpening { round } => write!(f, "fri round {round}: invalid merkle opening"),
-            VerifyError::InvalidTraceOpening { table } => {
-                write!(f, "table {table}: invalid trace opening")
-            }
-            VerifyError::InvalidAuxOpening { table } => {
-                write!(f, "table {table}: invalid auxiliary opening")
-            }
-            VerifyError::InvalidPreprocessedOpening { table } => {
-                write!(f, "table {table}: invalid preprocessed opening")
-            }
-            VerifyError::InvalidQuotientOpening { table } => {
-                write!(f, "table {table}: invalid quotient opening")
-            }
-        }
-    }
-}
-
-impl std::error::Error for VerifyError {}
-
-impl From<FriError> for VerifyError {
-    fn from(e: FriError) -> Self {
-        VerifyError::Fri(e)
     }
 }

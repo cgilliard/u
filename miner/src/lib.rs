@@ -2,6 +2,7 @@ pub mod block;
 pub mod challenger;
 pub mod codec;
 pub mod difficulty;
+pub mod error;
 pub mod expr;
 pub mod ext;
 pub mod field;

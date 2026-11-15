@@ -55,12 +55,13 @@
 use core::fmt;
 
 use crate::codec::read_u32;
+use crate::error::Error;
 use crate::hash::{DOM_BODY, Digest, DomainHasher};
 use crate::name::NameOp;
 use crate::output::{Commitment, Input, Key, OUTPUT_SIZE, Output, OutputList, Sig, amount_fps};
-use crate::policy::{PolicyError, PolicyInput, PolicyInputRef};
+use crate::policy::{PolicyInput, PolicyInputRef};
 use crate::poseidon2::{DIGEST, Fp};
-use crate::xmss::{KeyExhausted, PublicKey};
+use crate::xmss::PublicKey;
 
 // ---------------------------------------------------------------------------
 // The body
@@ -300,7 +301,11 @@ impl OutputList for OutputsRef<'_> {
 impl<'a> TransactionRef<'a> {
     /// Reads a transaction that is the whole of `bytes`, checking every
     /// item's encoding.
-    pub fn from_bytes(bytes: &'a [u8]) -> Option<TransactionRef<'a>> {
+    pub fn from_bytes(bytes: &'a [u8]) -> Result<TransactionRef<'a>, Error> {
+        Self::decode(bytes).ok_or(Error::Malformed("transaction"))
+    }
+
+    fn decode(bytes: &'a [u8]) -> Option<TransactionRef<'a>> {
         // The bytes of `n` items read one after another by `read`, and the rest.
         fn run<'b>(
             n: u32,
@@ -401,13 +406,13 @@ impl<'a> TransactionRef<'a> {
     /// Checks every policy input's leaf against this transaction, for a
     /// block at `height`; `created` gives the creation height of the
     /// output at a position (`None` if unknown: unspendable).
-    pub fn check_policy_inputs(&self, height: u32, created: impl Fn(u64) -> Option<u32>) -> Result<(), PolicyError> {
+    pub fn check_policy_inputs(&self, height: u32, created: impl Fn(u64) -> Option<u32>) -> Result<(), Error> {
         if self.counts.policy_inputs == 0 {
             return Ok(());
         }
         let body = self.body_hash();
         for p in self.policy_inputs() {
-            let c = created(p.position()).ok_or(PolicyError::Locked)?;
+            let c = created(p.position()).ok_or(Error::PolicyLocked)?;
             p.check(&body, &self.outputs, height, c)?;
         }
         Ok(())
@@ -475,7 +480,7 @@ impl fmt::Debug for TransactionRef<'_> {
 /// unchanged. Returns whether `bytes` are a transaction with one input per
 /// position; if not, nothing is written.
 pub fn set_positions(bytes: &mut [u8], positions: &[u64]) -> bool {
-    let Some(tx) = TransactionRef::from_bytes(bytes) else { return false };
+    let Ok(tx) = TransactionRef::from_bytes(bytes) else { return false };
     let n = tx.counts();
     if positions.len() != n.inputs + n.policy_inputs {
         return false;
@@ -592,36 +597,16 @@ impl UnsignedTransaction {
     }
 
     /// Signs every input with the one key `key`, which must own all of them.
-    pub fn sign_with(self, key: &mut Key) -> Result<Transaction, SignError> {
+    pub fn sign_with(self, key: &mut Key) -> Result<Transaction, Error> {
         let pk = key.public_key();
         self.sign(|i, input_pk, msg| {
             if *input_pk != pk {
-                return Err(SignError::WrongKey(i));
+                return Err(Error::WrongKey(i));
             }
-            key.sign(msg).map_err(SignError::Exhausted)
+            key.sign(msg)
         })
     }
 }
-
-/// Errors from [`UnsignedTransaction::sign_with`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SignError {
-    /// The key ran out of one-time leaves.
-    Exhausted(KeyExhausted),
-    /// Input at this index belongs to a different key.
-    WrongKey(usize),
-}
-
-impl fmt::Display for SignError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SignError::Exhausted(e) => write!(f, "{e}"),
-            SignError::WrongKey(i) => write!(f, "input {i} is not owned by the signing key"),
-        }
-    }
-}
-
-impl std::error::Error for SignError {}
 
 impl Transaction {
     /// Hash of the body, excluding signatures.
@@ -660,13 +645,13 @@ impl Transaction {
     /// Checks every policy input's leaf against this transaction, for a
     /// block at `height`; `created` gives the creation height of the
     /// output at a position (`None` if unknown: unspendable).
-    pub fn check_policy_inputs(&self, height: u32, created: impl Fn(u64) -> Option<u32>) -> Result<(), PolicyError> {
+    pub fn check_policy_inputs(&self, height: u32, created: impl Fn(u64) -> Option<u32>) -> Result<(), Error> {
         if self.policy_inputs.is_empty() {
             return Ok(());
         }
         let body = self.body_hash();
         for p in &self.policy_inputs {
-            let c = created(p.position).ok_or(PolicyError::Locked)?;
+            let c = created(p.position).ok_or(Error::PolicyLocked)?;
             p.check(&body, &self.outputs, height, c)?;
         }
         Ok(())
@@ -754,8 +739,8 @@ impl Transaction {
     }
 
     /// Parses a transaction; the whole slice must be consumed.
-    pub fn from_bytes(bytes: &[u8]) -> Option<Transaction> {
-        Some(TransactionRef::from_bytes(bytes)?.to_transaction())
+    pub fn from_bytes(bytes: &[u8]) -> Result<Transaction, Error> {
+        Ok(TransactionRef::from_bytes(bytes)?.to_transaction())
     }
 }
 
@@ -817,14 +802,14 @@ mod tests {
         // sign_with refuses inputs owned by another key.
         let other = key(5).public_key();
         let unsigned = UnsignedTransaction::new(vec![(pk, 1), (other, 1)], vec![]);
-        assert_eq!(unsigned.sign_with(&mut k).unwrap_err(), SignError::WrongKey(1));
-        assert!(SignError::WrongKey(1).to_string().contains("input 1"));
+        assert_eq!(unsigned.sign_with(&mut k).unwrap_err(), Error::WrongKey(1));
+        assert!(Error::WrongKey(1).to_string().contains("input 1"));
         // A key with no leaf left signs nothing.
         let mut spent = Key::generate_with_height(&[6; 32], 1);
         spent.set_next_index(2);
         let unsigned = UnsignedTransaction::new(vec![(spent.public_key(), 1)], vec![]);
         let err = unsigned.sign_with(&mut spent).unwrap_err();
-        assert_eq!(err, SignError::Exhausted(KeyExhausted));
+        assert_eq!(err, Error::KeyExhausted);
         assert!(err.to_string().contains("exhausted"));
     }
 
@@ -925,8 +910,8 @@ mod tests {
         let bytes = tx.to_bytes();
         assert_eq!(bytes.len(), tx.size());
         assert_eq!(bytes.len(), 16 + INPUT_SIZE + OUTPUT_SIZE + ops.iter().map(NameOp::size).sum::<usize>());
-        assert_eq!(Transaction::from_bytes(&bytes), Some(tx.clone()));
-        assert!(Transaction::from_bytes(&bytes[..bytes.len() - 1]).is_none());
+        assert_eq!(Transaction::from_bytes(&bytes), Ok(tx.clone()));
+        assert!(Transaction::from_bytes(&bytes[..bytes.len() - 1]).is_err());
         assert_eq!(tx.unsigned().body_hash(), tx.txid());
         // The view reads the operations where they lie.
         let view = TransactionRef::from_bytes(&bytes).unwrap();
@@ -960,17 +945,17 @@ mod tests {
         assert!(back.verify_signatures());
         assert_eq!(back.txid(), tx.txid());
 
-        assert!(Transaction::from_bytes(&bytes[..bytes.len() - 1]).is_none());
+        assert!(Transaction::from_bytes(&bytes[..bytes.len() - 1]).is_err());
         let mut extra = bytes.clone();
         extra.push(0);
-        assert!(Transaction::from_bytes(&extra).is_none());
+        assert!(Transaction::from_bytes(&extra).is_err());
         let mut huge = bytes.clone();
         huge[..4].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(Transaction::from_bytes(&huge).is_none());
-        assert!(Transaction::from_bytes(&[]).is_none());
+        assert!(Transaction::from_bytes(&huge).is_err());
+        assert!(Transaction::from_bytes(&[]).is_err());
 
         let empty = Transaction { inputs: vec![], policy_inputs: vec![], outputs: vec![], ops: vec![] };
-        assert_eq!(Transaction::from_bytes(&empty.to_bytes()), Some(empty));
+        assert_eq!(Transaction::from_bytes(&empty.to_bytes()), Ok(empty));
     }
 
     // -----------------------------------------------------------------------
@@ -1068,11 +1053,11 @@ mod tests {
             for height in [0, 49, 50, 1000] {
                 let got = view.check_policy_inputs(height, |p| (p == 7).then_some(0));
                 assert_eq!(got, tx.check_policy_inputs(height, |p| (p == 7).then_some(0)), "height {height}");
-                let want = if rebindable || height >= 50 { Ok(()) } else { Err(PolicyError::Locked) };
+                let want = if rebindable || height >= 50 { Ok(()) } else { Err(Error::PolicyLocked) };
                 assert_eq!(got, want, "height {height}");
             }
-            assert_eq!(view.check_policy_inputs(1000, |_| None), Err(PolicyError::Locked));
-            assert_eq!(tx.check_policy_inputs(1000, |_| None), Err(PolicyError::Locked));
+            assert_eq!(view.check_policy_inputs(1000, |_| None), Err(Error::PolicyLocked));
+            assert_eq!(tx.check_policy_inputs(1000, |_| None), Err(Error::PolicyLocked));
         }
         // No policy inputs: nothing to check, whatever is known of positions.
         let plain = UnsignedTransaction::new(vec![], vec![Output::new(&key(1).public_key(), 5)]);
@@ -1168,11 +1153,11 @@ mod tests {
     fn malformed_transactions_are_refused() {
         let tx = full(true);
         let bytes = tx.to_bytes();
-        assert!(TransactionRef::from_bytes(&bytes).is_some());
+        assert!(TransactionRef::from_bytes(&bytes).is_ok());
         for cut in [0, 3, 4, 100, bytes.len() / 2, bytes.len() - 1] {
-            assert!(TransactionRef::from_bytes(&bytes[..cut]).is_none(), "cut at {cut}");
+            assert!(TransactionRef::from_bytes(&bytes[..cut]).is_err(), "cut at {cut}");
         }
-        assert!(TransactionRef::from_bytes(&[&bytes[..], &[0]].concat()).is_none());
+        assert!(TransactionRef::from_bytes(&[&bytes[..], &[0]].concat()).is_err());
         // Where each section's count is.
         let inputs: usize = tx.inputs.iter().map(Input::size).sum();
         let policy: usize = tx.policy_inputs.iter().map(PolicyInput::size).sum();
@@ -1186,7 +1171,7 @@ mod tests {
             for other in [n - 1, n + 1, u32::MAX] {
                 let mut b = bytes.clone();
                 b[at..at + 4].copy_from_slice(&other.to_le_bytes());
-                assert!(TransactionRef::from_bytes(&b).is_none(), "{other} {name}");
+                assert!(TransactionRef::from_bytes(&b).is_err(), "{other} {name}");
             }
         }
         // An element that is none, in each kind of item: the first input's
@@ -1202,13 +1187,13 @@ mod tests {
         ] {
             let mut b = bytes.clone();
             b[at..at + 4].copy_from_slice(&p);
-            assert!(TransactionRef::from_bytes(&b).is_none(), "{name}");
-            assert!(Transaction::from_bytes(&b).is_none(), "{name}");
+            assert!(TransactionRef::from_bytes(&b).is_err(), "{name}");
+            assert!(Transaction::from_bytes(&b).is_err(), "{name}");
         }
         // An unknown kind of operation.
         let mut b = bytes.clone();
         b[n_ops + 4] = 9;
-        assert!(TransactionRef::from_bytes(&b).is_none());
+        assert!(TransactionRef::from_bytes(&b).is_err());
         // A transaction of nothing is one.
         let empty = [0u8; 16];
         let view = TransactionRef::from_bytes(&empty).unwrap();
@@ -1233,7 +1218,7 @@ mod tests {
         tx.set_positions(&[1 << 39, 12345]);
         let samples = [tx.to_bytes(), full(false).to_bytes(), full(true).to_bytes()];
         crate::test_util::fuzz_decoder("TransactionRef::from_bytes", &samples, 3_000, |b| {
-            TransactionRef::from_bytes(b).map(|view| {
+            TransactionRef::from_bytes(b).ok().map(|view| {
                 assert_eq!(view.to_transaction().to_bytes(), view.as_bytes());
                 assert_eq!(view.body_hash(), view.to_transaction().body_hash());
                 let _ = (view.verify_signatures(), view.weight(), view.balance());
@@ -1246,7 +1231,7 @@ mod tests {
             })
         });
         crate::test_util::fuzz_decoder("Transaction::from_bytes", &samples, 3_000, |b| {
-            Transaction::from_bytes(b).map(|t| Some(t.to_bytes()))
+            Transaction::from_bytes(b).ok().map(|t| Some(t.to_bytes()))
         });
     }
 }

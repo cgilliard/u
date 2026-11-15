@@ -505,17 +505,17 @@ pub(crate) fn fuzz_proof(proof: &Proof, iters: u64, seed: u64, verify: impl Fn(&
         }));
         match r {
             Err(_) => out.panicked.push(what),
-            Ok(None) => out.undecodable += 1,
-            Ok(Some((true, _))) => out.same_proof.push(what),
-            Ok(Some((false, false))) => out.rejected += 1,
-            Ok(Some((false, true))) => out.accepted.push(what),
+            Ok(Err(_)) => out.undecodable += 1,
+            Ok(Ok((true, _))) => out.same_proof.push(what),
+            Ok(Ok((false, false))) => out.rejected += 1,
+            Ok(Ok((false, true))) => out.accepted.push(what),
         }
     }
     drop(quiet);
     // Then every count, length, height and index at its boundary values:
     // what random mutation rarely reaches.
     let (fields, panicked, accepted) =
-        crate::codec::sweep_fields(&bytes, |b| Proof::from_bytes(b).map(|p| p != *proof && verify(&p)));
+        crate::codec::sweep_fields(&bytes, |b| Proof::from_bytes(b).ok().map(|p| p != *proof && verify(&p)));
     out.fields = fields;
     out.panicked.extend(panicked);
     out.accepted.extend(accepted);

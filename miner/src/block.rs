@@ -63,6 +63,7 @@
 use core::fmt;
 
 use crate::codec::{POSITION_BYTES, packed, read_digest, read_position, read_u32, read_u64, write_position};
+use crate::error::Error;
 use crate::hash::{DOM_BLOCK_BODY, DOM_BLOCK_PROOF, Digest, DomainHasher};
 use crate::name::{BlockNameOp, OpKind, count_ops};
 use crate::output::OUTPUT_CAPACITY;
@@ -129,7 +130,11 @@ impl Header {
         out
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Option<Header> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Header, Error> {
+        Self::decode(bytes).ok_or(Error::Malformed("block header"))
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Header> {
         if bytes.len() != HEADER_SIZE {
             return None;
         }
@@ -213,36 +218,6 @@ impl Header {
 // What a body must be
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BodyError {
-    /// The same position is spent twice.
-    DuplicateInput(u64),
-    /// An input position is not below the tree capacity.
-    InputOutOfRange(u64),
-    /// More operations of a kind than its cap.
-    TooMany(OpKind),
-    /// A position spent by a reveal or a sweep is repeated or also spent.
-    DuplicateSpend(u64),
-    /// A position spent by a reveal or a sweep is not below the tree capacity.
-    SpendOutOfRange(u64),
-    Malformed,
-}
-
-impl fmt::Display for BodyError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            BodyError::DuplicateInput(p) => write!(f, "input position {p} appears twice"),
-            BodyError::InputOutOfRange(p) => write!(f, "input position {p} exceeds the state tree"),
-            BodyError::TooMany(k) => write!(f, "more than {} {} operations", k.cap(), k.name()),
-            BodyError::DuplicateSpend(p) => write!(f, "position {p} is spent twice"),
-            BodyError::SpendOutOfRange(p) => write!(f, "spent position {p} exceeds the state tree"),
-            BodyError::Malformed => f.write_str("malformed block body"),
-        }
-    }
-}
-
-impl std::error::Error for BodyError {}
-
 /// Checks a body's positions and operations: `inputs`, then the positions
 /// `spends` that reveals and sweeps consume, all below the tree's capacity
 /// and no two alike, taken in order so that the first at fault is the one
@@ -251,14 +226,14 @@ fn validate(
     inputs: impl Iterator<Item = u64> + Clone,
     spends: impl Iterator<Item = u64> + Clone,
     kinds: impl Iterator<Item = OpKind>,
-) -> Result<(), BodyError> {
+) -> Result<(), Error> {
     let positions = || inputs.clone().map(|p| (p, true)).chain(spends.clone().map(|p| (p, false)));
     // In range, and gathered to be compared: the one list a body needs.
     let mut sorted = Vec::with_capacity(inputs.size_hint().0 + spends.size_hint().0);
     let mut out_of_range = None;
     for (i, (p, input)) in positions().enumerate() {
         if p >= OUTPUT_CAPACITY && out_of_range.is_none() {
-            out_of_range = Some((i, if input { BodyError::InputOutOfRange(p) } else { BodyError::SpendOutOfRange(p) }));
+            out_of_range = Some((i, if input { Error::InputOutOfRange(p) } else { Error::SpendOutOfRange(p) }));
         }
         sorted.push(p);
     }
@@ -273,7 +248,7 @@ fn validate(
         let mut seen = std::collections::HashSet::new();
         for (i, (p, input)) in positions().enumerate() {
             if !seen.insert(p) {
-                repeat = Some((i, if input { BodyError::DuplicateInput(p) } else { BodyError::DuplicateSpend(p) }));
+                repeat = Some((i, if input { Error::DuplicateInput(p) } else { Error::DuplicateSpend(p) }));
                 break;
             }
         }
@@ -285,7 +260,7 @@ fn validate(
         (_, Some((_, e))) | (Some((_, e)), None) => return Err(e),
         (None, None) => {}
     }
-    count_ops(kinds).map_err(BodyError::TooMany)?;
+    count_ops(kinds)?;
     Ok(())
 }
 
@@ -425,7 +400,7 @@ impl<'a> BodyRef<'a> {
     fn lists(bytes: &'a [u8]) -> Option<(BodyRef<'a>, &'a [u8])> {
         let (inputs, rest) = section(bytes, POSITION_BYTES)?;
         let (outputs, rest) = section(rest, BLOCK_OUTPUT_SIZE)?;
-        if !outputs.chunks_exact(BLOCK_OUTPUT_SIZE).all(|o| BlockOutput::from_bytes(o).is_some()) {
+        if !outputs.chunks_exact(BLOCK_OUTPUT_SIZE).all(|o| BlockOutput::from_bytes(o).is_ok()) {
             return None;
         }
         let (n_ops, ops) = read_u32(rest)?;
@@ -441,18 +416,18 @@ impl<'a> BodyRef<'a> {
     /// Reads and validates a body that is the whole of `bytes`: every item
     /// whole, the positions it spends in range and distinct, and no more
     /// operations of a kind than its cap.
-    pub fn from_bytes(bytes: &'a [u8]) -> Result<BodyRef<'a>, BodyError> {
-        let (mut body, rest) = Self::lists(bytes).ok_or(BodyError::Malformed)?;
-        let (proof, rest) = section(rest, 1).ok_or(BodyError::Malformed)?;
+    pub fn from_bytes(bytes: &'a [u8]) -> Result<BodyRef<'a>, Error> {
+        let (mut body, rest) = Self::lists(bytes).ok_or(Error::Malformed("block body"))?;
+        let (proof, rest) = section(rest, 1).ok_or(Error::Malformed("block body"))?;
         if !rest.is_empty() {
-            return Err(BodyError::Malformed);
+            return Err(Error::Malformed("block body"));
         }
         body.proof = proof;
         body.validate()?;
         Ok(body)
     }
 
-    fn validate(&self) -> Result<(), BodyError> {
+    fn validate(&self) -> Result<(), Error> {
         validate(
             self.inputs(),
             self.ops().filter_map(|op| op.spends()).chain(self.sweeps()),
@@ -568,9 +543,9 @@ pub struct BlockRef<'a> {
 }
 
 impl<'a> BlockRef<'a> {
-    pub fn from_bytes(bytes: &'a [u8]) -> Result<BlockRef<'a>, BodyError> {
-        let (head, body) = bytes.split_at_checked(HEADER_SIZE).ok_or(BodyError::Malformed)?;
-        let header = Header::from_bytes(head).ok_or(BodyError::Malformed)?;
+    pub fn from_bytes(bytes: &'a [u8]) -> Result<BlockRef<'a>, Error> {
+        let (head, body) = bytes.split_at_checked(HEADER_SIZE).ok_or(Error::Malformed("block"))?;
+        let header = Header::from_bytes(head)?;
         Ok(BlockRef { header, body: BodyRef::from_bytes(body)?, bytes })
     }
 
@@ -624,7 +599,7 @@ pub struct Body {
 impl Body {
     /// Checks that inputs and sweeps are in range and distinct and
     /// operation counts within the caps.
-    pub fn validate(&self) -> Result<(), BodyError> {
+    pub fn validate(&self) -> Result<(), Error> {
         validate(
             self.inputs.iter().copied(),
             self.ops.iter().filter_map(BlockNameOp::spends).chain(self.sweeps.iter().copied()),
@@ -728,7 +703,7 @@ impl Body {
     }
 
     /// Parses and validates a body; the whole slice must be consumed.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Body, BodyError> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Body, Error> {
         Ok(BodyRef::from_bytes(bytes)?.to_body())
     }
 }
@@ -765,9 +740,13 @@ impl Block {
     /// A lite block's header and the body commitment its bytes make (the
     /// proof's hash as given), or `None` if malformed: the header commits
     /// to it if the lite block is the block's. Read where the bytes lie.
-    pub fn lite_commitment(bytes: &[u8]) -> Option<(Header, Digest)> {
+    pub fn lite_commitment(bytes: &[u8]) -> Result<(Header, Digest), Error> {
+        Self::lite_decode(bytes).ok_or(Error::Malformed("lite block"))
+    }
+
+    fn lite_decode(bytes: &[u8]) -> Option<(Header, Digest)> {
         let (head, body) = bytes.split_at_checked(HEADER_SIZE)?;
-        let header = Header::from_bytes(head)?;
+        let header = Header::decode(head)?;
         // The lists as in a block, then the proof's length (which the hash
         // binds, not these four bytes) and its hash.
         let (lists, rest) = BodyRef::lists(body)?;
@@ -787,7 +766,7 @@ impl Block {
         out
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<Block, BodyError> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Block, Error> {
         Ok(BlockRef::from_bytes(bytes)?.to_block())
     }
 }
@@ -831,15 +810,15 @@ mod tests {
         let bytes = h.to_bytes();
         assert_eq!(bytes.len(), 204);
         assert_eq!(HEADER_SIZE, 204);
-        assert_eq!(Header::from_bytes(&bytes), Some(h));
+        assert_eq!(Header::from_bytes(&bytes), Ok(h));
         // The aux bytes are under the proof of work.
         let other = Header { aux: [10u8; 32], ..h };
         assert_ne!(other.pow_hash(), h.pow_hash());
         assert_ne!(other.hash(), h.hash());
-        assert!(Header::from_bytes(&bytes[1..]).is_none());
+        assert!(Header::from_bytes(&bytes[1..]).is_err());
         let mut bad = bytes;
         bad[..4].copy_from_slice(&0x7800_0001u32.to_le_bytes());
-        assert!(Header::from_bytes(&bad).is_none());
+        assert!(Header::from_bytes(&bad).is_err());
 
         // pow_hash ignores mix and nonce; hash does not.
         let mut h2 = h;
@@ -880,7 +859,7 @@ mod tests {
         for at in [44, 76, 140] {
             let mut bad = bytes;
             bad[at..at + 4].copy_from_slice(&0x7800_0001u32.to_le_bytes());
-            assert!(Header::from_bytes(&bad).is_none(), "digest at {at}");
+            assert!(Header::from_bytes(&bad).is_err(), "digest at {at}");
         }
     }
 
@@ -908,21 +887,21 @@ mod tests {
         };
         assert_eq!(ok.validate(), Ok(()));
         let dup = Body { inputs: vec![1, 7, 1], ..ok.clone() };
-        assert_eq!(dup.validate(), Err(BodyError::DuplicateInput(1)));
+        assert_eq!(dup.validate(), Err(Error::DuplicateInput(1)));
         let big = Body { inputs: vec![OUTPUT_CAPACITY], ..ok.clone() };
-        assert_eq!(big.validate(), Err(BodyError::InputOutOfRange(OUTPUT_CAPACITY)));
+        assert_eq!(big.validate(), Err(Error::InputOutOfRange(OUTPUT_CAPACITY)));
         assert_eq!(Body::default().validate(), Ok(()));
 
         let bytes = ok.to_bytes();
         assert_eq!(bytes.len(), ok.size());
         assert_eq!(bytes.len(), 20 + 4 * 6 + 2 * 60 + 3);
         assert_eq!(Body::from_bytes(&bytes), Ok(ok.clone()));
-        assert_eq!(Body::from_bytes(&dup.to_bytes()), Err(BodyError::DuplicateInput(1)));
-        assert_eq!(Body::from_bytes(&big.to_bytes()), Err(BodyError::InputOutOfRange(OUTPUT_CAPACITY)));
-        assert_eq!(Body::from_bytes(&bytes[..bytes.len() - 1]), Err(BodyError::Malformed));
+        assert_eq!(Body::from_bytes(&dup.to_bytes()), Err(Error::DuplicateInput(1)));
+        assert_eq!(Body::from_bytes(&big.to_bytes()), Err(Error::InputOutOfRange(OUTPUT_CAPACITY)));
+        assert_eq!(Body::from_bytes(&bytes[..bytes.len() - 1]), Err(Error::Malformed("block body")));
         let mut extra = bytes.clone();
         extra.push(0);
-        assert_eq!(Body::from_bytes(&extra), Err(BodyError::Malformed));
+        assert_eq!(Body::from_bytes(&extra), Err(Error::Malformed("block body")));
         // Six-byte positions hold the last position there is.
         let top = Body { inputs: vec![OUTPUT_CAPACITY - 1], sweeps: vec![OUTPUT_CAPACITY - 2], ..Default::default() };
         assert_eq!(OUTPUT_CAPACITY, 1 << 41);
@@ -932,14 +911,14 @@ mod tests {
         // spends, a position's range before its being a repeat.
         let both = |inputs: Vec<u64>, sweeps: Vec<u64>| Body { inputs, sweeps, ..Default::default() }.validate();
         let far = OUTPUT_CAPACITY + 5;
-        assert_eq!(both(vec![1, far, 1], vec![]), Err(BodyError::InputOutOfRange(far)));
-        assert_eq!(both(vec![1, 1, far], vec![]), Err(BodyError::DuplicateInput(1)));
-        assert_eq!(both(vec![far, far], vec![]), Err(BodyError::InputOutOfRange(far)));
-        assert_eq!(both(vec![3], vec![far, 3]), Err(BodyError::SpendOutOfRange(far)));
-        assert_eq!(both(vec![3], vec![3, far]), Err(BodyError::DuplicateSpend(3)));
-        assert_eq!(both(vec![3, 3], vec![far]), Err(BodyError::DuplicateInput(3)));
-        assert_eq!(both(vec![2, 9], vec![4, 9, 2]), Err(BodyError::DuplicateSpend(9)));
-        assert!(BodyError::DuplicateInput(1).to_string().contains("twice"));
+        assert_eq!(both(vec![1, far, 1], vec![]), Err(Error::InputOutOfRange(far)));
+        assert_eq!(both(vec![1, 1, far], vec![]), Err(Error::DuplicateInput(1)));
+        assert_eq!(both(vec![far, far], vec![]), Err(Error::InputOutOfRange(far)));
+        assert_eq!(both(vec![3], vec![far, 3]), Err(Error::SpendOutOfRange(far)));
+        assert_eq!(both(vec![3], vec![3, far]), Err(Error::DuplicateSpend(3)));
+        assert_eq!(both(vec![3, 3], vec![far]), Err(Error::DuplicateInput(3)));
+        assert_eq!(both(vec![2, 9], vec![4, 9, 2]), Err(Error::DuplicateSpend(9)));
+        assert!(Error::DuplicateInput(1).to_string().contains("twice"));
         // A position that does not fit six bytes has no encoding.
         let wide = Body { inputs: vec![1 << 48], ..Default::default() };
         assert!(std::panic::catch_unwind(|| wide.to_bytes()).is_err());
@@ -954,7 +933,7 @@ mod tests {
         assert_eq!(ok.names_size(), 53 + 2 * (98 + 5 + 6) + (98 + 6) + 2 * 6);
         assert_eq!(bytes.len(), 20 + 6 + 2 * 60 + ok.names_size() + 1);
         assert_eq!(Body::from_bytes(&bytes), Ok(ok.clone()));
-        assert_eq!(Body::from_bytes(&bytes[..bytes.len() - 1]), Err(BodyError::Malformed));
+        assert_eq!(Body::from_bytes(&bytes[..bytes.len() - 1]), Err(Error::Malformed("block body")));
         assert_eq!(ok.op_digests().len(), 4);
         assert_eq!(ok.op_digests(), ops().iter().map(|o| o.digest()).collect::<Vec<_>>());
         // A commit takes the position after the outputs.
@@ -991,27 +970,27 @@ mod tests {
 
         // Validation: sweeps distinct and apart from inputs, in range; caps.
         let bad = Body { sweeps: vec![1, 1], ..Default::default() };
-        assert_eq!(bad.validate(), Err(BodyError::DuplicateSpend(1)));
+        assert_eq!(bad.validate(), Err(Error::DuplicateSpend(1)));
         let bad = Body { inputs: vec![4], sweeps: vec![4], ..Default::default() };
-        assert_eq!(bad.validate(), Err(BodyError::DuplicateSpend(4)));
+        assert_eq!(bad.validate(), Err(Error::DuplicateSpend(4)));
         let bad = Body { ops: ops(), sweeps: vec![12], ..Default::default() };
-        assert_eq!(bad.validate(), Err(BodyError::DuplicateSpend(12)));
+        assert_eq!(bad.validate(), Err(Error::DuplicateSpend(12)));
         let bad = Body { sweeps: vec![OUTPUT_CAPACITY], ..Default::default() };
-        assert_eq!(bad.validate(), Err(BodyError::SpendOutOfRange(OUTPUT_CAPACITY)));
+        assert_eq!(bad.validate(), Err(Error::SpendOutOfRange(OUTPUT_CAPACITY)));
         assert_eq!(ok.spent_positions().collect::<Vec<_>>(), vec![3, 12, 14, 7, 8]);
         let bad = Body { sweeps: (0..MAX_SWEEPS as u64 + 1).collect(), ..Default::default() };
-        assert_eq!(bad.validate(), Err(BodyError::TooMany(OpKind::Sweep)));
-        assert_eq!(Body::from_bytes(&bad.to_bytes()), Err(BodyError::TooMany(OpKind::Sweep)));
+        assert_eq!(bad.validate(), Err(OpKind::Sweep.too_many()));
+        assert_eq!(Body::from_bytes(&bad.to_bytes()), Err(OpKind::Sweep.too_many()));
         let full = Body { sweeps: (0..MAX_SWEEPS as u64).collect(), ..Default::default() };
         assert_eq!(full.validate(), Ok(()));
         let reveal = |i: u64| BlockNameOp::Reveal { record: record("a", 1), commit: 100 + i };
         let bad = Body { ops: (0..MAX_REVEALS as u64 + 1).map(reveal).collect(), ..Default::default() };
-        assert_eq!(bad.validate(), Err(BodyError::TooMany(OpKind::Reveal)));
+        assert_eq!(bad.validate(), Err(OpKind::Reveal.too_many()));
         let bad = Body { ops: vec![BlockNameOp::Update(record("a", 1)); MAX_UPDATES + 1], ..Default::default() };
-        assert_eq!(bad.validate(), Err(BodyError::TooMany(OpKind::Update)));
+        assert_eq!(bad.validate(), Err(OpKind::Update.too_many()));
         let bad = Body { ops: vec![ops()[0]; MAX_COMMITS + 1], ..Default::default() };
-        assert_eq!(bad.validate(), Err(BodyError::TooMany(OpKind::Commit)));
-        assert!(BodyError::TooMany(OpKind::Commit).to_string().contains("commit"));
+        assert_eq!(bad.validate(), Err(OpKind::Commit.too_many()));
+        assert!(OpKind::Commit.too_many().to_string().contains("commit"));
         let at_caps = Body {
             ops: [
                 (0..MAX_REVEALS as u64).map(reveal).collect(),
@@ -1029,7 +1008,7 @@ mod tests {
         let name_at = 4 + 4 + 4 + 1 + 1;
         assert_eq!(bytes[name_at], b'a');
         bytes[name_at] = b'A';
-        assert_eq!(Body::from_bytes(&bytes), Err(BodyError::Malformed));
+        assert_eq!(Body::from_bytes(&bytes), Err(Error::Malformed("block body")));
     }
 
     #[test]
@@ -1112,7 +1091,7 @@ mod tests {
         let bytes = block.to_bytes();
         assert_eq!(bytes.len(), block.size());
         assert_eq!(Block::from_bytes(&bytes), Ok(block.clone()));
-        assert_eq!(Block::from_bytes(&bytes[..100]), Err(BodyError::Malformed));
+        assert_eq!(Block::from_bytes(&bytes[..100]), Err(Error::Malformed("block")));
         let mut other = block.clone();
         other.body.proof[0] ^= 1;
         assert!(!other.body_commitment_matches());
@@ -1172,9 +1151,13 @@ mod tests {
         // element that is none, bytes after the proof.
         let body_bytes = body.to_bytes();
         for cut in [0, 3, 4, 10, 100, body_bytes.len() - 1] {
-            assert_eq!(BodyRef::from_bytes(&body_bytes[..cut]).unwrap_err(), BodyError::Malformed, "cut at {cut}");
+            assert_eq!(
+                BodyRef::from_bytes(&body_bytes[..cut]).unwrap_err(),
+                Error::Malformed("block body"),
+                "cut at {cut}"
+            );
         }
-        assert_eq!(BodyRef::from_bytes(&[&body_bytes[..], &[0]].concat()).unwrap_err(), BodyError::Malformed);
+        assert_eq!(BodyRef::from_bytes(&[&body_bytes[..], &[0]].concat()).unwrap_err(), Error::Malformed("block body"));
         let n_out = 4 + 2 * POSITION_BYTES;
         let n_ops = n_out + 4 + 2 * BLOCK_OUTPUT_SIZE;
         let n_sweeps = n_ops + 4 + body.ops.iter().map(BlockNameOp::size).sum::<usize>();
@@ -1190,16 +1173,16 @@ mod tests {
             for other in [n - 1, n + 1, u32::MAX] {
                 let mut bad = body_bytes.clone();
                 bad[at..at + 4].copy_from_slice(&other.to_le_bytes());
-                assert_eq!(BodyRef::from_bytes(&bad).unwrap_err(), BodyError::Malformed, "{other} {name}");
+                assert_eq!(BodyRef::from_bytes(&bad).unwrap_err(), Error::Malformed("block body"), "{other} {name}");
             }
         }
         let mut bad = body_bytes.clone();
         bad[n_out + 4..n_out + 8].copy_from_slice(&crate::poseidon2::P.to_le_bytes());
-        assert_eq!(BodyRef::from_bytes(&bad).unwrap_err(), BodyError::Malformed);
-        assert_eq!(BlockRef::from_bytes(&bytes[..HEADER_SIZE - 1]).unwrap_err(), BodyError::Malformed);
+        assert_eq!(BodyRef::from_bytes(&bad).unwrap_err(), Error::Malformed("block body"));
+        assert_eq!(BlockRef::from_bytes(&bytes[..HEADER_SIZE - 1]).unwrap_err(), Error::Malformed("block"));
         let mut bad = bytes.clone();
         bad[..4].copy_from_slice(&crate::poseidon2::P.to_le_bytes());
-        assert_eq!(BlockRef::from_bytes(&bad).unwrap_err(), BodyError::Malformed);
+        assert_eq!(BlockRef::from_bytes(&bad).unwrap_err(), Error::Malformed("block header"));
         // A body of nothing is one.
         let empty = BodyRef::from_bytes(&[0u8; 20]).unwrap();
         assert_eq!((empty.inputs().len(), empty.outputs().len(), empty.ops().len(), empty.proof().len()), (0, 0, 0, 0));
@@ -1218,23 +1201,23 @@ mod tests {
         let block = Block { header: h, body };
         let lite = block.lite_bytes();
         assert_eq!(lite.len(), block.to_bytes().len() - 3000 + 32);
-        assert_eq!(Block::lite_commitment(&lite), Some((block.header, block.header.body_commitment)));
+        assert_eq!(Block::lite_commitment(&lite), Ok((block.header, block.header.body_commitment)));
         // the proof's hash changed: another commitment
         let mut bad = lite.clone();
         let n = bad.len();
         bad[n - 32] ^= 1;
-        assert_ne!(Block::lite_commitment(&bad).map(|(_, c)| c), Some(block.header.body_commitment));
+        assert_ne!(Block::lite_commitment(&bad).map(|(_, c)| c), Ok(block.header.body_commitment));
         // an output's amount changed: another commitment
         let mut bad = lite.clone();
         bad[HEADER_SIZE + 4 + 2 * POSITION_BYTES + 4 + 32 + 20] ^= 1;
-        assert_ne!(Block::lite_commitment(&bad).map(|(_, c)| c), Some(block.header.body_commitment));
+        assert_ne!(Block::lite_commitment(&bad).map(|(_, c)| c), Ok(block.header.body_commitment));
         // cut short, or the hash's bytes not canonical: malformed
-        assert_ne!(Block::lite_commitment(&lite[..lite.len() - 1]).map(|(_, c)| c), Some(block.header.body_commitment));
+        assert_ne!(Block::lite_commitment(&lite[..lite.len() - 1]).map(|(_, c)| c), Ok(block.header.body_commitment));
         let mut bad = lite.clone();
         bad[n - 4..].copy_from_slice(&[0xff; 4]);
-        assert_eq!(Block::lite_commitment(&bad), None);
-        assert_eq!(Block::lite_commitment(&[&lite[..], &[0]].concat()), None);
-        assert_eq!(Block::lite_commitment(&lite[..HEADER_SIZE + 3]), None);
+        assert!(Block::lite_commitment(&bad).is_err());
+        assert!(Block::lite_commitment(&[&lite[..], &[0]].concat()).is_err());
+        assert!(Block::lite_commitment(&lite[..HEADER_SIZE + 3]).is_err());
         // The proof's length is bound by its hash, not by the four bytes
         // before it: changing those changes nothing.
         let mut same = lite.clone();
@@ -1243,7 +1226,7 @@ mod tests {
         // A body at fault is no lite block either.
         let mut twice = block.clone();
         twice.body.inputs = vec![1, 1];
-        assert_eq!(Block::lite_commitment(&twice.lite_bytes()), None);
+        assert!(Block::lite_commitment(&twice.lite_bytes()).is_err());
     }
 
     /// The header, body and block decoders, fuzzed: no input makes them
@@ -1257,7 +1240,7 @@ mod tests {
         let block = Block { header: h, body: body.clone() };
         let empty = Body::default();
         crate::test_util::fuzz_decoder("Header::from_bytes", &[h.to_bytes().to_vec()], 20_000, |b| {
-            Header::from_bytes(b).map(|h| {
+            Header::from_bytes(b).ok().map(|h| {
                 let _ = (h.pow_hash(), h.hash(), h.quick_pow_check(&Target::MAX));
                 Some(h.to_bytes().to_vec())
             })
@@ -1280,7 +1263,7 @@ mod tests {
             Block::from_bytes(b).ok().map(|x| Some(x.to_bytes()))
         });
         crate::test_util::fuzz_decoder("Block::lite_commitment", &[block.lite_bytes()], 20_000, |b| {
-            Block::lite_commitment(b).map(|_| None)
+            Block::lite_commitment(b).ok().map(|_| None)
         });
     }
 

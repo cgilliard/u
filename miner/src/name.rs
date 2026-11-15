@@ -57,10 +57,11 @@ use core::fmt;
 use core::ops::Deref;
 
 use crate::codec::{DIGEST_BYTES, POSITION_BYTES, read_digest, read_position, write_position};
+use crate::error::Error;
 use crate::hash::{DOM_COMMIT, DOM_COMMIT_LEAF, DOM_NAME, DOM_OP, DOM_RECORD, DOM_UPDATE, Digest, hash_domain};
 use crate::output::{Key as OwnerKey, MEMO_BYTES, Memo, Sig, memo_from_bytes, memo_slot, memo_to_bytes, pubkey_hash};
 use crate::poseidon2::{DIGEST, Fp, digest_to_bytes};
-use crate::xmss::{KeyExhausted, PublicKey};
+use crate::xmss::PublicKey;
 
 /// Longest name, in characters.
 pub const NAME_MAX: usize = 32;
@@ -133,7 +134,11 @@ pub fn key_limbs(key: Key) -> [Fp; KEY_LIMBS] {
 
 /// A name's characters as field elements, zero padded: `None` unless it
 /// is 1 to [`NAME_MAX`] characters of [`CHARSET`].
-pub fn name_elements(name: &[u8]) -> Option<[Fp; NAME_MAX]> {
+pub fn name_elements(name: &[u8]) -> Result<[Fp; NAME_MAX], Error> {
+    name_elements_checked(name).ok_or(Error::Malformed("name"))
+}
+
+fn name_elements_checked(name: &[u8]) -> Option<[Fp; NAME_MAX]> {
     if name.is_empty() || name.len() > NAME_MAX {
         return None;
     }
@@ -147,7 +152,7 @@ pub fn name_elements(name: &[u8]) -> Option<[Fp; NAME_MAX]> {
 
 /// Whether `name` is well formed.
 pub fn valid_name(name: &[u8]) -> bool {
-    name_elements(name).is_some()
+    name_elements(name).is_ok()
 }
 
 /// The hash of a well-formed name.
@@ -156,7 +161,7 @@ pub fn name_hash(elements: &[Fp; NAME_MAX]) -> Digest {
 }
 
 /// The registry key of a well-formed name.
-pub fn name_key(name: &[u8]) -> Option<Key> {
+pub fn name_key(name: &[u8]) -> Result<Key, Error> {
     name_elements(name).map(|e| key_of(&name_hash(&e)))
 }
 
@@ -171,7 +176,11 @@ pub struct Name {
 
 impl Name {
     /// The name `name`; `None` unless it is well formed.
-    pub fn new(name: &[u8]) -> Option<Name> {
+    pub fn new(name: &[u8]) -> Result<Name, Error> {
+        Self::checked(name).ok_or(Error::Malformed("name"))
+    }
+
+    fn checked(name: &[u8]) -> Option<Name> {
         if !valid_name(name) {
             return None;
         }
@@ -262,8 +271,8 @@ impl Record {
     pub const MAX_SIZE: usize = RECORD_FIXED + NAME_MAX;
 
     /// A record for `name`; `None` unless the name is well formed.
-    pub fn new(name: &[u8], owner: Digest, value: Digest, memo: Digest) -> Option<Record> {
-        Some(Record { name: Name::new(name)?, owner, value, memo })
+    pub fn new(name: &[u8], owner: Digest, value: Digest, memo: Digest) -> Result<Record, Error> {
+        Ok(Record { name: Name::new(name)?, owner, value, memo })
     }
 
     pub fn elements(&self) -> [Fp; NAME_MAX] {
@@ -314,7 +323,7 @@ impl Record {
     pub fn read(bytes: &[u8]) -> Option<(Record, &[u8])> {
         let (&n, rest) = bytes.split_first()?;
         let (name, rest) = rest.split_at_checked(n as usize)?;
-        let name = Name::new(name)?;
+        let name = Name::checked(name)?;
         let (owner, rest) = read_digest(rest)?;
         let (value, rest) = read_digest(rest)?;
         let (memo, rest) = read_digest(rest)?;
@@ -322,7 +331,11 @@ impl Record {
     }
 
     /// A record that is the whole of `bytes`.
-    pub fn from_bytes(bytes: &[u8]) -> Option<Record> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Record, Error> {
+        Self::decode(bytes).ok_or(Error::Malformed("name record"))
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Record> {
         match Self::read(bytes)? {
             (record, []) => Some(record),
             _ => None,
@@ -345,7 +358,11 @@ impl Commit {
         out
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Option<Commit> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Commit, Error> {
+        Self::decode(bytes).ok_or(Error::Malformed("name commit"))
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Commit> {
         if bytes.len() != COMMIT_ENTRY {
             return None;
         }
@@ -411,6 +428,11 @@ pub enum OpKind {
 }
 
 impl OpKind {
+    /// The error of more operations of this kind than its cap.
+    pub fn too_many(self) -> Error {
+        Error::TooManyOps { kind: self.name(), cap: self.cap() }
+    }
+
     pub fn cap(self) -> usize {
         match self {
             OpKind::Commit => MAX_COMMITS,
@@ -430,14 +452,14 @@ impl OpKind {
     }
 }
 
-/// Counts of each kind in `kinds`, indexed by `OpKind as usize`; `Err`
-/// with the kind if one exceeds its cap.
-pub fn count_ops(kinds: impl IntoIterator<Item = OpKind>) -> Result<[usize; 4], OpKind> {
+/// Counts of each kind in `kinds`, indexed by `OpKind as usize`; an error
+/// naming the kind if one exceeds its cap.
+pub fn count_ops(kinds: impl IntoIterator<Item = OpKind>) -> Result<[usize; 4], Error> {
     let mut counts = [0usize; 4];
     for k in kinds {
         counts[k as usize] += 1;
         if counts[k as usize] > k.cap() {
-            return Err(k);
+            return Err(k.too_many());
         }
     }
     Ok(counts)
@@ -549,7 +571,7 @@ impl BlockNameOp {
             TAG_COMMIT => {
                 let (commit, rest) = read_digest(rest)?;
                 let (memo, rest) = rest.split_at_checked(MEMO_BYTES)?;
-                let memo = memo_from_bytes(memo)?;
+                let memo = memo_from_bytes(memo).ok()?;
                 Some((BlockNameOp::Commit { commit, memo }, rest))
             }
             TAG_REVEAL => {
@@ -566,7 +588,7 @@ impl BlockNameOp {
 impl NameOp {
     /// An update of `record`'s name to `record`, signed by `key`, the
     /// name's current owner key.
-    pub fn update(record: Record, key: &mut OwnerKey) -> Result<NameOp, KeyExhausted> {
+    pub fn update(record: Record, key: &mut OwnerKey) -> Result<NameOp, Error> {
         let signature = key.sign(&update_message(&record))?;
         Ok(NameOp::Update { record, pubkey: key.public_key(), signature })
     }
@@ -658,9 +680,9 @@ impl NameOp {
             }
             BlockNameOp::Update(record) => {
                 let (pk, rest) = rest.split_at_checked(PublicKey::SIZE)?;
-                let pubkey = PublicKey::from_bytes(pk)?;
+                let pubkey = PublicKey::from_bytes(pk).ok()?;
                 let (sig, rest) = rest.split_at_checked(Sig::size(pubkey.height()))?;
-                let signature = Sig::from_bytes(sig, pubkey.height())?;
+                let signature = Sig::from_bytes(sig, pubkey.height()).ok()?;
                 Some((NameOp::Update { record, pubkey, signature }, rest))
             }
         }
@@ -724,7 +746,7 @@ mod tests {
     #[test]
     fn a_name_is_well_formed_by_construction() {
         for bad in [&b""[..], &[b'z'; NAME_MAX + 1], b"Example", b"cool.example", b"a-b", "é".as_bytes(), b"a b"] {
-            assert_eq!(Name::new(bad), None);
+            assert!(Name::new(bad).is_err());
         }
         for good in [&b"a"[..], b"example", b"nvidia_2026", &[b'z'; NAME_MAX], &[b'_'; NAME_MAX]] {
             let name = Name::new(good).unwrap();
@@ -732,7 +754,7 @@ mod tests {
             assert_eq!(name.as_str().as_bytes(), good);
             assert_eq!(name.elements(), name_elements(good).unwrap());
             assert_eq!(name.hash(), name_hash(&name_elements(good).unwrap()));
-            assert_eq!(Some(name.key()), name_key(good));
+            assert_eq!(Ok(name.key()), name_key(good));
             assert_eq!(name.to_string().as_bytes(), good);
             assert_eq!(format!("{name:?}"), format!("{:?}", name.as_str()));
         }
@@ -756,17 +778,17 @@ mod tests {
         let r = record("example", 4);
         assert_eq!(r.size(), 1 + 7 + 96);
         crate::test_util::fuzz_decoder("Record::from_bytes", &[r.to_bytes()], 20_000, |b| {
-            Record::from_bytes(b).map(|x| Some(x.to_bytes()))
+            Record::from_bytes(b).ok().map(|x| Some(x.to_bytes()))
         });
         let bytes = r.to_bytes();
         assert_eq!(bytes.len(), r.size());
-        assert_eq!(Record::from_bytes(&bytes), Some(r));
-        assert_eq!(Record::from_bytes(&bytes[..bytes.len() - 1]), None);
-        assert_eq!(Record::from_bytes(&[&bytes[..], &[0]].concat()), None);
+        assert_eq!(Record::from_bytes(&bytes), Ok(r));
+        assert!(Record::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+        assert!(Record::from_bytes(&[&bytes[..], &[0]].concat()).is_err());
         assert_eq!(Record::read(&[&bytes[..], &[9]].concat()), Some((r, &[9u8][..])));
         let mut bad = bytes.clone();
         bad[1] = b'E';
-        assert_eq!(Record::from_bytes(&bad), None);
+        assert!(Record::from_bytes(&bad).is_err());
         // A length of none, and one past the longest name.
         let mut bad = bytes.clone();
         bad[0] = 0;
@@ -776,19 +798,19 @@ mod tests {
         // An owner that is no digest.
         let mut bad = bytes.clone();
         bad[8..12].copy_from_slice(&crate::poseidon2::P.to_le_bytes());
-        assert_eq!(Record::from_bytes(&bad), None);
+        assert!(Record::from_bytes(&bad).is_err());
         assert_ne!(r.leaf_value(), record("example", 5).leaf_value());
         assert_ne!(r.leaf_value(), record("exampl", 4).leaf_value());
-        assert_eq!(Record::new(b"", d(1), d(2), d(3)), None);
+        assert!(Record::new(b"", d(1), d(2), d(3)).is_err());
         assert_eq!((r.elements(), r.key()), (r.name.elements(), r.name.key()));
         // The longest record fills MAX_SIZE.
         let longest = record(&"z".repeat(NAME_MAX), 1);
         assert_eq!(longest.size(), Record::MAX_SIZE);
-        assert_eq!(Record::from_bytes(&longest.to_bytes()), Some(longest));
+        assert_eq!(Record::from_bytes(&longest.to_bytes()), Ok(longest));
         // A commit's side-table entry.
         let c = Commit { hash: d(8), height: 77 };
-        assert_eq!(Commit::from_bytes(&c.to_bytes()), Some(c));
-        assert_eq!(Commit::from_bytes(&c.to_bytes()[1..]), None);
+        assert_eq!(Commit::from_bytes(&c.to_bytes()), Ok(c));
+        assert!(Commit::from_bytes(&c.to_bytes()[1..]).is_err());
     }
 
     #[test]
@@ -857,8 +879,8 @@ mod tests {
         bad[2] = b'A';
         assert!(BlockNameOp::parse(&bad).is_none());
         assert!(BlockNameOp::parse(&[9, 0, 0]).is_none());
-        assert!(Record::new(b"Alice", d(1), d(2), d(3)).is_none());
-        assert_eq!(Record::new(b"alice", d(1), d(2), d(3)), Some(record("alice", 1)));
+        assert!(Record::new(b"Alice", d(1), d(2), d(3)).is_err());
+        assert_eq!(Record::new(b"alice", d(1), d(2), d(3)), Ok(record("alice", 1)));
 
         // Counts against the caps.
         let kinds = |n: usize, k: OpKind| std::iter::repeat_n(k, n);
@@ -866,10 +888,10 @@ mod tests {
             count_ops(kinds(MAX_REVEALS, OpKind::Reveal).chain(kinds(MAX_COMMITS, OpKind::Commit))),
             Ok([MAX_COMMITS, MAX_REVEALS, 0, 0])
         );
-        assert_eq!(count_ops(kinds(MAX_COMMITS + 1, OpKind::Commit)), Err(OpKind::Commit));
-        assert_eq!(count_ops(kinds(MAX_REVEALS + 1, OpKind::Reveal)), Err(OpKind::Reveal));
-        assert_eq!(count_ops(kinds(MAX_UPDATES + 1, OpKind::Update)), Err(OpKind::Update));
-        assert_eq!(count_ops(kinds(MAX_SWEEPS + 1, OpKind::Sweep)), Err(OpKind::Sweep));
+        assert_eq!(count_ops(kinds(MAX_COMMITS + 1, OpKind::Commit)), Err(OpKind::Commit.too_many()));
+        assert_eq!(count_ops(kinds(MAX_REVEALS + 1, OpKind::Reveal)), Err(OpKind::Reveal.too_many()));
+        assert_eq!(count_ops(kinds(MAX_UPDATES + 1, OpKind::Update)), Err(OpKind::Update.too_many()));
+        assert_eq!(count_ops(kinds(MAX_SWEEPS + 1, OpKind::Sweep)), Err(OpKind::Sweep.too_many()));
         assert_eq!(count_ops(kinds(MAX_SWEEPS, OpKind::Sweep)), Ok([0, 0, 0, 16]));
         let names: Vec<&str> =
             [OpKind::Commit, OpKind::Reveal, OpKind::Update, OpKind::Sweep].map(OpKind::name).to_vec();
@@ -907,7 +929,7 @@ mod tests {
         // A key with no leaf left signs no update.
         let mut spent = OwnerKey::generate_with_height(&[3; 32], 1);
         spent.set_next_index(2);
-        assert_eq!(NameOp::update(new, &mut spent), Err(KeyExhausted));
+        assert_eq!(NameOp::update(new, &mut spent), Err(Error::KeyExhausted));
         // An update whose signature is not of its key's height has no encoding.
         let mut short = OwnerKey::generate_with_height(&[4; 32], 2);
         let signature = short.sign(&update_message(&new)).unwrap();

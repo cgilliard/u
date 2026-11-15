@@ -55,6 +55,7 @@
 //! they lie.
 
 use crate::challenger::Challenger;
+use crate::error::Error;
 use crate::ext::{DEGREE, Fp4, as_base};
 use crate::merkle::{Digest, MerkleTree, verify as merkle_verify};
 use crate::ntt::{TWO_ADICITY, inv_two, log2_strict, root_of_unity};
@@ -141,45 +142,6 @@ pub struct FriProof {
     /// `num_queries` queries, each with one step per round.
     pub queries: Vec<Vec<QueryStep>>,
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FriError {
-    /// Number of commitments or queries does not match the parameters.
-    Shape,
-    InvalidOpening {
-        query: usize,
-        round: usize,
-    },
-    FoldMismatch {
-        query: usize,
-        round: usize,
-    },
-    FinalMismatch {
-        query: usize,
-    },
-    /// The proof-of-work witness does not meet `pow_bits`.
-    ProofOfWork,
-}
-
-impl core::fmt::Display for FriError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            FriError::Shape => f.write_str("fri proof has the wrong shape"),
-            FriError::InvalidOpening { query, round } => {
-                write!(f, "fri query {query} round {round}: invalid merkle opening")
-            }
-            FriError::FoldMismatch { query, round } => {
-                write!(f, "fri query {query} round {round}: fold does not match opened value")
-            }
-            FriError::FinalMismatch { query } => {
-                write!(f, "fri query {query}: last fold does not match final value")
-            }
-            FriError::ProofOfWork => f.write_str("fri proof-of-work witness is invalid"),
-        }
-    }
-}
-
-impl std::error::Error for FriError {}
 
 /// Finds the smallest witness `w` such that observing it makes the next
 /// sample's low `bits` bits zero, and leaves `challenger` past that sample
@@ -278,13 +240,13 @@ pub struct Schedule {
 }
 
 impl Schedule {
-    /// The rounds for these sizes, or `None` if they are none a test can
+    /// The rounds for these sizes, or [`Error::ProofShape`] if they are none a test can
     /// have: no sizes, a domain beyond the field's subgroups, or sizes
     /// that do not strictly decrease to above the blowup.
-    pub fn new(config: &FriConfig, log_sizes: &[usize]) -> Option<Schedule> {
-        let (&first, rest) = log_sizes.split_first()?;
+    pub fn new(config: &FriConfig, log_sizes: &[usize]) -> Result<Schedule, Error> {
+        let (&first, rest) = log_sizes.split_first().ok_or(Error::ProofShape)?;
         if first > TWO_ADICITY {
-            return None;
+            return Err(Error::ProofShape);
         }
         let mut s = Schedule {
             rounds: 0,
@@ -296,7 +258,7 @@ impl Schedule {
         let mut cur = first;
         for (g, &stop) in rest.iter().chain([&config.log_blowup]).enumerate() {
             if stop >= cur {
-                return None;
+                return Err(Error::ProofShape);
             }
             let mut inject = g;
             while cur > stop {
@@ -309,7 +271,7 @@ impl Schedule {
                 cur -= la;
             }
         }
-        Some(s)
+        Ok(s)
     }
 
     /// Number of folding rounds.
@@ -504,11 +466,11 @@ impl Verifier {
         fold_witnesses: &[Fp],
         final_value: &Fp4,
         pow_witness: Fp,
-    ) -> Result<Verifier, FriError> {
-        let schedule = Schedule::new(config, log_sizes).ok_or(FriError::Shape)?;
+    ) -> Result<Verifier, Error> {
+        let schedule = Schedule::new(config, log_sizes)?;
         let rounds = schedule.rounds();
         if commitments.len() != rounds || fold_witnesses.len() != rounds {
-            return Err(FriError::Shape);
+            return Err(Error::ProofShape);
         }
         let mut v = Verifier {
             schedule,
@@ -518,13 +480,13 @@ impl Verifier {
             omega_invs: [Fp::ZERO; MAX_ROUNDS],
             w_invs: [Fp::ZERO; MAX_ROUNDS],
         };
-        let mut s_inv = shift.inverse().ok_or(FriError::Shape)?;
+        let mut s_inv = shift.inverse().ok_or(Error::ProofShape)?;
         let mut w_inv = root_of_unity(schedule.log_n()).inverse().unwrap();
         for r in 0..rounds {
             let la = schedule.log_arity(r);
             challenger.observe_digest(&commitments[r]);
             if !check_pow(challenger, fold_grinding(config, la, schedule.log_size(r)), fold_witnesses[r]) {
-                return Err(FriError::ProofOfWork);
+                return Err(Error::FriGrinding);
             }
             v.betas[r] = challenger.sample_ext();
             v.shift_invs[r] = s_inv;
@@ -537,7 +499,7 @@ impl Verifier {
         }
         challenger.observe_ext(final_value);
         if !check_pow(challenger, config.pow_bits, pow_witness) {
-            return Err(FriError::ProofOfWork);
+            return Err(Error::FriGrinding);
         }
         Ok(v)
     }
@@ -568,17 +530,17 @@ impl Verifier {
         inputs: &[Fp4],
         mut leaf: impl FnMut(usize) -> Option<&'v [Fp4]>,
         mut opened: impl FnMut(usize, usize, &[Fp4]) -> bool,
-    ) -> Result<(), FriError> {
+    ) -> Result<(), Error> {
         let s = &self.schedule;
         if inputs.len() != s.inputs() || index >> s.log_n() != 0 {
-            return Err(FriError::Shape);
+            return Err(Error::ProofShape);
         }
         let mut index = index;
         let mut folded = inputs[0];
         for r in 0..s.rounds() {
-            let values = leaf(r).ok_or(FriError::Shape)?;
+            let values = leaf(r).ok_or(Error::ProofShape)?;
             if values.len() != 1 << s.log_arity(r) {
-                return Err(FriError::Shape);
+                return Err(Error::ProofShape);
             }
             if let Some(g) = s.injected(r) {
                 folded += inputs[g];
@@ -587,16 +549,16 @@ impl Verifier {
             let pos = index >> log_leaves;
             index &= (1usize << log_leaves) - 1;
             if !opened(r, index, values) {
-                return Err(FriError::InvalidOpening { query: q, round: r });
+                return Err(Error::InvalidFriOpening { round: r });
             }
             if values[pos] != folded {
-                return Err(FriError::FoldMismatch { query: q, round: r });
+                return Err(Error::FoldMismatch { query: q, round: r });
             }
             let x_inv = self.shift_invs[r].mul(&self.omega_invs[r].pow(index as u64));
             folded = fold_leaf(values, x_inv, self.w_invs[r], self.betas[r]);
         }
         if folded != self.final_value {
-            return Err(FriError::FinalMismatch { query: q });
+            return Err(Error::FinalMismatch { query: q });
         }
         Ok(())
     }
@@ -607,16 +569,16 @@ impl Verifier {
 /// input values at `index` (an index into the largest domain; the input of
 /// size `m` is read at `index mod m`), one per input, computed
 /// independently of the proof's FRI part.
-pub fn verify<E: From<FriError>>(
+pub fn verify(
     config: &FriConfig,
     challenger: &mut Challenger,
     shift: Fp,
     log_sizes: &[usize],
     proof: &FriProof,
-    mut open: impl FnMut(usize, usize, &mut [Fp4]) -> Result<(), E>,
-) -> Result<(), E> {
+    mut open: impl FnMut(usize, usize, &mut [Fp4]) -> Result<(), Error>,
+) -> Result<(), Error> {
     if proof.queries.len() != config.num_queries {
-        return Err(FriError::Shape.into());
+        return Err(Error::ProofShape);
     }
     let v = Verifier::new(
         config,
@@ -633,7 +595,7 @@ pub fn verify<E: From<FriError>>(
     let inputs = &mut inputs[..s.inputs()];
     for (q, steps) in proof.queries.iter().enumerate() {
         if steps.len() != s.rounds() {
-            return Err(FriError::Shape.into());
+            return Err(Error::ProofShape);
         }
         let index = v.sample_index(challenger);
         open(q, index, inputs)?;
@@ -675,14 +637,14 @@ mod tests {
 
     /// Verifies against the true input codewords, checking that the
     /// queried indices are the ones the prover opened.
-    fn check(log_sizes: &[usize], shift: Fp, proof: &FriProof, inputs: &[Vec<Fp4>]) -> Result<Vec<usize>, FriError> {
+    fn check(log_sizes: &[usize], shift: Fp, proof: &FriProof, inputs: &[Vec<Fp4>]) -> Result<Vec<usize>, Error> {
         let mut seen = Vec::new();
         verify(&CONFIG, &mut transcript(), shift, log_sizes, proof, |_, index, values| {
             seen.push(index);
             for (v, c) in values.iter_mut().zip(inputs) {
                 *v = c[index % c.len()];
             }
-            Ok::<_, FriError>(())
+            Ok(())
         })?;
         Ok(seen)
     }
@@ -728,7 +690,7 @@ mod tests {
         assert_eq!(widest.injected(MAX_ROUNDS - 1), Some(MAX_ROUNDS - 1));
         // Sizes that are no test's.
         for sizes in [&[][..], &[3], &[2], &[10, 10], &[10, 11], &[10, 3], &[28], &[usize::MAX]] {
-            assert_eq!(Schedule::new(&CONFIG, sizes), None, "{sizes:?}");
+            assert!(Schedule::new(&CONFIG, sizes).is_err(), "{sizes:?}");
         }
         assert!(std::panic::catch_unwind(|| round_log_arities(&CONFIG, &[10, 10])).is_err());
         assert!(std::panic::catch_unwind(|| num_rounds(&CONFIG, &[])).is_err());
@@ -798,7 +760,7 @@ mod tests {
         assert!(check(&[log_n], shift, &proof, &inputs).is_ok());
         let open = |_: usize, i: usize, v: &mut [Fp4]| {
             v[0] = cw[i % cw.len()];
-            Ok::<_, FriError>(())
+            Ok(())
         };
 
         // Different transcript prefix.
@@ -808,17 +770,17 @@ mod tests {
         // One size up has the same round count with arity four (5 and 6
         // folding bits), so it fails at the openings; two up changes shape.
         assert!(check(&[log_n + 1], shift, &proof, &inputs).is_err());
-        assert_eq!(check(&[log_n + 2], shift, &proof, &inputs).unwrap_err(), FriError::Shape);
+        assert_eq!(check(&[log_n + 2], shift, &proof, &inputs).unwrap_err(), Error::ProofShape);
         let fewer = FriConfig { num_queries: 19, ..CONFIG };
-        assert_eq!(verify(&fewer, &mut transcript(), shift, &[log_n], &proof, open).unwrap_err(), FriError::Shape);
+        assert_eq!(verify(&fewer, &mut transcript(), shift, &[log_n], &proof, open).unwrap_err(), Error::ProofShape);
         // An input value that differs from the committed codeword.
         let wrong = |_: usize, i: usize, v: &mut [Fp4]| {
             v[0] = cw[i] + Fp4::ONE;
-            Ok::<_, FriError>(())
+            Ok(())
         };
         assert_eq!(
             verify(&CONFIG, &mut transcript(), shift, &[log_n], &proof, wrong).unwrap_err(),
-            FriError::FoldMismatch { query: 0, round: 0 }
+            Error::FoldMismatch { query: 0, round: 0 }
         );
 
         let mut p = proof.clone();
@@ -826,13 +788,13 @@ mod tests {
         assert!(check(&[log_n], shift, &p, &inputs).is_err());
         let mut p = proof.clone();
         p.queries[3][1].values[0] += Fp4::ONE;
-        assert_eq!(check(&[log_n], shift, &p, &inputs).unwrap_err(), FriError::InvalidOpening { query: 3, round: 1 });
+        assert_eq!(check(&[log_n], shift, &p, &inputs).unwrap_err(), Error::InvalidFriOpening { round: 1 });
         let mut p = proof.clone();
         p.commitments[0][0] += Fp::ONE;
         assert!(check(&[log_n], shift, &p, &inputs).is_err());
         let mut p = proof.clone();
         p.queries[0].pop();
-        assert_eq!(check(&[log_n], shift, &p, &inputs).unwrap_err(), FriError::Shape);
+        assert_eq!(check(&[log_n], shift, &p, &inputs).unwrap_err(), Error::ProofShape);
         // A witness that misses the proof-of-work target; and any witness
         // but zero when no grinding is configured.
         let mut p = proof.clone();
@@ -840,55 +802,49 @@ mod tests {
         if check(&[log_n], shift, &p, &inputs).is_ok() {
             p.pow_witness += Fp::ONE;
         }
-        assert_eq!(check(&[log_n], shift, &p, &inputs).unwrap_err(), FriError::ProofOfWork);
+        assert_eq!(check(&[log_n], shift, &p, &inputs).unwrap_err(), Error::FriGrinding);
         let none = FriConfig { pow_bits: 0, ..CONFIG };
         let (p, _) = prove(&none, &mut transcript(), shift, inputs.to_vec());
         assert_eq!(p.pow_witness, Fp::ZERO);
         assert!(verify(&none, &mut transcript(), shift, &[log_n], &p, open).is_ok());
         let mut p = p;
         p.pow_witness = Fp::ONE;
-        assert_eq!(verify(&none, &mut transcript(), shift, &[log_n], &p, open).unwrap_err(), FriError::ProofOfWork);
+        assert_eq!(verify(&none, &mut transcript(), shift, &[log_n], &p, open).unwrap_err(), Error::FriGrinding);
         // Sizes no test has, and a shift with no coset, are refused, not panicked at.
         for sizes in [&[][..], &[3], &[28], &[log_n, log_n]] {
-            assert_eq!(verify(&CONFIG, &mut transcript(), shift, sizes, &proof, open).unwrap_err(), FriError::Shape);
+            assert_eq!(verify(&CONFIG, &mut transcript(), shift, sizes, &proof, open).unwrap_err(), Error::ProofShape);
         }
-        assert_eq!(verify(&CONFIG, &mut transcript(), Fp::ZERO, &[log_n], &proof, open).unwrap_err(), FriError::Shape);
+        assert_eq!(
+            verify(&CONFIG, &mut transcript(), Fp::ZERO, &[log_n], &proof, open).unwrap_err(),
+            Error::ProofShape
+        );
         // Every other part of the proof, each a refusal of its own kind.
         let mut p = proof.clone();
         p.fold_witnesses.pop();
-        assert_eq!(check(&[log_n], shift, &p, &inputs).unwrap_err(), FriError::Shape);
+        assert_eq!(check(&[log_n], shift, &p, &inputs).unwrap_err(), Error::ProofShape);
         let mut p = proof.clone();
         p.commitments.push(p.commitments[0]);
-        assert_eq!(check(&[log_n], shift, &p, &inputs).unwrap_err(), FriError::Shape);
+        assert_eq!(check(&[log_n], shift, &p, &inputs).unwrap_err(), Error::ProofShape);
         let mut p = proof.clone();
         p.fold_witnesses[0] += Fp::ONE;
-        assert_eq!(check(&[log_n], shift, &p, &inputs).unwrap_err(), FriError::ProofOfWork);
+        assert_eq!(check(&[log_n], shift, &p, &inputs).unwrap_err(), Error::FriGrinding);
         let mut p = proof.clone();
         p.queries[2][0].values.pop();
-        assert_eq!(check(&[log_n], shift, &p, &inputs).unwrap_err(), FriError::Shape);
+        assert_eq!(check(&[log_n], shift, &p, &inputs).unwrap_err(), Error::ProofShape);
         let mut p = proof.clone();
         p.queries[5][2].path[0][0] += Fp::ONE;
-        assert_eq!(check(&[log_n], shift, &p, &inputs).unwrap_err(), FriError::InvalidOpening { query: 5, round: 2 });
+        assert_eq!(check(&[log_n], shift, &p, &inputs).unwrap_err(), Error::InvalidFriOpening { round: 2 });
         let mut p = proof.clone();
         p.queries[1][0].path.pop();
-        assert_eq!(check(&[log_n], shift, &p, &inputs).unwrap_err(), FriError::InvalidOpening { query: 1, round: 0 });
+        assert_eq!(check(&[log_n], shift, &p, &inputs).unwrap_err(), Error::InvalidFriOpening { round: 0 });
         // The caller's own refusal comes back as it is.
         let refuse = |q: usize, i: usize, v: &mut [Fp4]| {
-            if q == 4 { Err(FriError::FinalMismatch { query: 99 }) } else { open(q, i, v) }
+            if q == 4 { Err(Error::FinalMismatch { query: 99 }) } else { open(q, i, v) }
         };
         assert_eq!(
             verify(&CONFIG, &mut transcript(), shift, &[log_n], &proof, refuse).unwrap_err(),
-            FriError::FinalMismatch { query: 99 }
+            Error::FinalMismatch { query: 99 }
         );
-        for e in [
-            FriError::Shape,
-            FriError::InvalidOpening { query: 1, round: 2 },
-            FriError::FoldMismatch { query: 1, round: 2 },
-            FriError::FinalMismatch { query: 1 },
-            FriError::ProofOfWork,
-        ] {
-            assert!(e.to_string().contains("fri"));
-        }
     }
 
     #[test]
@@ -994,7 +950,7 @@ mod tests {
         let all: usize = proof.queries.iter().flatten().map(|st| st.path.len()).sum();
         assert!(siblings.iter().map(Vec::len).sum::<usize>() < all);
 
-        let check = |proof: &FriProof, siblings: &[Vec<Digest>]| -> Result<(), FriError> {
+        let check = |proof: &FriProof, siblings: &[Vec<Digest>]| -> Result<(), Error> {
             let mut ch = transcript();
             let v = Verifier::new(
                 &CONFIG,
@@ -1028,7 +984,7 @@ mod tests {
                 let mut sent = siblings[r].iter().copied();
                 let root = batch_root(v.schedule().log_leaves(r), &idx, &leaves, || sent.next());
                 if root != Some(proof.commitments[r]) || sent.next().is_some() {
-                    return Err(FriError::InvalidOpening { query: 0, round: r });
+                    return Err(Error::InvalidFriOpening { round: r });
                 }
             }
             Ok(())
@@ -1038,13 +994,13 @@ mod tests {
         let r = (0..rounds).find(|&r| !siblings[r].is_empty()).unwrap();
         let mut bad = siblings.clone();
         bad[r][0][0] += Fp::ONE;
-        assert_eq!(check(&proof, &bad), Err(FriError::InvalidOpening { query: 0, round: r }));
+        assert_eq!(check(&proof, &bad), Err(Error::InvalidFriOpening { round: r }));
         let mut bad = siblings.clone();
         bad[r].pop();
-        assert_eq!(check(&proof, &bad), Err(FriError::InvalidOpening { query: 0, round: r }));
+        assert_eq!(check(&proof, &bad), Err(Error::InvalidFriOpening { round: r }));
         let mut bad = siblings.clone();
         bad[r].push([Fp::ZERO; 8]);
-        assert_eq!(check(&proof, &bad), Err(FriError::InvalidOpening { query: 0, round: r }));
+        assert_eq!(check(&proof, &bad), Err(Error::InvalidFriOpening { round: r }));
         // An opened value that is not the codeword's, where the fold does
         // not read it: only the tree can tell.
         let mut p = proof.clone();
@@ -1052,7 +1008,7 @@ mod tests {
         p.queries[3][0].values[(pos + 1) % 4] += Fp4::ONE;
         assert!(matches!(
             check(&p, &siblings),
-            Err(FriError::FoldMismatch { query: 3, round: 1 } | FriError::InvalidOpening { .. })
+            Err(Error::FoldMismatch { query: 3, round: 1 } | Error::InvalidFriOpening { .. })
         ));
         // A query's parts that are none: a round with no leaf, an index
         // outside the domain, an input too few.
@@ -1074,13 +1030,10 @@ mod tests {
         let steps = &proof.queries[0];
         let leaf = |r: usize| steps.get(r).map(|st| &st.values[..]);
         assert_eq!(v.query(0, index, &at, leaf, |_, _, _| true), Ok(()));
-        assert_eq!(v.query(0, index, &at, |r| leaf(r).filter(|_| r < 2), |_, _, _| true), Err(FriError::Shape));
-        assert_eq!(v.query(0, index + (1 << 11), &at, leaf, |_, _, _| true), Err(FriError::Shape));
-        assert_eq!(v.query(0, index, &at[..2], leaf, |_, _, _| true), Err(FriError::Shape));
-        assert_eq!(
-            v.query(7, index, &at, leaf, |r, _, _| r != 1),
-            Err(FriError::InvalidOpening { query: 7, round: 1 })
-        );
+        assert_eq!(v.query(0, index, &at, |r| leaf(r).filter(|_| r < 2), |_, _, _| true), Err(Error::ProofShape));
+        assert_eq!(v.query(0, index + (1 << 11), &at, leaf, |_, _, _| true), Err(Error::ProofShape));
+        assert_eq!(v.query(0, index, &at[..2], leaf, |_, _, _| true), Err(Error::ProofShape));
+        assert_eq!(v.query(7, index, &at, leaf, |r, _, _| r != 1), Err(Error::InvalidFriOpening { round: 1 }));
         assert!(size_of::<Verifier>() <= 1024);
     }
 

@@ -33,6 +33,7 @@
 //! [`TREE_HEIGHT`] can appear in at most `2^TREE_HEIGHT` inputs in total.
 
 use crate::codec::{DIGEST_BYTES, FP_BYTES, read_digest, read_u64};
+use crate::error::Error;
 use crate::hash::{DOM_COMMITMENT, DOM_PUBKEY, Digest, hash_domain};
 use crate::poseidon2::{DIGEST, Fp, digest_to_bytes};
 use crate::xmss::{PUB_SEED_LEN, PublicKey, SecretKey, Signature};
@@ -131,7 +132,11 @@ pub fn memo_to_bytes(memo: &Memo) -> [u8; MEMO_BYTES] {
 
 /// A memo from its bytes: `None` on a wrong length or a non-canonical
 /// element.
-pub fn memo_from_bytes(bytes: &[u8]) -> Option<Memo> {
+pub fn memo_from_bytes(bytes: &[u8]) -> Result<Memo, Error> {
+    memo_decode(bytes).ok_or(Error::Malformed("memo"))
+}
+
+fn memo_decode(bytes: &[u8]) -> Option<Memo> {
     if bytes.len() != MEMO_BYTES {
         return None;
     }
@@ -226,16 +231,20 @@ impl Output {
     pub fn is_encoding(bytes: &[u8]) -> bool {
         bytes.len() == OUTPUT_SIZE
             && read_digest(bytes).is_some()
-            && memo_from_bytes(&bytes[DIGEST_BYTES + 8..]).is_some()
+            && memo_from_bytes(&bytes[DIGEST_BYTES + 8..]).is_ok()
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Option<Output> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Output, Error> {
+        Self::decode(bytes).ok_or(Error::Malformed("output"))
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Output> {
         if bytes.len() != OUTPUT_SIZE {
             return None;
         }
         let (key_hash, rest) = read_digest(bytes)?;
         let (amount, rest) = read_u64(rest)?;
-        let memo = memo_from_bytes(rest)?;
+        let memo = memo_decode(rest)?;
         Some(Output::with_memo(&key_hash, amount, memo))
     }
 }
@@ -268,12 +277,16 @@ impl BlockOutput {
         out
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Option<BlockOutput> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<BlockOutput, Error> {
+        Self::decode(bytes).ok_or(Error::Malformed("block output"))
+    }
+
+    fn decode(bytes: &[u8]) -> Option<BlockOutput> {
         if bytes.len() != BLOCK_OUTPUT_SIZE {
             return None;
         }
         let (commitment, rest) = read_digest(bytes)?;
-        let memo = memo_from_bytes(&rest[..MEMO_BYTES])?;
+        let memo = memo_decode(&rest[..MEMO_BYTES])?;
         let (amount, _) = read_u64(&rest[MEMO_BYTES..])?;
         Some(BlockOutput { commitment, memo, amount })
     }
@@ -398,15 +411,19 @@ impl Input {
     /// Parses an input from the front of `bytes`, returning the rest.
     pub fn read(bytes: &[u8]) -> Option<(Input, &[u8])> {
         let (pk, rest) = bytes.split_at_checked(PublicKey::SIZE)?;
-        let pubkey = PublicKey::from_bytes(pk)?;
+        let pubkey = PublicKey::from_bytes(pk).ok()?;
         let (amount, rest) = read_u64(rest)?;
         let (position, rest) = read_u64(rest)?;
         let (sig, rest) = rest.split_at_checked(Signature::size(pubkey.height()))?;
-        let signature = Sig::from_bytes(sig, pubkey.height())?;
+        let signature = Sig::from_bytes(sig, pubkey.height()).ok()?;
         Some((Input { pubkey, amount, position, signature }, rest))
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Option<Input> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Input, Error> {
+        Self::decode(bytes).ok_or(Error::Malformed("input"))
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Input> {
         match Self::read(bytes)? {
             (input, []) => Some(input),
             _ => None,
@@ -463,10 +480,10 @@ mod tests {
             let mut buf = vec![0u8; input.size()];
             input.write_bytes(&mut buf);
             assert_eq!(buf, bytes);
-            assert_eq!(Input::from_bytes(&bytes), Some(input.clone()));
+            assert_eq!(Input::from_bytes(&bytes), Ok(input.clone()));
             assert_eq!(Input::read(&[&bytes[..], &[5, 6]].concat()), Some((input.clone(), &[5u8, 6][..])));
-            assert_eq!(Input::from_bytes(&bytes[..bytes.len() - 1]), None);
-            assert_eq!(Input::from_bytes(&[&bytes[..], &[0]].concat()), None);
+            assert!(Input::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+            assert!(Input::from_bytes(&[&bytes[..], &[0]].concat()).is_err());
             let mut moved = bytes.clone();
             moved[Input::POSITION_AT..Input::POSITION_AT + 8].copy_from_slice(&7u64.to_le_bytes());
             let moved = Input::from_bytes(&moved).unwrap();
@@ -475,7 +492,7 @@ mod tests {
             // A key that says another height: the signature is not its length.
             let mut other = bytes.clone();
             other[PublicKey::SIZE - 1] = height as u8 + 1;
-            assert_eq!(Input::from_bytes(&other), None);
+            assert!(Input::from_bytes(&other).is_err());
         }
         // An input whose signature is not of its key's height has no encoding.
         let mut a = SecretKey::generate_with_height(&[1; 32], 2);
@@ -535,8 +552,8 @@ mod tests {
             slot[MEMO_LEN + limb] = Fp::new(over);
             assert_eq!(slot_parts(&slot), None, "limb {limb}");
         }
-        assert_eq!(memo_from_bytes(&memo_to_bytes(&memo)), Some(memo));
-        assert_eq!(memo_from_bytes(&memo_to_bytes(&memo)[1..]), None);
+        assert_eq!(memo_from_bytes(&memo_to_bytes(&memo)), Ok(memo));
+        assert!(memo_from_bytes(&memo_to_bytes(&memo)[1..]).is_err());
     }
 
     /// A leaf depends on each of the commitment, the memo, the amount and
@@ -573,7 +590,11 @@ mod tests {
         for at in [0, DIGEST_BYTES - 4, DIGEST_BYTES + 8, OUTPUT_SIZE - 4] {
             let mut bad = bytes;
             bad[at..at + 4].copy_from_slice(&crate::poseidon2::P.to_le_bytes());
-            assert_eq!((Output::is_encoding(&bad), Output::from_bytes(&bad)), (false, None), "element at {at}");
+            assert_eq!(
+                (Output::is_encoding(&bad), Output::from_bytes(&bad)),
+                (false, Err(Error::Malformed("output"))),
+                "element at {at}"
+            );
         }
     }
 
@@ -587,16 +608,16 @@ mod tests {
         assert_eq!(listed.slot(), out.slot());
         let bytes = listed.to_bytes();
         assert_eq!((bytes.len(), BLOCK_OUTPUT_SIZE), (60, 60));
-        assert_eq!(BlockOutput::from_bytes(&bytes), Some(listed));
-        assert_eq!(BlockOutput::from_bytes(&bytes[1..]), None);
+        assert_eq!(BlockOutput::from_bytes(&bytes), Ok(listed));
+        assert!(BlockOutput::from_bytes(&bytes[1..]).is_err());
         for at in [0, DIGEST_BYTES - 4, DIGEST_BYTES, DIGEST_BYTES + MEMO_BYTES - 4] {
             let mut bad = bytes;
             bad[at..at + 4].copy_from_slice(&crate::poseidon2::P.to_le_bytes());
-            assert_eq!(BlockOutput::from_bytes(&bad), None, "element at {at}");
+            assert!(BlockOutput::from_bytes(&bad).is_err(), "element at {at}");
         }
         assert_eq!(BlockOutput::from(d(3)), BlockOutput { commitment: d(3), memo: EMPTY_MEMO, amount: 0 });
         crate::test_util::fuzz_decoder("BlockOutput::from_bytes", &[bytes.to_vec()], 20_000, |b| {
-            BlockOutput::from_bytes(b).map(|o| Some(o.to_bytes().to_vec()))
+            BlockOutput::from_bytes(b).ok().map(|o| Some(o.to_bytes().to_vec()))
         });
     }
 
@@ -606,13 +627,13 @@ mod tests {
     fn output_encoding() {
         let out = Output::with_memo(&d(7), u64::MAX, memo5(d(8)));
         let bytes = out.to_bytes();
-        assert_eq!(Output::from_bytes(&bytes), Some(out));
-        assert_eq!(Output::from_bytes(&bytes[1..]), None);
+        assert_eq!(Output::from_bytes(&bytes), Ok(out));
+        assert!(Output::from_bytes(&bytes[1..]).is_err());
         let mut bad = bytes;
         bad[..4].copy_from_slice(&crate::poseidon2::P.to_le_bytes()); // == p, non-canonical
-        assert_eq!(Output::from_bytes(&bad), None);
+        assert!(Output::from_bytes(&bad).is_err());
         crate::test_util::fuzz_decoder("Output::from_bytes", &[bytes.to_vec()], 20_000, |b| {
-            Output::from_bytes(b).map(|o| Some(o.to_bytes().to_vec()))
+            Output::from_bytes(b).ok().map(|o| Some(o.to_bytes().to_vec()))
         });
     }
 }
