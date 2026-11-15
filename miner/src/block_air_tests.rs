@@ -18,13 +18,13 @@ use crate::transaction::UnsignedTransaction;
 
 /// A set of outputs in a store, with the original set's ways of adding
 /// to it and of gathering witnesses from it.
-struct TestSet {
-    state: State<MemBackend>,
+pub(crate) struct TestSet {
+    pub(crate) state: State<MemBackend>,
     blocks: std::cell::Cell<u32>,
 }
 
 impl TestSet {
-    fn new() -> TestSet {
+    pub(crate) fn new() -> TestSet {
         TestSet { state: State::open(MemBackend::new(), 0).unwrap(), blocks: std::cell::Cell::new(0) }
     }
 
@@ -46,11 +46,11 @@ impl TestSet {
         Ok(position)
     }
 
-    fn next_position(&self) -> u64 {
+    pub(crate) fn next_position(&self) -> u64 {
         self.state.snapshot().unwrap().outputs().next
     }
 
-    fn root(&self) -> Digest {
+    pub(crate) fn root(&self) -> Digest {
         self.state.root()
     }
 
@@ -61,7 +61,7 @@ impl TestSet {
 
     /// Applies what `txs` spend and make at `height`, natively: what
     /// gathering their witnesses did to the original's set.
-    fn apply(&self, txs: &[Transaction], height: u32) {
+    pub(crate) fn apply(&self, txs: &[Transaction], height: u32) {
         let mut spends: Vec<u64> = txs
             .iter()
             .flat_map(|t| t.inputs.iter().map(|i| i.position).chain(t.policy_inputs.iter().map(|p| p.position)))
@@ -104,8 +104,12 @@ impl TestSet {
         self.gathered(txs, height, segments)
     }
 
-    #[allow(dead_code)]
-    fn collect_by_rows(&self, txs: &[Transaction], max_rows: usize, height: u32) -> Result<Vec<SegmentWitness>, Error> {
+    pub(crate) fn collect_by_rows(
+        &self,
+        txs: &[Transaction],
+        max_rows: usize,
+        height: u32,
+    ) -> Result<Vec<SegmentWitness>, Error> {
         let segments = SegmentWitness::collect_by_rows(&self.state.snapshot().unwrap(), txs, max_rows, height);
         self.gathered(txs, height, segments)
     }

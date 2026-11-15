@@ -2853,7 +2853,7 @@ impl BlockAir {
 pub type Leaf = Commitment;
 #[cfg(test)]
 #[path = "block_air_tests.rs"]
-mod circuit_tests;
+pub(crate) mod circuit_tests;
 
 #[cfg(test)]
 mod tests {
