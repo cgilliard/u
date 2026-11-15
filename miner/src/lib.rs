@@ -8,6 +8,8 @@ pub mod ext;
 pub mod field;
 pub mod fri;
 pub mod hash;
+pub mod hash_machine;
+pub mod hash_table;
 #[cfg(test)]
 pub mod inflate;
 pub mod merkle;
@@ -19,6 +21,7 @@ pub mod packed;
 pub mod parallel;
 pub mod policy;
 pub mod poseidon2;
+pub mod poseidon2_air;
 pub mod pow;
 pub mod random;
 pub mod stark;

@@ -98,7 +98,7 @@
 
 mod air;
 #[cfg(test)]
-mod audit;
+pub(crate) mod audit;
 mod check;
 mod config;
 mod deep;
