@@ -27,6 +27,7 @@
 //!                | names registered (2) | key (15) ...
 //!                | names replaced (2) | the record replaced ...
 //!                | names' root before (32)
+//!                | names' parts changed (2) | (index (4) | kind (1) | hash before (32)) ...
 //!                | parts changed (4) | (index (4) | was there (1) | root before (32)) ...
 //! list page   := blocks (2) | (height (4) | first page (6)) ...
 //! ```
@@ -36,6 +37,7 @@ use std::io;
 
 use super::backend::Backend;
 use super::pagefile::{Extent, MAX_UNITS, PageFile, ReadPages, Txn, UNIT};
+use super::trie::Part;
 use crate::hash::Digest;
 use crate::name::{KEY_BITS, Key, Record as NameRecord};
 use crate::poseidon2::{digest_from_bytes, digest_to_bytes};
@@ -83,6 +85,9 @@ pub struct BlockRecord {
     pub replaced: Vec<NameRecord>,
     /// The root of the names' tree before it.
     pub names_before: Digest,
+    /// The part of each part of the names it changed, as it was before
+    /// (`None` if the part had no name), ascending by index.
+    pub names_parts_before: Vec<(u32, Option<Part>)>,
     /// The root of each part of the outputs it changed, as it was before
     /// (`None` if the part was empty), ascending by index.
     pub parts_before: Vec<(u64, Option<Digest>)>,
@@ -117,6 +122,13 @@ impl BlockRecord {
             r.write_bytes(&mut out[at..]);
         }
         out.extend_from_slice(&digest_to_bytes(&self.names_before));
+        out.extend_from_slice(&(self.names_parts_before.len() as u16).to_le_bytes());
+        for (index, before) in &self.names_parts_before {
+            out.extend_from_slice(&index.to_le_bytes());
+            // Nothing, more names than one, or one.
+            out.push(before.map_or(0, |p| 1 + p.single as u8));
+            out.extend_from_slice(&digest_to_bytes(&before.map_or([crate::poseidon2::Fp::ZERO; 8], |p| p.hash)));
+        }
         out.extend_from_slice(&(self.parts_before.len() as u32).to_le_bytes());
         for (index, before) in &self.parts_before {
             out.extend_from_slice(&(*index as u32).to_le_bytes());
@@ -175,9 +187,23 @@ impl BlockRecord {
             replaced.push(r);
             b = rest;
         }
-        let (names_before, rest) = b.split_at_checked(32).ok_or_else(bad)?;
+        let (names_before, mut b) = b.split_at_checked(32).ok_or_else(bad)?;
         let names_before = digest_from_bytes(names_before).ok_or_else(bad)?;
-        let (parts, mut b) = rest.split_at_checked(4).ok_or_else(bad)?;
+        let mut names_parts_before = Vec::new();
+        for _ in 0..count(&mut b)? {
+            let (entry, rest) = b.split_at_checked(37).ok_or_else(bad)?;
+            let index = u32::from_le_bytes(entry[..4].try_into().unwrap());
+            let hash = digest_from_bytes(&entry[5..]).ok_or_else(bad)?;
+            if entry[4] > 2
+                || names_parts_before.last().is_some_and(|p: &(u32, Option<Part>)| p.0 >= index)
+                || (entry[4] == 0 && hash != [crate::poseidon2::Fp::ZERO; 8])
+            {
+                return Err(bad());
+            }
+            names_parts_before.push((index, (entry[4] > 0).then_some(Part { hash, single: entry[4] == 2 })));
+            b = rest;
+        }
+        let (parts, mut b) = b.split_at_checked(4).ok_or_else(bad)?;
         let parts = u32::from_le_bytes(parts.try_into().unwrap()) as usize;
         if b.len() != parts * 37 {
             return Err(bad());
@@ -199,6 +225,7 @@ impl BlockRecord {
         }
         Ok(BlockRecord {
             names_before,
+            names_parts_before,
             parts_before,
             registered,
             replaced,
@@ -415,6 +442,9 @@ mod tests {
                 })
                 .collect(),
             names_before: [Fp::new(height + 5); 8],
+            names_parts_before: (0..height % 3)
+                .map(|i| (i * 7, (i != 1).then_some(Part { hash: [Fp::new(i + 40); 8], single: i == 2 })))
+                .collect(),
             parts_before: (0..height as u64 % 5)
                 .map(|i| (i * 3, (i % 2 == 0).then_some([Fp::new(i as u32 + 1); 8])))
                 .collect(),

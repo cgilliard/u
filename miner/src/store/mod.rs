@@ -45,6 +45,8 @@
 //! - [`window`]: what undoes each of the last blocks.
 //! - [`state`]: the two under one root record, with the block they are
 //!   the state after: what a node applies blocks to.
+//! - [`receive`]: a state taken from other nodes part by part, each
+//!   part checked, until it is one to go on from.
 //!
 //! Memory is what these hold and no more: the map of free space (a bit
 //! for every 512 bytes of the file), a transaction's write buffer, and
@@ -56,6 +58,7 @@ pub mod freemap;
 pub mod names;
 pub mod outputs;
 pub mod pagefile;
+pub mod receive;
 pub mod sparse;
 pub mod state;
 #[cfg(test)]

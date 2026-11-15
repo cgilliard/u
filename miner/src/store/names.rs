@@ -31,6 +31,10 @@ use crate::hash::{DOM_NAME_LEAF, Digest, hash_domain};
 use crate::name::{KEY_BITS, KEY_LIMBS, Key, Record, key_limbs};
 use crate::poseidon2::{DIGEST, Fp, compress};
 
+/// The level of the subtrees the names are handed to another node in:
+/// 4,096 parts, by the first twelve bits of a key.
+pub const PART_LEVEL: u32 = 108;
+
 fn corrupt(what: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what)
 }
@@ -124,6 +128,23 @@ impl Tree for NameTree {
             _ => corrupt("a change to the names cannot be made").into(),
         }
     }
+}
+
+/// The root of the names' tree whose nonempty subtrees at `level` have
+/// the parts `parts` (ascending by index): what a node that is given the
+/// names in parts checks against the names' root.
+pub fn parts_root(level: u32, parts: &[(u32, Part)]) -> Digest {
+    let parts: Vec<(u128, Part)> = parts.iter().map(|(i, p)| (*i as u128, *p)).collect();
+    canonical(level, NameTree::HEIGHT, &parts).map_or_else(empty_root, |p| p.hash)
+}
+
+/// The part of the subtree at `level` whose names are `records`
+/// (ascending by key): what a part received is checked against. `None`
+/// if there are none.
+pub fn part_of(level: u32, records: &[Record]) -> Option<Part> {
+    let leaves: Vec<(u128, Part)> =
+        records.iter().map(|r| (r.key(), Part { hash: leaf_hash(r.key(), &r.leaf_value()), single: true })).collect();
+    canonical(0, level, &leaves)
 }
 
 /// What a key's path ends at.
@@ -295,6 +316,38 @@ impl Names {
         self.pass(txn, Edits { puts, ..Edits::none() })
     }
 
+    /// [`Names::apply`], which also returns the part of every subtree at
+    /// `level` the puts change, as it was before them (`None` where there
+    /// was no name).
+    #[allow(clippy::type_complexity)]
+    pub fn apply_keeping<B: Backend>(
+        &self,
+        txn: &mut Txn<'_, B>,
+        puts: &[(Key, Record, bool)],
+        level: u32,
+    ) -> Result<(Names, Vec<(u32, Option<Part>)>), Error> {
+        debug_assert!(puts.windows(2).all(|w| w[0].0 < w[1].0), "keys ascend");
+        let edits: Edits<'_, NameTree> = Edits { puts, ..Edits::none() };
+        let (root, change, before) = trie::update_keeping(txn, self.root, 0, edits, level)?;
+        let count = self.count.checked_add_signed(change).ok_or_else(|| corrupt("the count of names is wrong"))?;
+        Ok((Names { root, count }, before.into_iter().map(|(i, part)| (i as u32, part)).collect()))
+    }
+
+    /// The part of every nonempty subtree at `level`, ascending by index.
+    pub fn parts(&self, pages: &impl ReadPages, level: u32) -> io::Result<Vec<(u32, Part)>> {
+        let mut out = Vec::new();
+        trie::parts_at::<NameTree>(pages, self.root, level, &mut |index, part| out.push((index as u32, part)))?;
+        Ok(out)
+    }
+
+    /// Every name's record in the subtree of index `index` at `level`,
+    /// in key order.
+    pub fn part(&self, pages: &impl ReadPages, level: u32, index: u32) -> io::Result<Vec<Record>> {
+        let mut out = Vec::new();
+        trie::for_each_in::<NameTree>(pages, self.root, level, index as u128, &mut |_, record, _| out.push(*record))?;
+        Ok(out)
+    }
+
     /// The names before a block: the records it replaced are put back
     /// (`restore`, ascending) and those it registered are removed
     /// (`remove`, ascending).
@@ -306,6 +359,19 @@ impl Names {
     ) -> Result<Names, Error> {
         debug_assert!(restore.iter().all(|p| p.2), "what is put back replaces");
         self.pass(txn, Edits { puts: restore, removes: remove, ..Edits::none() })
+    }
+
+    /// The names with those at `removes` taken out and `puts` put in
+    /// (both ascending, each put where no name is left): how a part of
+    /// a state being received is put in place of an older one.
+    pub fn exchange<B: Backend>(
+        &self,
+        txn: &mut Txn<'_, B>,
+        removes: &[Key],
+        puts: &[(Key, Record, bool)],
+    ) -> Result<Names, Error> {
+        debug_assert!(puts.windows(2).all(|w| w[0].0 < w[1].0) && puts.iter().all(|p| !p.2 && p.0 == p.1.key()));
+        self.pass(txn, Edits { removes, puts, ..Edits::none() })
     }
 
     /// The record registered at `key`, if any.

@@ -337,6 +337,21 @@ impl Outputs {
         self.pass(txn, 0, Edits { puts: outputs, ..Edits::none() }, next.max(self.next))
     }
 
+    /// The set with the outputs at `removes` taken out and `puts` put
+    /// in (both ascending, each put where no output is left), and `next`
+    /// the next position: how a part of a state being received is put
+    /// in place of an older one.
+    pub fn exchange<B: Backend>(
+        &self,
+        txn: &mut Txn<'_, B>,
+        removes: &[u64],
+        puts: &[(u64, Record, bool)],
+        next: u64,
+    ) -> Result<Outputs, Error> {
+        debug_assert!(puts.windows(2).all(|w| w[0].0 < w[1].0) && puts.iter().all(|o| !o.2 && o.0 < next));
+        self.pass(txn, 0, Edits { removes, puts, ..Edits::none() }, next)
+    }
+
     /// The set before a block that spent `spends` (ascending) and made
     /// the outputs from position `next` on: those are removed, and the
     /// spent ones are unspent again. `height` is the block's less one.

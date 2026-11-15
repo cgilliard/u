@@ -123,6 +123,11 @@ pub enum Error {
     NoSuchName,
     /// The state after a block is not the one its header commits to.
     StateRoot,
+    /// A part of a state received is not the part its root says, or the
+    /// parts' roots are not the state's.
+    PartRoot,
+    /// A state received is not whole yet.
+    PartsMissing,
     /// The block to undo is older than the window of blocks whose
     /// records are kept.
     NoUndoRecord,
@@ -184,6 +189,8 @@ impl fmt::Display for Error {
             Error::NameTaken => f.write_str("the name is already registered"),
             Error::NoSuchName => f.write_str("the name is not registered"),
             Error::StateRoot => f.write_str("the state after the block is not its header's"),
+            Error::PartRoot => f.write_str("a part of the state received is not what its root says"),
+            Error::PartsMissing => f.write_str("the state received is not whole yet"),
             Error::NoUndoRecord => f.write_str("no record is kept to undo the block with"),
             Error::Io(kind) => write!(f, "the store failed: {kind}"),
         }
@@ -240,6 +247,8 @@ mod tests {
             Error::NameTaken,
             Error::NoSuchName,
             Error::StateRoot,
+            Error::PartRoot,
+            Error::PartsMissing,
             Error::NoUndoRecord,
             Error::Io(std::io::ErrorKind::InvalidData),
         ];

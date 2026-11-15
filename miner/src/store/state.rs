@@ -40,16 +40,21 @@
 //!   roots now, with those any block since changed put back as its
 //!   record has them. They hash to the outputs' root as of the block, so
 //!   each part that arrives is checked alone, against its root.
+//! - The names go the same way, in parts by the first bits of their
+//!   keys: the names of a part as of the block are those it has now,
+//!   less those registered since, with the records replaced since as
+//!   they were.
 
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use super::backend::Backend;
-use super::names::{NameProof, Names};
+use super::names::{NameProof, Names, PART_LEVEL as NAME_PART_LEVEL};
 use super::outputs::{Outputs, PART_LEVEL, Record};
 use super::pagefile::{PageFile, Pin, Root};
 use super::sparse::STATE_HEIGHT;
+use super::trie::Part;
 use super::window::{BlockRecord, Window};
 use crate::error::Error;
 use crate::hash::Digest;
@@ -57,6 +62,9 @@ use crate::name::{Key, Record as NameRecord};
 use crate::poseidon2::{DIGEST, Fp, compress, digest_from_bytes, digest_to_bytes};
 
 const VERSION: u8 = 1;
+/// What a root record begins with while its state is still being
+/// received from other nodes ([`super::receive`]): not a state to open.
+pub(super) const RECEIVING: u8 = 2;
 const RECORD: usize = 1 + 4 + 32 + Outputs::BYTES + Names::BYTES + Window::BYTES + 8;
 const NAMES_AT: usize = 37 + Outputs::BYTES;
 /// Records the sweep goes past with a block, at least.
@@ -102,16 +110,16 @@ impl<B: Backend + 'static> Drop for State<B> {
 
 /// What a root record says the state is.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Meta {
+pub(super) struct Meta {
     /// The height of the block the state is the state after; 0 with
     /// `tip` zero before any block.
-    height: u32,
-    tip: Digest,
-    outputs: Outputs,
-    names: Names,
-    window: Window,
+    pub(super) height: u32,
+    pub(super) tip: Digest,
+    pub(super) outputs: Outputs,
+    pub(super) names: Names,
+    pub(super) window: Window,
     /// The position the sweep of the outputs has reached.
-    sweep: u64,
+    pub(super) sweep: u64,
 }
 
 impl Meta {
@@ -126,7 +134,7 @@ impl Meta {
         }
     }
 
-    fn to_bytes(&self) -> [u8; RECORD] {
+    pub(super) fn to_bytes(&self) -> [u8; RECORD] {
         let mut out = Vec::with_capacity(RECORD);
         out.push(VERSION);
         out.extend_from_slice(&self.height.to_le_bytes());
@@ -157,6 +165,9 @@ impl Meta {
         let b = root.payload();
         if b.is_empty() && root.seq == 0 {
             return Ok((0, [Fp::ZERO; DIGEST], Outputs::EMPTY, Names::EMPTY));
+        }
+        if b.first() == Some(&RECEIVING) {
+            return Err(corrupt("the state is still being received"));
         }
         if b.len() != RECORD || b[0] != VERSION {
             return Err(corrupt("the state's root record is not one"));
@@ -198,6 +209,8 @@ pub struct State<B: Backend + 'static> {
     keep: usize,
     /// The level of the outputs' parts.
     part_level: u32,
+    /// The level of the names' parts.
+    name_level: u32,
     /// The thread that rebuilds the file's map of free space, until it
     /// has been waited for.
     marking: Mutex<Option<JoinHandle<Result<(), io::ErrorKind>>>>,
@@ -219,12 +232,45 @@ impl<B: Backend + 'static> State<B> {
     /// ([`super::pagefile`]). [`State::wait_ready`] waits for it.
     pub fn open(backend: B, keep: usize) -> io::Result<State<B>> {
         let state = State::open_idle(backend, keep)?;
-        if !state.file.is_sealed() {
-            let (file, meta) = (state.file.clone(), state.meta().clone());
-            let thread = std::thread::Builder::new().name("state-map".into());
-            *state.marking.lock().unwrap() = Some(thread.spawn(move || mark_all(&file, &meta))?);
-        }
+        state.start()?;
         Ok(state)
+    }
+
+    /// Starts the thread that rebuilds the map, if it is not whole.
+    fn start(&self) -> io::Result<()> {
+        if !self.file.is_sealed() {
+            let (file, meta) = (self.file.clone(), self.meta().clone());
+            let thread = std::thread::Builder::new().name("state-map".into());
+            *self.marking.lock().unwrap() = Some(thread.spawn(move || mark_all(&file, &meta))?);
+        }
+        Ok(())
+    }
+
+    /// The state of a file whose root record is `meta`'s: one just
+    /// received whole.
+    pub(super) fn of(file: PageFile<B>, meta: Meta, keep: usize) -> io::Result<State<B>> {
+        let state = State::with(file, meta, keep);
+        state.start()?;
+        Ok(state)
+    }
+
+    /// Tests: parts at other levels, so that small states have many.
+    #[cfg(test)]
+    pub(super) fn set_levels(&mut self, outputs: u32, names: u32) {
+        (self.part_level, self.name_level) = (outputs, names);
+    }
+
+    fn with(file: PageFile<B>, meta: Meta, keep: usize) -> State<B> {
+        State {
+            file: Arc::new(file),
+            meta: Mutex::new(meta),
+            keep,
+            part_level: PART_LEVEL,
+            name_level: NAME_PART_LEVEL,
+            marking: Mutex::new(None),
+            #[cfg(test)]
+            times: Mutex::new([std::time::Duration::ZERO; 4]),
+        }
     }
 
     /// As [`State::open`], with no thread started: the map is rebuilt
@@ -232,15 +278,7 @@ impl<B: Backend + 'static> State<B> {
     fn open_idle(backend: B, keep: usize) -> io::Result<State<B>> {
         let file = PageFile::open_or_create(backend)?;
         let meta = Meta::read(&file, &file.root())?;
-        Ok(State {
-            file: Arc::new(file),
-            meta: Mutex::new(meta),
-            keep,
-            part_level: PART_LEVEL,
-            marking: Mutex::new(None),
-            #[cfg(test)]
-            times: Mutex::new([std::time::Duration::ZERO; 4]),
-        })
+        Ok(State::with(file, meta, keep))
     }
 
     /// Rebuilds the map on the calling thread, from the state as it is:
@@ -311,6 +349,11 @@ impl<B: Backend + 'static> State<B> {
         let level = self.part_level;
         let mut parts: std::collections::BTreeMap<u64, Digest> = meta.outputs.parts(&pin, level)?.into_iter().collect();
         let (mut block, mut next, mut names_root) = (meta.tip, meta.outputs.next, meta.names.hash());
+        let name_level = self.name_level;
+        let mut name_parts: std::collections::BTreeMap<u32, Part> =
+            meta.names.parts(&pin, name_level)?.into_iter().collect();
+        // The names changed since: each as it was, or that it was not.
+        let mut names_then: std::collections::BTreeMap<Key, Option<NameRecord>> = std::collections::BTreeMap::new();
         // How many outputs each part has had spent since, then which.
         let mut spent: std::collections::BTreeMap<u64, Vec<u32>> = std::collections::BTreeMap::new();
         for h in (height + 1..=meta.height).rev() {
@@ -320,6 +363,19 @@ impl<B: Backend + 'static> State<B> {
                     Some(root) => parts.insert(*index, *root),
                     None => parts.remove(index),
                 };
+            }
+            for (index, before) in &record.names_parts_before {
+                match before {
+                    Some(part) => name_parts.insert(*index, *part),
+                    None => name_parts.remove(index),
+                };
+            }
+            // Blocks are met newest first, so the oldest has the last word.
+            for key in &record.registered {
+                names_then.insert(*key, None);
+            }
+            for old in &record.replaced {
+                names_then.insert(old.key(), Some(*old));
             }
             for p in &record.spends {
                 spent.entry(p >> level).or_default().push((p & ((1 << level) - 1)) as u32);
@@ -341,6 +397,10 @@ impl<B: Backend + 'static> State<B> {
             names_root,
             parts: parts.into_iter().collect(),
             spent,
+            names: meta.names,
+            name_level,
+            name_parts: name_parts.into_iter().collect(),
+            names_then,
         })
     }
 
@@ -370,7 +430,8 @@ impl<B: Backend + 'static> State<B> {
         for (key, _, _) in block.names.iter().filter(|n| n.2) {
             replaced.push(meta.names.get(&txn, *key)?.ok_or(Error::NoSuchName)?);
         }
-        meta.names = meta.names.apply(&mut txn, block.names)?;
+        let (names, names_parts_before) = meta.names.apply_keeping(&mut txn, block.names, self.name_level)?;
+        meta.names = names;
         let root = state_root(&meta.outputs, &meta.names);
         if block.state_root.is_some_and(|want| want != root) {
             return Err(Error::StateRoot);
@@ -384,6 +445,7 @@ impl<B: Backend + 'static> State<B> {
             registered: block.names.iter().filter(|n| !n.2).map(|n| n.0).collect(),
             replaced,
             names_before,
+            names_parts_before,
             parts_before,
         };
         meta.window.push(&mut txn, &record, self.keep)?;
@@ -447,6 +509,12 @@ pub struct Past<'a, B: Backend + 'static> {
     parts: Vec<(u64, Digest)>,
     /// The outputs spent since, by part: each its place within the part.
     spent: std::collections::BTreeMap<u64, Vec<u32>>,
+    /// The names as they are now.
+    names: Names,
+    name_level: u32,
+    name_parts: Vec<(u32, Part)>,
+    /// The names changed since: each as it was, or that it was not.
+    names_then: std::collections::BTreeMap<Key, Option<NameRecord>>,
 }
 
 impl<B: Backend + 'static> Past<'_, B> {
@@ -473,6 +541,37 @@ impl<B: Backend + 'static> Past<'_, B> {
     /// The root of the names' tree.
     pub fn names_root(&self) -> Digest {
         self.names_root
+    }
+
+    /// The level of the names' parts.
+    pub fn name_level(&self) -> u32 {
+        self.name_level
+    }
+
+    /// Each part of the names, ascending by index. They hash to the
+    /// names' root ([`super::names::parts_root`]).
+    pub fn name_parts(&self) -> &[(u32, Part)] {
+        &self.name_parts
+    }
+
+    /// The names of the part of index `index`, ascending by key: those
+    /// it has now, less those registered since, the records replaced
+    /// since as they were.
+    pub fn names_part(&self, index: u32) -> io::Result<Vec<NameRecord>> {
+        let (from, to) = ((index as Key) << self.name_level, (index as Key + 1) << self.name_level);
+        let mut then = self.names_then.range(from..to).peekable();
+        let mut out = Vec::new();
+        for now in self.names.part(&self.pin, self.name_level, index)? {
+            match then.next_if(|t| *t.0 == now.key()) {
+                Some((_, was)) => out.extend(*was),
+                None => out.push(now),
+            }
+        }
+        // Every name changed since is one there is now: none is removed.
+        match then.next() {
+            None => Ok(out),
+            Some(_) => Err(corrupt("a name the window changed is not in the names")),
+        }
     }
 
     /// The state's root: the one the block's header commits to.
@@ -1189,6 +1288,97 @@ mod tests {
         assert_ne!(state.past(1).unwrap().names_root(), state.past(2).unwrap().names_root());
     }
 
+    /// The names as of any block of the window are handed over in parts
+    /// and checked: each part against its own, the parts against the
+    /// names' root, and that with the outputs' against the state's.
+    #[test]
+    fn the_names_as_of_any_block_of_the_window() {
+        use crate::store::names::{part_of, parts_root};
+        use std::collections::BTreeMap;
+        // Parts of a sixteenth of the keys, with many names each, and
+        // the parts as they are, with few.
+        for level in [116, NAME_PART_LEVEL] {
+            let mut rng = Rng::new(0x4a57 + level as u64);
+            let d = |rng: &mut Rng| -> Digest { core::array::from_fn(|_| rng.fp()) };
+            let mut state = State::open(MemBackend::new(), 5).unwrap();
+            state.name_level = level;
+            // The names after each block, and the root.
+            let mut then: Vec<(BTreeMap<Key, NameRecord>, Digest)> = vec![(BTreeMap::new(), state.root())];
+            let check = |state: &State<MemBackend>, then: &[(BTreeMap<Key, NameRecord>, Digest)]| {
+                let tip = then.len() - 1;
+                // After a block is undone the window reaches one less far.
+                for height in state.oldest_undo().map_or(tip, |o| o as usize - 1)..=tip {
+                    let past = state.past(height as u32).unwrap();
+                    assert_eq!(past.root(), then[height].1, "as of block {height} at {tip}");
+                    assert_eq!(parts_root(level, past.name_parts()), past.names_root());
+                    let mut all = BTreeMap::new();
+                    for (index, part) in past.name_parts() {
+                        let names = past.names_part(*index).unwrap();
+                        assert!(names.iter().all(|r| (r.key() >> level) as u32 == *index));
+                        assert_eq!(part_of(level, &names), Some(*part), "part {index} as of block {height}");
+                        assert_ne!(part_of(level, &names[1..]), Some(*part));
+                        all.extend(names.into_iter().map(|r| (r.key(), r)));
+                    }
+                    assert_eq!(all, then[height].0, "as of block {height} at {tip}");
+                    let absent = (0..1u32 << (120 - level)).find(|i| past.name_parts().iter().all(|p| p.0 != *i));
+                    if let Some(index) = absent {
+                        assert!(past.names_part(index).unwrap().is_empty());
+                    }
+                }
+            };
+            let mut serial = 0u32;
+            for (height, (adds, changes)) in
+                [(1, 0), (40, 0), (0, 0), (60, 10), (3, 30), (0, 1), (200, 50), (10, 10)].into_iter().enumerate()
+            {
+                let height = height as u32 + 1;
+                let mut names = then.last().unwrap().0.clone();
+                let mut puts: BTreeMap<Key, (NameRecord, bool)> = BTreeMap::new();
+                let known: Vec<NameRecord> = names.values().copied().collect();
+                for _ in 0..changes.min(known.len()) {
+                    let old = known[rng.next_u64() as usize % known.len()];
+                    puts.insert(
+                        old.key(),
+                        (
+                            NameRecord {
+                                name: old.name,
+                                ..NameRecord::new(b"x", d(&mut rng), d(&mut rng), d(&mut rng)).unwrap()
+                            },
+                            true,
+                        ),
+                    );
+                }
+                for _ in 0..adds {
+                    serial += 1;
+                    let new = NameRecord::new(format!("n{serial}").as_bytes(), d(&mut rng), d(&mut rng), d(&mut rng))
+                        .unwrap();
+                    puts.insert(new.key(), (new, false));
+                }
+                let puts: Vec<(Key, NameRecord, bool)> =
+                    puts.into_iter().map(|(k, (r, replaces))| (k, r, replaces)).collect();
+                names.extend(puts.iter().map(|p| (p.0, p.1)));
+                let outputs = [record(&mut rng, height)];
+                let block = BlockEdit {
+                    height,
+                    block: id(height, 0),
+                    spends: &[],
+                    outputs: &outputs,
+                    names: &puts,
+                    state_root: None,
+                };
+                let root = state.apply(&block).unwrap();
+                then.push((names, root));
+                check(&state, &then);
+            }
+            // A block undone, and the file opened again.
+            state.undo().unwrap();
+            then.pop();
+            check(&state, &then);
+            let mut again = State::open(MemBackend::from_image(state.file().backend().image(Lost::All)), 5).unwrap();
+            again.name_level = level;
+            check(&again, &then);
+        }
+    }
+
     /// On a real file, closed and opened.
     #[test]
     fn on_a_real_file() {
@@ -1391,6 +1581,34 @@ mod tests {
             peak_memory()
         );
         assert_eq!(past.next(), unspent_end);
+
+        // The same parts put by a node that receives: each checked
+        // against its root, put in its trie and made durable.
+        {
+            use crate::store::receive::{Receiving, Target};
+            let into = dir.join("received");
+            let _ = std::fs::remove_file(&into);
+            let target = Target { height: start, block: past.tip().1, state_root: past.root(), next: past.next() };
+            let parts: Vec<(u64, Vec<(u64, Record)>)> =
+                taken.iter().map(|(index, _)| (*index, past.part(*index).unwrap())).collect();
+            let mut receiving =
+                Receiving::open(Counting::open(&into), target, past.parts(), past.name_parts()).unwrap();
+            let t = std::time::Instant::now();
+            for (index, part) in &parts {
+                receiving.put(*index, part).unwrap();
+            }
+            let took = t.elapsed();
+            let left = receiving.missing().len();
+            println!(
+                "received: {} parts put in {took:.2?}, {:.1?} a part; {left} still to come, about {:.0}s at that rate; file {} KB a part",
+                parts.len(),
+                took / parts.len() as u32,
+                took.as_secs_f64() / parts.len() as f64 * left as f64,
+                std::fs::metadata(&into).unwrap().len() / parts.len() as u64 / 1024,
+            );
+            drop(receiving);
+            std::fs::remove_file(&into).unwrap();
+        }
         drop(past);
         // Undone to where it began, so that a kept file is as it was.
         while state.tip().0 > start {

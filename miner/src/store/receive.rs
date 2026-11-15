@@ -1,0 +1,661 @@
+//! A state taken from other nodes, part by part.
+//!
+//! A node that joins does not apply every block there has been: it takes
+//! the state as of one block from the nodes there are
+//! ([`super::state::Past`]) and goes on from that block. What it knows
+//! beforehand is the block and the state root its header commits to
+//! ([`Target`]); everything else it is handed is checked against that
+//! root before it is kept:
+//!
+//! - the roots of the parts of the outputs and of the names, which must
+//!   hash to the state's root;
+//! - each part, which must hash to its root among those.
+//!
+//! So the parts can come from any nodes, in any order, and a node that
+//! hands over something else is found out by that one part.
+//!
+//! # Stopped and gone on with
+//!
+//! Each part is durable when it is put: the file's root record says the
+//! state is being received and for which block, and holds the tries as
+//! far as they have got. Opened again, with the parts' roots asked for
+//! again, what is wanted is what the tries do not hold yet. Nothing more
+//! is stored to know it.
+//!
+//! # Another block
+//!
+//! If the taking outlasts the window of the nodes that serve it, it is
+//! gone on with for a later block: opened with that block's roots, the
+//! parts whose roots are the same are kept, and only those that changed
+//! are asked for again, each put in place of what there was.
+//!
+//! Until the state is whole the file cannot be opened as a state
+//! ([`super::state::State::open`] refuses it); [`Receiving::finish`]
+//! makes it one, with no block to undo.
+
+use std::collections::BTreeMap;
+use std::io;
+
+use super::backend::Backend;
+use super::names::{self, Names, PART_LEVEL as NAME_PART_LEVEL};
+use super::outputs::{self, HEIGHT, Outputs, PART_LEVEL, Record};
+use super::pagefile::PageFile;
+use super::state::{Meta, RECEIVING, State};
+use super::trie::Part;
+use super::window::Window;
+use crate::error::Error;
+use crate::hash::Digest;
+use crate::name::{KEY_BITS, Key, Record as NameRecord};
+use crate::poseidon2::{compress, digest_from_bytes, digest_to_bytes};
+
+/// The root record while receiving: what it begins with, the block's
+/// height and id, the tries so far, the state root wanted and the
+/// position after the last output.
+const RECORD: usize = 1 + 4 + 32 + Outputs::BYTES + Names::BYTES + 32 + 8;
+
+fn corrupt(what: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, what)
+}
+
+/// The block a state is received as of, and what is known of its state
+/// beforehand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Target {
+    pub height: u32,
+    /// The block's id.
+    pub block: Digest,
+    /// The state root its header commits to.
+    pub state_root: Digest,
+    /// The position the next output after it takes.
+    pub next: u64,
+}
+
+/// A state being received: see the module.
+pub struct Receiving<B: Backend + 'static> {
+    file: PageFile<B>,
+    target: Target,
+    outputs: Outputs,
+    names: Names,
+    level: u32,
+    name_level: u32,
+    /// The root of each part of the outputs as of the block, and of each
+    /// part held now.
+    want: BTreeMap<u64, Digest>,
+    have: BTreeMap<u64, Digest>,
+    /// The same of the names.
+    want_names: BTreeMap<u32, Part>,
+    have_names: BTreeMap<u32, Part>,
+}
+
+impl<B: Backend + 'static> Receiving<B> {
+    /// Begins to receive the state as of `target` into the file of
+    /// `backend`, or goes on: the file holds nothing, or a state being
+    /// received, for this block or another.
+    ///
+    /// `parts` and `name_parts` are the roots of the state's parts as
+    /// another node gave them ([`super::state::Past::parts`],
+    /// [`super::state::Past::name_parts`]): [`Error::PartRoot`] if they
+    /// do not hash to the target's state root. A file that holds a whole
+    /// state is refused (`AlreadyExists`).
+    pub fn open(
+        backend: B,
+        target: Target,
+        parts: &[(u64, Digest)],
+        name_parts: &[(u32, Part)],
+    ) -> Result<Receiving<B>, Error> {
+        Receiving::open_at(backend, target, parts, name_parts, PART_LEVEL, NAME_PART_LEVEL)
+    }
+
+    fn open_at(
+        backend: B,
+        target: Target,
+        parts: &[(u64, Digest)],
+        name_parts: &[(u32, Part)],
+        level: u32,
+        name_level: u32,
+    ) -> Result<Receiving<B>, Error> {
+        // What was handed over, against the root: first that it is a
+        // list of parts at all, since the hashing takes that for granted.
+        let ordered = parts.windows(2).all(|w| w[0].0 < w[1].0) && name_parts.windows(2).all(|w| w[0].0 < w[1].0);
+        let in_range = target.next <= 1 << HEIGHT
+            && parts.last().is_none_or(|p| p.0 < target.next.div_ceil(1 << level))
+            && name_parts.last().is_none_or(|p| (p.0 as u64) < 1 << (KEY_BITS as u32 - name_level));
+        if !ordered || !in_range {
+            return Err(Error::PartRoot);
+        }
+        let root = compress(&outputs::parts_root(level, parts), &names::parts_root(name_level, name_parts));
+        if root != target.state_root {
+            return Err(Error::PartRoot);
+        }
+
+        let file = PageFile::open_or_create(backend)?;
+        let (outputs, names) = {
+            let root = file.root();
+            let b = root.payload();
+            if b.is_empty() && root.seq == 0 {
+                (Outputs::EMPTY, Names::EMPTY)
+            } else if b.len() == RECORD && b[0] == RECEIVING {
+                let names_at = 37 + Outputs::BYTES;
+                (Outputs::from_bytes(&b[37..names_at])?, Names::from_bytes(&b[names_at..names_at + Names::BYTES])?)
+            } else {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "the file holds a state").into());
+            }
+        };
+        // A file gone on with: what of it is in use is all the tries
+        // reach, known before anything is put in place of anything.
+        if !file.is_sealed() {
+            outputs.mark(&file)?;
+            names.mark(&file)?;
+            file.seal();
+        }
+        let mut this = Receiving {
+            have: outputs.parts(&file, level)?.into_iter().collect(),
+            have_names: names.parts(&file, name_level)?.into_iter().collect(),
+            want: parts.iter().copied().collect(),
+            want_names: name_parts.iter().copied().collect(),
+            file,
+            target,
+            outputs,
+            names,
+            level,
+            name_level,
+        };
+        // Parts held for another block that this one's state has not.
+        let gone: Vec<u64> = this.have.keys().filter(|i| !this.want.contains_key(i)).copied().collect();
+        for index in gone {
+            this.exchange(index, &[])?;
+        }
+        let gone: Vec<u32> = this.have_names.keys().filter(|i| !this.want_names.contains_key(i)).copied().collect();
+        for index in gone {
+            this.exchange_names(index, &[])?;
+        }
+        // The block is the file's from here on, before any part of it.
+        let txn = this.file.begin()?;
+        txn.commit(&this.record())?;
+        Ok(this)
+    }
+
+    /// The block the state is received as of.
+    pub fn target(&self) -> &Target {
+        &self.target
+    }
+
+    /// The parts of the outputs still to be put, ascending.
+    pub fn missing(&self) -> Vec<u64> {
+        self.want.iter().filter(|(i, root)| self.have.get(i) != Some(root)).map(|(i, _)| *i).collect()
+    }
+
+    /// The parts of the names still to be put, ascending.
+    pub fn missing_names(&self) -> Vec<u32> {
+        self.want_names.iter().filter(|(i, part)| self.have_names.get(i) != Some(part)).map(|(i, _)| *i).collect()
+    }
+
+    /// Puts the part of the outputs of index `index`: its unspent
+    /// outputs as of the block, ascending by position
+    /// ([`super::state::Past::part`]). Durable when this returns.
+    /// [`Error::PartRoot`], with nothing changed, if they are not that
+    /// part.
+    pub fn put(&mut self, index: u64, outputs: &[(u64, Record)]) -> Result<(), Error> {
+        let Some(want) = self.want.get(&index) else { return Err(Error::PartRoot) };
+        let sound = outputs.windows(2).all(|w| w[0].0 < w[1].0)
+            && outputs.iter().all(|o| o.0 >> self.level == index && o.0 < self.target.next);
+        if !sound || outputs::part_root(self.level, outputs) != *want {
+            return Err(Error::PartRoot);
+        }
+        if self.have.get(&index) == Some(want) {
+            return Ok(());
+        }
+        self.exchange(index, outputs)
+    }
+
+    /// Puts the part of the names of index `index`: its names' records
+    /// as of the block, ascending by key
+    /// ([`super::state::Past::names_part`]). As [`Receiving::put`].
+    pub fn put_names(&mut self, index: u32, records: &[NameRecord]) -> Result<(), Error> {
+        let Some(want) = self.want_names.get(&index) else { return Err(Error::PartRoot) };
+        let sound = records.windows(2).all(|w| w[0].key() < w[1].key())
+            && records.iter().all(|r| r.key() >> self.name_level == index as Key);
+        if !sound || names::part_of(self.name_level, records) != Some(*want) {
+            return Err(Error::PartRoot);
+        }
+        if self.have_names.get(&index) == Some(want) {
+            return Ok(());
+        }
+        self.exchange_names(index, records)
+    }
+
+    /// The state, whole: the file is one a state is opened of from here
+    /// on, at the block, with no block to undo. `keep` is the length of
+    /// its window. [`Error::PartsMissing`] if parts are still to be put.
+    pub fn finish(self, keep: usize) -> Result<State<B>, Error> {
+        if self.have != self.want || self.have_names != self.want_names {
+            return Err(Error::PartsMissing);
+        }
+        // Every part was checked, so this is the root unless the file
+        // lost something since.
+        if compress(&self.outputs.hash(), &self.names.hash()) != self.target.state_root {
+            return Err(corrupt("the state received is not the block's").into());
+        }
+        let meta = Meta {
+            height: self.target.height,
+            tip: self.target.block,
+            outputs: Outputs { next: self.target.next, ..self.outputs },
+            names: self.names,
+            window: Window::default(),
+            sweep: 0,
+        };
+        let txn = self.file.begin()?;
+        txn.commit(&meta.to_bytes())?;
+        Ok(State::of(self.file, meta, keep)?)
+    }
+
+    fn record(&self) -> [u8; RECORD] {
+        let mut out = Vec::with_capacity(RECORD);
+        out.push(RECEIVING);
+        out.extend_from_slice(&self.target.height.to_le_bytes());
+        out.extend_from_slice(&digest_to_bytes(&self.target.block));
+        out.extend_from_slice(&self.outputs.to_bytes());
+        out.extend_from_slice(&self.names.to_bytes());
+        out.extend_from_slice(&digest_to_bytes(&self.target.state_root));
+        out.extend_from_slice(&self.target.next.to_le_bytes());
+        out.try_into().unwrap()
+    }
+
+    /// Puts `outputs` in place of what the part of index `index` holds:
+    /// what is in both stays, since a position's output never changes.
+    fn exchange(&mut self, index: u64, outputs: &[(u64, Record)]) -> Result<(), Error> {
+        let held = match self.have.contains_key(&index) {
+            true => self.outputs.part(&self.file, self.level, index)?,
+            false => Vec::new(),
+        };
+        let removes: Vec<u64> =
+            held.iter().map(|h| h.0).filter(|p| outputs.binary_search_by_key(p, |o| o.0).is_err()).collect();
+        let puts: Vec<(u64, Record, bool)> = outputs
+            .iter()
+            .filter(|o| held.binary_search_by_key(&o.0, |h| h.0).is_err())
+            .map(|o| (o.0, o.1, false))
+            .collect();
+        let mut txn = self.file.begin()?;
+        self.outputs = self.outputs.exchange(&mut txn, &removes, &puts, self.target.next)?;
+        txn.commit(&self.record())?;
+        match self.want.get(&index).filter(|_| !outputs.is_empty()) {
+            Some(root) => self.have.insert(index, *root),
+            None => self.have.remove(&index),
+        };
+        Ok(())
+    }
+
+    /// The same of the names, whose records do change: one held with
+    /// another record is taken out and put again.
+    fn exchange_names(&mut self, index: u32, records: &[NameRecord]) -> Result<(), Error> {
+        let held = match self.have_names.contains_key(&index) {
+            true => self.names.part(&self.file, self.name_level, index)?,
+            false => Vec::new(),
+        };
+        let same =
+            |a: &[NameRecord], r: &NameRecord| a.binary_search_by_key(&r.key(), |x| x.key()).is_ok_and(|i| a[i] == *r);
+        let removes: Vec<Key> = held.iter().filter(|h| !same(records, h)).map(|h| h.key()).collect();
+        let puts: Vec<(Key, NameRecord, bool)> =
+            records.iter().filter(|r| !same(&held, r)).map(|r| (r.key(), *r, false)).collect();
+        let mut txn = self.file.begin()?;
+        self.names = self.names.exchange(&mut txn, &removes, &puts)?;
+        txn.commit(&self.record())?;
+        match self.want_names.get(&index).filter(|_| !records.is_empty()) {
+            Some(part) => self.have_names.insert(index, *part),
+            None => self.have_names.remove(&index),
+        };
+        Ok(())
+    }
+}
+
+/// The block a file's state is being received as of, if it is: what a
+/// node reads when it starts, to know whether to go on receiving.
+pub fn pending<B: Backend>(file: &PageFile<B>) -> io::Result<Option<Target>> {
+    let root = file.root();
+    let b = root.payload();
+    if b.len() != RECORD || b[0] != RECEIVING {
+        return Ok(None);
+    }
+    let digest = |b: &[u8]| digest_from_bytes(b).ok_or_else(|| corrupt("the block received for is not a digest"));
+    Ok(Some(Target {
+        height: u32::from_le_bytes(b[1..5].try_into().unwrap()),
+        block: digest(&b[5..37])?,
+        state_root: digest(&b[RECORD - 40..RECORD - 8])?,
+        next: u64::from_le_bytes(b[RECORD - 8..].try_into().unwrap()),
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::poseidon2::Fp;
+    use crate::store::state::{BlockEdit, Past};
+    use crate::store::testing::{Lost, MemBackend};
+    use crate::test_util::Rng;
+
+    /// Parts small enough that a few thousand outputs and a few hundred
+    /// names are many of them, and blocks that leave some as they were.
+    const LEVEL: u32 = 5;
+    const NAME_LEVEL: u32 = 112;
+    const KEEP: usize = 6;
+
+    /// A block as it was applied to the node that serves.
+    struct Block {
+        id: Digest,
+        spends: Vec<u64>,
+        outputs: Vec<Record>,
+        names: Vec<(Key, NameRecord, bool)>,
+        root: Digest,
+        next: u64,
+    }
+
+    impl Block {
+        fn edit(&self, height: u32) -> BlockEdit<'_> {
+            BlockEdit {
+                height,
+                block: self.id,
+                spends: &self.spends,
+                outputs: &self.outputs,
+                names: &self.names,
+                state_root: Some(self.root),
+            }
+        }
+    }
+
+    /// A node with `blocks` blocks applied, each spending, making
+    /// outputs, registering names and replacing some.
+    fn serving(seed: u64, blocks: u32) -> (State<MemBackend>, Vec<Block>) {
+        let mut rng = Rng::new(seed);
+        let d = |rng: &mut Rng| -> Digest { core::array::from_fn(|_| rng.fp()) };
+        let mut state = State::open(MemBackend::new(), KEEP).unwrap();
+        state.set_levels(LEVEL, NAME_LEVEL);
+        let (mut live, mut next, mut known): (Vec<u64>, u64, Vec<NameRecord>) = (Vec::new(), 0, Vec::new());
+        let mut chain = Vec::new();
+        for height in 1..=blocks {
+            let mut spends: Vec<u64> = (0..(live.len() / 3).min(15))
+                .map(|_| {
+                    let i = rng.next_u64() as usize % live.len();
+                    live.swap_remove(i)
+                })
+                .collect();
+            spends.sort_unstable();
+            let outputs: Vec<Record> = (0..300 + rng.next_u64() % 400)
+                .map(|_| Record {
+                    commitment: d(&mut rng),
+                    memo: core::array::from_fn(|_| rng.fp()),
+                    amount: rng.next_u64(),
+                    height,
+                })
+                .collect();
+            let mut puts: BTreeMap<Key, (NameRecord, bool)> = BTreeMap::new();
+            for _ in 0..known.len().min(8) {
+                let old = known[rng.next_u64() as usize % known.len()];
+                let other = NameRecord::new(b"x", d(&mut rng), d(&mut rng), d(&mut rng)).unwrap();
+                puts.insert(old.key(), (NameRecord { name: old.name, ..other }, true));
+            }
+            for i in 0..30 {
+                let name = format!("name{height}x{i}");
+                let new = NameRecord::new(name.as_bytes(), d(&mut rng), d(&mut rng), d(&mut rng)).unwrap();
+                puts.insert(new.key(), (new, false));
+                known.push(new);
+            }
+            let names: Vec<(Key, NameRecord, bool)> =
+                puts.into_iter().map(|(k, (r, replaces))| (k, r, replaces)).collect();
+            let id: Digest = core::array::from_fn(|i| Fp::new(height * 100 + i as u32));
+            let mut block = Block { id, spends, outputs, names, root: [Fp::ZERO; 8], next: 0 };
+            block.root = state.apply(&BlockEdit { state_root: None, ..block.edit(height) }).unwrap();
+            live.extend(next..next + block.outputs.len() as u64);
+            next += block.outputs.len() as u64;
+            block.next = next;
+            chain.push(block);
+        }
+        (state, chain)
+    }
+
+    fn target(chain: &[Block], height: u32) -> Target {
+        let b = &chain[height as usize - 1];
+        Target { height, block: b.id, state_root: b.root, next: b.next }
+    }
+
+    fn open(backend: MemBackend, target: Target, past: &Past<'_, MemBackend>) -> Result<Receiving<MemBackend>, Error> {
+        Receiving::open_at(backend, target, past.parts(), past.name_parts(), LEVEL, NAME_LEVEL)
+    }
+
+    /// Puts every part still missing, in an order of the seed's.
+    fn fill(receiving: &mut Receiving<MemBackend>, past: &Past<'_, MemBackend>, seed: u64) {
+        let mut rng = Rng::new(seed);
+        let (mut parts, mut names) = (receiving.missing(), receiving.missing_names());
+        while !parts.is_empty() || !names.is_empty() {
+            if !parts.is_empty() && (names.is_empty() || rng.next_u64() % 4 > 0) {
+                let index = parts.swap_remove(rng.next_u64() as usize % parts.len());
+                receiving.put(index, &past.part(index).unwrap()).unwrap();
+            } else {
+                let index = names.swap_remove(rng.next_u64() as usize % names.len());
+                receiving.put_names(index, &past.names_part(index).unwrap()).unwrap();
+            }
+        }
+    }
+
+    /// The node that received goes on as the one that served did: the
+    /// same blocks give the same roots, and the outputs and names it
+    /// holds are the same.
+    fn goes_on(mut state: State<MemBackend>, source: &State<MemBackend>, chain: &[Block], from: u32) {
+        state.set_levels(LEVEL, NAME_LEVEL);
+        assert_eq!(state.tip(), (from, chain[from as usize - 1].id));
+        assert_eq!(state.root(), chain[from as usize - 1].root);
+        assert_eq!(state.oldest_undo(), None, "no block to undo");
+        for height in from + 1..=chain.len() as u32 {
+            assert_eq!(state.apply(&chain[height as usize - 1].edit(height)).unwrap(), chain[height as usize - 1].root);
+        }
+        let (ours, theirs) = (state.past(chain.len() as u32).unwrap(), source.past(chain.len() as u32).unwrap());
+        assert_eq!((ours.parts(), ours.name_parts()), (theirs.parts(), theirs.name_parts()));
+        for (index, _) in theirs.parts() {
+            assert_eq!(ours.part(*index).unwrap(), theirs.part(*index).unwrap());
+        }
+        for (index, _) in theirs.name_parts() {
+            assert_eq!(ours.names_part(*index).unwrap(), theirs.names_part(*index).unwrap());
+        }
+        drop((ours, theirs));
+        // It serves in its turn, as of the blocks it applied itself.
+        assert!(state.past(from).is_ok());
+        // Back to the block it was received as of, and no further.
+        while state.oldest_undo().is_some() {
+            state.undo().unwrap();
+        }
+        assert_eq!((state.tip().0, state.root()), (from, chain[from as usize - 1].root));
+        assert_eq!(state.undo().err(), Some(Error::NoUndoRecord));
+        // Nothing of the receiving is left in the file but the state.
+        state.wait_ready().unwrap();
+        let fresh = State::open(MemBackend::from_image(state.file().backend().image(Lost::All)), KEEP).unwrap();
+        fresh.wait_ready().unwrap();
+        assert_eq!(state.file().space().0, fresh.file().space().0);
+    }
+
+    /// A state as of a block some way back is received whole, the parts
+    /// in any order, and the node goes on from that block.
+    #[test]
+    fn a_state_is_received_and_gone_on_from() {
+        let (source, chain) = serving(0x5e4d, 9);
+        for height in [9, 6, 3] {
+            let past = source.past(height).unwrap();
+            assert!(past.parts().len() >= 4 && past.name_parts().len() >= 4, "several parts of each");
+            let mut receiving = open(MemBackend::new(), target(&chain, height), &past).unwrap();
+            assert_eq!(receiving.missing().len(), past.parts().len());
+            assert_eq!(receiving.missing_names().len(), past.name_parts().len());
+            assert_eq!(pending(&receiving.file).unwrap(), Some(target(&chain, height)));
+            fill(&mut receiving, &past, height as u64);
+            assert!(receiving.missing().is_empty() && receiving.missing_names().is_empty());
+            // A part put twice changes nothing.
+            let first = past.parts()[0].0;
+            let used = receiving.file.space().0;
+            receiving.put(first, &past.part(first).unwrap()).unwrap();
+            assert_eq!(receiving.file.space().0, used);
+            let state = receiving.finish(KEEP).unwrap();
+            assert_eq!(pending(&state.file()).unwrap(), None);
+            goes_on(state, &source, &chain, height);
+        }
+    }
+
+    /// What is not the state is refused, and changes nothing.
+    #[test]
+    fn what_is_not_the_state_is_refused() {
+        let (source, chain) = serving(0x0bad, 7);
+        let past = source.past(5).unwrap();
+        let t = target(&chain, 5);
+        let open_with = |t: Target, parts: &[(u64, Digest)], names: &[(u32, Part)]| {
+            Receiving::open_at(MemBackend::new(), t, parts, names, LEVEL, NAME_LEVEL).err()
+        };
+        // The parts' roots: one left out, one changed, two out of order,
+        // one past the last position, the names' of another kind, the
+        // roots of another block.
+        let (parts, names) = (past.parts().to_vec(), past.name_parts().to_vec());
+        assert_eq!(open_with(t, &parts[1..], &names), Some(Error::PartRoot));
+        let mut changed = parts.clone();
+        changed[2].1[0] += Fp::ONE;
+        assert_eq!(open_with(t, &changed, &names), Some(Error::PartRoot));
+        let mut swapped = parts.clone();
+        swapped.swap(0, 1);
+        assert_eq!(open_with(t, &swapped, &names), Some(Error::PartRoot));
+        let mut beyond = parts.clone();
+        beyond.push((t.next.div_ceil(1 << LEVEL), parts[0].1));
+        assert_eq!(open_with(t, &beyond, &names), Some(Error::PartRoot));
+        let mut flagged = names.clone();
+        flagged[0].1.single ^= true;
+        assert_eq!(open_with(t, &parts, &flagged), Some(Error::PartRoot));
+        let mut far = names.clone();
+        far.push((1 << (KEY_BITS as u32 - NAME_LEVEL), names[0].1));
+        assert_eq!(open_with(t, &parts, &far), Some(Error::PartRoot));
+        let other = source.past(6).unwrap();
+        assert_eq!(open_with(t, other.parts(), other.name_parts()), Some(Error::PartRoot));
+        assert_eq!(open_with(Target { next: (1 << HEIGHT) + 1, ..t }, &parts, &names), Some(Error::PartRoot));
+
+        let mut receiving = open(MemBackend::new(), t, &past).unwrap();
+        let used = receiving.file.space().0;
+        // A part: one output left out, one changed, one more, out of
+        // order, under another index, at an index with no part.
+        let index = parts[1].0;
+        let part = past.part(index).unwrap();
+        assert_eq!(receiving.put(index, &part[1..]), Err(Error::PartRoot));
+        let mut changed = part.clone();
+        changed[0].1.amount ^= 1;
+        assert_eq!(receiving.put(index, &changed), Err(Error::PartRoot));
+        let mut more = part.clone();
+        more.push((t.next, part[0].1));
+        assert_eq!(receiving.put(index, &more), Err(Error::PartRoot));
+        let mut swapped = part.clone();
+        swapped.swap(0, 1);
+        assert_eq!(receiving.put(index, &swapped), Err(Error::PartRoot));
+        assert_eq!(receiving.put(parts[0].0, &part), Err(Error::PartRoot));
+        assert_eq!(receiving.put(1 << 30, &part), Err(Error::PartRoot));
+        assert_eq!(receiving.put(index, &[]), Err(Error::PartRoot));
+        // The same of the names.
+        let index = names[1].0;
+        let part = past.names_part(index).unwrap();
+        let mut changed = part.clone();
+        changed[0].owner[0] += Fp::ONE;
+        assert_eq!(receiving.put_names(index, &changed), Err(Error::PartRoot));
+        assert_eq!(receiving.put_names(index, &[]), Err(Error::PartRoot));
+        assert_eq!(receiving.put_names(names[0].0, &part), Err(Error::PartRoot));
+        assert_eq!(receiving.put_names(u32::MAX, &part), Err(Error::PartRoot));
+        assert_eq!(receiving.file.space().0, used);
+        assert_eq!(receiving.missing().len(), parts.len());
+
+        // Not whole, it is not a state: neither finished nor opened.
+        receiving.put(parts[0].0, &past.part(parts[0].0).unwrap()).unwrap();
+        let image = receiving.file.backend().image(Lost::All);
+        assert_eq!(
+            State::open(MemBackend::from_image(image), KEEP).err().map(|e| e.kind()),
+            Some(io::ErrorKind::InvalidData)
+        );
+        assert_eq!(receiving.finish(KEEP).err(), Some(Error::PartsMissing));
+        // And a state is not received over.
+        let whole = MemBackend::from_image(source.file().backend().image(Lost::All));
+        assert_eq!(open(whole, t, &past).err(), Some(Error::Io(io::ErrorKind::AlreadyExists)));
+    }
+
+    /// Stopped at any point, with or without the power lost, the
+    /// receiving goes on from the parts that were put.
+    #[test]
+    fn a_receiving_stopped_goes_on() {
+        let (source, chain) = serving(0x570b, 8);
+        let past = source.past(6).unwrap();
+        let t = target(&chain, 6);
+        let all = past.parts().len() + past.name_parts().len();
+        for (round, lost) in [Lost::All, Lost::None, Lost::Some(7), Lost::Some(8)].into_iter().enumerate() {
+            let mut receiving = open(MemBackend::new(), t, &past).unwrap();
+            // Some parts put, then the power lost in the middle of one more.
+            let (parts, names) = (receiving.missing(), receiving.missing_names());
+            for index in parts.iter().step_by(2) {
+                receiving.put(*index, &past.part(*index).unwrap()).unwrap();
+            }
+            for index in names.iter().skip(1).step_by(3) {
+                receiving.put_names(*index, &past.names_part(*index).unwrap()).unwrap();
+            }
+            let put = parts.len().div_ceil(2) + (names.len() - 1).div_ceil(3);
+            receiving.file.backend().crash_at(1 + round as u64);
+            assert!(receiving.put(parts[1], &past.part(parts[1]).unwrap()).is_err());
+            let image = receiving.file.backend().image(lost);
+
+            let file = PageFile::open(MemBackend::from_image(image.clone())).unwrap();
+            assert_eq!(pending(&file).unwrap(), Some(t));
+            let mut again = open(MemBackend::from_image(image), t, &past).unwrap();
+            let left = again.missing().len() + again.missing_names().len();
+            // The part the power was lost in is there or it is not.
+            assert!(left == all - put || left == all - put - 1, "{left} left of {all}, {put} put");
+            fill(&mut again, &past, round as u64);
+            goes_on(again.finish(KEEP).unwrap(), &source, &chain, 6);
+        }
+    }
+
+    /// Gone on with for another block: the parts that are the same stay,
+    /// those that changed are put again, those the other block's state
+    /// has not are taken out. To a later block and to an earlier one.
+    #[test]
+    fn a_receiving_goes_on_for_another_block() {
+        let (source, chain) = serving(0x4e37, 9);
+        for (first, then) in [(4, 8), (8, 4), (5, 9), (6, 6)] {
+            let past = source.past(first).unwrap();
+            let mut receiving = open(MemBackend::new(), target(&chain, first), &past).unwrap();
+            // Most of it, not all.
+            for index in receiving.missing().into_iter().skip(1) {
+                receiving.put(index, &past.part(index).unwrap()).unwrap();
+            }
+            for index in receiving.missing_names().into_iter().skip(1) {
+                receiving.put_names(index, &past.names_part(index).unwrap()).unwrap();
+            }
+            let image = receiving.file.backend().image(Lost::All);
+            drop(receiving);
+
+            let other = source.past(then).unwrap();
+            let mut again = open(MemBackend::from_image(image), target(&chain, then), &other).unwrap();
+            assert_eq!(pending(&again.file).unwrap(), Some(target(&chain, then)));
+            // Asked for again: what differs between the two blocks, and
+            // the one part of each left out before, no more.
+            let same = other.parts().iter().filter(|p| past.parts().contains(p)).count();
+            let missing = again.missing().len();
+            assert!(missing >= other.parts().len() - same && missing <= other.parts().len() - same + 1);
+            if first != then {
+                assert!(same > 0 && same < other.parts().len(), "{same} parts the same of {}", other.parts().len());
+            }
+            let same = other.name_parts().iter().filter(|p| past.name_parts().contains(p)).count();
+            assert!(again.missing_names().len() <= other.name_parts().len() - same + 1);
+            fill(&mut again, &other, then as u64);
+            goes_on(again.finish(KEEP).unwrap(), &source, &chain, then);
+        }
+    }
+
+    /// An empty state is received too: the one before any output.
+    #[test]
+    fn nothing_is_received() {
+        let state = State::open(MemBackend::new(), KEEP).unwrap();
+        let block =
+            BlockEdit { height: 1, block: [Fp::ONE; 8], spends: &[], outputs: &[], names: &[], state_root: None };
+        let root = state.apply(&block).unwrap();
+        let past = state.past(1).unwrap();
+        let t = Target { height: 1, block: [Fp::ONE; 8], state_root: root, next: 0 };
+        let receiving = Receiving::open(MemBackend::new(), t, past.parts(), past.name_parts()).unwrap();
+        assert!(receiving.missing().is_empty() && receiving.missing_names().is_empty());
+        let received = receiving.finish(KEEP).unwrap();
+        assert_eq!((received.tip(), received.root()), (state.tip(), root));
+    }
+}
