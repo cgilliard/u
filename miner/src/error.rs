@@ -17,7 +17,10 @@
 //! shared between implementations compare acceptance, not errors.
 //!
 //! Failures of the operating system (a file, memory, the random source)
-//! are not here: those functions return `std::io::Result`.
+//! are reported by `std::io::Result` where nothing else can fail. Where a
+//! function both reads the store and checks what it is given (applying a
+//! block to the state), a failure of the store is [`Error::Io`]: the
+//! kind of the failure, without its message.
 
 use core::fmt;
 
@@ -110,6 +113,27 @@ pub enum Error {
     /// An absorb at this instruction with no sponge to continue, or a
     /// compress before any hash.
     VmHashOrder(usize),
+
+    // -- The state
+    /// A position that is spent holds no unspent output.
+    NoSuchOutput(u64),
+    /// The state after a block is not the one its header commits to.
+    StateRoot,
+    /// The block to undo is older than the window of blocks whose
+    /// records are kept.
+    NoUndoRecord,
+    /// The operating system failed a read or a write of the store, or
+    /// what was read is not what was written (`InvalidData`). Only the
+    /// kind is kept: this type holds no heap.
+    Io(std::io::ErrorKind),
+}
+
+/// A failure of the store's files, carried up through code that also
+/// checks: its kind is kept, its message is not.
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Error {
+        Error::Io(e.kind())
+    }
 }
 
 impl fmt::Display for Error {
@@ -152,6 +176,10 @@ impl fmt::Display for Error {
             Error::VmInputs => f.write_str("the program takes more witness values than were given"),
             Error::VmNotScalarInput(pc) => write!(f, "instruction {pc}: a witness sibling is not a scalar"),
             Error::VmHashOrder(pc) => write!(f, "instruction {pc}: no hash to continue"),
+            Error::NoSuchOutput(p) => write!(f, "position {p} holds no unspent output"),
+            Error::StateRoot => f.write_str("the state after the block is not its header's"),
+            Error::NoUndoRecord => f.write_str("no record is kept to undo the block with"),
+            Error::Io(kind) => write!(f, "the store failed: {kind}"),
         }
     }
 }
@@ -202,6 +230,10 @@ mod tests {
             Error::VmInputs,
             Error::VmNotScalarInput(9),
             Error::VmHashOrder(9),
+            Error::NoSuchOutput(7),
+            Error::StateRoot,
+            Error::NoUndoRecord,
+            Error::Io(std::io::ErrorKind::InvalidData),
         ];
         let words: Vec<String> = all.iter().map(|e| e.to_string()).collect();
         for (i, w) in words.iter().enumerate() {

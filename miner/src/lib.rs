@@ -27,6 +27,7 @@ pub mod pow_air;
 pub mod random;
 pub mod recursion;
 pub mod stark;
+pub mod store;
 #[cfg(test)]
 pub(crate) mod test_util;
 pub mod transaction;
