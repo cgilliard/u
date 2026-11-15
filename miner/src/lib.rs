@@ -2,6 +2,7 @@ pub mod block;
 pub mod chain;
 pub mod challenger;
 pub mod codec;
+pub mod consensus;
 pub mod difficulty;
 pub mod error;
 pub mod expr;
@@ -28,6 +29,7 @@ pub mod pow;
 pub mod pow_air;
 pub mod random;
 pub mod recursion;
+pub mod sha256;
 pub mod stark;
 pub mod store;
 #[cfg(test)]

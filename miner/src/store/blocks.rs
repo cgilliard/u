@@ -267,6 +267,8 @@ pub struct Blocks {
     files: Child,
     /// The chain's own: kept, not read.
     pub chain: [u8; CHAIN_BYTES],
+    /// A note of the node's own, longer than those bytes: kept, not read.
+    note: Option<Blob>,
 }
 
 /// One record put where `key` is, in place of the one there if `replace`.
@@ -297,9 +299,10 @@ impl Blocks {
         bodies: Child::Empty,
         files: Child::Empty,
         chain: [0; CHAIN_BYTES],
+        note: None,
     };
     /// Serialized size.
-    pub const BYTES: usize = 5 * FLAT_BYTES + CHAIN_BYTES;
+    pub const BYTES: usize = 5 * FLAT_BYTES + CHAIN_BYTES + Blob::BYTES;
 
     pub fn to_bytes(&self) -> [u8; Self::BYTES] {
         let mut out = Vec::with_capacity(Self::BYTES);
@@ -307,6 +310,7 @@ impl Blocks {
             trie::write_flat(&root, &mut out);
         }
         out.extend_from_slice(&self.chain);
+        Blob::put_option(&self.note, &mut out);
         out.try_into().unwrap()
     }
 
@@ -322,7 +326,8 @@ impl Blocks {
             bodies: root(2)?,
             files: root(3)?,
             planned: root(4)?,
-            chain: b[5 * FLAT_BYTES..].try_into().unwrap(),
+            chain: b[5 * FLAT_BYTES..5 * FLAT_BYTES + CHAIN_BYTES].try_into().unwrap(),
+            note: Blob::get_option(&b[5 * FLAT_BYTES + CHAIN_BYTES..])?,
         })
     }
 
@@ -333,7 +338,7 @@ impl Blocks {
         trie::mark::<HeightTree, B>(file, self.planned)?;
         trie::mark::<BodyTree, B>(file, self.bodies)?;
         trie::mark::<FileTree, B>(file, self.files)?;
-        let mut blobs = Vec::new();
+        let mut blobs: Vec<Blob> = self.note.into_iter().collect();
         trie::for_each::<BodyTree>(file, self.bodies, &mut |_, kept, _| {
             blobs.extend(kept.body.iter().chain(&kept.aux).copied())
         })?;
@@ -568,6 +573,21 @@ impl Blocks {
             }
             _ => Ok(false),
         }
+    }
+
+    /// The node's own note, if it has written one.
+    pub fn note(&self, pages: &impl ReadPages) -> io::Result<Option<Vec<u8>>> {
+        self.note.map(|blob| blob.read(pages)).transpose()
+    }
+
+    /// Writes the node's own note in place of the one before: `None`,
+    /// or nothing, for none.
+    pub fn set_note<B: Backend>(&mut self, txn: &Txn<'_, B>, bytes: Option<&[u8]>) -> Result<(), Error> {
+        if let Some(old) = self.note.take() {
+            old.free(txn)?;
+        }
+        self.note = bytes.filter(|b| !b.is_empty()).map(|b| Blob::write(txn, b)).transpose()?;
+        Ok(())
     }
 
     /// The hashes of the files held.
@@ -816,7 +836,11 @@ mod tests {
             assert_eq!(txn.written(), written);
         });
         blocks.chain = [3; CHAIN_BYTES];
-        with(&file, &mut blocks, |_, _| ());
+        with(&file, &mut blocks, |txn, blocks| {
+            blocks.set_note(txn, Some(&[5; 512])).unwrap();
+            blocks.set_note(txn, Some(&[6; 700])).unwrap();
+        });
+        assert_eq!(blocks.note(&file).unwrap(), Some(vec![6; 700]));
         let (again, read) = reopened(&file);
         assert_eq!((read, again.space().0), (blocks, file.space().0));
         for (hash, bytes) in &held {
@@ -839,6 +863,7 @@ mod tests {
             for (hash, _) in &held {
                 blocks.drop_file(txn, hash).unwrap();
             }
+            blocks.set_note(txn, None).unwrap();
         });
         assert_eq!(file.space().0, empty);
     }
