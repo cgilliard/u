@@ -83,7 +83,7 @@ pub type Item = [Fp; WIDTH];
 /// Proof-of-work nonce: 32 arbitrary bytes.
 pub type Nonce = [u8; 32];
 /// Elements a nonce packs into, three bytes each.
-const NONCE_FPS: usize = 32usize.div_ceil(3);
+pub(crate) const NONCE_FPS: usize = 32usize.div_ceil(3);
 
 /// The seed file: the text gzipped, embedded at build time and used as it
 /// is.
@@ -102,10 +102,10 @@ pub const SEED_TEXT_LEN: usize = 1_291_059;
 /// Bytes of text absorbed per derivation step: one sponge block.
 pub const WINDOW: usize = 3 * RATE;
 
-const FNV_PRIME: Fp = Fp::new(0x0100_0193);
-const DOM_ITEM: u32 = 0x5041;
-const DOM_SEED: u32 = 0x5042;
-const MIX_WORDS: usize = 2 * WIDTH;
+pub(crate) const FNV_PRIME: Fp = Fp::new(0x0100_0193);
+pub(crate) const DOM_ITEM: u32 = 0x5041;
+pub(crate) const DOM_SEED: u32 = 0x5042;
+pub(crate) const MIX_WORDS: usize = 2 * WIDTH;
 
 /// Serialized size of one item.
 const ITEM_BYTES: usize = WIDTH * 4;
@@ -189,7 +189,7 @@ pub const fn table_bytes(log_items: u32) -> u64 {
 
 /// `a * FNV_PRIME + b`.
 #[inline(always)]
-fn fnv(a: Fp, b: Fp) -> Fp {
+pub(crate) fn fnv(a: Fp, b: Fp) -> Fp {
     a.mul(&FNV_PRIME).add(&b)
 }
 

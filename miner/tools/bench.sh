@@ -23,6 +23,7 @@ BENCHES=(
     poseidon2::batch_tests::batch_throughput
     poseidon2::speed::compress_speed
     pow::tests::mainnet_timing
+    pow_air::tests::cost
 )
 
 out=target/bench
