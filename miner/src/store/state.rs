@@ -517,6 +517,21 @@ impl<B: Backend + 'static> State<B> {
         })
     }
 
+    /// Work on the state that is then given up: `work` is handed a
+    /// transaction with the outputs, the names and the commits as they
+    /// are, changes them as it will and reads back what it changed, and
+    /// none of it is kept. It is how the changes of a block are seen
+    /// one at a time by whoever proves it. No block is applied while it
+    /// runs.
+    pub fn scratch<T>(
+        &self,
+        work: impl FnOnce(&mut Txn<'_, B>, Outputs, Names, &Commits) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let mut txn = self.file.begin()?;
+        let meta = self.meta().clone();
+        work(&mut txn, meta.outputs, meta.names, &meta.commits)
+    }
+
     /// Several changes as one step: blocks undone and blocks applied,
     /// and what goes with them, all in place when `change` returns well
     /// and this does, or none of it. It is how a chain goes over to

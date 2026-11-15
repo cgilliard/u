@@ -169,7 +169,7 @@ pub struct NameProof {
 
 /// Whether `key` goes right from depth `depth`: its bit there, the
 /// highest first.
-fn bit(key: Key, depth: usize) -> bool {
+pub fn bit(key: Key, depth: usize) -> bool {
     key >> (KEY_BITS - 1 - depth) & 1 == 1
 }
 

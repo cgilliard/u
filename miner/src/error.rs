@@ -168,6 +168,8 @@ pub enum Error {
     /// Leaves offered for a block are not the ones its header's
     /// auxiliary bytes commit to, or its header is not known.
     AuxMismatch,
+    /// An update of a name is not signed by the name's owner.
+    NameOwner,
     /// A reveal or a sweep spends an output that is no commit: its
     /// position.
     NotACommit(u64),
@@ -251,6 +253,7 @@ impl fmt::Display for Error {
             Error::BadProof => f.write_str("the block's proof is not accepted"),
             Error::MissingBody => f.write_str("a block of the branch has no body kept"),
             Error::AuxMismatch => f.write_str("the leaves are not the header's"),
+            Error::NameOwner => f.write_str("the name's owner did not sign the update"),
             Error::NotACommit(p) => write!(f, "position {p} holds no commit"),
             Error::CommitAge(made) => write!(f, "a commit made at height {made} is not of an age for this"),
             Error::Io(kind) => write!(f, "the store failed: {kind}"),
@@ -327,6 +330,7 @@ mod tests {
             Error::BadProof,
             Error::MissingBody,
             Error::AuxMismatch,
+            Error::NameOwner,
             Error::NotACommit(4),
             Error::CommitAge(4),
             Error::Io(std::io::ErrorKind::InvalidData),

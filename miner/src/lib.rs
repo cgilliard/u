@@ -18,6 +18,7 @@ pub mod hash_table;
 pub mod inflate;
 pub mod merkle;
 pub mod name;
+pub mod name_air;
 pub mod ntt;
 pub mod output;
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
