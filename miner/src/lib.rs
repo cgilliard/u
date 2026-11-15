@@ -31,3 +31,5 @@ pub(crate) mod test_util;
 pub mod transaction;
 pub mod u256;
 pub mod xmss;
+pub mod xmss_air;
+pub mod xmss_fragment;
