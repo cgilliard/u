@@ -45,8 +45,22 @@ use crate::poseidon2::{BATCH_FROM, LANES, compress_batch, digest_from_bytes, dig
 /// Height of the outputs' tree: positions are below `2^HEIGHT`.
 pub const HEIGHT: u32 = 41;
 /// The level of the subtrees the outputs are handed to another node in,
-/// when it takes the state from this one: parts of 131,072 positions.
-pub const PART_LEVEL: u32 = 17;
+/// when it takes the state from this one: parts of 8,192 positions.
+///
+/// A part is fetched whole and checked whole, against its root: a node
+/// that serves a wrong one costs the whole of it. With every position
+/// unspent and every output a commit, a part is 8,192 times the 72
+/// bytes of an output and the 40 of a commit, under a megabyte: less
+/// than a block. (At level 17 it was over nine.) The price is more
+/// roots to hand over first: one for each 8,192 positions in which
+/// anything is unspent.
+///
+/// A part is a subtree the trie keeps a hash for, and those are every
+/// fourth level down from the top: 17, 13, 9. Level 13 is the largest
+/// whose parts are no bigger than a block.
+pub const PART_LEVEL: u32 = 13;
+const _: () = assert!((1usize << PART_LEVEL) * (8 + RECORD_BYTES + 8 + 32) <= 1 << 20);
+const _: () = assert!((HEIGHT - PART_LEVEL).is_multiple_of(4));
 /// Serialized size of a [`Record`].
 pub const RECORD_BYTES: usize = 32 + MEMO_BYTES + 8 + 4;
 
