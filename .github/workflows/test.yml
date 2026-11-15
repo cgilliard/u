@@ -62,30 +62,9 @@ jobs:
       # The debug test suite: a debug build, so overflow checks and debug
       # assertions are on (the release build has its own job below). Built for
       # the runner's CPU (miner/.cargo/config.toml): the AVX2 code path on
-      # the x86-64 runners, the portable one on the arm64 ones.
-      - name: Test
-        run: cargo test --locked
-
-  # The portable code path on x86-64, which the job above does not build
-  # there: the same tests, built for the plainest x86-64, without AVX2.
-  test-portable:
-    name: test (ubuntu-latest, debug, no AVX2)
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    env:
-      RUSTFLAGS: -C target-cpu=x86-64
-    defaults:
-      run:
-        working-directory: miner
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust (stable)
-        run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
-          rustc --version
-
+      # the x86-64 runners, the portable one on the arm64 ones. The portable
+      # path is the same code on any CPU without AVX2, so the arm64 runners
+      # test it; the coverage job also builds it for the plainest x86-64.
       - name: Test
         run: cargo test --locked
 
