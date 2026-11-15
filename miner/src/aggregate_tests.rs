@@ -1234,8 +1234,11 @@ fn wrap_program_accepts_and_rejects() {
 #[test]
 #[ignore = "proves a mainnet root and wraps it; run with --release"]
 fn mainnet_wrap_timing() {
-    let s = setup("wrap-timing", &[30], 30);
+    let mut s = setup("wrap-timing", &[30], 30);
     let params = AggregatorParams::MAINNET;
+    // The parent's work under the main network's proof of work: its
+    // table and its text are not the small network's.
+    s.statement.parent_work = test_work(params.pow);
     let seg = prove_segment_padded(&params.segment, &s.segments[0], params.segment_log_n);
     let name = prove_name_padded(&params.segment, &s.names, params.name_log_n);
     let shape = plan(&params, 1);
@@ -1272,7 +1275,7 @@ fn mainnet_wrap_timing() {
         let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
         let pre = c.prog.preprocess(&wrap);
         let public =
-            VmAir::public_values(&pre.root(), &s.statement.output(&SMALL.work_shape(), &shape.wrap.unwrap().tree));
+            VmAir::public_values(&pre.root(), &s.statement.output(&params.work_shape(), &shape.wrap.unwrap().tree));
         let tables = VmAir::tables(&trace, &hashes, &pre);
         let proof = stark::prove_tables(&wrap, &tables, &public, &mut outer_transcript());
         let elapsed = t.elapsed();
@@ -1289,6 +1292,7 @@ fn mainnet_wrap_timing() {
             ok,
             t.elapsed()
         );
+        assert!(ok.is_ok(), "the wrap verifies");
     }
 }
 
