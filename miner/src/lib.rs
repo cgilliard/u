@@ -1,4 +1,5 @@
 pub mod block;
+pub mod block_air;
 pub mod chain;
 pub mod challenger;
 pub mod codec;

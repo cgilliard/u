@@ -58,6 +58,15 @@ pub(crate) const DOM_BLOCK_BODY: u32 = 0x12;
 /// A block's proof bytes, as the body's commitment takes them.
 pub(crate) const DOM_BLOCK_PROOF: u32 = 0x13;
 
+/// The sponge of a block's input positions ([`crate::block_air`]).
+pub(crate) const DOM_INPUTS: u32 = 0x21;
+/// The sponge of a block's outputs.
+pub(crate) const DOM_OUTPUTS: u32 = 0x22;
+/// The sponge of a block's name operations.
+pub(crate) const DOM_NAME_OPS: u32 = 0x23;
+/// The sponge of the positions a block sweeps.
+pub(crate) const DOM_SWEEPS: u32 = 0x24;
+
 /// Every tag above.
 const DOMAINS: &[u32] = &[
     DOM_PUBKEY,
@@ -76,6 +85,10 @@ const DOMAINS: &[u32] = &[
     DOM_SIGNERS,
     DOM_BLOCK_BODY,
     DOM_BLOCK_PROOF,
+    DOM_INPUTS,
+    DOM_OUTPUTS,
+    DOM_NAME_OPS,
+    DOM_SWEEPS,
 ];
 
 // No two domains share a tag.
