@@ -92,6 +92,24 @@ pub enum Error {
     FinalMismatch { query: usize },
     /// The prover was told to stop.
     Cancelled,
+
+    // -- The verifier machine's programs, run on a witness
+    /// The assertion at this instruction does not hold.
+    VmAssertion(usize),
+    /// An instruction reads a word nothing has written.
+    VmUninitialized { pc: usize, addr: u32 },
+    /// An instruction writes a word already written.
+    VmDoubleWrite { pc: usize, addr: u32 },
+    /// A hashing instruction reads a word that is not a base-field value.
+    VmNotScalar { pc: usize, addr: u32 },
+    /// The witness has fewer values than the program takes.
+    VmInputs,
+    /// A sibling taken from the witness at this instruction is not a
+    /// base-field value.
+    VmNotScalarInput(usize),
+    /// An absorb at this instruction with no sponge to continue, or a
+    /// compress before any hash.
+    VmHashOrder(usize),
 }
 
 impl fmt::Display for Error {
@@ -127,6 +145,13 @@ impl fmt::Display for Error {
             }
             Error::FinalMismatch { query } => write!(f, "fri query {query}: last fold does not match final value"),
             Error::Cancelled => f.write_str("proving was cancelled"),
+            Error::VmAssertion(pc) => write!(f, "instruction {pc}: assertion failed"),
+            Error::VmUninitialized { pc, addr } => write!(f, "instruction {pc}: word {addr} read before it is written"),
+            Error::VmDoubleWrite { pc, addr } => write!(f, "instruction {pc}: word {addr} written twice"),
+            Error::VmNotScalar { pc, addr } => write!(f, "instruction {pc}: word {addr} is not a scalar"),
+            Error::VmInputs => f.write_str("the program takes more witness values than were given"),
+            Error::VmNotScalarInput(pc) => write!(f, "instruction {pc}: a witness sibling is not a scalar"),
+            Error::VmHashOrder(pc) => write!(f, "instruction {pc}: no hash to continue"),
         }
     }
 }
@@ -170,6 +195,13 @@ mod tests {
             Error::FoldMismatch { query: 4, round: 2 },
             Error::FinalMismatch { query: 4 },
             Error::Cancelled,
+            Error::VmAssertion(9),
+            Error::VmUninitialized { pc: 9, addr: 5 },
+            Error::VmDoubleWrite { pc: 9, addr: 5 },
+            Error::VmNotScalar { pc: 9, addr: 5 },
+            Error::VmInputs,
+            Error::VmNotScalarInput(9),
+            Error::VmHashOrder(9),
         ];
         let words: Vec<String> = all.iter().map(|e| e.to_string()).collect();
         for (i, w) in words.iter().enumerate() {

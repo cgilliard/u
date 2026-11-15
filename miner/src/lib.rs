@@ -25,11 +25,13 @@ pub mod poseidon2_air;
 pub mod pow;
 pub mod pow_air;
 pub mod random;
+pub mod recursion;
 pub mod stark;
 #[cfg(test)]
 pub(crate) mod test_util;
 pub mod transaction;
 pub mod u256;
+pub mod vm_air;
 pub mod xmss;
 pub mod xmss_air;
 pub mod xmss_fragment;

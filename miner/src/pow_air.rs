@@ -1313,6 +1313,73 @@ mod tests {
         assert_eq!(Work::of_header(&seed, &header).log_items, 10);
     }
 
+    /// The verifier of a work proof as a machine program, as a block's
+    /// root runs it: given the window table's root and `work`.
+    fn fold(setup: &WorkSetup<'_>, config: &StarkConfig, work: &Work, proof: &Proof) -> crate::recursion::Compiler {
+        let mut c = crate::recursion::Compiler::new();
+        let public = work.to_values(&setup.shape);
+        let pubv = c.scalar_inputs(&public);
+        let root = c.scalar_inputs(&setup.root());
+        for (i, v) in setup.root().iter().enumerate() {
+            c.assert_scalar(root + i as u32, *v);
+        }
+        let (perm, mix) = (setup.shape.perm_air(), setup.shape.mix_air());
+        let tables: [(&dyn DynAir, Option<u32>); 4] =
+            [(&TextAir, Some(root)), (&perm, None), (&RangeAir, None), (&mix, None)];
+        c.verify_stark(&tables, config, &[Fp::new(DOM_WORK_PROOF)], pubv, public.len(), proof);
+        c
+    }
+
+    /// The work segment verified inside a machine program: it accepts the
+    /// proof for its own work and table, refuses it for another, and is
+    /// the same program whatever the proof and whichever the table.
+    #[test]
+    fn folds() {
+        use crate::vm_air::VmAir;
+        let text = small_text();
+        let seed = SeedText::from_bytes(SMALL, &text);
+        let setup = WorkSetup::new(&seed, &QUICK);
+        let (hh, nonce) = header();
+        let (proof, work) = prove_work(&setup, &QUICK, 9, &hh, &nonce);
+        let c = fold(&setup, &QUICK, &work, &proof);
+        VmAir::execute(&c.prog, &c.inputs).expect("the verifier program accepts");
+        for log_items in [8, 10] {
+            let other = fold(&setup, &QUICK, &Work { log_items, ..work }, &proof);
+            assert_eq!(other.prog.instrs, c.prog.instrs, "one program for every table");
+            assert!(VmAir::execute(&other.prog, &other.inputs).is_err(), "the table of 2^{log_items}");
+        }
+        // A proof of zeros of the same shape compiles to the same program:
+        // a verifier knows it with no proof in hand.
+        let heights = setup.shape.log_heights();
+        let (perm, mix) = (setup.shape.perm_air(), setup.shape.mix_air());
+        let airs: [(&dyn DynAir, usize); 4] =
+            [(&TextAir, heights[0]), (&perm, heights[1]), (&RangeAir, heights[2]), (&mix, heights[3])];
+        let dummy = crate::recursion::dummy_proof(&airs, &QUICK, setup.shape.num_public());
+        assert_eq!(fold(&setup, &QUICK, &work, &dummy).prog.instrs, c.prog.instrs);
+    }
+
+    /// Mainnet's work segment as a machine program: its size, and that it
+    /// accepts.
+    #[test]
+    #[ignore = "slow: proves a header's work and compiles its verifier"]
+    fn mainnet_folds() {
+        use crate::vm_air::VmAir;
+        let seed = SeedText::new(PowParams::MAINNET);
+        let (hh, nonce) = header();
+        let setup = WorkSetup::new(&seed, &SEGMENT);
+        let (proof, work) = prove_work(&setup, &SEGMENT, 26, &hh, &nonce);
+        let t = std::time::Instant::now();
+        let c = fold(&setup, &SEGMENT, &work, &proof);
+        println!(
+            "compiled in {:.2?}: {} rows (2^{}), hash rows 2^{}",
+            t.elapsed(),
+            c.prog.instrs.len(),
+            c.prog.height().trailing_zeros(),
+            VmAir::hash_height(&c.prog).trailing_zeros()
+        );
+        VmAir::execute(&c.prog, &c.inputs).expect("the verifier program accepts");
+    }
+
     /// Mainnet's work: the witness's mix is hashimoto's and the
     /// constraints hold, in the first table and the last.
     #[test]
