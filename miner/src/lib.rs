@@ -22,6 +22,7 @@ pub mod inflate;
 pub mod merkle;
 pub mod name;
 pub mod name_air;
+pub mod net;
 pub mod ntt;
 pub mod output;
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]

@@ -431,7 +431,6 @@ The defaults are the reference's unless noted.
 | Live peers below which more are looked for | 8 |
 | Peers per host (all ports) | 4 |
 | Peers per /16 network | 8 |
-| Addresses in one `Peers` | 32 |
 | Pings to unproven addresses per tick | 8 |
 | Ping interval | 30 s |
 | First re-ping of a peer not yet answering | 2 s, doubling |
@@ -441,8 +440,6 @@ The defaults are the reference's unless noted.
 | Strikes before a ban | 5 |
 | Strikes forgotten after | 10 min |
 | Ban | 1 hour |
-| Seeds | the network's built-in names |
-| Port | 3737 |
 
 ### Sync
 
@@ -466,18 +463,26 @@ The defaults are the reference's unless noted.
 | Setting | Default |
 |---|---|
 | Chunks sent a second, in all | 8,192 (about 10 MB/s) |
-| Requests waiting, in all and for one address | 64, 8 |
-| Chunks waiting for one address | 4,096 |
 | How often the token secret changes | 10 min (new) |
 
-The transport's own numbers (window bounds, retry bounds, how many
-places count as overtaken) stay constants: they are how the mechanism
+### Where a node is
+
+| Setting | Default |
+|---|---|
+| Port | 3737 |
+| Seeds | the network's built-in names |
+| Peers given by hand | none |
+
+The settings above are `net::config::Config` in the code (the last
+group comes with the node itself). The transport's own numbers (window
+bounds, retry bounds, how many places count as overtaken, how much may
+wait to be served to one address) stay constants: they are how the mechanism
 works, and a node that set them badly would hurt its peers as well as
 itself.
 
 A few things are not settings because the two ends must agree on them:
-the datagram size, the chunk size, the part sizes, and the most headers
-an object may hold.
+the datagram size, the chunk size, the part sizes, the most headers an
+object may hold and the most addresses a `Peers` may carry (32).
 
 ## 2.10 Decided, and still open
 

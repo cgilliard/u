@@ -176,6 +176,10 @@ pub enum Error {
     /// A commit is revealed outside its window, or swept before it is
     /// past: the height it was made at.
     CommitAge(u32),
+    // -- The network
+    /// A setting a node cannot run with: which, and why.
+    Setting(&'static str),
+
     /// The operating system failed a read or a write of the store, or
     /// what was read is not what was written (`InvalidData`). Only the
     /// kind is kept: this type holds no heap.
@@ -256,6 +260,7 @@ impl fmt::Display for Error {
             Error::NameOwner => f.write_str("the name's owner did not sign the update"),
             Error::NotACommit(p) => write!(f, "position {p} holds no commit"),
             Error::CommitAge(made) => write!(f, "a commit made at height {made} is not of an age for this"),
+            Error::Setting(what) => write!(f, "a setting cannot be run with: {what}"),
             Error::Io(kind) => write!(f, "the store failed: {kind}"),
         }
     }
