@@ -4,7 +4,9 @@
 //! first and removes the second, and the set of outputs keeps a spent
 //! output's record ([`super::outputs`]), so all that must be kept of a
 //! block is which positions it spent and where its own outputs began:
-//! a few bytes a spend. That is a block's record here, kept for the
+//! a few bytes a spend. Names are not spent but replaced, so for those a
+//! block's record holds the records it replaced, and the keys of the
+//! names it registered. That is a block's record here, kept for the
 //! window's length of blocks and then dropped.
 //!
 //! The records are pages of the state's file like any others, written in
@@ -16,6 +18,8 @@
 //! record page := next page (6) | bytes
 //! record      := height (4) | block (32) | block before (32)
 //!                | first new position (8) | spends (4) | distance (varint) ...
+//!                | names registered (2) | key (15) ...
+//!                | names replaced (2) | the record replaced ...
 //! list page   := blocks (2) | (height (4) | first page (6)) ...
 //! ```
 
@@ -25,7 +29,11 @@ use std::io;
 use super::backend::Backend;
 use super::pagefile::{Extent, MAX_UNITS, PageFile, ReadPages, Txn, UNIT};
 use crate::hash::Digest;
+use crate::name::{KEY_BITS, Key, Record as NameRecord};
 use crate::poseidon2::{digest_from_bytes, digest_to_bytes};
+
+/// Bytes of a name's key.
+const KEY_BYTES: usize = KEY_BITS / 8;
 
 /// The most blocks a window holds: what one page lists.
 pub const MAX_BLOCKS: usize = (Extent::capacity(MAX_UNITS) - 2) / 10;
@@ -61,6 +69,10 @@ pub struct BlockRecord {
     pub first_new: u64,
     /// The positions it spent, ascending.
     pub spends: Vec<u64>,
+    /// The keys of the names it registered, ascending.
+    pub registered: Vec<Key>,
+    /// The records it replaced, as they were, ascending by key.
+    pub replaced: Vec<NameRecord>,
 }
 
 impl BlockRecord {
@@ -80,6 +92,16 @@ impl BlockRecord {
             }
             out.push(x as u8);
             prev = *p;
+        }
+        out.extend_from_slice(&(self.registered.len() as u16).to_le_bytes());
+        for key in &self.registered {
+            out.extend_from_slice(&key.to_le_bytes()[..KEY_BYTES]);
+        }
+        out.extend_from_slice(&(self.replaced.len() as u16).to_le_bytes());
+        for r in &self.replaced {
+            let at = out.len();
+            out.resize(at + r.size(), 0);
+            r.write_bytes(&mut out[at..]);
         }
         out
     }
@@ -114,10 +136,31 @@ impl BlockRecord {
             prev = prev.checked_add(x).ok_or_else(bad)?;
             spends.push(prev);
         }
+        let count = |b: &mut &[u8]| -> io::Result<usize> {
+            let (n, rest) = b.split_at_checked(2).ok_or_else(bad)?;
+            *b = rest;
+            Ok(u16::from_le_bytes([n[0], n[1]]) as usize)
+        };
+        let mut registered = Vec::new();
+        for _ in 0..count(&mut b)? {
+            let (k, rest) = b.split_at_checked(KEY_BYTES).ok_or_else(bad)?;
+            let mut key = [0u8; 16];
+            key[..KEY_BYTES].copy_from_slice(k);
+            registered.push(Key::from_le_bytes(key));
+            b = rest;
+        }
+        let mut replaced = Vec::new();
+        for _ in 0..count(&mut b)? {
+            let (r, rest) = NameRecord::read(b).ok_or_else(bad)?;
+            replaced.push(r);
+            b = rest;
+        }
         if !b.is_empty() {
             return Err(bad());
         }
         Ok(BlockRecord {
+            registered,
+            replaced,
             height: u32::from_le_bytes(head[..4].try_into().unwrap()),
             block: digest_from_bytes(&head[4..36]).ok_or_else(bad)?,
             before: digest_from_bytes(&head[36..68]).ok_or_else(bad)?,
@@ -323,6 +366,13 @@ mod tests {
             before: [Fp::new(height - 1); 8],
             first_new: rng.next_u64() >> 24,
             spends,
+            registered: (0..height as u128 % 3).map(|i| (i + 1) << 100 | height as u128).collect(),
+            replaced: (0..height % 4)
+                .map(|i| {
+                    let d = |x: u32| -> Digest { [Fp::new(x + i); 8] };
+                    NameRecord::new(&b"abcdefghij"[..1 + i as usize], d(height), d(7), d(9)).unwrap()
+                })
+                .collect(),
         }
     }
 
@@ -334,7 +384,7 @@ mod tests {
             let bytes = r.to_bytes();
             assert_eq!(BlockRecord::from_bytes(&bytes).unwrap(), r);
             // About three bytes a spend.
-            assert!(bytes.len() <= 80 + 3 * spends, "{} bytes for {spends} spends", bytes.len());
+            assert!(bytes.len() <= 80 + 3 * spends + 500, "{} bytes for {spends} spends", bytes.len());
             for cut in [0, 79, bytes.len().saturating_sub(1)] {
                 if cut < bytes.len() {
                     assert!(BlockRecord::from_bytes(&bytes[..cut]).is_err());

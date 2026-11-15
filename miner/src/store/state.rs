@@ -1,18 +1,18 @@
-//! The state: the unspent outputs, the window of blocks that can be
-//! undone, and the block they are the state after, under one root record.
+//! The state: the unspent outputs, the names, the window of blocks that
+//! can be undone, and the block they are the state after, under one root
+//! record.
 //!
 //! A block is applied in one transaction: its spends and its outputs go
-//! into the set, its record into the window, and the root record that
+//! into the set, its names into theirs, its record into the window, and the root record that
 //! commits both names the block as the tip. Either all of it is on disk
 //! or none is. Undoing the tip is the same in reverse.
 //!
 //! The state's root is the hash the block's header commits to: the
-//! outputs' tree and the names' tree under one node. (The names are not
-//! stored yet: their half is the empty tree.)
+//! outputs' tree and the names' tree under one node.
 //!
 //! ```text
-//! root record := version (1) | height (4) | tip (32) | outputs (68) | window (6)
-//!                | sweep (8)
+//! root record := version (1) | height (4) | tip (32) | outputs (68) | names (60)
+//!                | window (6) | sweep (8)
 //! ```
 //!
 //! With every block the sweep of the outputs goes a little further round
@@ -27,16 +27,19 @@ use std::io;
 use std::sync::Mutex;
 
 use super::backend::Backend;
+use super::names::{NameProof, Names};
 use super::outputs::{Outputs, Record};
 use super::pagefile::{PageFile, Pin, Root};
-use super::sparse::{STATE_HEIGHT, empty};
+use super::sparse::STATE_HEIGHT;
 use super::window::{BlockRecord, Window};
 use crate::error::Error;
 use crate::hash::Digest;
+use crate::name::{Key, Record as NameRecord};
 use crate::poseidon2::{DIGEST, Fp, compress, digest_from_bytes, digest_to_bytes};
 
 const VERSION: u8 = 1;
-const RECORD: usize = 1 + 4 + 32 + Outputs::BYTES + Window::BYTES + 8;
+const RECORD: usize = 1 + 4 + 32 + Outputs::BYTES + Names::BYTES + Window::BYTES + 8;
+const NAMES_AT: usize = 37 + Outputs::BYTES;
 /// Leaves the sweep looks at with a block, at least.
 const SWEEP_MIN: usize = 64;
 /// The window's length unless another is asked for: a week of blocks.
@@ -54,6 +57,7 @@ struct Meta {
     height: u32,
     tip: Digest,
     outputs: Outputs,
+    names: Names,
     window: Window,
     /// The position the sweep of the outputs has reached.
     sweep: u64,
@@ -61,7 +65,14 @@ struct Meta {
 
 impl Meta {
     fn empty() -> Meta {
-        Meta { height: 0, tip: [Fp::ZERO; DIGEST], outputs: Outputs::EMPTY, window: Window::default(), sweep: 0 }
+        Meta {
+            height: 0,
+            tip: [Fp::ZERO; DIGEST],
+            outputs: Outputs::EMPTY,
+            names: Names::EMPTY,
+            window: Window::default(),
+            sweep: 0,
+        }
     }
 
     fn to_bytes(&self) -> [u8; RECORD] {
@@ -70,29 +81,32 @@ impl Meta {
         out.extend_from_slice(&self.height.to_le_bytes());
         out.extend_from_slice(&digest_to_bytes(&self.tip));
         out.extend_from_slice(&self.outputs.to_bytes());
+        out.extend_from_slice(&self.names.to_bytes());
         out.extend_from_slice(&self.window.to_bytes());
         out.extend_from_slice(&self.sweep.to_le_bytes());
         out.try_into().unwrap()
     }
 
-    /// The outputs and the tip of a root record: what a reader needs.
-    fn head(root: &Root) -> io::Result<(u32, Digest, Outputs)> {
+    /// The tip, the outputs and the names of a root record: what a
+    /// reader needs.
+    fn head(root: &Root) -> io::Result<(u32, Digest, Outputs, Names)> {
         let b = root.payload();
         if b.is_empty() && root.seq == 0 {
-            return Ok((0, [Fp::ZERO; DIGEST], Outputs::EMPTY));
+            return Ok((0, [Fp::ZERO; DIGEST], Outputs::EMPTY, Names::EMPTY));
         }
         if b.len() != RECORD || b[0] != VERSION {
             return Err(corrupt("the state's root record is not one"));
         }
         let height = u32::from_le_bytes(b[1..5].try_into().unwrap());
         let tip = digest_from_bytes(&b[5..37]).ok_or_else(|| corrupt("the state's tip is not a digest"))?;
-        Ok((height, tip, Outputs::from_bytes(&b[37..37 + Outputs::BYTES])?))
+        let names = Names::from_bytes(&b[NAMES_AT..NAMES_AT + Names::BYTES])?;
+        Ok((height, tip, Outputs::from_bytes(&b[37..NAMES_AT])?, names))
     }
 }
 
 /// The state's root: the outputs' tree and the names' under one node.
-fn state_root(outputs: &Outputs) -> Digest {
-    compress(&outputs.hash(), empty(STATE_HEIGHT - 1))
+fn state_root(outputs: &Outputs, names: &Names) -> Digest {
+    compress(&outputs.hash(), &names.hash())
 }
 
 /// A block, as the state takes it.
@@ -104,6 +118,9 @@ pub struct BlockEdit<'a> {
     pub spends: &'a [u64],
     /// The outputs it makes, in order.
     pub outputs: &'a [Record],
+    /// The names it registers (`false`) and the records it puts in place
+    /// of those registered (`true`), ascending by key.
+    pub names: &'a [(Key, NameRecord, bool)],
     /// The state root its header commits to. If given and the state after
     /// the block is another, the block is refused.
     pub state_root: Option<Digest>,
@@ -128,13 +145,14 @@ impl<B: Backend> State<B> {
         let meta = if root.payload().is_empty() && root.seq == 0 {
             Meta::empty()
         } else {
-            let (height, tip, outputs) = Meta::head(&root)?;
+            let (height, tip, outputs, names) = Meta::head(&root)?;
             let rest = &root.payload()[RECORD - Window::BYTES - 8..];
             let window = Window::read(&file, &rest[..Window::BYTES])?;
             let sweep = u64::from_le_bytes(rest[Window::BYTES..].try_into().unwrap());
             outputs.mark(&file)?;
+            names.mark(&file)?;
             window.mark(&file)?;
-            Meta { height, tip, outputs, window, sweep }
+            Meta { height, tip, outputs, names, window, sweep }
         };
         file.seal();
         Ok(State { file, meta: Mutex::new(meta), keep })
@@ -156,7 +174,8 @@ impl<B: Backend> State<B> {
 
     /// The state's root.
     pub fn root(&self) -> Digest {
-        state_root(&self.meta().outputs)
+        let m = self.meta();
+        state_root(&m.outputs, &m.names)
     }
 
     /// The height of the oldest block that can be undone, if any can.
@@ -167,21 +186,29 @@ impl<B: Backend> State<B> {
     /// The state as it is now, held: see [`Snapshot`].
     pub fn snapshot(&self) -> io::Result<Snapshot<'_, B>> {
         let pin = self.file.pin();
-        let (height, tip, outputs) = Meta::head(pin.root())?;
-        Ok(Snapshot { pin, height, tip, outputs })
+        let (height, tip, outputs, names) = Meta::head(pin.root())?;
+        Ok(Snapshot { pin, height, tip, outputs, names })
     }
 
     /// Applies the next block, and returns the state's root after it.
     /// Refused, with the state as it was: a block that spends what is not
-    /// there ([`Error::NoSuchOutput`]) or whose header commits to another
-    /// state ([`Error::StateRoot`]).
+    /// there ([`Error::NoSuchOutput`]), registers a name that is taken
+    /// ([`Error::NameTaken`]), replaces the record of one that is not
+    /// registered ([`Error::NoSuchName`]), or whose header commits to
+    /// another state ([`Error::StateRoot`]).
     pub fn apply(&self, block: &BlockEdit<'_>) -> Result<Digest, Error> {
         let mut txn = self.file.begin()?;
         let mut meta = self.meta().clone();
         assert_eq!(block.height, meta.height + 1, "blocks are applied in order");
         let first_new = meta.outputs.next;
         meta.outputs = meta.outputs.apply(&mut txn, block.height, block.spends, block.outputs)?;
-        let root = state_root(&meta.outputs);
+        // The records the block replaces, as they are, to undo it with.
+        let mut replaced = Vec::new();
+        for (key, _, _) in block.names.iter().filter(|n| n.2) {
+            replaced.push(meta.names.get(&txn, *key)?.ok_or(Error::NoSuchName)?);
+        }
+        meta.names = meta.names.apply(&mut txn, block.names)?;
+        let root = state_root(&meta.outputs, &meta.names);
         if block.state_root.is_some_and(|want| want != root) {
             return Err(Error::StateRoot);
         }
@@ -191,6 +218,8 @@ impl<B: Backend> State<B> {
             before: meta.tip,
             first_new,
             spends: block.spends.to_vec(),
+            registered: block.names.iter().filter(|n| !n.2).map(|n| n.0).collect(),
+            replaced,
         };
         meta.window.push(&mut txn, &record, self.keep)?;
         // What was spent before the oldest block of the window is dead
@@ -215,6 +244,8 @@ impl<B: Backend> State<B> {
             return Err(corrupt("the newest record is not the tip's").into());
         }
         meta.outputs = meta.outputs.undo(&mut txn, record.height - 1, &record.spends, record.first_new)?;
+        let restore: Vec<(Key, NameRecord, bool)> = record.replaced.iter().map(|r| (r.key(), *r, true)).collect();
+        meta.names = meta.names.undo(&mut txn, &restore, &record.registered)?;
         (meta.height, meta.tip) = (record.height - 1, record.before);
         txn.commit(&meta.to_bytes())?;
         let tip = (meta.height, meta.tip);
@@ -231,6 +262,7 @@ pub struct Snapshot<'a, B: Backend> {
     height: u32,
     tip: Digest,
     outputs: Outputs,
+    names: Names,
 }
 
 impl<B: Backend> Snapshot<'_, B> {
@@ -239,7 +271,23 @@ impl<B: Backend> Snapshot<'_, B> {
     }
 
     pub fn root(&self) -> Digest {
-        state_root(&self.outputs)
+        state_root(&self.outputs, &self.names)
+    }
+
+    /// The names: their count, and their tree's root.
+    pub fn names(&self) -> &Names {
+        &self.names
+    }
+
+    /// The record registered at `key`, if any.
+    pub fn name(&self, key: Key) -> io::Result<Option<NameRecord>> {
+        self.names.get(&self.pin, key)
+    }
+
+    /// The path of the name of `key` in the names' tree, whose root is
+    /// the right half of the state's: the outputs' root is its sibling.
+    pub fn prove_name(&self, key: Key) -> io::Result<(NameProof, Digest)> {
+        Ok((self.names.prove(&self.pin, key)?, self.outputs.hash()))
     }
 
     /// The outputs: their count, the next position, and their tree's root.
@@ -261,7 +309,7 @@ impl<B: Backend> Snapshot<'_, B> {
     /// sibling at each of the [`STATE_HEIGHT`] levels.
     pub fn prove(&self, position: u64) -> io::Result<(Digest, [Digest; STATE_HEIGHT])> {
         let (leaf, below) = self.outputs.prove(&self.pin, position)?;
-        let mut path = [*empty(STATE_HEIGHT - 1); STATE_HEIGHT];
+        let mut path = [self.names.hash(); STATE_HEIGHT];
         path[..STATE_HEIGHT - 1].copy_from_slice(&below);
         Ok((leaf, path))
     }
@@ -270,7 +318,7 @@ impl<B: Backend> Snapshot<'_, B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::sparse::{EMPTY, root_of_path};
+    use crate::store::sparse::{EMPTY, empty, root_of_path};
     use crate::store::testing::{Lost, MemBackend, temp_dir};
     use crate::test_util::Rng;
 
@@ -320,8 +368,14 @@ mod tests {
                 .collect();
             picked.sort_unstable();
             let outputs: Vec<Record> = (0..adds).map(|_| record(&mut self.rng, height)).collect();
-            let block =
-                BlockEdit { height, block: id(height, fork), spends: &picked, outputs: &outputs, state_root: None };
+            let block = BlockEdit {
+                height,
+                block: id(height, fork),
+                spends: &picked,
+                outputs: &outputs,
+                names: &[],
+                state_root: None,
+            };
             let root = state.apply(&block)?;
             self.live.extend(self.next..self.next + adds as u64);
             self.next += adds as u64;
@@ -427,6 +481,7 @@ mod tests {
             block: id(3, 0),
             spends,
             outputs: &outputs,
+            names: &[],
             state_root,
         };
         let gone: &'static [u64] = Box::leak(vec![spent].into_boxed_slice());
@@ -551,8 +606,14 @@ mod tests {
                 // It goes on: a block, and that block undone.
                 let height = again.tip().0 + 1;
                 let outputs = [record(&mut Rng::new(crash_at), height)];
-                let block =
-                    BlockEdit { height, block: id(height, 99), spends: &[], outputs: &outputs, state_root: None };
+                let block = BlockEdit {
+                    height,
+                    block: id(height, 99),
+                    spends: &[],
+                    outputs: &outputs,
+                    names: &[],
+                    state_root: None,
+                };
                 again.apply(&block).unwrap();
                 assert_eq!(again.undo().unwrap(), at.0);
                 assert_eq!(again.root(), at.1);
@@ -598,6 +659,85 @@ mod tests {
         let again = State::open(MemBackend::from_image(state.file().backend().image(Lost::All)), keep).unwrap();
         assert_eq!(again.file().space().0, state.file().space().0);
         assert_eq!(again.root(), state.root());
+    }
+
+    /// Names in blocks: registered and replaced with the outputs, in the
+    /// state's root, undone with the block, and proven to the root.
+    #[test]
+    fn names_change_with_the_blocks() {
+        use crate::store::names::{Terminal, empty_root};
+        let mut rng = Rng::new(0x4a3e);
+        let name = |rng: &mut Rng, text: &str| {
+            let d = |rng: &mut Rng| -> Digest { core::array::from_fn(|_| rng.fp()) };
+            NameRecord::new(text.as_bytes(), d(rng), d(rng), d(rng)).unwrap()
+        };
+        let sorted = |mut puts: Vec<(Key, NameRecord, bool)>| {
+            puts.sort_by_key(|p| p.0);
+            puts
+        };
+        let state = State::open(MemBackend::new(), 6).unwrap();
+        let outputs = [record(&mut rng, 1)];
+        let block = |height: u32, names: &[(Key, NameRecord, bool)]| {
+            state.apply(&BlockEdit {
+                height,
+                block: id(height, 0),
+                spends: &[],
+                outputs: &outputs,
+                names,
+                state_root: None,
+            })
+        };
+        // Block 1 registers three names.
+        let (alice, bob, carol) = (name(&mut rng, "alice"), name(&mut rng, "bob"), name(&mut rng, "carol_1"));
+        let root1 =
+            block(1, &sorted(vec![(alice.key(), alice, false), (bob.key(), bob, false), (carol.key(), carol, false)]))
+                .unwrap();
+        let snap1 = state.snapshot().unwrap();
+        assert_eq!(snap1.names().count, 3);
+        assert_eq!(snap1.name(bob.key()).unwrap(), Some(bob));
+        assert_eq!(root1, compress(&snap1.outputs().hash(), &snap1.names().hash()));
+        assert_ne!(snap1.names().hash(), empty_root());
+        // A name's path leads to the names' root, and that with the
+        // outputs' root to the state's.
+        let (proof, outputs_root) = snap1.prove_name(alice.key()).unwrap();
+        assert!(proof.verify_member(&snap1.names().hash(), alice.key(), &alice.leaf_value()));
+        assert_eq!(compress(&outputs_root, &proof.root(alice.key())), root1);
+        // An output's path passes the names' root on its way up.
+        let (leaf, path) = snap1.prove(0).unwrap();
+        assert_eq!(root_of_path(0, &leaf, &path), root1);
+        assert_eq!(path[STATE_HEIGHT - 1], snap1.names().hash());
+
+        // Block 2 replaces bob's record and registers dave.
+        let (bob2, dave) = (NameRecord { name: bob.name, ..name(&mut rng, "x") }, name(&mut rng, "dave"));
+        let root2 = block(2, &sorted(vec![(bob.key(), bob2, true), (dave.key(), dave, false)])).unwrap();
+        assert_ne!(root2, root1);
+        let used = state.file().space().0;
+        // Refused whole: a name taken, and a name not there.
+        assert_eq!(block(3, &[(alice.key(), alice, false)]).err(), Some(Error::NameTaken));
+        let erin = name(&mut rng, "erin");
+        assert_eq!(block(3, &[(erin.key(), erin, true)]).err(), Some(Error::NoSuchName));
+        assert_eq!((state.root(), state.tip().0), (root2, 2));
+        drop(snap1);
+        assert!(state.file().space().0 <= used);
+
+        // Opened again, then block 2 undone: bob's old record is back and
+        // dave is gone.
+        let state = State::open(MemBackend::from_image(state.file().backend().image(Lost::All)), 6).unwrap();
+        assert_eq!(state.root(), root2);
+        assert_eq!(state.snapshot().unwrap().name(bob.key()).unwrap(), Some(bob2));
+        assert_eq!(state.undo().unwrap().0, 1);
+        assert_eq!(state.root(), root1);
+        let snap = state.snapshot().unwrap();
+        assert_eq!(snap.name(bob.key()).unwrap(), Some(bob));
+        assert_eq!(snap.name(dave.key()).unwrap(), None);
+        let (proof, _) = snap.prove_name(dave.key()).unwrap();
+        assert!(proof.verify_absent(&snap.names().hash(), dave.key()));
+        assert!(!matches!(proof.terminal, Terminal::Leaf { key, .. } if key == dave.key()));
+        drop(snap);
+        // And block 1: no name, no output, no page.
+        state.undo().unwrap();
+        assert_eq!(state.root(), *empty(STATE_HEIGHT));
+        assert_eq!(state.file().space().0, crate::store::pagefile::HEADER_UNITS);
     }
 
     /// On a real file, closed and opened.

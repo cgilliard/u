@@ -37,8 +37,11 @@
 //!   above.
 //! - [`sparse`]: the hashes of the state's Merkle tree, from the nodes
 //!   that are not empty.
-//! - [`outputs`]: the unspent outputs, a trie over positions on the two
-//!   above.
+//! - [`trie`]: a trie over keys that is the Merkle tree of what it holds,
+//!   whatever the tree's keys, records and hashes: on the pages.
+//! - [`outputs`]: the unspent outputs, a trie over positions.
+//! - [`names`]: the names, a trie over the keys of names, hashed by their
+//!   own rule.
 //! - [`window`]: what undoes each of the last blocks.
 //! - [`state`]: the two under one root record, with the block they are
 //!   the state after: what a node applies blocks to.
@@ -50,12 +53,14 @@
 pub mod backend;
 pub mod crc32c;
 pub mod freemap;
+pub mod names;
 pub mod outputs;
 pub mod pagefile;
 pub mod sparse;
 pub mod state;
 #[cfg(test)]
 pub(crate) mod testing;
+pub mod trie;
 pub mod window;
 
 pub use backend::{Backend, DirLock, FileBackend, ReadReq, WriteReq};

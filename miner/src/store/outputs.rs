@@ -1,92 +1,51 @@
-//! The unspent outputs: a trie over positions that is also their Merkle
-//! tree.
+//! The unspent outputs: the trie of [`super::trie`] over positions, which
+//! is their Merkle tree.
 //!
 //! Every output ever made has a position, the next of a counter, and its
 //! leaf in a binary Merkle tree of height [`HEIGHT`] over all positions
-//! ([`crate::output::leaf`]); a spent output's leaf is empty again. This
-//! module stores the unspent ones so that the tree's root, any output and
-//! any path can be had from a few pages, and so that a block changes few.
-//!
-//! # Shape
-//!
-//! A node covers a subtree of the Merkle tree and has [`FANOUT`]
-//! children, each covering a sixteenth of it. A child is empty, another
-//! node, or a leaf: a page of the outputs under it, when they fit one.
-//! Beside each child the node keeps the child's Merkle hash, so a node's
-//! own hash follows from its page alone, and the path of any output from
-//! the pages on the way down to it.
-//!
-//! ```text
-//! node page := height (1) | children (1) | child ...
-//! child     := slot (1) | kind (1) | hash (32) | page (6) | leaf's
-//! leaf's    := records (1) | live (8) | last spend (4)
-//! leaf page := records (1) | record ...
-//! record    := distance from the position before (varint) | commitment (32)
-//!              | memo (20) | amount (8) | height (4)
-//! ```
+//! ([`crate::output::leaf`]); a spent output's leaf is empty again, and
+//! an empty subtree of each height has one hash, known beforehand.
 //!
 //! # A spend does not touch the output's page
 //!
-//! Which records of a leaf are unspent is a bit each in the node above
-//! (`live`). Spending an output clears its bit and changes the hashes
-//! above it: the nodes on the way are written anew, as they must be, and
-//! the page of records is left as it is. So a block writes about a
-//! kilobyte for an output it spends, not the four of the page, and the
+//! Spending an output clears its bit in the node above it and changes
+//! the hashes above: the nodes on the way are written anew, as they must
+//! be, and the page of records is left as it is. So a block writes about
+//! a kilobyte for an output it spends, not the four of the page, and the
 //! record of a spent output is still there to be had: undoing the block
 //! sets the bit again.
 //!
-//! A leaf's page is written when outputs are added to it (only ever at
-//! the end of the positions, where new outputs go) and when its dead
+//! An output's page is written when outputs are added to it (only ever
+//! at the end of the positions, where new outputs go) and when its dead
 //! records are dropped.
 //!
 //! # The sweep
 //!
 //! Dead records are dropped by a sweep ([`Outputs::sweep`]) that goes
-//! round the trie a little with every block. Beside a leaf the node
-//! keeps `last spend`, the height of the latest spend under it, so the
-//! sweep can tell without reading the page that everything dead in it is
-//! older than the window in which blocks may still be undone. Such a
-//! leaf is written anew without its dead records if they are a quarter
-//! of it or more (so a record is written at most a few times in its
-//! life), or dropped if nothing in it is unspent; and a node whose
-//! outputs have thinned until they fit one page becomes a leaf.
-//!
-//! # Changes
-//!
-//! A block's changes are made in one pass in position order
-//! ([`Outputs::apply`]): each page on the way is read once, and written
-//! once when the pass leaves it. Nothing is changed in place; the pages
-//! replaced are named to the transaction, and the new root is returned to
-//! be committed with it.
+//! round the trie a little with every block: a leaf in which everything
+//! dead was spent before the window in which blocks may still be undone
+//! is written anew without it, if that is a quarter of it or more (so a
+//! record is written at most a few times in its life), or dropped if
+//! nothing in it is unspent; and a node whose outputs have thinned until
+//! they fit one page becomes a leaf.
 
 use std::io;
 
-use super::pagefile::{Extent, PageFile, ReadPages, Txn};
+use super::backend::Backend;
+use super::pagefile::{PageFile, ReadPages, Txn};
 use super::sparse::{EMPTY, empty, root, root_with_path};
+use super::trie::{self, BITS, CHILD_BYTES, Child, Edits, FANOUT, Fault, LEAF_RECORDS, Part, Slot, Step, Tree};
 use crate::error::Error;
 use crate::hash::Digest;
-use crate::output::{Commitment, MEMO_BYTES, Memo, memo_from_bytes, memo_to_bytes, output_leaf};
-use crate::poseidon2::{digest_from_bytes, digest_to_bytes};
-use crate::store::backend::Backend;
+use crate::output::{
+    Commitment, MEMO_BYTES, Memo, height_digest, memo_from_bytes, memo_slot, memo_to_bytes, output_leaf,
+};
+use crate::poseidon2::{LANES, compress_batch, digest_from_bytes, digest_to_bytes};
 
 /// Height of the outputs' tree: positions are below `2^HEIGHT`.
 pub const HEIGHT: u32 = 41;
-/// Levels of the tree a node spans.
-pub const BITS: u32 = 4;
-/// Children of a node.
-pub const FANOUT: usize = 1 << BITS;
-/// The height of the lowest leaves: 32 positions, which always fit a page.
-const LEAF_HEIGHT: u32 = 5;
-const _: () = assert!((HEIGHT - LEAF_HEIGHT) % BITS == 0);
-
 /// Serialized size of a [`Record`].
 pub const RECORD_BYTES: usize = 32 + MEMO_BYTES + 8 + 4;
-/// The most records a leaf holds: a bit each in its `live`.
-const LEAF_RECORDS: usize = 64;
-/// The most bytes of a leaf page's payload: eight units.
-const LEAF_BYTES: usize = Extent::capacity(8);
-const PAGE: usize = 4096;
-const _: () = assert!(1 + (1 << LEAF_HEIGHT) * (RECORD_BYTES + 6) <= LEAF_BYTES);
 
 fn corrupt(what: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what)
@@ -107,574 +66,100 @@ impl Record {
     pub fn leaf(&self) -> Digest {
         output_leaf(&self.commitment, &self.memo, self.amount, self.height)
     }
+}
 
-    fn write(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&digest_to_bytes(&self.commitment));
-        out.extend_from_slice(&memo_to_bytes(&self.memo));
-        out.extend_from_slice(&self.amount.to_le_bytes());
-        out.extend_from_slice(&self.height.to_le_bytes());
+/// The outputs' tree: positions for keys, a fixed height, and the hash
+/// of an empty subtree for whatever is not there.
+pub struct OutputTree;
+
+impl Tree for OutputTree {
+    const HEIGHT: u32 = HEIGHT;
+    type Key = u64;
+    type Record = Record;
+
+    fn record_len(_: &Record) -> usize {
+        RECORD_BYTES
     }
 
-    fn read(b: &[u8]) -> io::Result<Record> {
+    fn write_record(r: &Record, out: &mut Vec<u8>) {
+        out.extend_from_slice(&digest_to_bytes(&r.commitment));
+        out.extend_from_slice(&memo_to_bytes(&r.memo));
+        out.extend_from_slice(&r.amount.to_le_bytes());
+        out.extend_from_slice(&r.height.to_le_bytes());
+    }
+
+    fn read_record(b: &[u8]) -> io::Result<(Record, &[u8])> {
         let bad = || corrupt("an output's record is not one");
-        let (commitment, rest) = b.split_at_checked(32).ok_or_else(bad)?;
-        let (memo, rest) = rest.split_at_checked(MEMO_BYTES).ok_or_else(bad)?;
-        if rest.len() != 12 {
-            return Err(bad());
-        }
-        Ok(Record {
-            commitment: digest_from_bytes(commitment).ok_or_else(bad)?,
-            memo: memo_from_bytes(memo).map_err(|_| bad())?,
-            amount: u64::from_le_bytes(rest[..8].try_into().unwrap()),
-            height: u32::from_le_bytes(rest[8..].try_into().unwrap()),
-        })
-    }
-}
-
-/// A child of a node, or the root: a subtree, and its Merkle hash.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Child {
-    /// No output under it, spent or unspent.
-    Empty,
-    /// A node's page.
-    Node { page: Extent, hash: Digest },
-    /// A page of records.
-    Leaf {
-        page: Extent,
-        hash: Digest,
-        /// Records in the page.
-        records: u8,
-        /// Which of them are unspent, the first the lowest bit.
-        live: u64,
-        /// The height of the latest spend among them, 0 if none.
-        last_spend: u32,
-    },
-}
-
-/// Bytes of a child's encoding, less its slot: the longest, a leaf's.
-const CHILD_BYTES: usize = 1 + 32 + 6 + 13;
-
-fn put_extent(out: &mut Vec<u8>, e: Extent) {
-    debug_assert!(e.start < 1 << 40 && e.units < 256);
-    out.extend_from_slice(&e.start.to_le_bytes()[..5]);
-    out.push(e.units as u8);
-}
-
-fn get_extent(b: &[u8]) -> Extent {
-    let mut start = [0u8; 8];
-    start[..5].copy_from_slice(&b[..5]);
-    Extent { start: u64::from_le_bytes(start), units: b[5] as u32 }
-}
-
-impl Child {
-    /// The Merkle hash of the subtree, which has `height` levels.
-    pub fn hash(&self, height: u32) -> Digest {
-        match self {
-            Child::Empty => *empty(height as usize),
-            Child::Node { hash, .. } | Child::Leaf { hash, .. } => *hash,
-        }
+        let (b, rest) = b.split_at_checked(RECORD_BYTES).ok_or_else(bad)?;
+        let record = Record {
+            commitment: digest_from_bytes(&b[..32]).ok_or_else(bad)?,
+            memo: memo_from_bytes(&b[32..32 + MEMO_BYTES]).map_err(|_| bad())?,
+            amount: u64::from_le_bytes(b[32 + MEMO_BYTES..40 + MEMO_BYTES].try_into().unwrap()),
+            height: u32::from_le_bytes(b[40 + MEMO_BYTES..].try_into().unwrap()),
+        };
+        Ok((record, rest))
     }
 
-    fn write(&self, out: &mut Vec<u8>) {
-        match self {
-            Child::Empty => out.push(0),
-            Child::Node { page, hash } => {
-                out.push(1);
-                out.extend_from_slice(&digest_to_bytes(hash));
-                put_extent(out, *page);
+    fn leaf(_: u128, r: &Record) -> Digest {
+        r.leaf()
+    }
+
+    /// A leaf is two compressions; those of eight records are done
+    /// together.
+    fn leaves(slots: &[Slot<Record>], out: &mut [(u128, Part); LEAF_RECORDS]) -> usize {
+        let mut n = 0;
+        let mut live = slots.iter().filter(|s| s.live);
+        loop {
+            let mut batch = [None; LANES];
+            let mut got = 0;
+            for (b, s) in batch.iter_mut().zip(&mut live) {
+                *b = Some(s);
+                got += 1;
             }
-            Child::Leaf { page, hash, records, live, last_spend } => {
-                out.push(2);
-                out.extend_from_slice(&digest_to_bytes(hash));
-                put_extent(out, *page);
-                out.push(*records);
-                out.extend_from_slice(&live.to_le_bytes());
-                out.extend_from_slice(&last_spend.to_le_bytes());
-            }
-        }
-    }
-
-    /// Reads a child from the front of `b`, and returns the rest.
-    fn read(b: &[u8]) -> io::Result<(Child, &[u8])> {
-        let bad = || corrupt("a node's child is not one");
-        let (&kind, b) = b.split_first().ok_or_else(bad)?;
-        if kind == 0 {
-            return Ok((Child::Empty, b));
-        }
-        let (head, b) = b.split_at_checked(38).ok_or_else(bad)?;
-        let hash = digest_from_bytes(&head[..32]).ok_or_else(bad)?;
-        let page = get_extent(&head[32..]);
-        if page.units == 0 {
-            return Err(bad());
-        }
-        match kind {
-            1 => Ok((Child::Node { page, hash }, b)),
-            2 => {
-                let (tail, b) = b.split_at_checked(13).ok_or_else(bad)?;
-                let records = tail[0];
-                let live = u64::from_le_bytes(tail[1..9].try_into().unwrap());
-                if records == 0 || records as usize > LEAF_RECORDS || (records < 64 && live >> records != 0) {
-                    return Err(bad());
+            if got < LANES {
+                for s in batch.iter().flatten() {
+                    out[n] = (s.key, Part { hash: s.record.leaf(), single: true });
+                    n += 1;
                 }
-                let last_spend = u32::from_le_bytes(tail[9..].try_into().unwrap());
-                Ok((Child::Leaf { page, hash, records, live, last_spend }, b))
+                return n;
             }
-            _ => Err(bad()),
-        }
-    }
-}
-
-/// A node's children, read from its page.
-fn read_node(payload: &[u8], height: u32) -> io::Result<[Child; FANOUT]> {
-    let bad = || corrupt("a node's page is not one");
-    let (head, mut b) = payload.split_at_checked(2).ok_or_else(bad)?;
-    if head[0] as u32 != height {
-        return Err(bad());
-    }
-    let mut children = [Child::Empty; FANOUT];
-    let mut last = None;
-    for _ in 0..head[1] {
-        let (&slot, rest) = b.split_first().ok_or_else(bad)?;
-        // Slots ascend, and none is given as empty.
-        if slot as usize >= FANOUT || last.is_some_and(|l| slot <= l) {
-            return Err(bad());
-        }
-        let (child, rest) = Child::read(rest)?;
-        if child == Child::Empty {
-            return Err(bad());
-        }
-        children[slot as usize] = child;
-        (last, b) = (Some(slot), rest);
-    }
-    if !b.is_empty() || last.is_none() {
-        return Err(bad());
-    }
-    Ok(children)
-}
-
-fn write_node(children: &[Child; FANOUT], height: u32, out: &mut Vec<u8>) {
-    out.clear();
-    out.push(height as u8);
-    out.push(children.iter().filter(|c| **c != Child::Empty).count() as u8);
-    for (slot, c) in children.iter().enumerate() {
-        if *c != Child::Empty {
-            out.push(slot as u8);
-            c.write(out);
-        }
-    }
-}
-
-/// A node's hash, from its children's: `base` is its first position.
-fn node_hash(children: &[Child; FANOUT], height: u32, base: u64) -> Digest {
-    let below = height - BITS;
-    let mut nodes = [(0u64, EMPTY); FANOUT];
-    let mut n = 0;
-    for (k, c) in children.iter().enumerate() {
-        if let Child::Node { hash, .. } | Child::Leaf { hash, .. } = c {
-            nodes[n] = ((base >> below) + k as u64, *hash);
-            n += 1;
-        }
-    }
-    root(below as usize, height as usize, &mut nodes[..n])
-}
-
-/// A record of a leaf, with its position and whether it is unspent.
-#[derive(Clone, Copy, Debug)]
-struct Slot {
-    position: u64,
-    record: Record,
-    live: bool,
-}
-
-fn put_varint(out: &mut Vec<u8>, mut x: u64) {
-    while x >= 0x80 {
-        out.push(x as u8 | 0x80);
-        x >>= 7;
-    }
-    out.push(x as u8);
-}
-
-fn get_varint(b: &[u8]) -> Option<(u64, &[u8])> {
-    let (mut x, mut shift) = (0u64, 0);
-    for (i, &byte) in b.iter().enumerate().take(6) {
-        x |= u64::from(byte & 0x7f) << shift;
-        shift += 7;
-        if byte < 0x80 {
-            return Some((x, &b[i + 1..]));
-        }
-    }
-    None
-}
-
-/// A leaf page's records, appended to `out`: those of the leaf whose
-/// subtree of `height` levels starts at `base`.
-fn read_leaf(payload: &[u8], base: u64, height: u32, records: u8, live: u64, out: &mut Vec<Slot>) -> io::Result<()> {
-    let bad = || corrupt("a leaf's page is not one");
-    let (&count, mut b) = payload.split_first().ok_or_else(bad)?;
-    if count != records {
-        return Err(bad());
-    }
-    let end = base + (1u64 << height);
-    let mut position = base;
-    for i in 0..count as usize {
-        let (delta, rest) = get_varint(b).ok_or_else(bad)?;
-        // Positions ascend, and stay under the leaf.
-        if i > 0 && delta == 0 {
-            return Err(bad());
-        }
-        position = position.checked_add(delta).filter(|p| *p < end).ok_or_else(bad)?;
-        let (rec, rest) = rest.split_at_checked(RECORD_BYTES).ok_or_else(bad)?;
-        out.push(Slot { position, record: Record::read(rec)?, live: live >> i & 1 == 1 });
-        b = rest;
-    }
-    if !b.is_empty() {
-        return Err(bad());
-    }
-    Ok(())
-}
-
-fn write_leaf(slots: &[Slot], base: u64, out: &mut Vec<u8>) {
-    out.clear();
-    out.push(slots.len() as u8);
-    let mut prev = base;
-    for s in slots {
-        put_varint(out, s.position - prev);
-        s.record.write(out);
-        prev = s.position;
-    }
-}
-
-/// Whether `slots`, under one subtree starting at `base`, fit a leaf.
-fn fits(slots: &[Slot], base: u64) -> bool {
-    if slots.len() > LEAF_RECORDS {
-        return false;
-    }
-    let mut bytes = 1;
-    let mut prev = base;
-    for s in slots {
-        let delta = s.position - prev;
-        bytes += RECORD_BYTES + (64 - delta.leading_zeros()).div_ceil(7).max(1) as usize;
-        prev = s.position;
-    }
-    bytes <= LEAF_BYTES
-}
-
-/// The hash of a subtree of `height` levels from its unspent records.
-fn leaf_hash(slots: &[Slot], height: u32) -> Digest {
-    let mut nodes = [(0u64, EMPTY); LEAF_RECORDS];
-    let mut n = 0;
-    for s in slots.iter().filter(|s| s.live) {
-        nodes[n] = (s.position, s.record.leaf());
-        n += 1;
-    }
-    root(0, height as usize, &mut nodes[..n])
-}
-
-fn live_bits(slots: &[Slot]) -> u64 {
-    slots.iter().enumerate().fold(0, |bits, (i, s)| bits | (s.live as u64) << i)
-}
-
-/// What one pass changes, as it applies to a subtree: every part of it
-/// is cut down to the subtree's positions as the pass descends, at no
-/// cost.
-#[derive(Clone, Copy)]
-struct Edits<'a> {
-    /// Positions whose outputs are spent, or (`unspend`) unspent again:
-    /// ascending.
-    flips: &'a [u64],
-    unspend: bool,
-    /// New outputs, at the positions from `add_from` on.
-    adds: &'a [Record],
-    add_from: u64,
-    /// Every output at this position or after is removed.
-    truncate: u64,
-}
-
-impl<'a> Edits<'a> {
-    /// The part that falls in `base..base + 2^height`.
-    fn within(&self, base: u64, height: u32) -> Edits<'a> {
-        let end = base + (1u64 << height);
-        let from = self.flips.partition_point(|p| *p < base);
-        let to = self.flips.partition_point(|p| *p < end);
-        let add_end = self.add_from + self.adds.len() as u64;
-        let lo = self.add_from.max(base).min(add_end);
-        let hi = add_end.min(end).max(lo);
-        Edits {
-            flips: &self.flips[from..to],
-            unspend: self.unspend,
-            adds: &self.adds[(lo - self.add_from) as usize..(hi - self.add_from) as usize],
-            add_from: lo,
-            truncate: self.truncate,
-        }
-    }
-
-    /// Whether nothing of it falls in `base..base + 2^height`: `self` is
-    /// already cut down to that.
-    fn is_empty(&self, base: u64, height: u32) -> bool {
-        self.flips.is_empty() && self.adds.is_empty() && self.truncate >= base + (1u64 << height)
-    }
-}
-
-/// A sweep under way.
-struct Sweep {
-    /// The position it has reached.
-    from: u64,
-    /// Leaves it may still look at.
-    budget: usize,
-    /// A leaf whose last spend is below this height has nothing dead that
-    /// a block still to be undone could want back.
-    horizon: u32,
-}
-
-/// One pass over the trie, inside a transaction.
-struct Pass<'t, 'f, B: Backend> {
-    txn: &'t mut Txn<'f, B>,
-    /// The height of the block the pass applies, or of the tip a pass
-    /// that undoes one leaves.
-    height: u32,
-    /// The change in the number of unspent outputs.
-    count: i64,
-    slots: Vec<Slot>,
-    out: Vec<u8>,
-}
-
-impl<B: Backend> Pass<'_, '_, B> {
-    /// The subtree `child` (of `height` levels from `base`) after `edits`.
-    fn update(&mut self, child: Child, height: u32, base: u64, edits: Edits<'_>) -> Result<Child, Error> {
-        if edits.is_empty(base, height) {
-            return Ok(child);
-        }
-        let Child::Node { page, .. } = child else { return self.update_leaf(child, height, base, edits) };
-        let mut buf = [0u8; PAGE];
-        let mut children = read_node(self.txn.read(page, &mut buf)?, height)?;
-        let below = height - BITS;
-        for (k, c) in children.iter_mut().enumerate() {
-            let at = base + ((k as u64) << below);
-            *c = self.update(*c, below, at, edits.within(at, below))?;
-        }
-        self.txn.free(page);
-        if children.iter().all(|c| *c == Child::Empty) {
-            return Ok(Child::Empty);
-        }
-        self.write_node(&children, height, base)
-    }
-
-    fn write_node(&mut self, children: &[Child; FANOUT], height: u32, base: u64) -> Result<Child, Error> {
-        write_node(children, height, &mut self.out);
-        let page = self.txn.write(&self.out)?;
-        Ok(Child::Node { page, hash: node_hash(children, height, base) })
-    }
-
-    /// A leaf, or an empty subtree, after `edits`.
-    fn update_leaf(&mut self, child: Child, height: u32, base: u64, edits: Edits<'_>) -> Result<Child, Error> {
-        let mut slots = std::mem::take(&mut self.slots);
-        slots.clear();
-        let mut old = None;
-        if let Child::Leaf { page, records, live, last_spend, .. } = child {
-            let mut buf = [0u8; PAGE];
-            read_leaf(self.txn.read(page, &mut buf)?, base, height, records, live, &mut slots)?;
-            old = Some((page, last_spend));
-        }
-        let done = self.edit(&mut slots, old, height, base, edits);
-        self.slots = slots;
-        done
-    }
-
-    fn edit(
-        &mut self,
-        slots: &mut Vec<Slot>,
-        old: Option<(Extent, u32)>,
-        height: u32,
-        base: u64,
-        edits: Edits<'_>,
-    ) -> Result<Child, Error> {
-        let mut last_spend = old.map_or(0, |o| o.1);
-        for p in edits.flips {
-            let slot = slots.binary_search_by_key(p, |s| s.position).ok().map(|i| &mut slots[i]);
-            match slot {
-                Some(s) if s.live != edits.unspend => {
-                    s.live = edits.unspend;
-                    self.count += if edits.unspend { 1 } else { -1 };
-                }
-                // A spend of what is not there to spend is the block's
-                // fault; an unspend of what was not spent is ours.
-                _ if !edits.unspend => return Err(Error::NoSuchOutput(*p)),
-                _ => return Err(corrupt("an output to unspend is not a spent one").into()),
-            }
-        }
-        if !edits.flips.is_empty() {
-            last_spend = if edits.unspend { last_spend.min(self.height) } else { self.height };
-        }
-        // Only the bits changed: the page stands.
-        let mut rewrite = false;
-        let keep = slots.partition_point(|s| s.position < edits.truncate);
-        if keep < slots.len() {
-            self.count -= slots[keep..].iter().filter(|s| s.live).count() as i64;
-            slots.truncate(keep);
-            rewrite = true;
-        }
-        if !edits.adds.is_empty() {
-            if slots.last().is_some_and(|s| s.position >= edits.add_from) {
-                return Err(corrupt("a new output's position is not past the last").into());
-            }
-            slots.extend(edits.adds.iter().enumerate().map(|(i, r)| Slot {
-                position: edits.add_from + i as u64,
-                record: *r,
-                live: true,
-            }));
-            self.count += edits.adds.len() as i64;
-            rewrite = true;
-        }
-        match old {
-            Some((page, _)) if !rewrite => Ok(Child::Leaf {
-                page,
-                hash: leaf_hash(slots, height),
-                records: slots.len() as u8,
-                live: live_bits(slots),
-                last_spend,
-            }),
-            _ => {
-                if let Some((page, _)) = old {
-                    self.txn.free(page);
-                }
-                self.build(slots, height, base, last_spend)
+            let batch = batch.map(|s| s.unwrap());
+            let slot = batch.map(|s| memo_slot(&s.record.memo, s.record.amount));
+            let height = batch.map(|s| height_digest(s.record.height));
+            let inner = compress_batch(core::array::from_fn(|i| (&batch[i].record.commitment, &slot[i])));
+            let leaf = compress_batch(core::array::from_fn(|i| (&inner[i], &height[i])));
+            for (s, hash) in batch.iter().zip(leaf) {
+                out[n] = (s.key, Part { hash, single: true });
+                n += 1;
             }
         }
     }
 
-    /// Sweeps the subtree `child` from position `sweep.from` on, while
-    /// the budget lasts. Returns the subtree after it.
-    fn sweep(&mut self, child: Child, height: u32, base: u64, sweep: &mut Sweep) -> Result<Child, Error> {
-        let end = base + (1u64 << height);
-        if end <= sweep.from || sweep.budget == 0 {
-            return Ok(child);
+    /// The sparse tree's root over the parts ([`super::sparse::root`]).
+    fn combine(level: u32, top: u32, parts: &mut [(u128, Part)]) -> Option<Part> {
+        if parts.is_empty() {
+            return None;
         }
-        match child {
-            Child::Empty => {
-                sweep.from = end;
-                Ok(child)
-            }
-            Child::Leaf { page, records, live, last_spend, .. } => {
-                sweep.budget -= 1;
-                sweep.from = end;
-                let dead = records as u32 - live.count_ones();
-                // Everything dead here was spent before the horizon, and
-                // there is enough of it to be worth a page.
-                if dead == 0 || last_spend >= sweep.horizon || (live != 0 && dead * 4 < records as u32) {
-                    return Ok(child);
-                }
-                self.txn.free(page);
-                if live == 0 {
-                    return Ok(Child::Empty);
-                }
-                let mut slots = std::mem::take(&mut self.slots);
-                slots.clear();
-                let mut buf = [0u8; PAGE];
-                read_leaf(self.txn.read(page, &mut buf)?, base, height, records, live, &mut slots)?;
-                slots.retain(|s| s.live);
-                let built = self.build(&slots, height, base, 0);
-                self.slots = slots;
-                built
-            }
-            Child::Node { page, .. } => {
-                let mut buf = [0u8; PAGE];
-                let mut children = read_node(self.txn.read(page, &mut buf)?, height)?;
-                let below = height - BITS;
-                let mut changed = false;
-                for (k, c) in children.iter_mut().enumerate() {
-                    let swept = self.sweep(*c, below, base + ((k as u64) << below), sweep)?;
-                    changed |= swept != *c;
-                    *c = swept;
-                }
-                // Swept to its end, a node that has thinned to a page's
-                // worth of unspent outputs becomes that page.
-                if sweep.from >= end
-                    && let Some(leaf) = self.collapse(&children, height, base)?
-                {
-                    self.txn.free(page);
-                    return Ok(leaf);
-                }
-                if !changed {
-                    return Ok(child);
-                }
-                self.txn.free(page);
-                if children.iter().all(|c| *c == Child::Empty) {
-                    return Ok(Child::Empty);
-                }
-                self.write_node(&children, height, base)
-            }
+        let mut nodes = [(0u64, EMPTY); LEAF_RECORDS];
+        for (node, part) in nodes.iter_mut().zip(parts.iter()) {
+            *node = (part.0 as u64, part.1.hash);
         }
+        Some(Part { hash: root(level as usize, top as usize, &mut nodes[..parts.len()]), single: false })
     }
 
-    /// The one leaf that holds all of a node's outputs, if its children
-    /// are leaves with nothing dead in them and few enough records; the
-    /// children's pages are then freed.
-    fn collapse(&mut self, children: &[Child; FANOUT], height: u32, base: u64) -> Result<Option<Child>, Error> {
-        let mut total = 0usize;
-        for c in children {
-            match c {
-                Child::Empty => {}
-                Child::Leaf { records, live, .. } if live.count_ones() == *records as u32 => total += *records as usize,
-                _ => return Ok(None),
-            }
+    fn refuse(key: u128, fault: Fault) -> Error {
+        match fault {
+            // A spend of what is not there to spend is the block's fault;
+            // anything else is ours.
+            Fault::NotLive => Error::NoSuchOutput(key as u64),
+            _ => corrupt("a change to the outputs cannot be made").into(),
         }
-        // Well under a full page, so that the leaf does not at once
-        // become a node again.
-        if total == 0 || total > LEAF_RECORDS * 3 / 4 {
-            return Ok(None);
-        }
-        let mut slots = Vec::with_capacity(total);
-        let below = height - BITS;
-        let mut buf = [0u8; PAGE];
-        for (k, c) in children.iter().enumerate() {
-            if let Child::Leaf { page, records, live, .. } = c {
-                let at = base + ((k as u64) << below);
-                read_leaf(self.txn.read(*page, &mut buf)?, at, below, *records, *live, &mut slots)?;
-            }
-        }
-        if !fits(&slots, base) {
-            return Ok(None);
-        }
-        for c in children {
-            if let Child::Leaf { page, .. } = c {
-                self.txn.free(*page);
-            }
-        }
-        self.build(&slots, height, base, 0).map(Some)
     }
+}
 
-    /// The subtree of `height` levels from `base` holding `slots`, all
-    /// of it written anew: a leaf if they fit one, else a node over the
-    /// sixteen parts of them.
-    fn build(&mut self, slots: &[Slot], height: u32, base: u64, last_spend: u32) -> Result<Child, Error> {
-        if slots.is_empty() {
-            return Ok(Child::Empty);
-        }
-        if fits(slots, base) {
-            write_leaf(slots, base, &mut self.out);
-            let page = self.txn.write(&self.out)?;
-            // Only a leaf with something spent has a last spend.
-            let last_spend = if slots.iter().all(|s| s.live) { 0 } else { last_spend };
-            return Ok(Child::Leaf {
-                page,
-                hash: leaf_hash(slots, height),
-                records: slots.len() as u8,
-                live: live_bits(slots),
-                last_spend,
-            });
-        }
-        debug_assert!(height > LEAF_HEIGHT, "the lowest leaves always fit");
-        let below = height - BITS;
-        let mut children = [Child::Empty; FANOUT];
-        let mut rest = slots;
-        for (k, c) in children.iter_mut().enumerate() {
-            let at = base + ((k as u64) << below);
-            let n = rest.partition_point(|s| s.position < at + (1u64 << below));
-            *c = self.build(&rest[..n], below, at, last_spend)?;
-            rest = &rest[n..];
-        }
-        self.write_node(&children, height, base)
-    }
+/// The hash of a subtree of `height` levels with this part.
+fn hash_of(part: Option<Part>, height: u32) -> Digest {
+    part.map_or(*empty(height as usize), |p| p.hash)
 }
 
 /// The set of unspent outputs, as a root record holds it: the root of
@@ -696,7 +181,7 @@ impl Outputs {
 
     /// The root of the outputs' tree.
     pub fn hash(&self) -> Digest {
-        self.root.hash(HEIGHT)
+        hash_of(self.root.part(), HEIGHT)
     }
 
     pub fn to_bytes(&self) -> [u8; Self::BYTES] {
@@ -729,14 +214,12 @@ impl Outputs {
         &self,
         txn: &mut Txn<'_, B>,
         height: u32,
-        edits: Edits<'_>,
+        edits: Edits<'_, OutputTree>,
         next: u64,
     ) -> Result<Outputs, Error> {
         debug_assert!(edits.flips.windows(2).all(|w| w[0] <= w[1]), "positions ascend");
-        let mut pass = Pass { txn, height, count: 0, slots: Vec::new(), out: Vec::new() };
-        let root = pass.update(self.root, HEIGHT, 0, edits.within(0, HEIGHT))?;
-        let count =
-            self.count.checked_add_signed(pass.count).ok_or_else(|| corrupt("the count of outputs is wrong"))?;
+        let (root, change) = trie::update(txn, self.root, height, edits)?;
+        let count = self.count.checked_add_signed(change).ok_or_else(|| corrupt("the count of outputs is wrong"))?;
         Ok(Outputs { root, next, count })
     }
 
@@ -757,7 +240,7 @@ impl Outputs {
         if let Some(p) = spends.iter().find(|p| **p >= self.next) {
             return Err(Error::NoSuchOutput(*p));
         }
-        let edits = Edits { flips: spends, unspend: false, adds: outputs, add_from: self.next, truncate: u64::MAX };
+        let edits = Edits { flips: spends, run: outputs, run_from: self.next as u128, ..Edits::none() };
         self.pass(txn, height, edits, next)
     }
 
@@ -772,7 +255,7 @@ impl Outputs {
         next: u64,
     ) -> Result<Outputs, Error> {
         assert!(next <= self.next);
-        let edits = Edits { flips: spends, unspend: true, adds: &[], add_from: next, truncate: next };
+        let edits = Edits { flips: spends, revive: true, truncate: next as u128, ..Edits::none() };
         self.pass(txn, height, edits, next)
     }
 
@@ -788,11 +271,8 @@ impl Outputs {
         budget: usize,
         horizon: u32,
     ) -> Result<(Outputs, u64), Error> {
-        let mut pass = Pass { txn, height: 0, count: 0, slots: Vec::new(), out: Vec::new() };
-        let mut sweep = Sweep { from, budget, horizon };
-        let root = pass.sweep(self.root, HEIGHT, 0, &mut sweep)?;
-        debug_assert_eq!(root.hash(HEIGHT), self.hash(), "a sweep changes no hash");
-        let next = if sweep.from >= self.next { 0 } else { sweep.from };
+        let (root, reached) = trie::sweep::<OutputTree, B>(txn, self.root, from as u128, budget, horizon)?;
+        let next = if reached >= self.next as u128 { 0 } else { reached as u64 };
         Ok((Outputs { root, ..*self }, next))
     }
 
@@ -800,25 +280,7 @@ impl Outputs {
     /// record of one is kept (there never was one, or it was spent and
     /// its record has since been dropped).
     pub fn get(&self, pages: &impl ReadPages, position: u64) -> io::Result<Option<(Record, bool)>> {
-        let (mut child, mut height, mut base) = (self.root, HEIGHT, 0u64);
-        let mut buf = [0u8; PAGE];
-        loop {
-            match child {
-                Child::Empty => return Ok(None),
-                Child::Node { page, .. } => {
-                    let children = read_node(pages.read_page(page, &mut buf)?, height)?;
-                    height -= BITS;
-                    let k = (position - base) >> height;
-                    child = children[k as usize];
-                    base += k << height;
-                }
-                Child::Leaf { page, records, live, .. } => {
-                    let mut slots = Vec::with_capacity(records as usize);
-                    read_leaf(pages.read_page(page, &mut buf)?, base, height, records, live, &mut slots)?;
-                    return Ok(slots.iter().find(|s| s.position == position).map(|s| (s.record, s.live)));
-                }
-            }
-        }
+        trie::get::<OutputTree>(pages, self.root, position as u128)
     }
 
     /// The path of `position` in the outputs' tree: its leaf (empty if no
@@ -826,107 +288,53 @@ impl Outputs {
     /// root, which [`super::sparse::root_of_path`] recomputes from them.
     pub fn prove(&self, pages: &impl ReadPages, position: u64) -> io::Result<(Digest, [Digest; HEIGHT as usize])> {
         let mut path = [EMPTY; HEIGHT as usize];
-        let (mut child, mut height, mut base) = (self.root, HEIGHT, 0u64);
-        let mut buf = [0u8; PAGE];
-        loop {
-            match child {
-                // Nothing below: the siblings are those of an empty tree.
-                Child::Empty => {
-                    for (l, s) in path[..height as usize].iter_mut().enumerate() {
-                        *s = *empty(l);
-                    }
-                    return Ok((EMPTY, path));
-                }
-                Child::Node { page, .. } => {
-                    let children = read_node(pages.read_page(page, &mut buf)?, height)?;
-                    let below = height - BITS;
-                    let mut nodes = [(0u64, EMPTY); FANOUT];
-                    let mut n = 0;
-                    for (k, c) in children.iter().enumerate() {
-                        if *c != Child::Empty {
-                            nodes[n] = ((base >> below) + k as u64, c.hash(below));
-                            n += 1;
-                        }
-                    }
-                    let siblings = &mut path[below as usize..height as usize];
-                    root_with_path(
-                        below as usize,
-                        height as usize,
-                        &mut nodes[..n],
-                        Some((position >> below, siblings)),
-                    );
-                    let k = (position - base) >> below;
-                    child = children[k as usize];
-                    base += k << below;
-                    height = below;
-                }
-                Child::Leaf { page, records, live, .. } => {
-                    let mut slots = Vec::with_capacity(records as usize);
-                    read_leaf(pages.read_page(page, &mut buf)?, base, height, records, live, &mut slots)?;
-                    let mut nodes = [(0u64, EMPTY); LEAF_RECORDS];
-                    let (mut n, mut leaf) = (0, EMPTY);
-                    for s in slots.iter().filter(|s| s.live) {
-                        nodes[n] = (s.position, s.record.leaf());
-                        if s.position == position {
-                            leaf = nodes[n].1;
-                        }
-                        n += 1;
-                    }
-                    root_with_path(0, height as usize, &mut nodes[..n], Some((position, &mut path[..height as usize])));
-                    return Ok((leaf, path));
+        let mut leaf = EMPTY;
+        trie::walk_to::<OutputTree>(pages, self.root, position as u128, &mut |step| match step {
+            // Nothing below: the siblings are those of an empty tree.
+            Step::Empty { height, .. } => {
+                for (l, s) in path[..height as usize].iter_mut().enumerate() {
+                    *s = *empty(l);
                 }
             }
-        }
+            Step::Node { height, base, children } => {
+                let below = height.saturating_sub(BITS);
+                let mut nodes = [(0u64, EMPTY); FANOUT];
+                let mut n = 0;
+                for (k, c) in children.iter().enumerate() {
+                    if let Some(part) = c.part() {
+                        nodes[n] = ((base >> below) as u64 + k as u64, part.hash);
+                        n += 1;
+                    }
+                }
+                let siblings = &mut path[below as usize..height as usize];
+                root_with_path(below as usize, height as usize, &mut nodes[..n], Some((position >> below, siblings)));
+            }
+            Step::Leaf { height, slots, .. } => {
+                let mut nodes = [(0u64, EMPTY); LEAF_RECORDS];
+                let mut n = 0;
+                for s in slots.iter().filter(|s| s.live) {
+                    nodes[n] = (s.key as u64, s.record.leaf());
+                    if s.key == position as u128 {
+                        leaf = nodes[n].1;
+                    }
+                    n += 1;
+                }
+                root_with_path(0, height as usize, &mut nodes[..n], Some((position, &mut path[..height as usize])));
+            }
+        })?;
+        Ok((leaf, path))
     }
 
     /// Marks every page of the set in `file`'s map of free space, as must
     /// be done when the file is opened. Reads the nodes, not the leaves.
     pub fn mark<B: Backend>(&self, file: &PageFile<B>) -> io::Result<()> {
-        fn walk<B: Backend>(file: &PageFile<B>, child: Child, height: u32) -> io::Result<()> {
-            match child {
-                Child::Empty => Ok(()),
-                Child::Leaf { page, .. } => file.mark(page),
-                Child::Node { page, .. } => {
-                    file.mark(page)?;
-                    let mut buf = [0u8; PAGE];
-                    let children = read_node(file.read(page, &mut buf)?, height)?;
-                    children.iter().try_for_each(|c| walk(file, *c, height - BITS))
-                }
-            }
-        }
-        walk(file, self.root, HEIGHT)
+        trie::mark::<OutputTree, B>(file, self.root)
     }
 
     /// Calls `f` with every output kept, in position order: its position,
     /// its record and whether it is unspent.
     pub fn for_each(&self, pages: &impl ReadPages, f: &mut dyn FnMut(u64, &Record, bool)) -> io::Result<()> {
-        fn walk(
-            pages: &impl ReadPages,
-            child: Child,
-            height: u32,
-            base: u64,
-            f: &mut dyn FnMut(u64, &Record, bool),
-        ) -> io::Result<()> {
-            let mut buf = [0u8; PAGE];
-            match child {
-                Child::Empty => Ok(()),
-                Child::Leaf { page, records, live, .. } => {
-                    let mut slots = Vec::with_capacity(records as usize);
-                    read_leaf(pages.read_page(page, &mut buf)?, base, height, records, live, &mut slots)?;
-                    slots.iter().for_each(|s| f(s.position, &s.record, s.live));
-                    Ok(())
-                }
-                Child::Node { page, .. } => {
-                    let children = read_node(pages.read_page(page, &mut buf)?, height)?;
-                    let below = height - BITS;
-                    for (k, c) in children.iter().enumerate() {
-                        walk(pages, *c, below, base + ((k as u64) << below), f)?;
-                    }
-                    Ok(())
-                }
-            }
-        }
-        walk(pages, self.root, HEIGHT, 0, f)
+        trie::for_each::<OutputTree>(pages, self.root, &mut |key, record, live| f(key as u64, record, live))
     }
 }
 
@@ -935,6 +343,7 @@ mod tests {
     use super::*;
     use crate::store::sparse::root_of_path;
     use crate::store::testing::{Lost, MemBackend};
+    use crate::store::trie::{read_leaf, read_node, write_leaf, write_node};
     use crate::test_util::Rng;
     use std::collections::BTreeMap;
 
@@ -1128,7 +537,7 @@ mod tests {
         let mut rng = Rng::new(0x1eaf);
         w.block(&mut rng, 0, 5000).unwrap();
         // Nine nodes lie between the root and a lowest leaf.
-        let levels = ((HEIGHT - LEAF_HEIGHT) / BITS) as u64;
+        let levels = ((HEIGHT - 5) / BITS) as u64;
         assert_eq!(levels, 9);
         let one = w.block(&mut rng, 1, 0).unwrap();
         assert!(one <= levels * 1024, "{one} bytes for one spend");
@@ -1248,28 +657,31 @@ mod tests {
         w.block(&mut rng, 0, 400).unwrap();
         w.block(&mut rng, 90, 30).unwrap();
         let Child::Node { page, .. } = w.set.root else { panic!("a node") };
-        let mut buf = [0u8; PAGE];
+        let mut buf = [0u8; 4096];
         let node = w.file.read(page, &mut buf).unwrap().to_vec();
         let children = read_node(&node, HEIGHT).unwrap();
         assert!(read_node(&node, HEIGHT - BITS).is_err(), "a node of another height");
         // A leaf's page and its entry, found on the way down.
         let (mut child, mut height) = (w.set.root, HEIGHT);
-        let mut base = 0u64;
+        let mut base = 0u128;
         while let Child::Node { page, .. } = child {
             let kids = read_node(w.file.read(page, &mut buf).unwrap(), height).unwrap();
             height -= BITS;
             let k = kids.iter().position(|c| *c != Child::Empty).unwrap();
-            (child, base) = (kids[k], base + ((k as u64) << height));
+            (child, base) = (kids[k], base + ((k as u128) << height));
         }
         let Child::Leaf { page, records, live, .. } = child else { panic!("a leaf") };
         let leaf = w.file.read(page, &mut buf).unwrap().to_vec();
         let mut slots = Vec::new();
-        read_leaf(&leaf, base, height, records, live, &mut slots).unwrap();
-        assert!(read_leaf(&leaf, base, height, records - 1, live, &mut Vec::new()).is_err());
-        assert!(read_leaf(&leaf, base + (1 << height), height, records, live, &mut Vec::new()).is_ok());
-        assert!(read_leaf(&leaf, base, 1, records, live, &mut Vec::new()).is_err(), "positions past the leaf");
+        read_leaf::<OutputTree>(&leaf, base, height, records, live, &mut slots).unwrap();
+        assert!(read_leaf::<OutputTree>(&leaf, base, height, records - 1, live, &mut Vec::new()).is_err());
+        assert!(read_leaf::<OutputTree>(&leaf, base + (1 << height), height, records, live, &mut Vec::new()).is_ok());
+        assert!(
+            read_leaf::<OutputTree>(&leaf, base, 1, records, live, &mut Vec::new()).is_err(),
+            "positions past the leaf"
+        );
         let mut again = Vec::new();
-        write_leaf(&slots, base, &mut again);
+        write_leaf::<OutputTree>(&slots, base, &mut again);
         assert_eq!(again, leaf);
         write_node(&children, HEIGHT, &mut again);
         assert_eq!(again, node);
@@ -1291,8 +703,8 @@ mod tests {
                     assert_eq!(again, b);
                 }
                 let mut s = Vec::new();
-                if read_leaf(&b, base, height, records, live, &mut s).is_ok() {
-                    write_leaf(&s, base, &mut again);
+                if read_leaf::<OutputTree>(&b, base, height, records, live, &mut s).is_ok() {
+                    write_leaf::<OutputTree>(&s, base, &mut again);
                     assert_eq!(again, b);
                 }
                 if let Ok(set) = Outputs::from_bytes(&b) {
@@ -1411,6 +823,25 @@ mod tests {
         w.sweep_round(64, w.tip + 1);
         assert_eq!(w.set.root, Child::Empty);
         assert_eq!(w.file.space().0, crate::store::pagefile::HEADER_UNITS);
+    }
+
+    /// Hashed eight at a time or one by one, a record's leaf is the same.
+    #[test]
+    fn leaves_hashed_together_are_the_same() {
+        let mut rng = Rng::new(0xba7c);
+        for n in [0usize, 1, 7, 8, 9, 16, 31, 64] {
+            let slots: Vec<Slot<Record>> = (0..n)
+                .map(|i| Slot { key: 3 * i as u128, record: record(&mut rng, i as u32), live: i % 5 != 2 })
+                .collect();
+            let mut out = [(0u128, Part { hash: EMPTY, single: false }); LEAF_RECORDS];
+            let got = OutputTree::leaves(&slots, &mut out);
+            let want: Vec<(u128, Part)> = slots
+                .iter()
+                .filter(|s| s.live)
+                .map(|s| (s.key, Part { hash: s.record.leaf(), single: true }))
+                .collect();
+            assert_eq!(&out[..got], &want[..], "{n} records");
+        }
     }
 
     /// A file that counts what is asked of it.

@@ -117,6 +117,10 @@ pub enum Error {
     // -- The state
     /// A position that is spent holds no unspent output.
     NoSuchOutput(u64),
+    /// A name to register is registered already.
+    NameTaken,
+    /// A name to update is not registered.
+    NoSuchName,
     /// The state after a block is not the one its header commits to.
     StateRoot,
     /// The block to undo is older than the window of blocks whose
@@ -177,6 +181,8 @@ impl fmt::Display for Error {
             Error::VmNotScalarInput(pc) => write!(f, "instruction {pc}: a witness sibling is not a scalar"),
             Error::VmHashOrder(pc) => write!(f, "instruction {pc}: no hash to continue"),
             Error::NoSuchOutput(p) => write!(f, "position {p} holds no unspent output"),
+            Error::NameTaken => f.write_str("the name is already registered"),
+            Error::NoSuchName => f.write_str("the name is not registered"),
             Error::StateRoot => f.write_str("the state after the block is not its header's"),
             Error::NoUndoRecord => f.write_str("no record is kept to undo the block with"),
             Error::Io(kind) => write!(f, "the store failed: {kind}"),
@@ -231,6 +237,8 @@ mod tests {
             Error::VmNotScalarInput(9),
             Error::VmHashOrder(9),
             Error::NoSuchOutput(7),
+            Error::NameTaken,
+            Error::NoSuchName,
             Error::StateRoot,
             Error::NoUndoRecord,
             Error::Io(std::io::ErrorKind::InvalidData),

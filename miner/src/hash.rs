@@ -28,6 +28,9 @@ pub(crate) const DOM_COMMITMENT: u32 = 2;
 /// A transaction's body: what its inputs sign, and its id
 /// ([`crate::transaction`]).
 pub(crate) const DOM_BODY: u32 = 3;
+/// A leaf of the names' tree: a name's key and its record's value
+/// ([`crate::store::names`]).
+pub(crate) const DOM_NAME_LEAF: u32 = 4;
 /// A name: its characters as elements ([`crate::name`]).
 pub(crate) const DOM_NAME: u32 = 5;
 /// A name's record: what its trie leaf holds.
