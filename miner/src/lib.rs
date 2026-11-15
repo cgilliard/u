@@ -2,6 +2,7 @@ pub mod block;
 pub mod block_air;
 pub mod block_proof;
 pub mod chain;
+pub mod chain_verifier;
 pub mod challenger;
 pub mod codec;
 pub mod consensus;
