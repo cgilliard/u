@@ -1427,6 +1427,13 @@ impl Air for BlockAir {
                 b.assert_zero(after * (bits_v - (height - blk)));
                 b.assert_zero(older * (bits_v - (height - created - blk)));
                 b.assert_zero(state_t * (bits_v - (pstate - blk - one)));
+                // That the difference has bits says nothing: every
+                // element has. One below zero is an element near the
+                // modulus, whose top bits are set; with the two highest
+                // zero the difference is below 2^29 and so not below
+                // zero, heights, locks and state numbers all being
+                // under 2^30.
+                b.assert_zero(word * (l[XCOLS.bits(29)] + l[XCOLS.bits(30)]));
             } else {
                 b.assert_zero(word * blk);
             }
@@ -2420,7 +2427,7 @@ impl Gen {
                         Cond::Older(_) => (T_OLDER, height as i64 - self.regs.created as i64 - *v as i64),
                         _ => (T_STATE, self.regs.pstate as i64 - *v as i64 - 1),
                     };
-                    crate::stark::refuse((0..1 << 31).contains(&value), "a policy condition's lock has not passed");
+                    crate::stark::refuse((0..1 << 29).contains(&value), "a policy condition's lock has not passed");
                     self.leaf_absorb(blocks[bi], ty);
                     bi += 1;
                     let ksel = self.regs.xmss.ksel;
@@ -2844,6 +2851,10 @@ impl BlockAir {
 
 /// Commitment type re-export for callers.
 pub type Leaf = Commitment;
+#[cfg(test)]
+#[path = "block_air_tests.rs"]
+mod circuit_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
