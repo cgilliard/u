@@ -5,11 +5,8 @@ on:
     branches: [main]
   pull_request:
 
-# A run that has started finishes: a newer push to the same branch waits
-# for it. Of several pushes waiting, only the newest runs next.
-concurrency:
-  group: test-${{ github.ref }}
-  cancel-in-progress: false
+# Every push is tested: runs of the same branch go side by side, and none
+# cancels another.
 
 permissions:
   contents: read
