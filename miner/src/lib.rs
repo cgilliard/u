@@ -1,4 +1,5 @@
 pub mod block;
+pub mod chain;
 pub mod challenger;
 pub mod codec;
 pub mod difficulty;
@@ -7,6 +8,7 @@ pub mod expr;
 pub mod ext;
 pub mod field;
 pub mod fri;
+pub mod genesis;
 pub mod hash;
 pub mod hash_machine;
 pub mod hash_table;

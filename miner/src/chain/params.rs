@@ -1,0 +1,293 @@
+//! A network's parameters: what every node of it must agree on before
+//! the first block.
+//!
+//! # What a block pays
+//!
+//! Coins are made by blocks and by nothing else. The schedule is a list
+//! of eras, each so many blocks at so much a block, starting at block 1;
+//! genesis pays nothing. When the last era ends the chain ends: a block
+//! above [`ChainParams::final_height`] is not valid. Every amount is in
+//! base units, [`COIN`] of them a coin.
+//!
+//! # Work
+//!
+//! Between two branches a node follows the one with the most work, a
+//! block counting for the hashes its target asks on average:
+//! [`block_work`].
+
+use crate::block::{Block, Body, Header};
+use crate::difficulty::Schedule;
+use crate::pow::PowParams;
+use crate::store::sparse::{EMPTY, STATE_HEIGHT, empty};
+use crate::u256::U256;
+
+/// Base units per coin: ten decimals, the most that fits. Every coin the
+/// schedule makes, 735,840,000 of them, is 7.4 × 10^18 base units, which a
+/// `u64` (1.8 × 10^19) holds with room for 2.5 times as many; at eleven
+/// decimals it would not.
+pub const COIN: u64 = 10_000_000_000;
+/// Decimal places of [`COIN`].
+pub const DECIMALS: usize = 10;
+/// Blocks per year at the ten-minute target: 144 a day.
+pub const BLOCKS_PER_YEAR: u32 = 144 * 365;
+
+/// Mainnet emission: 1500 coins a block for 3.5 years, 500 for 3.5 years,
+/// then 7 for 1000 years, 735,840,000 coins in all; then the chain ends.
+pub const MAINNET_EMISSION: &[(u32, u64)] = &[
+    (BLOCKS_PER_YEAR * 7 / 2, 1500 * COIN),
+    (BLOCKS_PER_YEAR * 7 / 2, 500 * COIN),
+    (BLOCKS_PER_YEAR * 1000, 7 * COIN),
+];
+
+/// Consensus parameters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainParams {
+    pub pow: PowParams,
+    /// Timestamp of the genesis block, an empty block (see
+    /// [`ChainParams::genesis`]).
+    pub genesis_timestamp: u64,
+    /// The genesis header's nonce: on mainnet, the hash of the latest
+    /// Bitcoin block when genesis was made, so the chain provably did not
+    /// exist before it.
+    pub genesis_nonce: [u8; 32],
+    /// Target of the block after genesis; the ASERT anchor.
+    pub genesis_target: U256,
+    /// Easiest permitted target.
+    pub max_target: U256,
+    /// Largest serialized block, header and body (input positions,
+    /// outputs and proof), in bytes. The only limit on a block's contents.
+    pub max_block_size: usize,
+    /// Seconds a timestamp may lead the local clock.
+    pub max_future_drift: u64,
+    /// Number of past blocks whose median timestamp bounds the next.
+    pub median_time_window: usize,
+    /// The emission schedule: consecutive eras of `(blocks, subsidy per
+    /// block in base units)`, starting at height 1 (genesis pays nothing).
+    /// The chain ends with the last era: a block above
+    /// [`ChainParams::final_height`] is invalid.
+    pub emission: &'static [(u32, u64)],
+    /// Blocks a name's commit waits before its reveal
+    /// ([`crate::name::MIN_REVEAL`] on mainnet).
+    pub min_reveal: u32,
+    /// The block time and difficulty schedule.
+    pub schedule: Schedule,
+}
+
+impl ChainParams {
+    pub const MAINNET: ChainParams = ChainParams {
+        pow: PowParams::MAINNET,
+        genesis_timestamp: crate::genesis::TIMESTAMP,
+        genesis_nonce: crate::genesis::BITCOIN_HASH,
+        genesis_target: U256(crate::genesis::TARGET),
+        max_target: U256([u64::MAX, u64::MAX, u64::MAX, u64::MAX >> 8]), // 2^248 - 1
+        max_block_size: 2_000_000,
+        max_future_drift: 2 * 3600,
+        median_time_window: 11,
+        emission: MAINNET_EMISSION,
+        min_reveal: crate::name::MIN_REVEAL,
+        schedule: Schedule::MAINNET,
+    };
+
+    /// The dev network (`--network dev`), for rapid testing on a machine
+    /// or a few: a block a second (the schedule starting at block 1), the
+    /// built-in 64 KB dataset, an easy target. Its own genesis, so its
+    /// nodes never mix with mainnet's.
+    pub const DEV: ChainParams = ChainParams {
+        pow: PowParams::DEV,
+        genesis_timestamp: 1_767_225_600, // 2026-01-01
+        genesis_nonce: *b"tabminer dev network, direct....",
+        genesis_target: U256([0, 0, 0, 1 << 36]), // 2^20 hashes, about a second on 12 cores
+        max_target: ChainParams::MAINNET.max_target,
+        max_block_size: 2_000_000,
+        max_future_drift: 2 * 3600,
+        median_time_window: 11,
+        emission: MAINNET_EMISSION,
+        min_reveal: 3,
+        schedule: Schedule { block_time: 1, half_life: 60, from_first_block: true },
+    };
+
+    /// The recursive dev network (`--network dev-recursive`): as
+    /// [`ChainParams::DEV`], a block every ten seconds, its blocks to
+    /// carry chain proofs made the mainnet way at the smallest
+    /// parameters.
+    pub const DEV_RECURSIVE: ChainParams = ChainParams {
+        genesis_nonce: *b"tabminer dev network, recursive.",
+        schedule: Schedule { block_time: 10, half_life: 300, from_first_block: true },
+        ..Self::DEV
+    };
+
+    /// Subsidy paid by the block at `height`: zero for genesis and above
+    /// the final height.
+    pub fn subsidy(&self, height: u32) -> u64 {
+        if height == 0 {
+            return 0;
+        }
+        let mut first = 1u64;
+        for &(blocks, subsidy) in self.emission {
+            if (height as u64) < first + blocks as u64 {
+                return subsidy;
+            }
+            first += blocks as u64;
+        }
+        0
+    }
+
+    /// The subsidies of blocks 1 to `height`: with what genesis creates
+    /// (nothing on mainnet), what the amounts of the unspent outputs
+    /// after block `height` sum to exactly.
+    pub fn issued(&self, height: u32) -> u128 {
+        let (mut total, mut first) = (0u128, 1u64);
+        for &(blocks, subsidy) in self.emission {
+            if (height as u64) < first {
+                break;
+            }
+            let n = (blocks as u64).min(height as u64 + 1 - first);
+            total += n as u128 * subsidy as u128;
+            first += blocks as u64;
+        }
+        total
+    }
+
+    /// Height of the last block the chain can have.
+    pub fn final_height(&self) -> u32 {
+        self.emission.iter().map(|&(blocks, _)| blocks as u64).sum::<u64>().min(u32::MAX as u64) as u32
+    }
+
+    /// Every coin the schedule creates, in base units.
+    pub fn total_supply(&self) -> u128 {
+        self.emission.iter().map(|&(blocks, subsidy)| blocks as u128 * subsidy as u128).sum()
+    }
+
+    /// The genesis block: empty, at `genesis_timestamp`, over the empty
+    /// state tree, with `genesis_nonce` as its nonce (proof of work is not
+    /// checked on genesis). Every node of a network must start from the
+    /// same one. Nothing is allocated: an empty body holds no memory.
+    pub fn genesis(&self) -> Block {
+        let body = Body::default();
+        let header = Header {
+            prev_hash: EMPTY,
+            height: 0,
+            timestamp: self.genesis_timestamp,
+            body_commitment: body.commitment(),
+            state_root: *empty(STATE_HEIGHT),
+            aux: [0u8; 32],
+            mix: EMPTY,
+            nonce: self.genesis_nonce,
+        };
+        Block { header, body }
+    }
+}
+
+/// Work a block mined at `target` adds to its chain: `2^256 / (target +
+/// 1)`, computed as `(!target / (target + 1)) + 1`.
+pub fn block_work(target: U256) -> U256 {
+    let t1 = target.saturating_add(U256::ONE);
+    target.not().div(t1).saturating_add(U256::ONE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::poseidon2::digest_to_bytes;
+
+    fn small() -> ChainParams {
+        ChainParams { emission: &[(10, 50), (10, 25), (5, 12)], ..ChainParams::MAINNET }
+    }
+
+    #[test]
+    fn subsidy_schedule() {
+        let p = small();
+        assert_eq!(p.subsidy(0), 0);
+        assert_eq!((p.subsidy(1), p.subsidy(10)), (50, 50));
+        assert_eq!((p.subsidy(11), p.subsidy(20)), (25, 25));
+        assert_eq!((p.subsidy(21), p.subsidy(25)), (12, 12));
+        assert_eq!(p.subsidy(26), 0);
+        assert_eq!(p.subsidy(u32::MAX), 0);
+        assert_eq!(p.final_height(), 25);
+        let m = ChainParams::MAINNET;
+        let era = 144 * 365 * 7 / 2;
+        assert_eq!(era, 183_960);
+        assert_eq!(m.subsidy(0), 0);
+        assert_eq!((m.subsidy(1), m.subsidy(era)), (1500 * COIN, 1500 * COIN));
+        assert_eq!((m.subsidy(era + 1), m.subsidy(2 * era)), (500 * COIN, 500 * COIN));
+        assert_eq!(m.subsidy(2 * era + 1), 7 * COIN);
+        assert_eq!(m.final_height(), 2 * era + 144 * 365 * 1000);
+        assert_eq!(m.final_height(), 52_927_920);
+        assert_eq!(m.subsidy(m.final_height()), 7 * COIN);
+        assert_eq!(m.subsidy(m.final_height() + 1), 0);
+        assert_eq!(m.total_supply(), 735_840_000 * COIN as u128);
+        // All of it fits the type an amount has, and COIN is its decimals.
+        assert!(m.total_supply() < u64::MAX as u128);
+        assert_eq!(COIN, 10u64.pow(DECIMALS as u32));
+    }
+
+    #[test]
+    fn issued_sums_the_schedule() {
+        let p = small();
+        assert_eq!(p.issued(0), 0);
+        assert_eq!(p.issued(1), 50);
+        assert_eq!(p.issued(10), 500);
+        assert_eq!(p.issued(11), 525);
+        assert_eq!(p.issued(25), 500 + 250 + 60);
+        assert_eq!(p.issued(1000), p.total_supply());
+        for h in 0..30 {
+            assert_eq!(p.issued(h), (1..=h).map(|i| p.subsidy(i) as u128).sum::<u128>());
+        }
+        let m = ChainParams::MAINNET;
+        assert_eq!(m.issued(m.final_height()), m.total_supply());
+        assert_eq!(m.issued(u32::MAX), m.total_supply());
+        // An era that ends where a height can no longer count.
+        let long = ChainParams { emission: &[(u32::MAX, 1), (u32::MAX, 2)], ..m };
+        assert_eq!(long.final_height(), u32::MAX);
+        assert_eq!(long.issued(u32::MAX), u32::MAX as u128);
+        assert_eq!(long.subsidy(u32::MAX), 1);
+    }
+
+    #[test]
+    fn work_of_a_block() {
+        assert_eq!(block_work(U256::MAX.shift_right(8)), U256::from_u64(256));
+        assert_eq!(block_work(U256::ZERO), U256::MAX);
+        assert_eq!(block_work(U256::MAX), U256::ONE);
+        // 2^256 / (2^232 + 1), rounded down; a harder target is more work.
+        let t = U256([0, 0, 0, 1 << 40]);
+        assert_eq!(block_work(t), U256::from_u64((1 << 24) - 1));
+        assert!(block_work(t.shift_right(1)) > block_work(t));
+    }
+
+    /// Mainnet's genesis is the one the generated file names: the same
+    /// block id as the original's, so the header, the empty body's
+    /// commitment and the empty state's root are all the original's.
+    #[test]
+    fn mainnet_genesis_matches_the_generated_file() {
+        let g = ChainParams::MAINNET.genesis();
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        assert_eq!(hex(&digest_to_bytes(&g.header.hash())), crate::genesis::ID);
+        // The state tree here is two levels taller than the original's,
+        // so the root of the empty state is another and the id with it.
+        // Over the original's empty root the header is the original's
+        // genesis, to the byte: its id is the one the original printed.
+        let theirs = Header { state_root: *empty(40), ..g.header };
+        assert_eq!(
+            hex(&digest_to_bytes(&theirs.hash())),
+            "f4181d63f110290d0c6f03396a826432034093171eb832361c06c61c99d03e3c"
+        );
+        assert_eq!(g.header.timestamp, crate::genesis::TIMESTAMP);
+        assert_eq!(hex(&g.header.nonce), crate::genesis::BITCOIN_HASH_HEX);
+        assert!(crate::genesis::BITCOIN_TIME <= g.header.timestamp, "the Bitcoin block must come first");
+        assert_eq!((g.header.height, g.header.state_root), (0, *empty(STATE_HEIGHT)));
+        assert_eq!(g.header.body_commitment, g.body.commitment());
+        assert_eq!(g.size(), crate::block::HEADER_SIZE + g.body.size());
+    }
+
+    /// Each network has a genesis of its own, and is made the same way
+    /// every time.
+    #[test]
+    fn networks_do_not_share_a_genesis() {
+        let ids =
+            [ChainParams::MAINNET, ChainParams::DEV, ChainParams::DEV_RECURSIVE].map(|p| p.genesis().header.hash());
+        assert!(ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2]);
+        assert_eq!(ChainParams::DEV.genesis(), ChainParams::DEV.genesis());
+        assert_eq!(ChainParams::DEV.pow, PowParams::DEV);
+        assert!(ChainParams::DEV.min_reveal < ChainParams::MAINNET.min_reveal);
+    }
+}
