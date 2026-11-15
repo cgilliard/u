@@ -28,8 +28,8 @@ mkdir -p "$out/prof"
 
 # The code has two paths where it matters for speed: AVX2 (packed.rs and
 # what uses it) and a portable one. A build has one or the other, so on
-# x86-64 the tests run twice, built for this CPU and for the plainest
-# x86-64, and a line counts as covered if either run reached it. Each
+# x86-64 there are two builds, for this CPU and for the plainest x86-64,
+# and a line counts as covered if a run of either reached it. Each
 # build has its own target directory: instrumented objects do not mix
 # with ordinary ones, nor the two with each other.
 case "$host" in
@@ -47,13 +47,65 @@ export LLVM_PROFILE_FILE="$PWD/$out/prof/%p-%m.profraw"
 export CARGO_PROFILE_TEST_OPT_LEVEL=2
 export CARGO_PROFILE_DEV_OPT_LEVEL=2
 export TABMINER_FUZZ_ITERS="${TABMINER_FUZZ_ITERS:-500}"
+#
+# An instrumented build counts in memory every thread shares, and threads
+# that run the same hot code (every test hashes) spend their time taking
+# the counters from each other: measured, twelve threads on one test used
+# twelve times the processor time of one. So no two threads of a process
+# run tests here. The tests are dealt out among as many processes as
+# there are cores, each running its share one at a time with the crate's
+# own worker threads held to one: a process has its own counters.
+#
+# The second build differs from the first only in the files that have two
+# paths (poseidon2.rs, ntt.rs, and packed.rs, which only one of them
+# has), so it runs only the tests that reach those: the whole suite twice
+# is twice the time for the same lines.
+cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
 objects=""
 for cpu in $variants; do
     export RUSTFLAGS="-C instrument-coverage -C target-cpu=$cpu"
-    cargo test --locked --target-dir "$out/$cpu"
-    # The test binaries just run, as cargo names them.
-    objects="$objects $(cargo test --locked --target-dir "$out/$cpu" --no-run --message-format=json \
-        | grep -o '"executable":"[^"]*"' | cut -d'"' -f4 | sed 's/^/--object=/' | tr '\n' ' ')"
+    # The test binaries, as cargo names them.
+    binaries=$(cargo test --locked --target-dir "$out/$cpu" --no-run --message-format=json \
+        | grep -o '"executable":"[^"]*"' | cut -d'"' -f4)
+    for binary in $binaries; do
+        objects="$objects --object=$binary"
+        if [ "$cpu" = native ]; then
+            "$binary" --list --format terse 2>/dev/null | sed -n 's/: test$//p' > "$out/tests.txt"
+        else
+            "$binary" --list --format terse 2>/dev/null | sed -n 's/: test$//p' \
+                | grep -E '^(poseidon2|ntt|merkle|field|ext)::' > "$out/tests.txt" || true
+        fi
+        total=$(wc -l < "$out/tests.txt")
+        [ "$total" -gt 0 ] || continue
+        echo "$binary: $total tests in $cores processes"
+        pids=""
+        for k in $(seq 0 $((cores - 1))); do
+            # Every cores-th test from the k-th: neighbours, which are of
+            # one module and cost alike, go to different processes.
+            awk -v n="$cores" -v k="$k" 'NR % n == k' "$out/tests.txt" > "$out/shard.$k.txt"
+            [ -s "$out/shard.$k.txt" ] || continue
+            # shellcheck disable=SC2046
+            TABMINER_THREADS=1 "$binary" --test-threads=1 --exact $(cat "$out/shard.$k.txt") \
+                > "$out/shard.$k.log" 2>&1 &
+            pids="$pids $!"
+        done
+        failed=0
+        for pid in $pids; do
+            wait "$pid" || failed=1
+        done
+        grep -h '^test result' "$out"/shard.*.log
+        if [ "$failed" -ne 0 ]; then
+            cat "$out"/shard.*.log
+            echo "a test failed" >&2
+            exit 1
+        fi
+        rm -f "$out"/shard.*
+        # The code that splits work among threads, with threads to split
+        # it among.
+        if [ "$cpu" = native ] && grep -q '^parallel::' "$out/tests.txt"; then
+            "$binary" parallel:: store::backend:: | grep '^test result'
+        fi
+    done
 done
 unset RUSTFLAGS
 

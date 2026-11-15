@@ -376,7 +376,7 @@ pub(crate) fn freedom_report(
         let n = list.len().min(per_kind);
         rows.extend((0..n).map(|k| list[if n == 1 { 0 } else { k * (list.len() - 1) / (n - 1) }]));
     }
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let threads = crate::parallel::threads();
     let chunk = rows.len().div_ceil(threads).max(1);
     let found: Vec<Freedom> = std::thread::scope(|s| {
         let hs: Vec<_> =
