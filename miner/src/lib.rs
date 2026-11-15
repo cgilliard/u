@@ -40,6 +40,7 @@ pub mod store;
 #[cfg(test)]
 pub(crate) mod test_util;
 pub mod transaction;
+pub mod transport;
 pub mod u256;
 pub mod vm_air;
 pub mod xmss;
