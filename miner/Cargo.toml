@@ -13,11 +13,8 @@ path = "tools/genesis.rs"
 # dataset and plan. Off by default, so release builds carry none of it.
 dev = []
 
+# No dependencies: the standard library and nothing else.
 [dependencies]
-# read-txn-no-tls: environments opened with MDB_NOTLS. LMDB on Windows
-# keeps at most 64 thread-local keys, one per open environment, and the
-# test suite opens more than that at once.
-heed = { version = "0.20", default-features = false, features = ["read-txn-no-tls"] }
 
 [profile.release]
 codegen-units = 1
