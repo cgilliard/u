@@ -19,6 +19,7 @@
 pub mod config;
 pub mod message;
 pub mod object;
+pub mod peers;
 
 /// The largest datagram sent: what every path carries unbroken.
 pub const MAX_DATAGRAM: usize = 1232;
