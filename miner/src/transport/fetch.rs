@@ -15,38 +15,61 @@
 //! flight is also the order chunks are expected in, and its front is
 //! always the chunk waited for longest.
 //!
-//! Each ask has a number, one more than the ask before. When a chunk
-//! arrives, the asks at the front of the flight numbered
-//! [`super::REORDER`] or more below it have been overtaken: they are taken for
-//! lost, leave the flight, and are asked for again before anything new.
-//! That is the whole of fast retransmission, and because the flight is
-//! in order it looks only at the front.
+//! # Asks are numbered
 //!
-//! A chunk asked for twice may arrive twice, and either copy is taken;
-//! the second is counted and dropped. A chunk asked for more than once
-//! gives no round-trip measurement (which ask did it answer?) and does
-//! not overtake anything, for the same reason.
+//! Each ask has a number, one more than the ask before, and the chunk
+//! sent in answer carries it back. So when a chunk has been asked for
+//! twice, it is known which ask an arrival answers: every arrival
+//! measures a round trip, and every arrival shows that the asks before
+//! its own were answered before it, if they were answered at all.
+//!
+//! # Loss
+//!
+//! An ask is *overtaken* when an ask numbered after it has been
+//! answered. It is taken for lost, leaves the flight and is asked again
+//! before anything new, when either
+//!
+//! * it has been overtaken by [`Path::reorder`] places or more; or
+//! * it has been overtaken at all, and nothing has arrived since for
+//!   [`Path::grace`]: a small window never holds enough to overtake by
+//!   many.
+//!
+//! When nothing at all arrives for the retry time, that is a *silence*.
+//! Nothing is known then of what is in the flight: lost, or only late.
+//! So one chunk alone, the one waited for longest, is asked for again,
+//! as a probe. If the rest were lost, the probe's answer overtakes them
+//! all, and they are asked for again then. If they were only late (a
+//! peer sending slowly, a long queue) they arrive before it, and
+//! nothing was asked twice but the probe. A second silence running
+//! probes with two chunks, a third with four: where most of everything
+//! is lost, one chunk asked for is seldom one chunk answered.
+//!
+//! A chunk that arrives after it was taken for lost is taken all the
+//! same, and shows the path to deliver further out of order than was
+//! allowed for ([`Path::disordered`]).
 //!
 //! # Rounds
 //!
-//! A round is a window's worth of arrivals. At its end the window is
-//! halved if more than one chunk in [`LOSS_TOLERANCE`] was lost, and
-//! grows if none of that happened and the window had been full: a
-//! window that was never filled has shown nothing about the path.
-//! A silence halves it at once. It is halved once a round at most.
+//! A round is a window's worth of arrivals. If more than one chunk in
+//! [`LOSS_TOLERANCE`] was lost in it, the path is told
+//! ([`Path::lost`]), and brings the window down if it is full; so too
+//! at a silence. Otherwise, if the window had been full of asks, it
+//! grows: a window that was never filled has shown nothing about the
+//! path.
 
 use std::collections::VecDeque;
 
 use super::path::Path;
 use super::wire::{Chunk, Ranges};
-use super::{CHUNK_BYTES, LOSS_TOLERANCE, MAX_RETRIES, MAX_WINDOW, MIN_RATE, Micros, REFILL, SLOW_GRACE, chunk_count};
+use super::{CHUNK_BYTES, LOSS_TOLERANCE, MAX_RETRIES, MAX_RETRY, MAX_WINDOW, Micros, REFILL, SECOND, chunk_count};
 use crate::error::Error;
 
 /// What to do now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Poll {
-    /// Ask for the chunks put in the ranges, and poll again.
-    Ask,
+    /// Ask for the chunks put in the ranges, the first of them under
+    /// this number ([`super::wire::Get::seq`]), and poll again.
+    Ask(u32),
     /// Nothing until a chunk arrives or this time comes.
     Wait(Micros),
     /// Every chunk is here.
@@ -60,8 +83,6 @@ pub enum Poll {
 pub enum Why {
     /// Nothing arrived, [`MAX_RETRIES`] times over.
     Silent,
-    /// It came too slowly to be worth waiting for.
-    Slow,
     /// The peer said it does not have it.
     Gone,
     /// The peer sent a chunk no honest peer would.
@@ -82,8 +103,8 @@ pub enum Taken {
 struct Asked {
     index: u32,
     at: Micros,
-    /// Asked for before as well.
-    again: bool,
+    /// How many chunks were here when it was asked for.
+    got: u32,
     /// Still awaited: false once it has arrived, or was found to be
     /// past the object's end.
     flying: bool,
@@ -125,8 +146,8 @@ pub struct Fetch {
     /// yet seen to have been.
     passed: Vec<u64>,
     got: u32,
-    /// For each chunk, the number of its ask in the flight and one; zero
-    /// if it is not in the flight.
+    /// For each chunk, the number of its latest ask in the flight and
+    /// one; zero if it is not in the flight.
     slot: Vec<u64>,
     flight: VecDeque<Asked>,
     /// The number of the ask at the front of the flight.
@@ -139,6 +160,9 @@ pub struct Fetch {
     lost: VecDeque<u32>,
     /// The first chunk never asked for.
     fresh: u32,
+    /// A silence has passed, and this many chunks are still to be
+    /// asked for as its probe.
+    probe: u32,
     path: Path,
     // This round.
     delivered: u32,
@@ -149,8 +173,16 @@ pub struct Fetch {
     // Silence.
     last_progress: Micros,
     last_request: Micros,
+    /// When a chunk last arrived, new or not.
+    last_arrival: Micros,
+    /// Silences since anything new arrived.
     retries: u32,
+    /// Silences since an ask was answered: the retry time is doubled
+    /// this many times.
+    backoff: u32,
     started: Micros,
+    /// Chunks here when this peer was first asked.
+    got_before: u32,
     over: Option<Poll>,
     stats: Stats,
 }
@@ -180,6 +212,7 @@ impl Fetch {
             highest: 0,
             lost: VecDeque::with_capacity(MAX_WINDOW as usize),
             fresh: 0,
+            probe: 0,
             path,
             delivered: 0,
             losses: 0,
@@ -188,8 +221,11 @@ impl Fetch {
             disordered: false,
             last_progress: now,
             last_request: now,
+            last_arrival: now,
             retries: 0,
+            backoff: 0,
             started: now,
+            got_before: 0,
             over: None,
             stats: Stats::default(),
         };
@@ -240,6 +276,52 @@ impl Fetch {
         (self.over == Some(Poll::Done)).then_some(self.buf)
     }
 
+    /// Bytes a second from this peer so far, counting from when it was
+    /// first asked: for whoever decides whether another would do
+    /// better.
+    pub fn rate(&self, now: Micros) -> u64 {
+        let bytes = (self.got - self.got_before) as u64 * CHUNK_BYTES as u64;
+        bytes * SECOND / now.saturating_sub(self.started).max(1)
+    }
+
+    /// Takes up a fetch that is not finished, keeping what has arrived:
+    /// with the same peer after it was given up for silence, or with
+    /// another (whose `path` this is), under a new number. Chunks sent
+    /// under the old number are no longer taken.
+    ///
+    /// Not after a peer was found to lie ([`Why::Bad`]): what it sent
+    /// may be anything, and the fetch is to be started afresh. Nothing
+    /// is changed then, nor once the object is here.
+    pub fn resume(&mut self, transfer: u64, path: Path, now: Micros) {
+        if matches!(self.over, Some(Poll::Done | Poll::Failed(Why::Bad))) {
+            return;
+        }
+        self.transfer = transfer;
+        self.path = path;
+        self.over = None;
+        // Asks go on being numbered from where they were.
+        self.base += self.flight.len() as u64;
+        self.highest = 0;
+        self.flight.clear();
+        self.lost.clear();
+        self.flying = 0;
+        self.fresh = 0;
+        self.probe = 0;
+        for words in [&mut self.asked, &mut self.passed] {
+            words.fill(0);
+        }
+        self.slot.fill(0);
+        if self.len == 0 {
+            // Still blind: this path's first window.
+            self.count = chunk_count(self.max_len).min(self.path.window());
+            self.size(self.count);
+        }
+        (self.delivered, self.losses, self.filled, self.cut, self.disordered) = (0, 0, false, false, false);
+        (self.last_progress, self.last_request, self.last_arrival, self.started) = (now, now, now, now);
+        (self.retries, self.backoff) = (0, 0);
+        self.got_before = self.got;
+    }
+
     /// The peer does not have the object.
     pub fn gone(&mut self) {
         if self.over.is_none() {
@@ -279,15 +361,18 @@ impl Fetch {
     /// The time after which silence is a loss, from the later of the
     /// last arrival and the last request.
     fn silence(&self) -> Micros {
-        self.last_progress.max(self.last_request) + (self.path.retry() << self.retries.min(3))
+        let wait = (self.path.retry() << self.backoff.min(10)).min(MAX_RETRY);
+        self.last_progress.max(self.last_request) + wait
     }
 
-    /// Ends a round: the window halves if too much was lost, and grows
-    /// if nothing went wrong while it was full.
+    /// Ends a round: the window is brought down if too much was lost
+    /// and the path is full, and grows if nothing much was lost while
+    /// it was full of asks.
     fn end_round(&mut self) {
+        self.path.round();
         let sent = self.delivered + self.losses;
         if self.losses * LOSS_TOLERANCE > sent {
-            self.halve();
+            self.bring_down();
         } else if self.filled && !self.cut {
             self.path.grow();
         }
@@ -301,12 +386,44 @@ impl Fetch {
         self.filled = self.flying >= self.path.window();
     }
 
-    /// Halves the window, once a round.
-    fn halve(&mut self) {
+    /// Chunks were lost: the path decides whether the window comes
+    /// down ([`Path::lost`]), once a round.
+    fn bring_down(&mut self) {
         if !self.cut {
             self.cut = true;
-            self.path.cut();
+            self.path.lost(self.filled);
         }
+    }
+
+    /// Whether the chunk waited for longest has been overtaken: an ask
+    /// after its own has been answered.
+    fn overtaken(&self) -> bool {
+        self.flying > 0 && self.highest > self.base + 1
+    }
+
+    /// Takes the front of the flight, which is awaited, out of it: to
+    /// be asked for again first of all (`first`) or after the others
+    /// waiting to be.
+    fn lose_front(&mut self, first: bool) {
+        let a = self.flight.pop_front().expect("a chunk awaited");
+        self.base += 1;
+        self.slot[a.index as usize] = 0;
+        if first {
+            self.lost.push_front(a.index);
+        } else {
+            self.lost.push_back(a.index);
+        }
+        self.flying -= 1;
+        self.trim();
+    }
+
+    /// Takes the front of the flight for lost, having been overtaken.
+    fn overtake_front(&mut self) {
+        let i = self.flight.front().expect("a chunk awaited").index;
+        self.passed[i as usize / 64] |= 1 << (i % 64);
+        self.losses += 1;
+        self.stats.overtaken += 1;
+        self.lose_front(false);
     }
 
     /// Drops from the front of the flight what is no longer awaited.
@@ -325,42 +442,59 @@ impl Fetch {
         if let Some(over) = self.over {
             return over;
         }
-        // Too slow to be worth it.
-        let elapsed = now.saturating_sub(self.started);
-        // (A peer that has sent nothing at all is silent, not slow.)
-        if elapsed >= SLOW_GRACE && self.got > 0 {
-            let bytes = self.got as u64 * CHUNK_BYTES as u64;
-            if bytes * 1_000_000 / elapsed < MIN_RATE {
-                return self.fail(Why::Slow);
+        // Overtaken, and nothing since for long enough: lost, though not
+        // overtaken by many.
+        if self.overtaken() && now >= self.last_arrival + self.path.grace() {
+            while self.overtaken() {
+                self.overtake_front();
             }
         }
-        // Silence: all that is awaited is lost.
+        // Silence: the chunk waited for longest is asked for again, and
+        // what comes of that tells of the rest.
         if self.flying > 0 && now >= self.silence() {
             self.retries += 1;
+            self.backoff += 1;
             self.stats.silences += 1;
             if self.retries > MAX_RETRIES {
                 return self.fail(Why::Silent);
             }
-            for a in self.flight.drain(..) {
-                self.base += 1;
-                if a.flying {
-                    self.slot[a.index as usize] = 0;
-                    self.lost.push_back(a.index);
-                }
+            // One chunk the first time; twice as many each silence after,
+            // while nothing comes: where most of everything is lost, one
+            // chunk asked for is seldom one chunk answered.
+            let probe = (1u32 << (self.retries - 1).min(6)).min(self.flying);
+            let mut front = [0u32; 64];
+            for slot in front[..probe as usize].iter_mut() {
+                *slot = self.flight.front().expect("a chunk awaited").index;
+                self.lose_front(true);
             }
-            self.flying = 0;
-            self.halve();
+            // (Each went to the front of those to ask again, ahead of
+            // the one before it: back into the order they were in.)
+            self.lost.rotate_left(0);
+            for (k, i) in front[..probe as usize].iter().enumerate() {
+                self.lost[k] = *i;
+            }
+            self.probe = probe;
+            self.bring_down();
         }
         // Ask: the lost first, then what was never asked for.
         let window = self.path.window();
-        let room = window.saturating_sub(self.flying);
+        // (The probe is asked for though the window is full of what is
+        // still awaited.)
+        let room = window.saturating_sub(self.flying).max(self.probe);
         while self.lost.front().is_some_and(|&i| self.has(i) || self.slot[i as usize] != 0) {
             self.lost.pop_front();
+        }
+        // Past what is here already (after a fetch is taken up again).
+        while self.fresh < self.count && self.has(self.fresh) {
+            self.fresh += 1;
         }
         let waiting = self.lost.len() as u64 + (self.count - self.fresh) as u64;
         // In batches: when there is room for a batch, or for all there
         // is, or when nothing is awaited at all.
-        if waiting > 0 && room > 0 && (room >= REFILL || waiting <= room as u64 || self.flying == 0) {
+        let batch = REFILL.min(window / 2).max(1);
+        let now_is_time = room >= batch || waiting <= room as u64 || self.flying == 0 || self.probe > 0;
+        if waiting > 0 && room > 0 && now_is_time {
+            let first = self.base + self.flight.len() as u64;
             let mut n = 0;
             while n < room {
                 let i = match self.lost.front() {
@@ -369,6 +503,10 @@ impl Fetch {
                         continue;
                     }
                     Some(&i) => i,
+                    None if self.fresh < self.count && self.has(self.fresh) => {
+                        self.fresh += 1;
+                        continue;
+                    }
                     None if self.fresh < self.count => self.fresh,
                     None => break,
                 };
@@ -382,7 +520,7 @@ impl Fetch {
                 let again = *word >> (i % 64) & 1 == 1;
                 *word |= 1 << (i % 64);
                 self.slot[i as usize] = self.base + self.flight.len() as u64 + 1;
-                self.flight.push_back(Asked { index: i, at: now, again, flying: true });
+                self.flight.push_back(Asked { index: i, at: now, got: self.got, flying: true });
                 self.flying += 1;
                 self.stats.asked += 1;
                 self.stats.asked_again += again as u64;
@@ -392,15 +530,20 @@ impl Fetch {
                 if self.flying >= window {
                     self.filled = true;
                 }
+                self.probe = 0;
                 self.last_request = now;
                 self.stats.requests += 1;
-                return Poll::Ask;
+                return Poll::Ask(first as u32);
             }
         }
-        // Back when silence would be a loss, or when slowness would be
-        // seen, whichever is first.
-        let slow = if elapsed < SLOW_GRACE { self.started + SLOW_GRACE } else { now + SLOW_GRACE };
-        Poll::Wait(self.silence().min(slow).max(now + 1))
+        self.probe = 0;
+        // Back when silence would be a loss, or when what was overtaken
+        // has had long enough.
+        let mut back = self.silence();
+        if self.overtaken() {
+            back = back.min(self.last_arrival + self.path.grace());
+        }
+        Poll::Wait(back.max(now + 1))
     }
 
     fn fail(&mut self, why: Why) -> Poll {
@@ -440,21 +583,44 @@ impl Fetch {
             self.fail(Why::Bad);
             return Err(BAD);
         }
-        // Its ask, if it is in the flight.
-        let ask = match self.slot[i as usize] {
-            0 => None,
-            s => {
-                self.slot[i as usize] = 0;
-                let a = &mut self.flight[(s - 1 - self.base) as usize];
+        self.last_arrival = now;
+        // The ask it answers, if that is still in the flight: the one
+        // of its number, for this chunk. (A number that is no ask's, or
+        // another chunk's, answers nothing; its bytes are the chunk's
+        // all the same.)
+        let place = c.seq.wrapping_sub(self.base as u32) as usize;
+        let answered = match self.flight.get_mut(place) {
+            Some(a) if a.index == i && a.flying => {
                 a.flying = false;
-                self.flying -= 1;
-                Some((s, *a))
+                Some((self.base + place as u64 + 1, *a))
             }
+            _ => None,
         };
-        // Taken for lost, and here it is: before it was even asked for
-        // again, or for the second time. It had only been overtaken.
+        if let Some((s, a)) = answered {
+            self.flying -= 1;
+            if self.slot[i as usize] == s {
+                self.slot[i as usize] = 0;
+            }
+            // A round trip, and how many arrived while it was on its
+            // way (itself among them, if it is new): the path held them
+            // all at once. And every ask before its own has been
+            // overtaken.
+            self.path.sample(now.saturating_sub(a.at));
+            self.path.carry(self.got + !self.has(i) as u32 - a.got);
+            self.backoff = 0;
+            self.highest = self.highest.max(s);
+        }
+        // The chunk is here, whichever ask brought it: a later ask for
+        // it still in the flight is awaited no longer.
+        if let s @ 1.. = self.slot[i as usize] {
+            self.slot[i as usize] = 0;
+            self.flight[(s - 1 - self.base) as usize].flying = false;
+            self.flying -= 1;
+        }
+        // Taken for lost, and here it is: by an ask given up on, or for
+        // the second time. It had only been overtaken.
         let bit = 1u64 << (i % 64);
-        if self.passed[i as usize / 64] & bit != 0 && (ask.is_none() || self.has(i)) {
+        if self.passed[i as usize / 64] & bit != 0 && (answered.is_none() || self.has(i)) {
             self.passed[i as usize / 64] &= !bit;
             self.path.disordered();
             self.disordered = true;
@@ -465,38 +631,18 @@ impl Fetch {
             Taken::Spare
         } else {
             self.buf[start..start + c.data.len()].copy_from_slice(c.data);
-            self.have[i as usize / 64] |= 1 << (i % 64);
+            self.have[i as usize / 64] |= bit;
             self.got += 1;
             self.last_progress = now;
             self.retries = 0;
             self.delivered += 1;
             Taken::New
         };
-        // Asked for once only: it measures the round trip, and it has
-        // overtaken the asks well before it.
-        if let Some((s, a)) = ask
-            && !a.again
-        {
-            if taken == Taken::New {
-                self.path.sample(now.saturating_sub(a.at));
-            }
-            self.highest = self.highest.max(s);
-        }
         self.trim();
-        while let Some(a) = self.flight.front().copied()
-            && self.base + 1 + self.path.reorder() <= self.highest
-        {
-            // The front is awaited (the flight was trimmed) and has been
-            // overtaken.
-            self.slot[a.index as usize] = 0;
-            self.passed[a.index as usize / 64] |= 1 << (a.index % 64);
-            self.lost.push_back(a.index);
-            self.flying -= 1;
-            self.losses += 1;
-            self.stats.overtaken += 1;
-            self.flight.pop_front();
-            self.base += 1;
-            self.trim();
+        // The front is awaited (the flight was trimmed): lost, while it
+        // has been overtaken by enough.
+        while self.flying > 0 && self.base + 1 + self.path.reorder() <= self.highest {
+            self.overtake_front();
         }
         if self.got == self.count {
             // An object smaller than the window: what it lost counts too.

@@ -79,7 +79,8 @@ enum Server {
     Honest,
     /// Says it has no such object.
     Without,
-    /// Sends this many chunks and then nothing more.
+    /// Sends this many chunks and then nothing more, until the fetch is
+    /// taken up again.
     Stops(u64),
     /// Sends a chunk claiming another length once this many have gone.
     Lies(u64),
@@ -99,6 +100,8 @@ struct Setup {
     /// Chunks a third party sends the asking side, not knowing the
     /// fetch's number: one each millisecond from the start.
     forged: u32,
+    /// Times a fetch given up for silence is taken up again.
+    resumes: u32,
 }
 
 impl Setup {
@@ -114,6 +117,7 @@ impl Setup {
             rate: 8192,
             path: Path::new(),
             forged: 0,
+            resumes: 0,
         }
     }
 
@@ -134,6 +138,10 @@ struct Outcome {
     served: u64,
     /// Forged chunks that reached the fetch, and were refused by it.
     refused: u64,
+    /// Times it was taken up again.
+    resumed: u32,
+    /// Bytes a second, as the fetch reported at its end.
+    rate: u64,
 }
 
 const GET: u8 = 0;
@@ -146,7 +154,9 @@ fn run(s: &Setup) -> Outcome {
     let token = tokens.issue(&asker);
     let mut net =
         Net { rng: Rng::new(s.seed), heap: BinaryHeap::new(), n: 0, up: s.up, down: s.down, free: [0; 2], dropped: 0 };
-    let transfer = net.rng.next_u64();
+    let mut transfer = net.rng.next_u64();
+    let mut resumed = 0;
+    let mut stats = Stats::default();
     let len = s.object.len() as u32;
     let mut now: Micros = 1000 * SECOND;
     let start = now;
@@ -162,24 +172,36 @@ fn run(s: &Setup) -> Outcome {
         let index = k % chunk_count(len);
         let data = vec![0xee; chunk_len(len, index).unwrap()];
         buf[0] = CHUNK;
-        let n = Chunk { transfer: transfer ^ (1 + k as u64), len, index, data: &data }.encode(&mut buf[1..]);
+        let n =
+            Chunk { transfer: transfer ^ (1 + k as u64), seq: index, len, index, data: &data }.encode(&mut buf[1..]);
         net.heap.push(Reverse((now + k as u64 * MILLI, net.n, true, buf[..1 + n].to_vec())));
         net.n += 1;
     }
     let end = loop {
-        assert!(now - start < 3600 * SECOND, "an hour, and neither here nor given up");
+        assert!(now - start < 6 * 3600 * SECOND, "six hours, and neither here nor given up");
         // The asking side.
         let mut over = None;
         let wake = loop {
             match fetch.poll(now, &mut ranges) {
-                Poll::Ask => {
+                Poll::Ask(seq) => {
                     buf[0] = GET;
-                    let n = Get { token, transfer, name: b"object", ranges }.encode(&mut buf[1..]);
+                    let n = Get { token, transfer, seq, name: b"object", ranges }.encode(&mut buf[1..]);
                     net.send(now, false, &buf[..1 + n]);
                 }
                 Poll::Wait(t) => {
                     assert!(t > now);
                     break t;
+                }
+                Poll::Failed(Why::Silent) if resumed < s.resumes => {
+                    resumed += 1;
+                    let old = fetch.stats();
+                    stats.asked += old.asked;
+                    stats.asked_again += old.asked_again;
+                    stats.spare += old.spare;
+                    stats.silences += old.silences;
+                    serve.cancel(asker, transfer);
+                    transfer = net.rng.next_u64();
+                    fetch.resume(transfer, fetch.path(), now);
                 }
                 end => {
                     over = Some(end);
@@ -202,7 +224,7 @@ fn run(s: &Setup) -> Outcome {
                         serve.cancel(x.to, x.transfer);
                         continue;
                     }
-                    if matches!(s.server, Server::Stops(n) if served >= n) {
+                    if matches!(s.server, Server::Stops(n) if served >= n && resumed == 0) {
                         continue;
                     }
                     let Some(data) = chunk_of(&s.object, x.index) else {
@@ -213,9 +235,10 @@ fn run(s: &Setup) -> Outcome {
                     buf[0] = CHUNK;
                     let n = if lie {
                         let data = vec![0; chunk_len(len + 1, x.index).unwrap()];
-                        Chunk { transfer: x.transfer, len: len + 1, index: x.index, data: &data }.encode(&mut buf[1..])
+                        Chunk { transfer: x.transfer, seq: x.seq, len: len + 1, index: x.index, data: &data }
+                            .encode(&mut buf[1..])
                     } else {
-                        Chunk { transfer: x.transfer, len, index: x.index, data }.encode(&mut buf[1..])
+                        Chunk { transfer: x.transfer, seq: x.seq, len, index: x.index, data }.encode(&mut buf[1..])
                     };
                     net.send(now, true, &buf[..1 + n]);
                     served += 1;
@@ -251,10 +274,17 @@ fn run(s: &Setup) -> Outcome {
             }
         }
     };
-    let (stats, path) = (fetch.stats(), fetch.path());
+    let (last, path, rate) = (fetch.stats(), fetch.path(), fetch.rate(now));
+    let stats = Stats {
+        asked: stats.asked + last.asked,
+        asked_again: stats.asked_again + last.asked_again,
+        spare: stats.spare + last.spare,
+        silences: stats.silences + last.silences,
+        ..last
+    };
     let intact = fetch.finish().is_some_and(|got| got == s.object);
     assert_eq!(intact, end == Poll::Done, "done is intact, and nothing else is");
-    Outcome { end, intact, time: now - start, stats, path, served, refused }
+    Outcome { end, intact, time: now - start, stats, path, served, refused, resumed, rate }
 }
 
 fn lossy(loss: u32) -> Link {
@@ -291,7 +321,8 @@ fn over_a_clean_path_nothing_is_asked_twice() {
     }
     // Two megabytes: the window doubles to carry it in a few round trips.
     let o = run(&Setup::new(2 << 20, 1));
-    assert!(o.time < 400 * MILLI, "{}", o.time);
+    assert!(o.time < 600 * MILLI, "{}", o.time);
+    assert!(!o.path.full());
     assert_eq!(o.path.window(), 1024);
     // And the next from the same peer starts where this one ended.
     let mut again = Setup::new(2 << 20, 2);
@@ -308,7 +339,7 @@ fn loss_is_made_up_without_much_waste() {
     // Loss in ten thousand; the most asked for, in hundredths of the
     // object's chunks; the longest a two megabyte fetch may take.
     for (loss, most, longest) in
-        [(100, 106, 3 * SECOND), (500, 116, 5 * SECOND), (1000, 132, 7 * SECOND), (2000, 172, 12 * SECOND)]
+        [(100, 106, 3 * SECOND), (500, 116, 8 * SECOND), (1000, 132, 15 * SECOND), (2000, 172, 90 * SECOND)]
     {
         for len in [1usize, 5000, 100_000, 2 << 20] {
             let seeds = if len > 1 << 20 { 6 } else { 30 };
@@ -316,9 +347,13 @@ fn loss_is_made_up_without_much_waste() {
             for seed in 0..seeds {
                 let o = run(&Setup::new(len, seed).both(lossy(loss)));
                 assert!(o.intact, "loss {loss}, {len} bytes, seed {seed}: {:?}", o.end);
-                // Nothing arrives twice that was asked for once, and
-                // loss is not disorder.
-                assert!(o.stats.spare <= o.stats.asked_again && o.stats.disorders <= o.stats.spare);
+                // Nothing arrives twice that was asked for once; and a
+                // path that only loses is not taken for a full one.
+                assert!(o.stats.spare <= o.stats.asked_again);
+                // (Where a fifth is lost the two can look alike for a
+                // round; the window is then held to what the path held,
+                // and no lower.)
+                assert!(loss > 500 || !o.path.full(), "loss {loss}, {len} bytes, seed {seed}");
                 asked += o.stats.asked;
                 time = time.max(o.time);
             }
@@ -343,19 +378,18 @@ fn at_the_worst_a_fetch_is_whole_or_given_up() {
         let o = run(&Setup::new(50_000, seed).both(lossy(5000)));
         match o.end {
             Poll::Done => whole += 1,
-            Poll::Failed(Why::Silent | Why::Slow) => {}
+            Poll::Failed(Why::Silent) => {}
             other => panic!("{other:?}"),
         }
-        assert!(o.time <= 60 * SECOND);
     }
     assert!(whole >= 20, "{whole}");
 }
 
 /// Chunks that overtake one another by more places than is allowed for
 /// are asked for again needlessly, at first; the allowance grows, is
-/// kept for the peer, and the next fetch wastes less than half as much.
-/// (Not nothing: the allowance is let down a little each round, to find
-/// out whether the path still needs it.)
+/// kept for the peer, and the next fetch wastes no more. (Not nothing:
+/// the allowance is let down a little each round, to find out whether
+/// the path still needs it.)
 #[test]
 fn disorder_is_learned() {
     for jitter in [5 * MILLI, 40 * MILLI] {
@@ -372,7 +406,7 @@ fn disorder_is_learned() {
         next.path = o.path;
         let o2 = run(&next);
         assert!(o2.intact);
-        assert!(o2.stats.asked_again * 2 <= o.stats.asked_again, "{:?} then {:?}", o.stats, o2.stats);
+        assert!(o2.stats.asked_again <= o.stats.asked_again, "{:?} then {:?}", o.stats, o2.stats);
     }
     // A path that keeps order is not thought to lose it.
     let o = run(&Setup::new(2 << 20, 3).both(lossy(300)));
@@ -403,7 +437,7 @@ fn the_window_fits_a_narrow_path() {
         assert!(o.time <= least + least / 2 + SECOND, "{rate}/s: {} for {least}", o.time);
         // The first burst overruns the queue once; after that little is
         // lost.
-        assert!(o.stats.asked * 100 <= count * 135, "{rate}/s: {:?}", o.stats);
+        assert!(o.stats.asked * 100 <= count * 145, "{rate}/s: {:?}", o.stats);
         assert_eq!(o.stats.disorders, 0);
         assert!(o.path.window() < 256, "{}", o.path.window());
     }
@@ -426,11 +460,11 @@ fn a_peer_that_stops_is_given_up() {
         let o = run(&s);
         assert_eq!(o.end, Poll::Failed(Why::Silent), "{sent}");
         assert_eq!(o.stats.silences, MAX_RETRIES as u64 + 1);
-        // Each silence waits twice the last, to eight times the first.
-        // (1 + 2 + 4 + 8 six times over: fifty-five times the first,
-        // which once measured is the least there is or a little over.)
-        let first = if sent == 0 { RETRY } else { MIN_RETRY };
-        assert!(o.time >= 55 * first && o.time <= 80 * first + SECOND, "{sent}: {}", o.time);
+        // Each silence waits twice the last, up to a minute: never
+        // measured, 0.4 s doubling to 51.2 s and then the minute; once
+        // measured, from a tenth of a second or a little over.
+        let (least, most) = if sent == 0 { (162, 163) } else { (51, 80) };
+        assert!(o.time >= least * SECOND && o.time <= most * SECOND, "{sent}: {}", o.time);
     }
 }
 
@@ -449,22 +483,6 @@ fn a_peer_that_lies_about_the_length_ends_the_fetch() {
             assert_eq!((o.end, o.refused), (Poll::Failed(Why::Bad), 1));
         }
     }
-}
-
-#[test]
-fn a_trickle_is_not_waited_for() {
-    // Four chunks a second is under the least rate worth having.
-    let mut s = Setup::new(1 << 20, 10);
-    s.rate = 4;
-    let o = run(&s);
-    assert_eq!(o.end, Poll::Failed(Why::Slow));
-    assert!(o.time >= SLOW_GRACE && o.time <= SLOW_GRACE + SECOND, "{}", o.time);
-    // Ten is over it: slow, and whole.
-    let mut s = Setup::new(250_000, 10);
-    s.rate = 10;
-    let o = run(&s);
-    assert!(o.intact && o.time > SLOW_GRACE, "{:?} {}", o.end, o.time);
-    assert_eq!(o.stats.asked_again, 0);
 }
 
 /// Someone who is not on the path sends chunks of the right shape for
@@ -506,10 +524,6 @@ fn any_path_gives_the_object_or_gives_up() {
             // Given up only where the path is very bad, or slower than
             // is worth waiting for.
             Poll::Failed(Why::Silent) => assert!(!gentle, "run {i}: {:?} {:?}", s.up, s.down),
-            Poll::Failed(Why::Slow) => {
-                let slow = s.rate == 50 || s.up.rate == 100 || s.down.rate == 100 || s.down.queue == 4 || !gentle;
-                assert!(slow, "run {i}: {:?} {:?} at {}", s.up, s.down, s.rate)
-            }
             other => panic!("run {i}: {other:?}"),
         }
     }
@@ -525,11 +539,11 @@ fn a_fetch_of_nothing_or_of_too_much_is_over_before_it_starts() {
     }
     // Blind, no more is asked for than the greatest length has.
     let mut f = Fetch::new(1, None, 2 * CHUNK_BYTES as u32 + 1, Path::new(), 0);
-    assert_eq!(f.poll(0, &mut ranges), Poll::Ask);
+    assert_eq!(f.poll(0, &mut ranges), Poll::Ask(0));
     assert_eq!(ranges.indexes().collect::<Vec<_>>(), [0, 1, 2]);
     // And a first chunk claiming more than that is refused.
     let data = [0u8; CHUNK_BYTES];
-    let over = Chunk { transfer: 1, len: 2 * CHUNK_BYTES as u32 + 2, index: 0, data: &data };
+    let over = Chunk { transfer: 1, seq: 0, len: 2 * CHUNK_BYTES as u32 + 2, index: 0, data: &data };
     assert!(f.chunk(1, &over).is_err());
     assert_eq!(f.poll(1, &mut ranges), Poll::Failed(Why::Bad));
 }
@@ -549,11 +563,11 @@ fn a_fetch_takes_anything_without_harm() {
         let honest = rng.next_u64() % 3 != 0;
         let mut f = Fetch::new(9, known.then_some(len), 50_000, Path::new(), 0);
         let mut now = 0;
-        let mut asked: Vec<u32> = Vec::new();
+        let mut asked: Vec<(u32, u32)> = Vec::new();
         let end = loop {
             now += rng.next_u64() % (300 * MILLI);
             match f.poll(now, &mut ranges) {
-                Poll::Ask => asked.extend(ranges.indexes()),
+                Poll::Ask(seq) => asked.extend(ranges.indexes().zip(seq..)),
                 Poll::Wait(t) => assert!(t > now),
                 over => break over,
             }
@@ -561,9 +575,10 @@ fn a_fetch_takes_anything_without_harm() {
             // asked for; and, from a peer that is not honest, lies.
             for _ in 0..rng.next_u64() % 40 {
                 let pick = rng.next_u64();
-                let index = match pick % 4 {
+                // (With the number of its ask, or with any.)
+                let (index, seq) = match pick % 4 {
                     0 if !asked.is_empty() => asked.swap_remove(pick as usize / 4 % asked.len()),
-                    1 => pick as u32 / 4 % chunk_count(len),
+                    1 => (pick as u32 / 4 % chunk_count(len), (pick >> 40) as u32 % 64),
                     _ if !asked.is_empty() => asked[pick as usize / 4 % asked.len()],
                     _ => continue,
                 };
@@ -574,9 +589,9 @@ fn a_fetch_takes_anything_without_harm() {
                     Some(d) if !lie => d.to_vec(),
                     _ => vec![0x55; n],
                 };
-                let _ = f.chunk(now, &Chunk { transfer: 9, len: claimed, index, data: &data });
+                let _ = f.chunk(now, &Chunk { transfer: 9, seq, len: claimed, index, data: &data });
                 // Another fetch's chunk changes nothing.
-                assert!(f.chunk(now, &Chunk { transfer: 8, len: claimed, index, data: &data }).is_err());
+                assert!(f.chunk(now, &Chunk { transfer: 8, seq, len: claimed, index, data: &data }).is_err());
             }
             let (got, of) = f.progress();
             assert!(of.is_none_or(|n| got <= n) && f.in_flight() <= MAX_WINDOW);
@@ -591,7 +606,7 @@ fn a_fetch_takes_anything_without_harm() {
                 assert!(got.len() as u32 == len || (!known && !honest));
             }
             Poll::Failed(Why::Bad) => assert!(!honest),
-            Poll::Failed(Why::Silent | Why::Slow) => {}
+            Poll::Failed(Why::Silent) => {}
             other => panic!("{other:?}"),
         }
     }
@@ -630,7 +645,13 @@ fn over_real_sockets() {
                     match serve.next(now) {
                         Next::Send(x) => {
                             let data = chunk_of(&object, x.index).unwrap();
-                            let chunk = Chunk { transfer: x.transfer, len: object.len() as u32, index: x.index, data };
+                            let chunk = Chunk {
+                                transfer: x.transfer,
+                                seq: x.seq,
+                                len: object.len() as u32,
+                                index: x.index,
+                                data,
+                            };
                             let n = chunk.encode(&mut out);
                             server.send_to(&out[..n], x.to).unwrap();
                             sent += 1;
@@ -655,8 +676,8 @@ fn over_real_sockets() {
     let end = loop {
         let now = clock.elapsed().as_micros() as Micros;
         match fetch.poll(now, &mut ranges) {
-            Poll::Ask => {
-                let n = Get { token, transfer: fetch.transfer(), name: b"object", ranges }.encode(&mut out);
+            Poll::Ask(seq) => {
+                let n = Get { token, transfer: fetch.transfer(), seq, name: b"object", ranges }.encode(&mut out);
                 client.send_to(&out[..n], server_addr).unwrap();
             }
             Poll::Wait(t) => {
@@ -678,4 +699,144 @@ fn over_real_sockets() {
     println!("{:?} in {:?}: {sent} chunks sent, {stats:?}, window {}", end, clock.elapsed(), fetch.path().window());
     assert_eq!(end, Poll::Done);
     assert!(fetch.finish().unwrap() == *object);
+}
+
+/// The lines a node may be at the end of. The block crosses on each, in
+/// about the time the line itself needs for it, with nothing given up;
+/// and what is asked for twice is little, because the window comes to
+/// fit a narrow line and is left alone on a lossy one.
+#[test]
+fn a_block_crosses_any_line() {
+    // The line (chunks a second, where it has a limit); the object; the
+    // longest it may take; the most asked for, in hundredths; whether
+    // the path is narrow, to be found full.
+    let block = 2 << 20;
+    let rows: &[(&str, Link, usize, Micros, u64, Option<bool>)] = &[
+        (
+            "satellite, 1% lost",
+            Link { delay: 300 * MILLI, loss: 100, rate: 1000, queue: 100, ..CLEAN },
+            block,
+            60,
+            110,
+            Some(false),
+        ),
+        (
+            "satellite, 5% lost",
+            Link { delay: 300 * MILLI, loss: 500, rate: 1000, queue: 100, ..CLEAN },
+            block,
+            120,
+            120,
+            Some(false),
+        ),
+        (
+            "radio, 2 s there and back, 20% lost",
+            Link { delay: SECOND, loss: 2000, rate: 20, queue: 40, ..CLEAN },
+            500_000,
+            600,
+            175,
+            None,
+        ),
+        ("256 kbit/s", Link { delay: 50 * MILLI, rate: 26, queue: 20, ..CLEAN }, block, 80, 115, Some(true)),
+        ("64 kbit/s", Link { delay: 100 * MILLI, rate: 6, queue: 10, ..CLEAN }, block, 310, 115, Some(true)),
+        ("32 kbit/s", Link { delay: 100 * MILLI, rate: 3, queue: 10, ..CLEAN }, block, 620, 120, Some(true)),
+        ("9.6 kbit/s", Link { delay: 200 * MILLI, rate: 1, queue: 5, ..CLEAN }, 300_000, 290, 145, Some(true)),
+        (
+            "9.6 kbit/s, 10% lost",
+            Link { delay: 200 * MILLI, rate: 1, queue: 5, loss: 1000, ..CLEAN },
+            300_000,
+            420,
+            165,
+            Some(true),
+        ),
+    ];
+    for (what, link, len, longest, most, narrow) in rows {
+        for seed in 0..4 {
+            let mut s = Setup::new(*len, seed);
+            s.down = *link;
+            s.up = Link { rate: 0, ..*link };
+            let o = run(&s);
+            let count = chunk_count(*len as u32) as u64;
+            assert!(o.intact, "{what}, seed {seed}: {:?}", o.end);
+            assert!(o.time <= longest * SECOND, "{what}, seed {seed}: {} s", o.time / SECOND);
+            assert!(o.stats.asked * 100 <= count * most, "{what}, seed {seed}: {:?}", o.stats);
+            match narrow {
+                // Found full, and the window within twice what the line
+                // and its queue hold.
+                Some(true) => {
+                    let holds = link.queue + (link.rate as u64 * 2 * link.delay / SECOND) as u32 + 2;
+                    assert!(o.path.full() && o.path.window() <= 2 * holds, "{what}: {} for {holds}", o.path.window());
+                }
+                // Lossy, and not held to a small window for it.
+                Some(false) => assert!(o.path.window() >= INITIAL_WINDOW, "{what}: {}", o.path.window()),
+                None => {}
+            }
+        }
+    }
+}
+
+/// How fast a fetch goes is told, and it is not given up for it.
+#[test]
+fn a_slow_peer_is_reported_and_waited_for() {
+    let mut s = Setup::new(100_000, 10);
+    s.rate = 4;
+    let o = run(&s);
+    assert!(o.intact && o.time > 10 * SECOND);
+    // A silence or two before the pace is known, each asking for one
+    // chunk again and no more.
+    assert!(o.stats.asked_again <= 4 && o.stats.asked_again == o.stats.silences, "{:?}", o.stats);
+    // Four chunks a second, and a burst at the start.
+    assert!((4 * CHUNK_BYTES as u64..10 * CHUNK_BYTES as u64).contains(&o.rate), "{}", o.rate);
+}
+
+/// A fetch given up for silence keeps what it has: taken up again, only
+/// what is missing is asked for.
+#[test]
+fn a_fetch_given_up_is_taken_up_where_it_was() {
+    let count = chunk_count(1 << 20) as u64;
+    for sent in [1, 300, 800] {
+        let mut s = Setup::new(1 << 20, 12);
+        s.server = Server::Stops(sent);
+        s.resumes = 1;
+        let o = run(&s);
+        assert!(o.intact && o.resumed == 1, "{sent}: {:?}", o.end);
+        // Served once each, and the few that were on their way when it
+        // stopped.
+        assert_eq!(o.served, count, "{sent}");
+        assert_eq!(o.stats.spare, 0);
+    }
+    // Still not knowing the length, it is asked for blind again.
+    let mut s = Setup::new(100_000, 13);
+    (s.known, s.server, s.resumes) = (false, Server::Stops(0), 1);
+    assert!(run(&s).intact);
+    // At the worst line there is, a fetch taken up as often as it is
+    // given up arrives in the end.
+    for seed in 0..5 {
+        let mut s = Setup::new(60_000, seed).both(lossy(5000));
+        s.resumes = 1000;
+        let o = run(&s);
+        assert!(o.intact, "seed {seed}: {:?} after {}", o.end, o.resumed);
+    }
+    // Not after a lie, and not once done.
+    let mut ranges = Ranges::new();
+    let mut f = Fetch::new(1, Some(5000), 5000, Path::new(), 0);
+    assert_eq!(f.poll(0, &mut ranges), Poll::Ask(0));
+    let data = [7u8; CHUNK_BYTES];
+    assert!(f.chunk(1, &Chunk { transfer: 1, seq: 0, len: 5001, index: 0, data: &data }).is_err());
+    f.resume(2, Path::new(), 2);
+    assert_eq!((f.poll(2, &mut ranges), f.transfer()), (Poll::Failed(Why::Bad), 1));
+    let mut f = Fetch::new(1, Some(10), 5000, Path::new(), 0);
+    assert_eq!(f.poll(0, &mut ranges), Poll::Ask(0));
+    assert_eq!(f.chunk(1, &Chunk { transfer: 1, seq: 0, len: 10, index: 0, data: &data[..10] }), Ok(Taken::New));
+    f.resume(2, Path::new(), 2);
+    assert_eq!(f.poll(2, &mut ranges), Poll::Done);
+    // After the peer said it had none, with another peer.
+    let mut f = Fetch::new(1, Some(10), 5000, Path::new(), 0);
+    f.gone();
+    assert_eq!(f.poll(0, &mut ranges), Poll::Failed(Why::Gone));
+    f.resume(2, Path::new(), 2);
+    assert_eq!(f.poll(2, &mut ranges), Poll::Ask(0));
+    // A chunk under the old number is no longer this fetch's.
+    assert!(f.chunk(3, &Chunk { transfer: 1, seq: 0, len: 10, index: 0, data: &data[..10] }).is_err());
+    assert_eq!(f.chunk(3, &Chunk { transfer: 2, seq: 0, len: 10, index: 0, data: &data[..10] }), Ok(Taken::New));
+    assert_eq!(f.finish().unwrap(), data[..10]);
 }

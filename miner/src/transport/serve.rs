@@ -13,8 +13,9 @@
 //! asking side sees silence, takes it for loss and asks for less.
 //!
 //! A request for more of the fetch its address asked for last is joined
-//! to that one while the two fit in one, so that a fetch asking a little
-//! at a time, as chunks arrive, is one request here and not many.
+//! to that one while there is room in it, so that a fetch asking a
+//! little at a time, as chunks arrive, is one request here and not
+//! many.
 //!
 //! # Order, and turns
 //!
@@ -34,7 +35,7 @@
 use std::net::SocketAddr;
 
 use super::token::Tokens;
-use super::wire::{Get, MAX_NAME, Range, Ranges};
+use super::wire::{Get, MAX_NAME, MAX_RANGES, Range};
 use super::{MAX_WINDOW, Micros, SECOND};
 
 /// Requests waiting, at most.
@@ -51,12 +52,57 @@ struct Job {
     transfer: u64,
     name: [u8; MAX_NAME],
     name_len: u8,
-    ranges: Ranges,
-    /// The run being sent, and how far into it.
+    /// The runs still to send, the first of them from where it has got
+    /// to, each with the number of its first chunk's ask.
+    runs: [(Range, u32); MAX_RANGES],
+    n: usize,
+    /// The run being sent.
     run: usize,
-    offset: u16,
     /// Chunks still to send.
     left: u32,
+}
+
+impl Job {
+    /// Adds a run after the others: joined to the last if it follows it
+    /// both as chunks and as asks. False, and nothing added, when there
+    /// is no room.
+    fn push(&mut self, r: Range, seq: u32) -> bool {
+        if self.n > self.run {
+            let (last, last_seq) = &mut self.runs[self.n - 1];
+            if last.start.checked_add(last.count as u32) == Some(r.start)
+                && last_seq.wrapping_add(last.count as u32) == seq
+                && let Some(count) = last.count.checked_add(r.count)
+            {
+                last.count = count;
+                self.left += r.count as u32;
+                return true;
+            }
+        }
+        if self.n == MAX_RANGES {
+            return false;
+        }
+        self.runs[self.n] = (r, seq);
+        self.n += 1;
+        self.left += r.count as u32;
+        true
+    }
+
+    /// Adds a request's runs, all or none.
+    fn extend(&mut self, get: &Get<'_>) -> bool {
+        let before = (self.runs, self.n, self.left);
+        // Sent runs make room for new ones.
+        self.runs.copy_within(self.run..self.n, 0);
+        (self.n, self.run) = (self.n - self.run, 0);
+        let mut seq = get.seq;
+        for r in get.ranges.as_slice() {
+            if !self.push(*r, seq) {
+                (self.runs, self.n, self.left) = before;
+                return false;
+            }
+            seq = seq.wrapping_add(r.count as u32);
+        }
+        true
+    }
 }
 
 /// A chunk to send.
@@ -67,6 +113,8 @@ pub struct Send {
     name: [u8; MAX_NAME],
     name_len: u8,
     pub index: u32,
+    /// The number of the ask this chunk answers.
+    pub seq: u32,
 }
 
 impl Send {
@@ -137,35 +185,28 @@ impl Serve {
             return Err(Refused::Full);
         }
         // More of what its address asked for last: one request with it,
-        // if what is left of that one and this one fit in one.
+        // while there is room in that one.
         if let Some(j) = self.jobs.iter_mut().rev().find(|j| j.to == from)
             && j.transfer == get.transfer
             && j.name[..j.name_len as usize] == *get.name
+            && j.extend(get)
         {
-            let runs = j.ranges.as_slice();
-            let mut all = Ranges::new();
-            let first = runs[j.run];
-            let mut fits = all.push_run(Range { start: first.start + j.offset as u32, count: first.count - j.offset });
-            for r in runs[j.run + 1..].iter().chain(get.ranges.as_slice()) {
-                fits &= all.push_run(*r);
-            }
-            if fits {
-                (j.ranges, j.run, j.offset, j.left) = (all, 0, 0, all.chunks());
-                return Ok(());
-            }
+            return Ok(());
         }
         let mut name = [0; MAX_NAME];
         name[..get.name.len()].copy_from_slice(get.name);
-        self.jobs.push(Job {
+        let mut job = Job {
             to: from,
             transfer: get.transfer,
             name,
             name_len: get.name.len() as u8,
-            ranges: get.ranges,
+            runs: [(Range::default(), 0); MAX_RANGES],
+            n: 0,
             run: 0,
-            offset: 0,
-            left: get.ranges.chunks(),
-        });
+            left: 0,
+        };
+        job.extend(get);
+        self.jobs.push(job);
         Ok(())
     }
 
@@ -196,19 +237,16 @@ impl Serve {
         }
         self.due = due + self.cost;
         let j = &mut self.jobs[i];
-        let r = j.ranges.as_slice()[j.run];
-        let send = Send {
-            to: j.to,
-            transfer: j.transfer,
-            name: j.name,
-            name_len: j.name_len,
-            index: r.start + j.offset as u32,
-        };
-        j.offset += 1;
+        let (r, seq) = &mut j.runs[j.run];
+        let send =
+            Send { to: j.to, transfer: j.transfer, name: j.name, name_len: j.name_len, index: r.start, seq: *seq };
+        // The run is what is left of it.
+        r.start = r.start.wrapping_add(1);
+        r.count -= 1;
+        *seq = seq.wrapping_add(1);
         j.left -= 1;
-        if j.offset == r.count {
+        if r.count == 0 {
             j.run += 1;
-            j.offset = 0;
         }
         let (to, done) = (j.to, j.left == 0);
         self.after = i + 1;
@@ -231,6 +269,7 @@ impl Serve {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::wire::Ranges;
 
     fn addr(n: u8) -> SocketAddr {
         SocketAddr::from(([10, 0, 0, n], 4000))
@@ -245,7 +284,9 @@ mod tests {
     }
 
     fn get<'a>(tokens: &Tokens, from: SocketAddr, transfer: u64, name: &'a [u8], r: Ranges) -> Get<'a> {
-        Get { token: tokens.issue(&from), transfer, name, ranges: r }
+        // Asks numbered as the chunks are, so that chunks that follow are
+        // asks that follow.
+        Get { token: tokens.issue(&from), transfer, seq: r.as_slice()[0].start, name, ranges: r }
     }
 
     /// Everything waiting, with the clock far enough on that the pace
@@ -317,11 +358,26 @@ mod tests {
         let mut want: Vec<(u64, u32)> = (1..800).map(|i| (5, i)).collect();
         want.extend([(5, 3), (5, 4), (6, 0), (6, 1), (6, 0), (6, 1), (5, 9)]);
         assert_eq!(sent, want);
-        // One that would pass a window is a request of its own.
-        s.get(&tokens, addr(2), &get(&tokens, addr(2), 1, b"x", ranges(0..MAX_WINDOW - 4))).unwrap();
-        s.get(&tokens, addr(2), &get(&tokens, addr(2), 1, b"x", ranges(5000..5008))).unwrap();
+        // Each chunk goes with the number of its ask: the request's, and
+        // one more for each chunk after its first, over all its runs.
+        let g = |seq, r| Get { seq, ..get(&tokens, addr(2), 1, b"x", r) };
+        s.get(&tokens, addr(2), &g(100, ranges([7, 8, 3]))).unwrap();
+        s.get(&tokens, addr(2), &g(103, ranges([4, 5]))).unwrap();
+        // Chunks that follow, asks that do not: not one run.
+        s.get(&tokens, addr(2), &g(200, ranges([6]))).unwrap();
+        s.get(&tokens, addr(2), &g(u32::MAX, ranges([0, 1]))).unwrap();
+        assert_eq!(s.waiting(), 1);
+        let mut sent = Vec::new();
+        while let Next::Send(x) = s.next(1 << 41) {
+            sent.push((x.index, x.seq));
+        }
+        assert_eq!(sent, [(7, 100), (8, 101), (3, 102), (4, 103), (5, 104), (6, 200), (0, u32::MAX), (1, 0)]);
+        // More runs than one request holds: another request.
+        for k in 0..MAX_RANGES as u32 + 1 {
+            s.get(&tokens, addr(3), &get(&tokens, addr(3), 1, b"x", ranges([2 * k]))).unwrap();
+        }
         assert_eq!(s.waiting(), 2);
-        assert_eq!(drain(&mut s).len(), MAX_WINDOW as usize + 4);
+        assert_eq!(drain(&mut s).len(), MAX_RANGES + 1);
     }
 
     #[test]

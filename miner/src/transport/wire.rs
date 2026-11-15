@@ -3,7 +3,7 @@
 //!
 //! These are the bodies only. The layer above puts before them whatever
 //! says which network the datagram is of and which of its kinds it is,
-//! in the sixteen bytes [`super::CHUNK_BYTES`] leaves.
+//! in the twelve bytes [`super::CHUNK_BYTES`] leaves.
 //!
 //! Integers are little-endian. Nothing is taken that is not exactly the
 //! encoding of something that could have been sent.
@@ -16,10 +16,10 @@ pub const MAX_NAME: usize = 64;
 /// The most ranges in one request.
 pub const MAX_RANGES: usize = 64;
 /// The longest request.
-pub const MAX_GET: usize = 8 + 8 + 1 + MAX_NAME + 1 + MAX_RANGES * 6;
+pub const MAX_GET: usize = 8 + 8 + 4 + 1 + MAX_NAME + 1 + MAX_RANGES * 6;
 /// The longest chunk.
 pub const MAX_CHUNK: usize = CHUNK_HEAD + CHUNK_BYTES;
-const CHUNK_HEAD: usize = 16;
+const CHUNK_HEAD: usize = 20;
 
 /// Chunks `start`, `start + 1`, ... `count` of them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -130,6 +130,10 @@ pub struct Get<'a> {
     /// The asking side's number for this fetch: every chunk sent in
     /// answer carries it.
     pub transfer: u64,
+    /// The number of the first chunk asked for here, as an ask: the
+    /// next is one more, and so on through the ranges. Each chunk sent
+    /// in answer carries its own back.
+    pub seq: u32,
     /// Which object: the layer above's business.
     pub name: &'a [u8],
     pub ranges: Ranges,
@@ -143,6 +147,7 @@ impl<'a> Get<'a> {
         let mut w = Out(out, 0);
         w.put(&self.token.to_le_bytes());
         w.put(&self.transfer.to_le_bytes());
+        w.put(&self.seq.to_le_bytes());
         w.put(&[self.name.len() as u8]);
         w.put(self.name);
         w.put(&[self.ranges.n as u8]);
@@ -158,6 +163,7 @@ impl<'a> Get<'a> {
         let mut r = In(bytes);
         let token = u64::from_le_bytes(r.array().ok_or(BAD)?);
         let transfer = u64::from_le_bytes(r.array().ok_or(BAD)?);
+        let seq = u32::from_le_bytes(r.array().ok_or(BAD)?);
         let [name_len] = r.array().ok_or(BAD)?;
         if name_len as usize > MAX_NAME {
             return Err(BAD);
@@ -182,7 +188,7 @@ impl<'a> Get<'a> {
         if ranges.chunks > MAX_WINDOW || !r.0.is_empty() {
             return Err(BAD);
         }
-        Ok(Get { token, transfer, name, ranges })
+        Ok(Get { token, transfer, seq, name, ranges })
     }
 }
 
@@ -191,6 +197,8 @@ impl<'a> Get<'a> {
 pub struct Chunk<'a> {
     /// The number of the fetch it answers.
     pub transfer: u64,
+    /// The number of the ask it answers ([`Get::seq`]).
+    pub seq: u32,
     /// The whole object's length.
     pub len: u32,
     pub index: u32,
@@ -204,6 +212,7 @@ impl<'a> Chunk<'a> {
         assert_eq!(chunk_len(self.len, self.index), Some(self.data.len()));
         let mut w = Out(out, 0);
         w.put(&self.transfer.to_le_bytes());
+        w.put(&self.seq.to_le_bytes());
         w.put(&self.len.to_le_bytes());
         w.put(&self.index.to_le_bytes());
         w.put(self.data);
@@ -216,12 +225,13 @@ impl<'a> Chunk<'a> {
         const BAD: Error = Error::Malformed("chunk");
         let mut r = In(bytes);
         let transfer = u64::from_le_bytes(r.array().ok_or(BAD)?);
+        let seq = u32::from_le_bytes(r.array().ok_or(BAD)?);
         let len = u32::from_le_bytes(r.array().ok_or(BAD)?);
         let index = u32::from_le_bytes(r.array().ok_or(BAD)?);
         if chunk_len(len, index) != Some(r.0.len()) {
             return Err(BAD);
         }
-        Ok(Chunk { transfer, len, index, data: r.0 })
+        Ok(Chunk { transfer, seq, len, index, data: r.0 })
     }
 }
 
@@ -325,7 +335,13 @@ mod tests {
                 ranges.push(rng.next_u64() as u32 % 5000);
             }
             let name: Vec<u8> = (0..rng.next_u64() % (MAX_NAME as u64 + 1)).map(|_| rng.next_u64() as u8).collect();
-            let get = Get { token: rng.next_u64(), transfer: rng.next_u64(), name: &name, ranges };
+            let get = Get {
+                token: rng.next_u64(),
+                transfer: rng.next_u64(),
+                seq: rng.next_u64() as u32,
+                name: &name,
+                ranges,
+            };
             let n = get.encode(&mut buf);
             assert_eq!(Get::decode(&buf[..n]), Ok(get));
             // Not with a byte more, nor with one less.
@@ -339,7 +355,7 @@ mod tests {
         for i in 0..MAX_RANGES as u32 {
             ranges.push(2 * i);
         }
-        let get = Get { token: 1, transfer: 2, name: &[7; MAX_NAME], ranges };
+        let get = Get { token: 1, transfer: 2, seq: 3, name: &[7; MAX_NAME], ranges };
         assert_eq!(get.encode(&mut buf), MAX_GET);
     }
 
@@ -348,7 +364,7 @@ mod tests {
         let mut buf = [0u8; MAX_GET];
         let mut ranges = Ranges::new();
         ranges.push(3);
-        let n = Get { token: 1, transfer: 2, name: b"ab", ranges }.encode(&mut buf);
+        let n = Get { token: 1, transfer: 2, seq: 3, name: b"ab", ranges }.encode(&mut buf);
         let good = buf[..n].to_vec();
         let with = |at: usize, v: &[u8]| {
             let mut b = good.clone();
@@ -357,15 +373,15 @@ mod tests {
         };
         assert!(Get::decode(&good).is_ok());
         // A name longer than any, no ranges, more ranges than fit.
-        assert!(with(16, &[MAX_NAME as u8 + 1]));
-        assert!(with(19, &[0]));
-        assert!(with(19, &[2]));
+        assert!(with(20, &[MAX_NAME as u8 + 1]));
+        assert!(with(23, &[0]));
+        assert!(with(23, &[2]));
         // An empty run, and one that passes the last index.
-        assert!(with(24, &[0, 0]));
-        assert!(with(20, &[0xff, 0xff, 0xff, 0xff, 2, 0]));
-        assert!(!with(20, &[0xff, 0xff, 0xff, 0xff, 1, 0]));
+        assert!(with(28, &[0, 0]));
+        assert!(with(24, &[0xff, 0xff, 0xff, 0xff, 2, 0]));
+        assert!(!with(24, &[0xff, 0xff, 0xff, 0xff, 1, 0]));
         // More chunks than a window, over two runs.
-        let mut b = good[..19].to_vec();
+        let mut b = good[..23].to_vec();
         b.push(2);
         for _ in 0..2 {
             b.extend_from_slice(&0u32.to_le_bytes());
@@ -389,9 +405,9 @@ mod tests {
         for (len, index, n) in
             [(1, 0, 1), (c, 0, c), (c + 1, 0, c), (c + 1, 1, 1), (5 * c, 4, c), (u32::MAX, 3579139, 495)]
         {
-            let chunk = Chunk { transfer: 77, len, index, data: &data[..n as usize] };
+            let chunk = Chunk { transfer: 77, seq: 0xdead_beef, len, index, data: &data[..n as usize] };
             let m = chunk.encode(&mut buf);
-            assert_eq!(m, 16 + n as usize);
+            assert_eq!(m, 20 + n as usize);
             assert_eq!(Chunk::decode(&buf[..m]), Ok(chunk));
             // A byte short, a byte long.
             assert!(Chunk::decode(&buf[..m - 1]).is_err());
@@ -400,13 +416,13 @@ mod tests {
             assert!(Chunk::decode(&longer).is_err());
         }
         // No object has no bytes; no chunk is past the end.
-        let mut b = vec![0u8; 16];
+        let mut b = vec![0u8; 20];
         assert!(Chunk::decode(&b).is_err());
-        b[8] = 1;
         b[12] = 1;
+        b[16] = 1;
         assert!(Chunk::decode(&b).is_err());
-        assert!(Chunk::decode(&b[..15]).is_err());
-        assert_eq!(MAX_CHUNK, 1216);
+        assert!(Chunk::decode(&b[..19]).is_err());
+        assert_eq!(MAX_CHUNK, 1220);
     }
 
     #[test]
