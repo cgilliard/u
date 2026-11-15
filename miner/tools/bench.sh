@@ -28,6 +28,7 @@ BENCHES=(
     pow_air::tests::cost
     store::outputs::tests::cost
     store::state::tests::cost_at_scale
+    aggregate::tree_tests::dev_block_timing
 )
 
 out=target/bench

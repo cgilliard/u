@@ -113,16 +113,34 @@ jobs:
         run: ./tools/ignored.sh
 
   # The slow tests: those marked #[ignore] that are not benchmarks, a job
-  # each, in a release build. The audits of the circuits take the longest.
+  # each, in a release build. Two of them check constants of the source
+  # against the circuits (the chain's programs and plans): a change to a
+  # circuit fails them until the constants are made again.
   slow:
     name: slow (${{ matrix.test }})
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         test:
           # slow-tests:begin
+          - aggregate::tree_tests::aggregate_proof_roundtrip
+          - aggregate::tree_tests::aggregate_tree_roundtrip
+          - aggregate::tree_tests::chain_proofs_cover_history
+          - aggregate::tree_tests::deep_tree_roundtrip
+          - aggregate::tree_tests::dev_recursive_chain_constants
+          - aggregate::tree_tests::mainnet_chain_constants
+          - aggregate::tree_tests::mainnet_chain_timing
+          - aggregate::tree_tests::mainnet_node_timing
+          - aggregate::tree_tests::mainnet_plans
+          - aggregate::tree_tests::mainnet_rate_timing
+          - aggregate::tree_tests::mainnet_wrap_timing
+          - aggregate::tree_tests::proving_can_be_cancelled
+          - aggregate::tree_tests::security_configs
+          - aggregate::tree_tests::soundness_parameters
+          - aggregate::tree_tests::spanning_transaction_roundtrip
+          - aggregate::tree_tests::write_fam_chain_proof
           - block_air::circuit_tests::a_replaced_permutation_is_caught_where_it_is_used
           - block_air::circuit_tests::the_block_circuit_has_no_unintended_freedom
           - block_air::circuit_tests::the_circuit_agrees_with_the_chain_on_random_blocks
