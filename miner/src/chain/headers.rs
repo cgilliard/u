@@ -139,7 +139,7 @@ impl Known {
 /// The times of the last blocks of a branch, newest last: what the
 /// median is taken of. Carried along a run of headers.
 #[derive(Clone, Copy)]
-struct Times {
+pub(super) struct Times {
     times: [u64; Times::MOST],
     n: usize,
     window: usize,
@@ -163,7 +163,7 @@ impl Times {
         self.n += 1;
     }
 
-    fn median(&self) -> u64 {
+    pub(super) fn median(&self) -> u64 {
         let mut sorted = self.times;
         sorted[..self.n].sort_unstable();
         sorted[self.n / 2]
@@ -279,7 +279,7 @@ impl<B: Backend + 'static, V> Chain<B, V> {
     }
 
     /// The times of the blocks ending at `tip`, along its own branch.
-    fn times_in(&self, pages: &impl ReadPages, blocks: &Blocks, tip: &Header) -> Result<Times, Error> {
+    pub(super) fn times_in(&self, pages: &impl ReadPages, blocks: &Blocks, tip: &Header) -> Result<Times, Error> {
         let window = self.params.median_time_window;
         let mut newest_first = [0u64; Times::MOST];
         let (mut n, mut header) = (0, *tip);
@@ -308,7 +308,12 @@ impl<B: Backend + 'static, V> Chain<B, V> {
     /// Block 1 of `parent`'s branch, where a schedule that starts at the
     /// first block is anchored (block 1's own target is genesis's either
     /// way); `None` for a schedule anchored at genesis.
-    fn anchor_in(&self, pages: &impl ReadPages, blocks: &Blocks, parent: &Header) -> Result<Option<Header>, Error> {
+    pub(super) fn anchor_in(
+        &self,
+        pages: &impl ReadPages,
+        blocks: &Blocks,
+        parent: &Header,
+    ) -> Result<Option<Header>, Error> {
         if !self.params.schedule.from_first_block || parent.height == 0 {
             return Ok(None);
         }
@@ -336,7 +341,7 @@ impl<B: Backend + 'static, V> Chain<B, V> {
 
     /// The target of the block after `parent`, whose branch's block 1 is
     /// `first` if the schedule starts there.
-    fn target_from(&self, parent: &Header, first: Option<&Header>) -> Target {
+    pub(super) fn target_from(&self, parent: &Header, first: Option<&Header>) -> Target {
         let (p, schedule) = (&self.params, self.params.schedule);
         let asert = match first {
             Some(first) => Asert::anchored(1, first.timestamp as i64, p.genesis_target, p.max_target, schedule),
@@ -376,7 +381,7 @@ impl<B: Backend + 'static, V> Chain<B, V> {
         Ok(if best.work > tip.work { best } else { *tip })
     }
 
-    fn tip_in(&self, pages: &impl ReadPages, blocks: &Blocks, height: u32) -> Result<Known, Error> {
+    pub(super) fn tip_in(&self, pages: &impl ReadPages, blocks: &Blocks, height: u32) -> Result<Known, Error> {
         let id = blocks.at(pages, height)?.ok_or_else(|| corrupt("the tip is not in the chain"))?;
         self.known_in(pages, blocks, &id)?.ok_or_else(|| corrupt("the tip has no header"))
     }
@@ -753,7 +758,7 @@ impl<B: Backend + 'static, V> Chain<B, V> {
 pub const LOCATOR: usize = 32;
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::chain::verify::AcceptAllProofs;
     use crate::difficulty::Schedule;
@@ -762,12 +767,12 @@ mod tests {
 
     type TestChain = Chain<MemBackend, AcceptAllProofs>;
 
-    const T0: u64 = 1_800_000_000;
+    pub(in crate::chain) const T0: u64 = 1_800_000_000;
     /// Far enough ahead that no header is too new.
-    const NOW: u64 = T0 + 1_000_000;
+    pub(in crate::chain) const NOW: u64 = T0 + 1_000_000;
 
     /// A network whose every header meets its target, on the dev table.
-    fn easy() -> ChainParams {
+    pub(in crate::chain) fn easy() -> ChainParams {
         ChainParams {
             pow: PowParams::DEV,
             genesis_timestamp: T0,
@@ -782,14 +787,14 @@ mod tests {
         ChainParams { genesis_target: U256([0, 0, 0, 1 << 54]), ..easy() }
     }
 
-    fn seed() -> SeedText<'static> {
+    pub(in crate::chain) fn seed() -> SeedText<'static> {
         SeedText::new(PowParams::DEV)
     }
 
     /// The dev table, made once: headers are mined from it, and the
     /// chains check against it, a thousand times faster than from the
     /// seed text.
-    fn table() -> std::sync::Arc<Dataset<'static>> {
+    pub(in crate::chain) fn table() -> std::sync::Arc<Dataset<'static>> {
         static TABLE: std::sync::OnceLock<std::sync::Arc<Dataset<'static>>> = std::sync::OnceLock::new();
         TABLE.get_or_init(|| std::sync::Arc::new(Dataset::generate(&seed(), 10))).clone()
     }

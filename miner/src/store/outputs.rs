@@ -107,6 +107,11 @@ impl Tree for OutputTree {
         r.leaf()
     }
 
+    /// An output weighs its amount: a pass that spends adds them up.
+    fn weight(r: &Record) -> u64 {
+        r.amount
+    }
+
     /// A leaf is two compressions; those of up to eight records are done
     /// together.
     fn leaves(slots: &[Slot<Record>], out: &mut [(u128, Part); LEAF_RECORDS]) -> usize {
@@ -284,7 +289,8 @@ impl Outputs {
     /// [`Outputs::apply`], which also returns the root of every subtree
     /// at `level` the block changes, as it was before the block (`None`
     /// where there was nothing): what takes the roots of the set's parts
-    /// back to the block before.
+    /// back to the block before. And the amounts of the outputs spent,
+    /// added up.
     pub fn apply_keeping<B: Backend>(
         &self,
         txn: &mut Txn<'_, B>,
@@ -292,7 +298,7 @@ impl Outputs {
         spends: &[u64],
         outputs: &[Record],
         level: u32,
-    ) -> Result<(Outputs, Vec<(u64, Option<Digest>)>), Error> {
+    ) -> Result<(Outputs, Vec<(u64, Option<Digest>)>, u128), Error> {
         let next = self.next + outputs.len() as u64;
         assert!(next <= 1 << HEIGHT, "more outputs than the tree has positions");
         if let Some(p) = spends.iter().find(|p| **p >= self.next) {
@@ -300,10 +306,10 @@ impl Outputs {
         }
         let edits: Edits<'_, OutputTree> =
             Edits { flips: spends, run: outputs, run_from: self.next as u128, ..Edits::none() };
-        let (root, change, before) = trie::update_keeping(txn, self.root, height, edits, level)?;
+        let (root, change, before, spent) = trie::update_keeping(txn, self.root, height, edits, level)?;
         let count = self.count.checked_add_signed(change).ok_or_else(|| corrupt("the count of outputs is wrong"))?;
         let before = before.into_iter().map(|(i, part)| (i as u64, part.map(|p| p.hash))).collect();
-        Ok((Outputs { root, next, count }, before))
+        Ok((Outputs { root, next, count }, before, spent))
     }
 
     /// The root of every nonempty subtree at `level`, ascending by index:

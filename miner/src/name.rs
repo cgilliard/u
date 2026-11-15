@@ -90,6 +90,17 @@ pub const MAX_SWEEPS: usize = 16;
 pub const MIN_REVEAL: u32 = 12;
 pub const MAX_REVEAL: u32 = 288;
 
+/// Whether a commit made at `commit_height` can be revealed at `height`,
+/// where a commit waits `min_reveal` blocks ([`MIN_REVEAL`] on mainnet).
+pub fn in_window(height: u32, commit_height: u32, min_reveal: u32) -> bool {
+    height >= commit_height && (min_reveal..=MAX_REVEAL).contains(&(height - commit_height))
+}
+
+/// Whether a commit made at `commit_height` can be swept at `height`.
+pub fn expired(height: u32, commit_height: u32) -> bool {
+    height > commit_height && height - commit_height > MAX_REVEAL
+}
+
 /// Serialized size of a commit operation.
 pub const COMMIT_OP_SIZE: usize = 1 + DIGEST_BYTES + MEMO_BYTES;
 /// Serialized size of a record, less the name.

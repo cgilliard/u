@@ -488,86 +488,12 @@ impl<B: Backend + 'static> State<B> {
         block: &BlockEdit<'_>,
         also: impl FnOnce(&Txn<'_, B>, &mut Blocks) -> Result<(), Error>,
     ) -> Result<Digest, Error> {
-        let mut txn = self.file.begin()?;
-        let mut meta = self.meta().clone();
-        assert_eq!(block.height, meta.height + 1, "blocks are applied in order");
-        let first_new = meta.outputs.next;
-        #[cfg(test)]
-        let (clock, mut times) = (std::time::Instant::now(), [std::time::Duration::ZERO; 4]);
-        let names_before = meta.names.hash();
-        let (outputs, parts_before) =
-            meta.outputs.apply_keeping(&mut txn, block.height, block.spends, block.outputs, self.part_level)?;
-        meta.outputs = outputs;
-        #[cfg(test)]
-        {
-            times[0] = clock.elapsed();
-        }
-        // The records the block replaces, as they are, to undo it with.
-        let mut replaced = Vec::new();
-        for (key, _, _) in block.names.iter().filter(|n| n.2) {
-            replaced.push(meta.names.get(&txn, *key)?.ok_or(Error::NoSuchName)?);
-        }
-        let (names, names_parts_before) = meta.names.apply_keeping(&mut txn, block.names, self.name_level)?;
-        meta.names = names;
-        let root = state_root(&meta.outputs, &meta.names);
-        if block.state_root.is_some_and(|want| want != root) {
-            return Err(Error::StateRoot);
-        }
-        // The table of commits: those spent leave it, those made enter.
-        // One spent that it has not is no fault: the table is an index.
-        let mut commits_spent = Vec::new();
-        for position in block.commits_spent {
-            debug_assert!(block.spends.binary_search(position).is_ok(), "a commit spent is among the spends");
-            if let Some(commit) = meta.commits.remove(&txn, *position)? {
-                commits_spent.push((*position, commit));
-            }
-        }
-        let made = block.outputs.len().checked_sub(block.commits.len()).expect("the commits are among the outputs");
-        for (i, hash) in block.commits.iter().enumerate() {
-            let output = &block.outputs[made + i];
-            assert!(
-                output.commitment == crate::name::commit_leaf(hash, block.height) && output.height == block.height,
-                "a commit's output is its leaf"
-            );
-            meta.commits.add(&txn, first_new + (made + i) as u64, Commit { hash: *hash, height: block.height })?;
-        }
-        let record = BlockRecord {
-            height: block.height,
-            block: block.block,
-            before: meta.tip,
-            first_new,
-            spends: block.spends.to_vec(),
-            registered: block.names.iter().filter(|n| !n.2).map(|n| n.0).collect(),
-            replaced,
-            names_before,
-            names_parts_before,
-            parts_before,
-            commits_spent,
-        };
-        meta.window.push(&mut txn, &record, self.keep)?;
-        // What was spent before the oldest block of the window is dead
-        // for good.
-        let horizon = (block.height + 1).saturating_sub(self.keep as u32);
-        let budget = SWEEP_MIN.max(SWEEP_RATE * block.spends.len());
-        #[cfg(test)]
-        {
-            times[1] = clock.elapsed();
-        }
-        (meta.outputs, meta.sweep) = meta.outputs.sweep(&mut txn, meta.sweep, budget, horizon)?;
-        (meta.height, meta.tip) = (block.height, block.block);
-        also(&txn, &mut meta.blocks)?;
-        #[cfg(test)]
-        {
-            times[2] = clock.elapsed();
-        }
-        txn.commit(&meta.to_bytes())?;
-        #[cfg(test)]
-        {
-            times[3] = clock.elapsed();
-            *self.times.lock().unwrap() = times;
-        }
-        *self.meta() = meta;
-        Ok(root)
+        self.session(|session| {
+            let (root, _) = session.apply(block)?;
+            let (txn, blocks) = session.blocks();
+            also(txn, blocks)?;
+            Ok(root)
+        })
     }
 
     /// Undoes the tip: the state is again the one after the block before
@@ -583,25 +509,189 @@ impl<B: Backend + 'static> State<B> {
         &self,
         also: impl FnOnce(&Txn<'_, B>, &mut Blocks) -> Result<(), Error>,
     ) -> Result<(u32, Digest), Error> {
-        let mut txn = self.file.begin()?;
-        let mut meta = self.meta().clone();
-        let record = meta.window.pop(&mut txn)?.ok_or(Error::NoUndoRecord)?;
+        self.session(|session| {
+            let tip = session.undo()?;
+            let (txn, blocks) = session.blocks();
+            also(txn, blocks)?;
+            Ok(tip)
+        })
+    }
+
+    /// Several changes as one step: blocks undone and blocks applied,
+    /// and what goes with them, all in place when `change` returns well
+    /// and this does, or none of it. It is how a chain goes over to
+    /// another branch: a branch that turns out to have a block that is
+    /// not valid leaves the state where it was.
+    ///
+    /// What the session has done is read back through it; nothing else
+    /// sees any of it until it is all done.
+    pub fn session<T>(&self, change: impl FnOnce(&mut Session<'_, B>) -> Result<T, Error>) -> Result<T, Error> {
+        let txn = self.file.begin()?;
+        let meta = self.meta().clone();
+        let mut session = Session {
+            state: self,
+            txn,
+            meta,
+            #[cfg(test)]
+            clock: std::time::Instant::now(),
+            #[cfg(test)]
+            times: [std::time::Duration::ZERO; 4],
+        };
+        let done = change(&mut session)?;
+        #[cfg(test)]
+        let (clock, mut times) = (session.clock, session.times);
+        let Session { txn, meta, .. } = session;
+        txn.commit(&meta.to_bytes())?;
+        #[cfg(test)]
+        {
+            times[3] = clock.elapsed();
+            *self.times.lock().unwrap() = times;
+        }
+        *self.meta() = meta;
+        Ok(done)
+    }
+}
+
+/// Changes to the state being made as one step ([`State::session`]).
+pub struct Session<'a, B: Backend + 'static> {
+    state: &'a State<B>,
+    txn: Txn<'a, B>,
+    meta: Meta,
+    /// Tests: when the last block's application began, and how long its
+    /// steps took.
+    #[cfg(test)]
+    clock: std::time::Instant,
+    #[cfg(test)]
+    times: [std::time::Duration; 4],
+}
+
+impl<'a, B: Backend + 'static> Session<'a, B> {
+    /// The block the state is the state after, as the session has it.
+    pub fn tip(&self) -> (u32, Digest) {
+        (self.meta.height, self.meta.tip)
+    }
+
+    /// The state's root, as the session has it.
+    pub fn root(&self) -> Digest {
+        state_root(&self.meta.outputs, &self.meta.names)
+    }
+
+    /// The position the next output takes.
+    pub fn next(&self) -> u64 {
+        self.meta.outputs.next
+    }
+
+    /// The output at `position` and whether it is unspent.
+    pub fn output(&self, position: u64) -> io::Result<Option<(Record, bool)>> {
+        self.meta.outputs.get(&self.txn, position)
+    }
+
+    /// The record registered at `key`, if any.
+    pub fn name(&self, key: Key) -> io::Result<Option<NameRecord>> {
+        self.meta.names.get(&self.txn, key)
+    }
+
+    /// The blocks known of, to read through the transaction and to
+    /// change with it.
+    pub fn blocks(&mut self) -> (&Txn<'a, B>, &mut Blocks) {
+        (&self.txn, &mut self.meta.blocks)
+    }
+
+    /// Applies the next block: returns the state's root after it, and
+    /// the amounts of the outputs it spent, added up. As
+    /// [`State::apply`]; after an error the session is to be given up.
+    pub fn apply(&mut self, block: &BlockEdit<'_>) -> Result<(Digest, u128), Error> {
+        let (state, txn, meta) = (self.state, &mut self.txn, &mut self.meta);
+        assert_eq!(block.height, meta.height + 1, "blocks are applied in order");
+        let first_new = meta.outputs.next;
+        #[cfg(test)]
+        {
+            self.clock = std::time::Instant::now();
+        }
+        let names_before = meta.names.hash();
+        let (outputs, parts_before, spent) =
+            meta.outputs.apply_keeping(txn, block.height, block.spends, block.outputs, state.part_level)?;
+        meta.outputs = outputs;
+        #[cfg(test)]
+        {
+            self.times[0] = self.clock.elapsed();
+        }
+        // The records the block replaces, as they are, to undo it with.
+        let mut replaced = Vec::new();
+        for (key, _, _) in block.names.iter().filter(|n| n.2) {
+            replaced.push(meta.names.get(&*txn, *key)?.ok_or(Error::NoSuchName)?);
+        }
+        let (names, names_parts_before) = meta.names.apply_keeping(txn, block.names, state.name_level)?;
+        meta.names = names;
+        let root = state_root(&meta.outputs, &meta.names);
+        if block.state_root.is_some_and(|want| want != root) {
+            return Err(Error::StateRoot);
+        }
+        // The table of commits: those spent leave it, those made enter.
+        // One spent that it has not is no fault: the table is an index.
+        let mut commits_spent = Vec::new();
+        for position in block.commits_spent {
+            debug_assert!(block.spends.binary_search(position).is_ok(), "a commit spent is among the spends");
+            if let Some(commit) = meta.commits.remove(&*txn, *position)? {
+                commits_spent.push((*position, commit));
+            }
+        }
+        let made = block.outputs.len().checked_sub(block.commits.len()).expect("the commits are among the outputs");
+        for (i, hash) in block.commits.iter().enumerate() {
+            let output = &block.outputs[made + i];
+            assert!(
+                output.commitment == crate::name::commit_leaf(hash, block.height) && output.height == block.height,
+                "a commit's output is its leaf"
+            );
+            meta.commits.add(&*txn, first_new + (made + i) as u64, Commit { hash: *hash, height: block.height })?;
+        }
+        let record = BlockRecord {
+            height: block.height,
+            block: block.block,
+            before: meta.tip,
+            first_new,
+            spends: block.spends.to_vec(),
+            registered: block.names.iter().filter(|n| !n.2).map(|n| n.0).collect(),
+            replaced,
+            names_before,
+            names_parts_before,
+            parts_before,
+            commits_spent,
+        };
+        meta.window.push(txn, &record, state.keep)?;
+        // What was spent before the oldest block of the window is dead
+        // for good.
+        let horizon = (block.height + 1).saturating_sub(state.keep as u32);
+        let budget = SWEEP_MIN.max(SWEEP_RATE * block.spends.len());
+        #[cfg(test)]
+        {
+            self.times[1] = self.clock.elapsed();
+        }
+        (meta.outputs, meta.sweep) = meta.outputs.sweep(txn, meta.sweep, budget, horizon)?;
+        (meta.height, meta.tip) = (block.height, block.block);
+        #[cfg(test)]
+        {
+            self.times[2] = self.clock.elapsed();
+        }
+        Ok((root, spent))
+    }
+
+    /// Undoes the tip, as [`State::undo`].
+    pub fn undo(&mut self) -> Result<(u32, Digest), Error> {
+        let (txn, meta) = (&mut self.txn, &mut self.meta);
+        let record = meta.window.pop(txn)?.ok_or(Error::NoUndoRecord)?;
         if record.height != meta.height || record.block != meta.tip {
             return Err(corrupt("the newest record is not the tip's").into());
         }
-        meta.outputs = meta.outputs.undo(&mut txn, record.height - 1, &record.spends, record.first_new)?;
+        meta.outputs = meta.outputs.undo(txn, record.height - 1, &record.spends, record.first_new)?;
         let restore: Vec<(Key, NameRecord, bool)> = record.replaced.iter().map(|r| (r.key(), *r, true)).collect();
-        meta.names = meta.names.undo(&mut txn, &restore, &record.registered)?;
-        meta.commits.remove_between(&txn, record.first_new, u64::MAX)?;
+        meta.names = meta.names.undo(txn, &restore, &record.registered)?;
+        meta.commits.remove_between(&*txn, record.first_new, u64::MAX)?;
         for (position, commit) in &record.commits_spent {
-            meta.commits.add(&txn, *position, *commit)?;
+            meta.commits.add(&*txn, *position, *commit)?;
         }
         (meta.height, meta.tip) = (record.height - 1, record.before);
-        also(&txn, &mut meta.blocks)?;
-        txn.commit(&meta.to_bytes())?;
-        let tip = (meta.height, meta.tip);
-        *self.meta() = meta;
-        Ok(tip)
+        Ok((meta.height, meta.tip))
     }
 }
 
@@ -1759,6 +1849,87 @@ mod tests {
         assert_eq!(lacking.undo().unwrap(), whole.undo().unwrap());
         assert_eq!((table(&lacking), lacking.root()), (vec![], whole.root()));
         assert_eq!(table(&whole), vec![(9, 1), (19, 2)]);
+    }
+
+    /// Blocks undone and blocks applied as one step: a branch left for
+    /// another is all in place or not at all, and what the session has
+    /// done so far it reads back.
+    #[test]
+    fn several_blocks_are_one_step() {
+        let mut chain = Chain::new(0x5e55);
+        let state = State::open(MemBackend::new(), 6).unwrap();
+        for _ in 0..4 {
+            chain.extend(&state, 40, 120, 0).unwrap();
+        }
+        let before = (state.tip(), state.root(), state.file().space().0);
+        // Another branch from block 2: three blocks, made on a copy.
+        let other = State::open(MemBackend::from_image(state.file().backend().image(Lost::All)), 6).unwrap();
+        let mut fork = Chain::new(0x5e55);
+        fork.blocks = chain.blocks[..2].to_vec();
+        fork.next = fork.blocks.iter().map(|b| b.2.len() as u64).sum();
+        other.undo().unwrap();
+        other.undo().unwrap();
+        fork.live = (0..fork.next).filter(|p| other.snapshot().unwrap().is_unspent(*p).unwrap()).collect();
+        for _ in 0..3 {
+            fork.extend(&other, 30, 90, 1).unwrap();
+        }
+        let edit = |b: &(Digest, Vec<u64>, Vec<Record>, Digest), height: u32, root: Option<Digest>| {
+            (
+                BlockEdit {
+                    height,
+                    block: b.0,
+                    spends: &[],
+                    outputs: &[],
+                    names: &[],
+                    commits: &[],
+                    commits_spent: &[],
+                    state_root: root,
+                },
+                b.1.clone(),
+                b.2.clone(),
+            )
+        };
+        let go_over = |wrong: bool| {
+            state.session(|s| {
+                assert_eq!(s.undo()?, (3, chain.blocks[2].0));
+                assert_eq!(s.undo()?, (2, chain.blocks[1].0));
+                assert_eq!((s.tip().0, s.root()), (2, chain.blocks[1].3));
+                let mut spent = Vec::new();
+                for (i, b) in fork.blocks[2..].iter().enumerate() {
+                    let height = 3 + i as u32;
+                    // The last block's header commits to another state.
+                    let root = if wrong && i == 2 { Some(chain.blocks[0].3) } else { Some(b.3) };
+                    let (e, spends, outputs) = edit(b, height, root);
+                    // What it spends is there to read, as the session has it.
+                    let amounts: u128 = spends
+                        .iter()
+                        .map(|p| s.output(*p).unwrap().unwrap())
+                        .map(|(r, live)| (live as u128) * r.amount as u128)
+                        .sum();
+                    let (root, sum) = s.apply(&BlockEdit { spends: &spends, outputs: &outputs, ..e })?;
+                    assert_eq!((root, sum), (b.3, amounts));
+                    spent.push(sum);
+                }
+                assert_eq!(s.tip(), (5, fork.blocks[4].0));
+                Ok(spent)
+            })
+        };
+        // The branch refused at its last block: nothing has changed.
+        assert_eq!(go_over(true).err(), Some(Error::StateRoot));
+        assert_eq!((state.tip(), state.root(), state.file().space().0), before);
+        let again = State::open(MemBackend::from_image(state.file().backend().image(Lost::All)), 6).unwrap();
+        assert_eq!((again.tip(), again.root()), (before.0, before.1));
+        // Taken: the state is the other branch's, and goes back down it.
+        let spent = go_over(false).unwrap();
+        assert!(spent.iter().all(|s| *s > 0));
+        assert_eq!((state.tip(), state.root()), (other.tip(), other.root()));
+        state.wait_ready().unwrap();
+        other.wait_ready().unwrap();
+        assert_eq!(state.file().space().0, other.file().space().0);
+        for _ in 0..3 {
+            assert_eq!(state.undo().unwrap(), other.undo().unwrap());
+        }
+        assert_eq!(state.root(), chain.blocks[1].3);
     }
 
     /// On a real file, closed and opened.

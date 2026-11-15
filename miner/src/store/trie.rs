@@ -137,6 +137,11 @@ pub trait Tree {
         }
         (n > 0).then(|| parts[0].1)
     }
+    /// What a record weighs: a pass adds up the weights of the records
+    /// it marks dead. A tree with nothing to add up weighs nothing.
+    fn weight(_: &Self::Record) -> u64 {
+        0
+    }
     /// What a change that cannot be made is refused with.
     fn refuse(key: u128, fault: Fault) -> Error;
 }
@@ -630,6 +635,8 @@ struct Pass<'t, 'f, T: Tree, B: Backend> {
     height: u32,
     /// The change in the number of live records.
     count: i64,
+    /// The weights of the records marked dead.
+    weight: u128,
     slots: Vec<Slot<T::Record>>,
     out: Vec<u8>,
     /// The level whose subtrees' parts are kept as they were before the
@@ -642,7 +649,7 @@ struct Pass<'t, 'f, T: Tree, B: Backend> {
 
 impl<'t, 'f, T: Tree, B: Backend> Pass<'t, 'f, T, B> {
     fn new(txn: &'t Txn<'f, B>, height: u32, capture: Option<u32>) -> Self {
-        Pass { txn, height, count: 0, slots: Vec::new(), out: Vec::new(), capture, before: Vec::new() }
+        Pass { txn, height, count: 0, weight: 0, slots: Vec::new(), out: Vec::new(), capture, before: Vec::new() }
     }
 
     /// Keeps the parts at the captured level that `edits` reach in a
@@ -737,7 +744,7 @@ impl<'t, 'f, T: Tree, B: Backend> Pass<'t, 'f, T, B> {
             type Done = Vec<(usize, u32, Result<([Child; FANOUT], bool), Error>)>;
             type Before = Vec<(u128, Option<Part>)>;
             let capture = self.capture;
-            let done: Vec<(i64, Before, Done)> = std::thread::scope(|scope| {
+            let done: Vec<((i64, u128), Before, Done)> = std::thread::scope(|scope| {
                 let handles: Vec<_> = (0..workers)
                     .map(|_| {
                         scope.spawn(|| {
@@ -745,7 +752,9 @@ impl<'t, 'f, T: Tree, B: Backend> Pass<'t, 'f, T, B> {
                             let mut made: Done = Vec::new();
                             loop {
                                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                let Some(&(k, span)) = groups.get(i) else { return (pass.count, pass.before, made) };
+                                let Some(&(k, span)) = groups.get(i) else {
+                                    return ((pass.count, pass.weight), pass.before, made);
+                                };
                                 let mut mine = *kids;
                                 let did = pass.update_group(&mut mine, k, span, height, base, edits, threads / workers);
                                 made.push((k, span, did.map(|t| (mine, t))));
@@ -758,8 +767,9 @@ impl<'t, 'f, T: Tree, B: Backend> Pass<'t, 'f, T, B> {
             // The first fault in key order is the one reported, as when
             // one thread does it all.
             let mut made: Done = Vec::with_capacity(n);
-            for (count, before, part) in done {
+            for ((count, weight), before, part) in done {
                 self.count += count;
+                self.weight += weight;
                 self.before.extend(before);
                 made.extend(part);
             }
@@ -902,6 +912,9 @@ impl<'t, 'f, T: Tree, B: Backend> Pass<'t, 'f, T, B> {
                 Some(s) if s.live != edits.revive => {
                     s.live = edits.revive;
                     self.count += if edits.revive { 1 } else { -1 };
+                    if !edits.revive {
+                        self.weight += T::weight(&s.record) as u128;
+                    }
                 }
                 _ => return Err(T::refuse(key, if edits.revive { Fault::NotDead } else { Fault::NotLive })),
             }
@@ -1298,7 +1311,8 @@ pub fn update_on<T: Tree, B: Backend>(
 /// were before it: `(index, part)`, ascending, `None` where nothing was.
 pub type Before = Vec<(u128, Option<Part>)>;
 
-/// [`update`], which also returns the part of every subtree at `level`
+/// [`update`], which also returns the weights of the records marked
+/// dead, added up, and the part of every subtree at `level`
 /// the edits reach, as it was before them: what takes a tree's parts
 /// back to an earlier state. `level` is one at which nodes' slots lie.
 pub fn update_keeping<T: Tree, B: Backend>(
@@ -1307,14 +1321,14 @@ pub fn update_keeping<T: Tree, B: Backend>(
     height: u32,
     edits: Edits<'_, T>,
     level: u32,
-) -> Result<(Child, i64, Before), Error> {
+) -> Result<(Child, i64, Before, u128), Error> {
     debug_assert!(level <= T::HEIGHT && (T::HEIGHT - level).is_multiple_of(BITS));
     debug_assert!(edits.truncate == u128::MAX, "a pass that removes a tail keeps nothing");
     let mut pass = Pass::<T, B>::new(txn, height, Some(level));
     let root = pass.update(root, T::HEIGHT, 0, edits.within(0, T::HEIGHT), crate::parallel::threads())?;
     let mut before = pass.before;
     before.sort_unstable_by_key(|b| b.0);
-    Ok((root, pass.count, before))
+    Ok((root, pass.count, before, pass.weight))
 }
 
 /// Sweeps part of the trie: from key `from`, looks at leaves holding up

@@ -11,9 +11,12 @@
 //!   checks it.
 //! - [`headers`]: the rules of a header, and the headers a node keeps
 //!   ahead of the blocks it has.
+//! - [`apply`]: the rules of a block, and the chain going from one
+//!   branch to another.
 //!
 //! A [`Chain`] is a store with a network's rules over it.
 
+pub mod apply;
 pub mod headers;
 pub mod params;
 pub mod verify;
@@ -33,6 +36,8 @@ use params::ChainParams;
 /// A network's chain, in a store.
 pub struct Chain<B: Backend + 'static, V> {
     state: State<B>,
+    /// Blocks that can be undone, and whose bodies are kept.
+    keep: usize,
     params: ChainParams,
     seed: SeedText<'static>,
     verifier: V,
@@ -43,6 +48,8 @@ pub struct Chain<B: Backend + 'static, V> {
     /// A header and block 1 of its branch, as last found: where a
     /// schedule that starts at the first block is anchored.
     anchor: Mutex<Option<(Digest, Header)>>,
+    /// The work of genesis, whose header claims none: computed once.
+    genesis_work: std::sync::OnceLock<crate::pow_air::Work>,
     /// Heights whose full proof of work was checked, for the tests.
     #[cfg(test)]
     pub(crate) full_pow_heights: Mutex<Vec<u32>>,
@@ -80,11 +87,13 @@ impl<B: Backend + 'static, V> Chain<B, V> {
         }
         Ok(Chain {
             state,
+            keep,
             params,
             seed,
             verifier,
             dataset: RwLock::new(None),
             anchor: Mutex::new(None),
+            genesis_work: std::sync::OnceLock::new(),
             #[cfg(test)]
             full_pow_heights: Mutex::new(Vec::new()),
         })

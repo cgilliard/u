@@ -328,7 +328,7 @@ impl Names {
     ) -> Result<(Names, Vec<(u32, Option<Part>)>), Error> {
         debug_assert!(puts.windows(2).all(|w| w[0].0 < w[1].0), "keys ascend");
         let edits: Edits<'_, NameTree> = Edits { puts, ..Edits::none() };
-        let (root, change, before) = trie::update_keeping(txn, self.root, 0, edits, level)?;
+        let (root, change, before, _) = trie::update_keeping(txn, self.root, 0, edits, level)?;
         let count = self.count.checked_add_signed(change).ok_or_else(|| corrupt("the count of names is wrong"))?;
         Ok((Names { root, count }, before.into_iter().map(|(i, part)| (i as u32, part)).collect()))
     }

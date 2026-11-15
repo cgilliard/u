@@ -154,6 +154,23 @@ pub enum Error {
     BadProofOfWork,
     /// The store holds the chain of another genesis.
     WrongGenesis,
+    /// The body is not the one the header commits to.
+    BadBodyCommitment,
+    /// The block is larger than a block may be: its size.
+    TooLarge(usize),
+    /// The outputs a block makes do not sum to what it spends and its
+    /// subsidy.
+    Supply,
+    /// The block's proof is not accepted.
+    BadProof,
+    /// The body of a block of the branch is not kept.
+    MissingBody,
+    /// A reveal or a sweep spends an output that is no commit: its
+    /// position.
+    NotACommit(u64),
+    /// A commit is revealed outside its window, or swept before it is
+    /// past: the height it was made at.
+    CommitAge(u32),
     /// The operating system failed a read or a write of the store, or
     /// what was read is not what was written (`InvalidData`). Only the
     /// kind is kept: this type holds no heap.
@@ -225,6 +242,13 @@ impl fmt::Display for Error {
             Error::TimestampTooNew { limit, got } => write!(f, "time {got} is past the limit {limit}"),
             Error::BadProofOfWork => f.write_str("the proof of work does not hold"),
             Error::WrongGenesis => f.write_str("the store holds another network's chain"),
+            Error::BadBodyCommitment => f.write_str("the body is not the header's"),
+            Error::TooLarge(size) => write!(f, "a block of {size} bytes is too large"),
+            Error::Supply => f.write_str("the block makes coins it may not"),
+            Error::BadProof => f.write_str("the block's proof is not accepted"),
+            Error::MissingBody => f.write_str("a block of the branch has no body kept"),
+            Error::NotACommit(p) => write!(f, "position {p} holds no commit"),
+            Error::CommitAge(made) => write!(f, "a commit made at height {made} is not of an age for this"),
             Error::Io(kind) => write!(f, "the store failed: {kind}"),
         }
     }
@@ -293,6 +317,13 @@ mod tests {
             Error::TimestampTooNew { limit: 5, got: 6 },
             Error::BadProofOfWork,
             Error::WrongGenesis,
+            Error::BadBodyCommitment,
+            Error::TooLarge(9),
+            Error::Supply,
+            Error::BadProof,
+            Error::MissingBody,
+            Error::NotACommit(4),
+            Error::CommitAge(4),
             Error::Io(std::io::ErrorKind::InvalidData),
         ];
         let words: Vec<String> = all.iter().map(|e| e.to_string()).collect();
