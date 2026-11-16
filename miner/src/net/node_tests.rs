@@ -654,11 +654,22 @@ fn headers_are_served_only_of_the_chain_named() {
 /// the other and takes its headers and then its blocks.
 #[test]
 fn over_real_sockets() {
+    sockets_sync(1);
+}
+
+/// And each with four workers, every one on a thread of its own.
+#[test]
+fn over_real_sockets_with_several_workers() {
+    sockets_sync(4);
+}
+
+fn sockets_sync(workers: usize) {
     use std::net::UdpSocket;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
     let mut cfg = small_runs();
     cfg.tick = 50 * MILLI;
+    cfg.workers = workers;
     let chains = vec![chain_of(easy()), chain_of(easy())];
     grow(&chains[0], 45, 1);
     let tip = chains[0].tip().unwrap();
@@ -673,7 +684,7 @@ fn over_real_sockets() {
         .map(|(i, (socket, chain))| {
             let (cfg, stop) = (cfg.clone(), Arc::clone(&stop));
             std::thread::spawn(move || {
-                let mut node = Node::new(cfg, NET, chain, [i as u8 + 1; 32], 0).threaded();
+                let mut node = Node::new(cfg, NET, chain, [i as u8 + 1; 32], 0).threaded().by_port();
                 if i == 1 {
                     node.add_peer(first, true, 0);
                 }
@@ -786,11 +797,11 @@ fn over_real_sockets_requests_are_logged_and_counted() {
                 let log = Logger::open(dir.join(format!("request{i}.log")), Rotation::default()).unwrap();
                 let requests = Queued::start(log, 100_000, main).unwrap();
                 let stats = Stats::new(socket::STATS);
-                let mut node = Node::new(cfg, NET, chain, [i as u8 + 1; 32], 0).threaded();
+                let mut node = Node::new(cfg, NET, chain, [i as u8 + 1; 32], 0).threaded().by_port();
                 if i == 1 {
                     node.add_peer(first, true, 0);
                 }
-                let watch = Watch { requests: Some(&requests), stats: Some(&stats) };
+                let watch = Watch { requests: Some(&requests), stats: Some(&stats), main: None };
                 socket::run_watched(&mut node, &socket, &stop, Instant::now(), &|| NOW, &watch).unwrap();
                 requests.flush();
                 stats.read()
@@ -1438,11 +1449,17 @@ fn a_node_restarted_while_taking_a_state_goes_on() {
 #[test]
 #[cfg_attr(debug_assertions, ignore = "builds long chains; run with --release")]
 fn over_real_sockets_a_state_is_taken() {
+    sockets_state(1);
+    sockets_state(4);
+}
+
+fn sockets_state(workers: usize) {
     use std::net::UdpSocket;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
     let mut cfg = joining();
     cfg.tick = 50 * MILLI;
+    cfg.workers = workers;
     let (ahead, _) = long_chain(KEEP + 16);
     let chains = vec![ahead, chain_of(easy())];
     let (target, root) = (chains[0].tip().unwrap(), chains[0].state().root());
@@ -1457,7 +1474,7 @@ fn over_real_sockets_a_state_is_taken() {
         .map(|(i, (socket, chain))| {
             let (cfg, stop) = (cfg.clone(), Arc::clone(&stop));
             std::thread::spawn(move || {
-                let mut node = Node::new(cfg, NET, chain, [i as u8 + 1; 32], 0).threaded();
+                let mut node = Node::new(cfg, NET, chain, [i as u8 + 1; 32], 0).threaded().by_port();
                 if i == 1 {
                     node.add_peer(first, true, 0);
                 }
@@ -1551,4 +1568,59 @@ fn a_host_is_one_workers_and_the_nodes_limits_hold_over_all() {
     let far = |k: u8| SocketAddrV4::new(Ipv4Addr::new(60, k, 0, 1), 3737);
     assert_eq!((0..100).filter(|k| node.add_peer(far(*k), false, 0)).count(), 100);
     assert_eq!((sizes(&node).iter().sum::<usize>(), node.peer_counts(0)), (40, (40, 0)));
+}
+
+/// Several nodes ahead and one behind, over real sockets, four workers
+/// to each on threads of their own: the one behind takes its blocks of
+/// all of them, each block once.
+#[test]
+fn over_real_sockets_blocks_come_from_several_peers_of_several_workers() {
+    use std::net::UdpSocket;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    let mut cfg = small_runs();
+    (cfg.tick, cfg.workers) = (50 * MILLI, 4);
+    let chains: Vec<_> = (0..5).map(|_| chain_of(easy())).collect();
+    let blocks = grow(&chains[0], 45, 1);
+    (1..4).for_each(|i| give(&chains[i], &blocks));
+    let tip = chains[0].tip().unwrap();
+    let sockets: Vec<UdpSocket> = (0..5).map(|_| UdpSocket::bind("127.0.0.1:0").unwrap()).collect();
+    let ahead: Vec<SocketAddrV4> = sockets[..4]
+        .iter()
+        .map(|s| match s.local_addr().unwrap() {
+            SocketAddr::V4(a) => a,
+            _ => unreachable!(),
+        })
+        .collect();
+    let stop = Arc::new(AtomicBool::new(false));
+    let behind = Arc::clone(&chains[4]);
+    let threads: Vec<_> = sockets
+        .into_iter()
+        .zip(chains)
+        .enumerate()
+        .map(|(i, (socket, chain))| {
+            let (cfg, stop, ahead) = (cfg.clone(), Arc::clone(&stop), ahead.clone());
+            std::thread::spawn(move || {
+                let mut node = Node::new(cfg, NET, chain, [i as u8 + 1; 32], 0).threaded().by_port();
+                if i == 4 {
+                    ahead.iter().for_each(|a| assert!(node.add_peer(*a, true, 0)));
+                }
+                crate::net::socket::run_until(&mut node, &socket, &stop, Instant::now(), &|| NOW).unwrap();
+                (node.counts(), node.tables().filter(|t| t.len() > 0).count())
+            })
+        })
+        .collect();
+    let start = Instant::now();
+    while behind.tip().unwrap() != tip {
+        assert!(start.elapsed() < Duration::from_secs(60), "at {}", behind.tip().unwrap().height);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    stop.store(true, Ordering::Relaxed);
+    let ended: Vec<(Counts, usize)> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    let (c, _) = ended[4];
+    assert_eq!((c.headers, c.blocks, c.blocks_refused), (45, 45, 0));
+    // Five runs of headers and forty-five bodies: each fetched once,
+    // though four workers were fetching.
+    assert_eq!((c.fetched, c.fetches_failed), (50, 0));
 }

@@ -250,6 +250,7 @@ Uptime: 0:01:00           Requests_______AvgLatency(us)__BytesIn___________Bytes
 | Column | Is |
 |---|---|
 | Requests | Datagrams taken, chunks too (counted) |
+| Dropped | Datagrams dropped because the queue of the thread they were for was full (counted): `THREADS.md` |
 | AvgLatency(us) | What taking one took, in microseconds, on average: of the interval in an interval's line, of the whole run in a whole's. `-` where there were none |
 | BytesIn, BytesSent | What came and went (counted) |
 | Peers, PeersLive | Peers known, and those heard from lately (levels) |
@@ -373,7 +374,7 @@ library's `signal`, the same on every platform the node is built for
 
 1. **Mining.** It is not in this node yet, so `tabminer` without
    `--no-mine` says so and does not start.
-2. **Requests on more than one thread**: `THREADS.md`.
+2. **What is left of `THREADS.md`** (its 8.3).
 3. **The peers file and the built-in seeds.** `--peer` and `--seed` are
    what a node begins from today.
 4. **The genesis tool** itself, in its package.

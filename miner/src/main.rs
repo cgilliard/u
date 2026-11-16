@@ -66,6 +66,12 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     if c.threads > 0 {
         tabminer::parallel::set_threads(c.threads);
     }
+    // A worker to a core, unless told how many.
+    let mut net = c.net.clone();
+    net.workers = match c.threads {
+        0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+        n => n,
+    };
 
     // Somewhere to keep things, and the logs: the main one first, so
     // that whatever else goes wrong is said there.
@@ -106,7 +112,7 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     tabminer::random::fill(&mut secret).map_err(|e| format!("the system gave no random bytes: {e}"))?;
     let clock = Instant::now();
     let now = || clock.elapsed().as_micros() as u64;
-    let mut node = Node::new(c.net.clone(), c.network.magic(), Arc::new(chain), secret, now()).threaded();
+    let mut node = Node::new(net, c.network.magic(), Arc::new(chain), secret, now()).threaded();
     for peer in &c.peers {
         node.add_peer(*peer, true, now());
     }
@@ -125,7 +131,7 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     c.announce(&main);
     Configuration::ready(&main);
 
-    let watch = Watch { requests: Some(&requests), stats: Some(&stats) };
+    let watch = Watch { requests: Some(&requests), stats: Some(&stats), main: Some(&main) };
     let never = AtomicBool::new(false);
     match socket::run_watched(&mut node, &socket, &never, clock, &socket::unix, &watch) {
         Ok(()) => Err("the node stopped of itself".into()),

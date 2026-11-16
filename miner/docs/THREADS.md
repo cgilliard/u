@@ -28,11 +28,12 @@ handled on every core.
   own: counts in atomics, and one list of what is to be downloaded,
   behind a lock held only to take from it or put back (section 4).
 
-Nothing here is built yet: section 1 is how the node runs today.
+All of it is built but for what section 8.2 says is not. Section 1 is
+how the node ran before.
 
 ---
 
-## 1. Today
+## 1. Before
 
 | Thread | Does |
 |---|---|
@@ -347,12 +348,36 @@ Each leaves the tests passing:
      be looked for; and "whom else do you know" answered from every
      worker's live peers.
 
-   Not yet as they are to be: the chunks served a second and the
-   requests that may wait are divided evenly among the workers, not
-   drawn from one budget; and a worker takes the list's lock every
-   time it looks to its fetches, which real threads would queue on.
-
 3. **Real threads**: the receiver, the pool, the queues, the shared
    counts and budgets.
+
+   *Done*, but for the budgets (`net::socket`). The thread that runs
+   the node is the receiver; each worker has a thread of its own and
+   waits on its queue, for a datagram, for word that something was
+   left for it, or for its own next timer. The store's thread wakes a
+   worker when work on the chain is done (each in turn), so nobody
+   looks to see whether it is. A worker takes the list's lock only
+   when it has something to say to it: a fetch come whole or given
+   up, work on the chain done, a decision about what to fetch. Run
+   over real sockets with four workers to a node in the tests.
+
 4. **Stats and settings**: datagrams dropped at a full queue; the two
    options.
+
+   *Done.* `Dropped` is a column of the stats log; the main log says
+   `dropped requests: a worker's queue is full`, not more than once in
+   five seconds. `--threads` (one a core unless set) and
+   `--request-queue-size` (4,096).
+
+### 8.3 Not yet as it is to be
+
+- **How fast chunks are served, and how many requests for them may
+  wait, in all**: divided evenly among the workers, not drawn from one
+  budget (4.4). A node serving one busy peer serves it at a worker's
+  share of the rate.
+- **Sync decisions are made with the list's lock held**, and some of
+  them read the store (which bodies are missing, which parts). They
+  hold up only other sync decisions, not pings or chunks, but they are
+  longer than the microseconds 4.2 speaks of.
+- **How many peers are live** is as each worker last counted, once a
+  tick: the stats may be a second behind.

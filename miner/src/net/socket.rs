@@ -1,14 +1,33 @@
-//! A node over the machine's own socket and clock.
+//! A node over the machine's own socket and clock, on its threads.
 //!
-//! Everything a node decides is in [`super::node`]; this only carries
-//! datagrams between it and a socket and tells it the time.
+//! Everything a node decides is in [`super::node`]; this carries
+//! datagrams between it and a socket, tells it the time, and gives each
+//! of its workers a thread (`docs/THREADS.md`):
+//!
+//! * **The receiver** (the thread that calls [`run`]) reads the port.
+//!   For each datagram it finds the worker its sender's host belongs
+//!   to and puts the datagram on that worker's queue. It decodes
+//!   nothing and never waits: a datagram for a queue that is full is
+//!   dropped, as one lost on the way would be, counted, and said in the
+//!   main log (not more than once in five seconds).
+//! * **Each worker** waits on its queue: for a datagram, for word that
+//!   another thread has left it something, or until its own next timer
+//!   is due. It handles what it takes off there and then, and sends
+//!   its answers on the port itself.
+//!
+//! Nobody looks to see whether something has changed: whoever changes
+//! it wakes whoever is to know.
 
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::MAX_DATAGRAM;
-use super::node::{CHUNK, Heard, Node, socket_addr};
+use super::node::{CHUNK, Gauge, Heard, Node, Worker, socket_addr};
+use crate::chain::Chain;
+use crate::chain::verify::ProofVerifier;
+use crate::logger::Logger;
 use crate::logger::queued::Queued;
 use crate::logger::stats::{Kind, Stats};
 use crate::store::backend::Backend;
@@ -19,39 +38,12 @@ pub fn unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-/// Runs `node` over `socket` until `stop` is set, then says goodbye to
-/// its peers.
-pub fn run<B: Backend + 'static, V: crate::chain::verify::ProofVerifier + Sync>(
-    node: &mut Node<B, V>,
-    socket: &UdpSocket,
-    stop: &AtomicBool,
-) -> std::io::Result<()> {
-    let clock = Instant::now();
-    run_until(node, socket, stop, clock, &unix)?;
-    node.goodbye(clock.elapsed().as_micros() as Micros, &mut |to, bytes: &[u8]| {
-        let _ = socket.send_to(bytes, socket_addr(to));
-    });
-    Ok(())
-}
-
-/// [`run`] without the goodbye, on a clock begun at `clock` and a
-/// calendar that says `unix`: a node run in stretches, its time going
-/// on from one to the next; or one whose headers are of another day.
-pub fn run_until<B: Backend + 'static, V: crate::chain::verify::ProofVerifier + Sync>(
-    node: &mut Node<B, V>,
-    socket: &UdpSocket,
-    stop: &AtomicBool,
-    clock: Instant,
-    unix: &dyn Fn() -> u64,
-) -> std::io::Result<()> {
-    run_watched(node, socket, stop, clock, unix, &Watch::default())
-}
-
 /// The numbers a node keeps of itself for its stats log, in the order
 /// of their columns.
 pub const STATS: &[(&str, Kind)] = &[
     ("Requests", Kind::Count),
     ("AvgLatency(us)", Kind::Average(REQUESTS)),
+    ("Dropped", Kind::Count),
     ("BytesIn", Kind::Bytes),
     ("BytesSent", Kind::Bytes),
     ("Peers", Kind::Level),
@@ -64,17 +56,25 @@ pub const STATS: &[(&str, Kind)] = &[
 pub const REQUESTS: usize = 0;
 /// The microseconds taking them took: shown as the average of one.
 pub const LATENCY: usize = 1;
-pub const BYTES_IN: usize = 2;
-pub const BYTES_SENT: usize = 3;
-pub const PEERS: usize = 4;
-pub const PEERS_LIVE: usize = 5;
-pub const HEIGHT: usize = 6;
+/// Datagrams dropped because the queue of the worker they were for was
+/// full.
+pub const DROPPED: usize = 2;
+pub const BYTES_IN: usize = 3;
+pub const BYTES_SENT: usize = 4;
+pub const PEERS: usize = 5;
+pub const PEERS_LIVE: usize = 6;
+pub const HEIGHT: usize = 7;
 /// Blocks that joined the chain here.
-pub const BLOCKS: usize = 7;
+pub const BLOCKS: usize = 8;
 /// Objects being fetched.
-pub const FETCHING: usize = 8;
+pub const FETCHING: usize = 9;
 
-/// Who is told what a node does as it runs: neither need be there.
+/// What the main log says when datagrams are dropped.
+pub const DROPPING: &str = "dropped requests: a worker's queue is full";
+/// It is not said again for this long.
+const TOLD_EVERY: Duration = Duration::from_secs(5);
+
+/// Who is told what a node does as it runs: none need be there.
 #[derive(Clone, Copy, Default)]
 pub struct Watch<'a> {
     /// The request log: a line for each datagram taken
@@ -83,6 +83,8 @@ pub struct Watch<'a> {
     pub requests: Option<&'a Queued>,
     /// The stats ([`STATS`]).
     pub stats: Option<&'a Stats>,
+    /// The main log: told when datagrams are dropped.
+    pub main: Option<&'a Logger>,
 }
 
 impl Watch<'_> {
@@ -100,34 +102,166 @@ impl Watch<'_> {
         }
     }
 
-    /// How the node stands at `now`.
-    fn levels<B: Backend + 'static, V: crate::chain::verify::ProofVerifier + Sync>(
-        &self,
-        node: &Node<B, V>,
-        now: Micros,
-    ) {
+    /// How the node stands.
+    fn levels<B: Backend + 'static, V>(&self, gauge: &Gauge<B, V>) {
         let Some(stats) = self.stats else { return };
-        let (peers, live) = node.peer_counts(now);
-        stats.set(PEERS, peers as u64);
-        stats.set(PEERS_LIVE, live as u64);
-        if let Ok(tip) = node.chain().tip() {
-            stats.set(HEIGHT, tip.height as u64);
-        }
-        stats.set(BLOCKS, node.counts().blocks);
-        stats.set(FETCHING, node.fetching() as u64);
+        let now = gauge.read();
+        stats.set(PEERS, now.peers as u64);
+        stats.set(PEERS_LIVE, now.live as u64);
+        stats.set(HEIGHT, now.height as u64);
+        stats.set(BLOCKS, now.blocks);
+        stats.set(FETCHING, now.fetching as u64);
     }
 }
 
-/// [`run_until`], with `watch` told of each datagram taken and how the
-/// node stands.
-pub fn run_watched<B: Backend + 'static, V: crate::chain::verify::ProofVerifier + Sync>(
+/// What waits for a worker.
+enum Item {
+    /// A datagram, and who sent it. (One byte more than any datagram
+    /// of ours: what fills it is not one.)
+    Datagram { from: SocketAddr, len: u16, bytes: [u8; MAX_DATAGRAM + 1] },
+    /// Something was left for it by another thread.
+    Wake,
+}
+
+/// Runs `node` over `socket` until `stop` is set, then says goodbye to
+/// its peers.
+pub fn run<B: Backend + 'static, V: ProofVerifier + Sync>(
+    node: &mut Node<B, V>,
+    socket: &UdpSocket,
+    stop: &AtomicBool,
+) -> std::io::Result<()>
+where
+    Chain<B, V>: Send + Sync,
+    Worker<B, V>: Send,
+{
+    let clock = Instant::now();
+    run_until(node, socket, stop, clock, &unix)?;
+    node.goodbye(clock.elapsed().as_micros() as Micros, &mut |to, bytes: &[u8]| {
+        let _ = socket.send_to(bytes, socket_addr(to));
+    });
+    Ok(())
+}
+
+/// [`run`] without the goodbye, on a clock begun at `clock` and a
+/// calendar that says `unix`: a node run in stretches, its time going
+/// on from one to the next; or one whose headers are of another day.
+pub fn run_until<B: Backend + 'static, V: ProofVerifier + Sync>(
     node: &mut Node<B, V>,
     socket: &UdpSocket,
     stop: &AtomicBool,
     clock: Instant,
-    unix: &dyn Fn() -> u64,
+    unix: &(dyn Fn() -> u64 + Sync),
+) -> std::io::Result<()>
+where
+    Chain<B, V>: Send + Sync,
+    Worker<B, V>: Send,
+{
+    run_watched(node, socket, stop, clock, unix, &Watch::default())
+}
+
+/// [`run_until`], with `watch` told of each datagram taken, of those
+/// dropped, and how the node stands.
+///
+/// This thread is the receiver; each of the node's workers has a
+/// thread of its own until this returns.
+pub fn run_watched<B: Backend + 'static, V: ProofVerifier + Sync>(
+    node: &mut Node<B, V>,
+    socket: &UdpSocket,
+    stop: &AtomicBool,
+    clock: Instant,
+    unix: &(dyn Fn() -> u64 + Sync),
     watch: &Watch<'_>,
+) -> std::io::Result<()>
+where
+    Chain<B, V>: Send + Sync,
+    Worker<B, V>: Send,
+{
+    let (gauge, queue) = (node.gauge(), node.request_queue());
+    let (workers, shared) = node.parts();
+    let (senders, queues): (Vec<SyncSender<Item>>, Vec<Receiver<Item>>) =
+        workers.iter().map(|_| sync_channel(queue)).unzip();
+    // Whoever leaves something for a worker wakes it. (If its queue is
+    // full it is not waiting, and looks when it is through.)
+    let wake = senders.clone();
+    shared.set_waker(Some(Box::new(move |worker| {
+        let _ = wake[worker].try_send(Item::Wake);
+    })));
+    let gauge = &gauge;
+    let received = std::thread::scope(|scope| {
+        for (k, (worker, queue)) in workers.iter_mut().zip(queues).enumerate() {
+            // (The first of them says, now and then, how the node stands.)
+            let gauge = (k == 0).then_some(gauge);
+            std::thread::Builder::new()
+                .name(format!("worker {k}"))
+                .spawn_scoped(scope, move || work(worker, queue, socket, stop, clock, unix, watch, gauge))
+                .expect("a thread");
+        }
+        let received = receive(socket, stop, watch, |from| shared.worker_of(from), &senders);
+        // The receiver is through, for whatever reason: so are they.
+        stop.store(true, Ordering::Relaxed);
+        received
+    });
+    shared.set_waker(None);
+    received
+}
+
+/// The receiver: reads the port and hands each datagram to the worker
+/// `owner` says its sender is of.
+fn receive(
+    socket: &UdpSocket,
+    stop: &AtomicBool,
+    watch: &Watch<'_>,
+    owner: impl Fn(&SocketAddr) -> usize,
+    queues: &[SyncSender<Item>],
 ) -> std::io::Result<()> {
+    // (Not for ever: so that being told to stop is seen.)
+    socket.set_read_timeout(Some(Duration::from_millis(50)))?;
+    let mut told: Option<Instant> = None;
+    let mut item = Item::Datagram { from: SocketAddr::from(([0, 0, 0, 0], 0)), len: 0, bytes: [0u8; MAX_DATAGRAM + 1] };
+    while !stop.load(Ordering::Relaxed) {
+        let Item::Datagram { from, len, bytes } = &mut item else { unreachable!() };
+        // Nothing in time, or the machine's own complaint about a
+        // datagram we sent, is no datagram.
+        let Ok((n, sender)) = socket.recv_from(bytes) else {
+            continue;
+        };
+        (*from, *len) = (sender, n as u16);
+        let queue = &queues[owner(&sender)];
+        let next = Item::Datagram { from: sender, len: 0, bytes: [0u8; MAX_DATAGRAM + 1] };
+        match queue.try_send(std::mem::replace(&mut item, next)) {
+            Ok(()) => {}
+            // No room: dropped, and said.
+            Err(TrySendError::Full(_)) => {
+                if let Some(stats) = watch.stats {
+                    stats.add(DROPPED, 1);
+                }
+                if told.is_none_or(|at| at.elapsed() >= TOLD_EVERY) {
+                    told = Some(Instant::now());
+                    if let Some(main) = watch.main {
+                        main.log(DROPPING);
+                    }
+                }
+            }
+            // Its worker is gone: the node is stopping.
+            Err(TrySendError::Disconnected(_)) => break,
+        }
+    }
+    Ok(())
+}
+
+/// A worker's thread: handles what comes off its queue, and looks to
+/// what is due when it is.
+#[allow(clippy::too_many_arguments)]
+fn work<B: Backend + 'static, V: ProofVerifier + Sync>(
+    worker: &mut Worker<B, V>,
+    queue: Receiver<Item>,
+    socket: &UdpSocket,
+    stop: &AtomicBool,
+    clock: Instant,
+    unix: &(dyn Fn() -> u64 + Sync),
+    watch: &Watch<'_>,
+    gauge: Option<&Gauge<B, V>>,
+) {
     let now = || clock.elapsed().as_micros() as Micros;
     // A datagram that cannot be sent is a datagram lost, as any may be.
     let mut out = |to, bytes: &[u8]| {
@@ -136,41 +270,115 @@ pub fn run_watched<B: Backend + 'static, V: crate::chain::verify::ProofVerifier 
         }
         let _ = socket.send_to(bytes, socket_addr(to));
     };
-    // One byte more than any datagram of ours: what fills it is not one.
-    let mut buf = [0u8; MAX_DATAGRAM + 1];
     // When how the node stands was last told: once a second is enough.
     let mut told: Option<Micros> = None;
     while !stop.load(Ordering::Relaxed) {
         let t = now();
-        let wake = node.tick(t, unix(), &mut out);
-        if told.is_none_or(|at| t.saturating_sub(at) >= 1_000_000) {
-            watch.levels(node, t);
+        let wake = worker.tick(t, unix(), &mut out);
+        if let Some(gauge) = gauge
+            && told.is_none_or(|at| t.saturating_sub(at) >= 1_000_000)
+        {
+            watch.levels(gauge);
             told = Some(t);
         }
-        // Until the node wants to be called, a twentieth of a second at
-        // the most (to see `stop`), or a datagram comes.
-        // Sooner while work given to the applier is still to be heard of.
-        let most = if node.busy() { 1_000 } else { 50_000 };
-        let wait = wake.saturating_sub(t).clamp(50, most);
-        socket.set_read_timeout(Some(Duration::from_micros(wait)))?;
-        // Nothing in time, or the machine's own complaint about a
-        // datagram we sent, is no datagram.
-        let mut take = |node: &mut Node<B, V>, bytes: &[u8], from| {
-            let began = now();
-            let heard = node.handle(began, from, bytes, &mut out);
-            watch.heard(&heard, bytes.len(), now().saturating_sub(began));
+        // Until the worker's own next timer, a twentieth of a second
+        // at the most (to see `stop`); or something comes.
+        let wait = wake.saturating_sub(t).clamp(50, 50_000);
+        let mut take = |worker: &mut Worker<B, V>, item: Item| {
+            if let Item::Datagram { from, len, bytes } = item {
+                let began = now();
+                let heard = worker.handle(began, from, &bytes[..len as usize], &mut out);
+                watch.heard(&heard, len as usize, now().saturating_sub(began));
+            }
         };
-        if let Ok((n, from)) = socket.recv_from(&mut buf) {
-            take(node, &buf[..n], from);
-            // And whatever else is waiting, before looking to the time.
-            socket.set_read_timeout(Some(Duration::from_micros(1)))?;
-            for _ in 0..64 {
-                match socket.recv_from(&mut buf) {
-                    Ok((n, from)) => take(node, &buf[..n], from),
-                    Err(_) => break,
+        match queue.recv_timeout(Duration::from_micros(wait)) {
+            Ok(item) => {
+                take(worker, item);
+                // And whatever else is waiting, before looking to the
+                // time.
+                for _ in 0..64 {
+                    match queue.try_recv() {
+                        Ok(item) => take(worker, item),
+                        Err(_) => break,
+                    }
                 }
             }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
-    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::logger::Rotation;
+
+    /// A datagram for a worker whose queue is full is dropped: counted
+    /// every time, said in the main log once in a while, and the
+    /// receiver goes on reading. What was there is still there.
+    #[test]
+    fn a_full_queue_drops_and_says_so() {
+        let dir = std::env::temp_dir().join(format!("tabminer-dropped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let main = Logger::open(dir.join("tabernacle.log"), Rotation::default()).unwrap();
+        let stats = Stats::new(STATS);
+        let watch = Watch { requests: None, stats: Some(&stats), main: Some(&main) };
+        let port = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let to = port.local_addr().unwrap();
+        // Two workers, by whether the sender's port is odd: room for
+        // three datagrams each, and nobody taking them off.
+        let (senders, queues): (Vec<_>, Vec<_>) = (0..2).map(|_| sync_channel::<Item>(3)).unzip();
+        let stop = AtomicBool::new(false);
+        let senders_of: Vec<UdpSocket> = (0..2).map(|_| UdpSocket::bind("127.0.0.1:0").unwrap()).collect();
+        let odd = |s: &UdpSocket| (s.local_addr().unwrap().port() % 2) as usize;
+        std::thread::scope(|scope| {
+            scope.spawn(|| receive(&port, &stop, &watch, |from| (from.port() % 2) as usize, &senders).unwrap());
+            // Ten from the first sender, then two from the second.
+            for k in 0..10u8 {
+                senders_of[0].send_to(&[k; 20], to).unwrap();
+            }
+            let all = |n: u64| {
+                let start = Instant::now();
+                while stats.read()[DROPPED] < n {
+                    assert!(start.elapsed() < Duration::from_secs(20), "{:?}", stats.read());
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            };
+            // Three wait; seven were dropped.
+            all(7);
+            senders_of[1].send_to(&[77; 30], to).unwrap();
+            senders_of[1].send_to(&[78; 30], to).unwrap();
+            if odd(&senders_of[0]) == odd(&senders_of[1]) {
+                // (Of the same worker, as it happens: dropped as well.)
+                all(9);
+            } else {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        // The first three of the first sender wait, in the order sent.
+        let first = &queues[odd(&senders_of[0])];
+        for k in 0..3u8 {
+            match first.try_recv() {
+                Ok(Item::Datagram { from, len, bytes }) => {
+                    assert_eq!((from, &bytes[..len as usize]), (senders_of[0].local_addr().unwrap(), &[k; 20][..]));
+                }
+                _ => panic!("the datagram {k} is not there"),
+            }
+        }
+        // A full queue is one worker's: the other's took what was its.
+        if odd(&senders_of[0]) != odd(&senders_of[1]) {
+            assert!(first.try_recv().is_err());
+            let other = &queues[odd(&senders_of[1])];
+            assert!(matches!(other.try_recv(), Ok(Item::Datagram { len: 30, .. })));
+            assert!(matches!(other.try_recv(), Ok(Item::Datagram { len: 30, .. })));
+            assert_eq!(stats.read()[DROPPED], 7);
+        }
+        // Said once, for all of them.
+        let said = std::fs::read_to_string(dir.join("tabernacle.log")).unwrap();
+        assert_eq!(said.lines().filter(|l| l.ends_with(DROPPING)).count(), 1, "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

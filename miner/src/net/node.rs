@@ -70,7 +70,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{SocketAddr, SocketAddrV4};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::config::Config;
@@ -428,7 +428,7 @@ enum Notice {
 }
 
 /// What the workers of a node share besides the list.
-struct Shared {
+pub(crate) struct Shared {
     /// What is left for each worker by the others.
     mail: Vec<Mutex<Vec<Notice>>>,
     /// What a host's address is mixed with to find its worker: so that
@@ -440,7 +440,25 @@ struct Shared {
     /// and which, for telling others whom the node knows.
     live: Vec<AtomicUsize>,
     known: Vec<Mutex<Vec<SocketAddrV4>>>,
+    /// Work on the chain that is done and not yet heard of: so that
+    /// nobody takes the list to find there is nothing.
+    ready: AtomicUsize,
+    /// Whether that work is done on a thread of its own.
+    threaded: AtomicBool,
+    /// Blocks that have joined the chain here.
+    blocks: AtomicU64,
+    /// Wakes a worker that is waiting, where each waits on a thread of
+    /// its own ([`super::socket`]): called when something is left for
+    /// it, so that nobody has to look to see whether anything was.
+    waker: RwLock<Option<Waker>>,
+    /// Whose turn it is to hear of work done on the chain.
+    turn: AtomicUsize,
+    #[cfg(test)]
+    by_port: AtomicBool,
 }
+
+/// Wakes the worker of this number.
+pub(crate) type Waker = Box<dyn Fn(usize) + Send + Sync>;
 
 impl Shared {
     /// The worker `addr` belongs to: by its host, whatever the port.
@@ -450,7 +468,12 @@ impl Shared {
         }
         // (A mix in which every bit of the address tells on every bit
         // of the result.)
-        let mut x = (u32::from(*addr.ip()) as u64 ^ self.key).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let host = u32::from(*addr.ip()) as u64;
+        // (Tests on one machine, where every node is of one host: by
+        // the port too, so that its nodes are spread over the workers.)
+        #[cfg(test)]
+        let host = host | (addr.port() as u64 * self.by_port.load(Ordering::Relaxed) as u64) << 32;
+        let mut x = (host ^ self.key).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         ((x ^ (x >> 31)) % self.mail.len() as u64) as usize
@@ -458,6 +481,28 @@ impl Shared {
 
     fn post(&self, worker: usize, notice: Notice) {
         self.mail[worker].lock().unwrap_or_else(|e| e.into_inner()).push(notice);
+        self.wake(worker);
+    }
+
+    /// Wakes `worker`, if workers wait.
+    fn wake(&self, worker: usize) {
+        if let Some(waker) = &*self.waker.read().unwrap_or_else(|e| e.into_inner()) {
+            waker(worker);
+        }
+    }
+
+    /// How workers are woken, or that they no longer wait.
+    pub(crate) fn set_waker(&self, waker: Option<Waker>) {
+        *self.waker.write().unwrap_or_else(|e| e.into_inner()) = waker;
+    }
+
+    /// The worker `addr` belongs to, as [`Shared::owner`]: for whoever
+    /// hands datagrams out.
+    pub(crate) fn worker_of(&self, addr: &SocketAddr) -> usize {
+        match addr {
+            SocketAddr::V4(a) => self.owner(a),
+            SocketAddr::V6(a) => a.ip().to_ipv4_mapped().map_or(0, |ip| self.owner(&SocketAddrV4::new(ip, a.port()))),
+        }
     }
 
     /// Tells every worker but `but` that what the node is after has
@@ -467,6 +512,8 @@ impl Shared {
             let mut mail = self.mail[worker].lock().unwrap_or_else(|e| e.into_inner());
             if !mail.iter().any(|n| matches!(n, Notice::Work)) {
                 mail.push(Notice::Work);
+                drop(mail);
+                self.wake(worker);
             }
         }
     }
@@ -787,7 +834,10 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         l.outstanding += 1;
         match &mut l.applier {
             Applier::Here(done) => match apply(&self.chain, job) {
-                Some(outcome) => done.push_back(outcome),
+                Some(outcome) => {
+                    done.push_back(outcome);
+                    self.shared.ready.fetch_add(1, Ordering::Relaxed);
+                }
                 None => l.outstanding -= 1,
             },
             Applier::Thread(jobs, _) => {
@@ -854,7 +904,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     /// sees whether there are headers to catch up with. Every call:
     /// what the fetches under way and the chunks being served want
     /// done.
-    fn tick(&mut self, now: Micros, unix: u64, out: Out<'_>) -> Micros {
+    pub(crate) fn tick(&mut self, now: Micros, unix: u64, out: Out<'_>) -> Micros {
         self.unix = unix;
         self.mail(now, out);
         if now >= self.due {
@@ -905,7 +955,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
 
     /// Takes a datagram that arrived from `from`, and says what it was
     /// and what was done about it. Call [`Node::tick`] after it.
-    fn handle(&mut self, now: Micros, from: SocketAddr, bytes: &[u8], out: Out<'_>) -> Heard {
+    pub(crate) fn handle(&mut self, now: Micros, from: SocketAddr, bytes: &[u8], out: Out<'_>) -> Heard {
         let unheard =
             |from, request| Heard { from, request, about: About::Nothing, answer: "malformed", sent: 0, sent_bytes: 0 };
         // Addresses of the older kind only (`docs/WIRE.md`, 1.1).
@@ -1449,6 +1499,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             let Some(outcome) = outcome else {
                 return;
             };
+            let _ = self.shared.ready.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
             self.shared.work(self.me);
             l.outstanding = l.outstanding.saturating_sub(1);
             match outcome {
@@ -1519,6 +1570,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             // one it came from.
             Ok(Applied::Extended | Applied::Reorganized { .. }) => {
                 self.counts.blocks += 1;
+                self.shared.blocks.fetch_add(1, Ordering::Relaxed);
                 self.announce(now, header, len, from, out);
                 self.shared.post_others(self.me, Notice::Announce { header, len, except: from });
             }
@@ -1966,25 +2018,29 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     /// Does what the fetches under way and the chunks being served want
     /// done at `now`, and says when either next wants doing.
     fn pump(&mut self, now: Micros, out: Out<'_>) -> Micros {
-        let list = Arc::clone(&self.list);
-        let wake = {
-            let l = &mut *write(&list);
-            let mut wake = self.fetch(l, now, out);
-            // A body that arrived may have been applied in place, and
-            // what came of that may want more fetched: until nothing
-            // does.
-            while matches!(&l.applier, Applier::Here(done) if !done.is_empty()) {
-                wake = self.fetch(l, now, out);
-            }
-            wake
-        };
+        let mut wake = self.fetch(now, out);
+        // A body that arrived may have been applied in place, and what
+        // came of that may want more fetched: until nothing does.
+        while !self.shared.threaded.load(Ordering::Relaxed) && self.shared.ready.load(Ordering::Relaxed) > 0 {
+            wake = self.fetch(now, out);
+        }
         self.serve_some(now, out).min(wake)
     }
 
     /// What became of blocks applied, and what the fetches under way
     /// want done: when a fetch next wants looking to.
-    fn fetch(&mut self, l: &mut List, now: Micros, out: Out<'_>) -> Micros {
-        self.applied(l, now, out);
+    ///
+    /// The list is taken only if there is something to say to it: work
+    /// on the chain that is done, a fetch that has come whole or been
+    /// given up. A fetch that only wants its next chunks asked for, or
+    /// to wait, does not touch it.
+    fn fetch(&mut self, now: Micros, out: Out<'_>) -> Micros {
+        let list = Arc::clone(&self.list);
+        let mut held: Option<RwLockWriteGuard<'_, List>> = None;
+        if self.shared.ready.load(Ordering::Relaxed) > 0 {
+            let l = &mut **held.get_or_insert_with(|| write(&list));
+            self.applied(l, now, out);
+        }
         let mut wake = Micros::MAX;
         let mut ranges = Ranges::new();
         let mut name = [0u8; MAX_NAME];
@@ -1996,6 +2052,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     // Asked with the token the peer gave us: one that has
                     // given none, or is gone, is not asked.
                     let Some(token) = self.peers.get(&from).and_then(|p| p.token()) else {
+                        let l = &mut **held.get_or_insert_with(|| write(&list));
                         self.fetches.swap_remove(i);
                         fetched(&mut l.fetching, &object, &from);
                         self.fetch_failed(l, now, object, from);
@@ -2010,6 +2067,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 }
                 Poll::Wait(at) => wake = wake.min(at),
                 Poll::Done => {
+                    let l = &mut **held.get_or_insert_with(|| write(&list));
                     let done = self.fetches.swap_remove(i);
                     fetched(&mut l.fetching, &object, &from);
                     self.counts.fetched += 1;
@@ -2019,6 +2077,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     continue;
                 }
                 Poll::Failed(why) => {
+                    let l = &mut **held.get_or_insert_with(|| write(&list));
                     let failed = self.fetches.swap_remove(i);
                     fetched(&mut l.fetching, &object, &from);
                     self.peers.set_path(&from, failed.fetch.path());
@@ -2138,6 +2197,13 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             totals: Arc::new(Totals::new()),
             live: (0..n).map(|_| AtomicUsize::new(0)).collect(),
             known: (0..n).map(|_| Mutex::new(Vec::new())).collect(),
+            ready: AtomicUsize::new(0),
+            threaded: AtomicBool::new(false),
+            blocks: AtomicU64::new(0),
+            waker: RwLock::new(None),
+            turn: AtomicUsize::new(0),
+            #[cfg(test)]
+            by_port: AtomicBool::new(false),
         });
         let list = Arc::new(RwLock::new(List::new(n)));
         // What is of the whole node is divided among its workers.
@@ -2164,7 +2230,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
     {
         let (jobs, todo) = std::sync::mpsc::channel::<Job>();
         let (done, outcomes) = std::sync::mpsc::channel();
-        let chain = Arc::clone(&self.workers[0].chain);
+        let (chain, shared) = (Arc::clone(&self.workers[0].chain), Arc::clone(&self.shared));
+        shared.threaded.store(true, Ordering::Relaxed);
         std::thread::Builder::new()
             .name("applier".into())
             .spawn(move || {
@@ -2173,9 +2240,14 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                     // (Something is always said of a job, so that the
                     // node knows it is done with.)
                     let outcome = apply(&chain, job).unwrap_or(Outcome::Nothing);
+                    // (Said to be ready before it is, never after: so
+                    // that it is not there and nobody looks.)
+                    shared.ready.fetch_add(1, Ordering::Relaxed);
                     if done.send(outcome).is_err() {
                         break;
                     }
+                    // One worker hears of it, each in turn.
+                    shared.wake(shared.turn.fetch_add(1, Ordering::Relaxed) % shared.mail.len());
                 }
             })
             .expect("a thread");
@@ -2194,6 +2266,13 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                 w.cfg = first.cfg.clone();
             }
         }
+    }
+
+    /// Tests on one machine: a peer is its worker's by its port too.
+    #[cfg(test)]
+    pub(crate) fn by_port(self) -> Self {
+        self.shared.by_port.store(true, Ordering::Relaxed);
+        self
     }
 
     /// Tests: tells every live peer of a block.
@@ -2219,6 +2298,26 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
     #[cfg(test)]
     pub(crate) fn tables(&self) -> impl Iterator<Item = &Peers> {
         self.workers.iter().map(|w| &w.peers)
+    }
+
+    /// The workers, and what they share: for whoever runs each on a
+    /// thread of its own.
+    pub(crate) fn parts(&mut self) -> (&mut [Worker<B, V>], &Arc<Shared>) {
+        (&mut self.workers, &self.shared)
+    }
+
+    /// How the node stands, to be asked while its workers run.
+    pub fn gauge(&self) -> Gauge<B, V> {
+        Gauge {
+            shared: Arc::clone(&self.shared),
+            list: Arc::clone(&self.list),
+            chain: Arc::clone(&self.workers[0].chain),
+        }
+    }
+
+    /// Datagrams that may wait for one worker.
+    pub fn request_queue(&self) -> usize {
+        self.workers[0].cfg.request_queue
     }
 
     /// The worker `addr` belongs to.
@@ -2342,6 +2441,41 @@ impl<B: Backend + 'static, V> std::ops::Deref for Node<B, V> {
 impl<B: Backend + 'static, V> std::ops::DerefMut for Node<B, V> {
     fn deref_mut(&mut self) -> &mut Worker<B, V> {
         &mut self.workers[0]
+    }
+}
+
+/// How a node stands, for whoever watches it: asked of what its
+/// workers share, so that none of them is held up to answer.
+pub struct Gauge<B: Backend + 'static, V> {
+    shared: Arc<Shared>,
+    list: Arc<RwLock<List>>,
+    chain: Arc<Chain<B, V>>,
+}
+
+/// What a [`Gauge`] reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Standing {
+    /// Peers known, and those of them heard from lately (as each
+    /// worker last counted).
+    pub peers: usize,
+    pub live: usize,
+    /// The chain's height.
+    pub height: u32,
+    /// Blocks that have joined the chain here.
+    pub blocks: u64,
+    /// Objects the node is after that are being fetched.
+    pub fetching: usize,
+}
+
+impl<B: Backend + 'static, V> Gauge<B, V> {
+    pub fn read(&self) -> Standing {
+        Standing {
+            peers: self.shared.totals.peers(),
+            live: self.shared.live.iter().map(|n| n.load(Ordering::Relaxed)).sum(),
+            height: self.chain.tip().map_or(0, |tip| tip.height),
+            blocks: self.shared.blocks.load(Ordering::Relaxed),
+            fetching: self.list.read().unwrap_or_else(|e| e.into_inner()).fetching.len(),
+        }
     }
 }
 

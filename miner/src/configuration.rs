@@ -65,7 +65,7 @@ const OPTIONS: &[(&str, &[Opt])] = &[
             Opt {
                 name: "threads",
                 takes: Takes::Value("N"),
-                help: "threads for hashing and checking proofs\n(default 0: every core)",
+                help: "threads that handle requests, and threads for hashing and\nchecking proofs (default 0: one a core)",
             },
         ],
     ),
@@ -89,6 +89,11 @@ const OPTIONS: &[(&str, &[Opt])] = &[
                 help: "a seed to look up besides the built-in ones; may be repeated",
             },
             Opt { name: "no-seeds", takes: Takes::Nothing, help: "do not use the built-in seeds" },
+            Opt {
+                name: "request-queue-size",
+                takes: Takes::Value("N"),
+                help: "requests that may wait for one thread; one that comes\nwhen so many do is dropped (default 4096)",
+            },
         ],
     ),
     (
@@ -343,7 +348,8 @@ impl Network {
 pub struct Configuration {
     pub network: Network,
     pub data_dir: PathBuf,
-    /// Threads for hashing and checking proofs; zero for every core.
+    /// Threads that handle requests, and threads for hashing and
+    /// checking proofs; zero for one a core.
     pub threads: usize,
     pub mine: bool,
     pub listen: SocketAddrV4,
@@ -612,6 +618,7 @@ impl Configuration {
         net.serve.rate =
             given.number("serve-chunks-per-second", 1)?.map_or(net.serve.rate, |n| n.min(u32::MAX as u64) as u32);
         net.serve.waiting = count("serve-queue", 1)?.unwrap_or(net.serve.waiting);
+        net.request_queue = count("request-queue-size", 1)?.unwrap_or(net.request_queue);
         net.serve.waiting_each = count("serve-queue-per-peer", 1)?.unwrap_or(net.serve.waiting_each);
         // What cannot both hold, said by the options' own names.
         let (p, s) = (&net.peers, &net.sync);
@@ -713,7 +720,8 @@ impl Configuration {
         lines.extend([
             ("Network", self.network.name().to_string()),
             ("Mining", yes(self.mine)),
-            ("Threads", if self.threads == 0 { "every core".to_string() } else { commas(self.threads as u64) }),
+            ("Threads", if self.threads == 0 { "one a core".to_string() } else { commas(self.threads as u64) }),
+            ("Request Queue Size", commas(self.net.request_queue as u64)),
             ("Data Directory", self.data_dir.display().to_string()),
             ("Main Log", self.main_log.display().to_string()),
             ("Request Log", self.request_log.display().to_string()),
@@ -909,6 +917,8 @@ mod tests {
             "5",
             "--stat-summary-seconds",
             "30",
+            "--request-queue-size",
+            "99",
         ])
         .unwrap();
         assert_eq!((c.network, c.mine, c.threads, c.keep), (Network::Dev, false, 4, 500));
@@ -929,6 +939,7 @@ mod tests {
         assert_eq!((c.net.serve.rate, c.net.serve.waiting, c.net.serve.waiting_each), (100_000, 5000, 16));
         assert_eq!(c.rotation, Rotation { max_age: 600, max_size: 5_000_000 });
         assert_eq!((c.request_log_queue, c.stats), (250, Every { interval: 5000, summary: 30_000 }));
+        assert_eq!(c.net.request_queue, 99);
         // What was not given is still its default.
         assert_eq!(p.host_stale, Net::default().peers.host_stale);
     }
