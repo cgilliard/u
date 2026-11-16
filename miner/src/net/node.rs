@@ -40,10 +40,25 @@
 //! [`super::config::Sync::header_wait`] is passed over for a while, so
 //! that a false claim cannot hold a node up.
 //!
+//! # Blocks
+//!
+//! The headers kept say which bodies are wanted: those of the best
+//! header's branch that the chain does not have
+//! ([`Chain::missing_bodies`]). They are fetched several at once, from
+//! whoever announced each or from a peer whose chain holds it, and
+//! join the chain in order; one that arrives before the block below it
+//! waits. A block that joins the chain is announced to every live
+//! peer but the one it came from ([`Message::Block`]): each checks the
+//! header, fetches the body, and announces it in turn, so that a new
+//! block crosses the network in a few hops.
+//!
+//! A peer that serves a body that is not its header's, or a block that
+//! breaks a rule, takes a strike.
+//!
 //! # What is here so far
 //!
-//! Finding and keeping peers, and headers. Bodies and the state come
-//! on top of this.
+//! Finding and keeping peers, headers and blocks. Taking the state
+//! whole from others comes on top of this.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{SocketAddr, SocketAddrV4};
@@ -54,9 +69,12 @@ use super::message::{Locator, Message, Status};
 use super::object::{MAX_NAME, Object};
 use super::peers::Peers;
 use super::{MAX_DATAGRAM, VERSION};
-use crate::block::{HEADER_SIZE, Header};
+use crate::block::{BlockRef, HEADER_SIZE, Header};
 use crate::chain::Chain;
+use crate::chain::apply::{Applied, condemns};
 use crate::chain::headers::LOCATOR;
+use crate::chain::verify::ProofVerifier;
+use crate::error::Error;
 use crate::hash::Digest;
 use crate::sha256::Sha256;
 use crate::store::backend::Backend;
@@ -86,6 +104,11 @@ pub struct Counts {
     pub fetches_failed: u64,
     /// Headers kept that were new.
     pub headers: u64,
+    /// Blocks that joined the chain here, and blocks refused.
+    pub blocks: u64,
+    pub blocks_refused: u64,
+    /// Announcements of a block sent.
+    pub announced: u64,
 }
 
 /// Objects made to be served, kept while they are being asked for.
@@ -98,6 +121,42 @@ struct Fetching {
     object: Object,
     from: SocketAddrV4,
     fetch: Fetch,
+}
+
+/// Announcements remembered: who said it had which block.
+const ANNOUNCED: usize = 256;
+
+/// A block to apply: whole, and who it came from (nobody, if it was
+/// made here).
+struct Job {
+    block: Vec<u8>,
+    from: Option<SocketAddrV4>,
+    unix: u64,
+}
+
+/// What became of one.
+struct Outcome {
+    header: Header,
+    /// The length of its body.
+    len: u32,
+    from: Option<SocketAddrV4>,
+    result: Result<Applied, Error>,
+}
+
+fn apply<B: Backend + 'static, V: ProofVerifier + Sync>(chain: &Chain<B, V>, job: Job) -> Option<Outcome> {
+    let block = BlockRef::from_bytes(&job.block).ok()?;
+    let result = chain.apply_block(&block, job.unix);
+    Some(Outcome { header: *block.header(), len: (job.block.len() - HEADER_SIZE) as u32, from: job.from, result })
+}
+
+/// Where blocks are applied. Applying one takes as long as checking its
+/// proof does, and a node that did it between datagrams would answer
+/// nobody meanwhile: so a node over a socket gives blocks to a thread
+/// of their own ([`Node::threaded`]). In the tests they are applied in
+/// place, so that a run is the same every time.
+enum Applier {
+    Here(VecDeque<Outcome>),
+    Thread(std::sync::mpsc::Sender<Job>, std::sync::mpsc::Receiver<Outcome>),
 }
 
 /// The chain being caught up with: a tip some peer has, and its headers
@@ -113,6 +172,9 @@ struct Aim {
     done: BTreeMap<u32, (Vec<Header>, SocketAddrV4)>,
     /// The first height not yet kept.
     next: u32,
+    /// Who told us of it: asked for its headers though its last ping
+    /// said its chain was shorter.
+    source: SocketAddrV4,
 }
 
 pub struct Node<B: Backend + 'static, V> {
@@ -145,9 +207,20 @@ pub struct Node<B: Backend + 'static, V> {
     /// Objects lately made to be served, the latest first.
     served: VecDeque<(Object, Arc<Vec<u8>>)>,
     fetches: Vec<Fetching>,
-    /// The peer asked where its chain leaves ours, and when.
-    probe: Option<(SocketAddrV4, Micros)>,
+    /// The peer asked where its chain leaves ours, when, and the block
+    /// it announced that made us ask, with its height: its tip, as far
+    /// as we know, though its last ping said less.
+    probe: Option<(SocketAddrV4, Micros, Option<(Digest, u32)>)>,
     aim: Option<Aim>,
+    applier: Applier,
+    /// Blocks given to be applied and not yet heard of.
+    applying: Vec<Digest>,
+    /// Bodies fetched and waiting for the blocks before them: the
+    /// block whole, and who served it.
+    held: Vec<(Digest, Vec<u8>, SocketAddrV4)>,
+    /// Who announced which block, and how long its body is: the newest
+    /// last.
+    announced: VecDeque<(Digest, SocketAddrV4, u32)>,
     counts: Counts,
     /// Tests: a chain's work claimed that is not there; objects served
     /// with a byte wrong.
@@ -155,12 +228,15 @@ pub struct Node<B: Backend + 'static, V> {
     pub(crate) boast: Option<U256>,
     #[cfg(test)]
     pub(crate) spoil: bool,
+    /// Tests: a block served that is on no chain here.
+    #[cfg(test)]
+    pub(crate) foist: Option<(Digest, Vec<u8>)>,
 }
 
 /// A datagram to send goes to this.
 pub type Out<'a> = &'a mut dyn FnMut(SocketAddrV4, &[u8]);
 
-impl<B: Backend + 'static, V: Sync> Node<B, V> {
+impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
     /// A node of the network `network` keeping `chain`, with these
     /// settings. `secret` is from the operating system's random source:
     /// the tokens this node gives, the numbers of its pings and those
@@ -187,11 +263,64 @@ impl<B: Backend + 'static, V: Sync> Node<B, V> {
             fetches: Vec::new(),
             probe: None,
             aim: None,
+            applier: Applier::Here(VecDeque::new()),
+            applying: Vec::new(),
+            held: Vec::new(),
+            announced: VecDeque::new(),
             counts: Counts::default(),
             #[cfg(test)]
             boast: None,
             #[cfg(test)]
             spoil: false,
+            #[cfg(test)]
+            foist: None,
+        }
+    }
+
+    /// Has blocks applied on a thread of their own from here on: for a
+    /// node over a socket.
+    pub fn threaded(mut self) -> Node<B, V>
+    where
+        Chain<B, V>: Send + Sync,
+        V: 'static,
+    {
+        let (jobs, todo) = std::sync::mpsc::channel::<Job>();
+        let (done, outcomes) = std::sync::mpsc::channel();
+        let chain = Arc::clone(&self.chain);
+        std::thread::Builder::new()
+            .name("applier".into())
+            .spawn(move || {
+                // Until the node is dropped, and its end of either with it.
+                for job in todo {
+                    if let Some(outcome) = apply(&chain, job)
+                        && done.send(outcome).is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .expect("a thread");
+        self.applier = Applier::Thread(jobs, outcomes);
+        self
+    }
+
+    /// A block made here: applied, and if it joins the chain, announced.
+    pub fn mined(&mut self, block: Vec<u8>) {
+        self.give(block, None);
+    }
+
+    /// Gives a block to be applied.
+    fn give(&mut self, block: Vec<u8>, from: Option<SocketAddrV4>) {
+        let Ok(header) = BlockRef::from_bytes(&block).map(|b| *b.header()) else {
+            return;
+        };
+        self.applying.push(header.hash());
+        let job = Job { block, from, unix: self.unix };
+        match &mut self.applier {
+            Applier::Here(done) => done.extend(apply(&self.chain, job)),
+            Applier::Thread(jobs, _) => {
+                let _ = jobs.send(job);
+            }
         }
     }
 
@@ -240,7 +369,9 @@ impl<B: Backend + 'static, V: Sync> Node<B, V> {
             token: self.tokens.issue(&SocketAddr::V4(*to)),
             genesis: self.genesis,
             height: tip.height,
-            oldest: 0,
+            // Bodies are kept for the blocks that can be undone, and no
+            // further back: below those a node has headers only.
+            oldest: (tip.height + 1).saturating_sub(self.chain.keep() as u32),
             window: tip.height.saturating_sub(self.chain.keep() as u32),
             tip: tip.hash(),
             work,
@@ -305,6 +436,7 @@ impl<B: Backend + 'static, V: Sync> Node<B, V> {
             }
         }
         self.sync_headers(now, out);
+        self.sync_blocks(now);
     }
 
     /// Takes a datagram that arrived from `from`. Call [`Node::tick`]
@@ -357,6 +489,7 @@ impl<B: Backend + 'static, V: Sync> Node<B, V> {
                 }
             }
             Message::Fork { height, id } => self.on_fork(now, from, height, id),
+            Message::Block { header, len } => self.on_block(now, from, header, len, out),
             Message::Get(get) => self.on_get(now, from, &get),
             Message::Chunk(chunk) => self.on_chunk(now, from, &chunk),
             Message::Gone(gone) => {
@@ -365,7 +498,7 @@ impl<B: Backend + 'static, V: Sync> Node<B, V> {
                     None => self.counts.unheard += 1,
                 }
             }
-            // Blocks, transactions and aux leaves are not here yet.
+            // Transactions and aux leaves are not here yet.
             _ => self.counts.unheard += 1,
         }
     }
@@ -449,7 +582,7 @@ impl<B: Backend + 'static, V: Sync> Node<B, V> {
         };
         // Those that claimed work and have sent nothing for it.
         self.peers.doubt_silent_claimants(best.work, now, |_| {});
-        if let Some((addr, _)) = self.probe
+        if let Some((addr, _, _)) = self.probe
             && !self.peers.may_ask(&addr, now)
         {
             self.probe = None;
@@ -457,7 +590,7 @@ impl<B: Backend + 'static, V: Sync> Node<B, V> {
         if self.aim.is_some() {
             return self.fetch_headers(now);
         }
-        if self.probe.is_some_and(|(_, at)| now.saturating_sub(at) < self.cfg.sync.header_spacing) {
+        if self.probe.is_some_and(|(_, at, _)| now.saturating_sub(at) < self.cfg.sync.header_spacing) {
             return;
         }
         // Ask whoever claims most where its chain leaves ours.
@@ -465,7 +598,14 @@ impl<B: Backend + 'static, V: Sync> Node<B, V> {
         let Some(source) = self.peers.best_source(best.work, next, now) else {
             return;
         };
-        let (addr, Some(token)) = (source.addr, source.token()) else {
+        let addr = source.addr;
+        self.ask_fork(now, addr, None, out);
+    }
+
+    /// Asks `addr` where its chain leaves ours. `tip` is the block it
+    /// announced, if that is why.
+    fn ask_fork(&mut self, now: Micros, addr: SocketAddrV4, tip: Option<(Digest, u32)>, out: Out<'_>) {
+        let Some(token) = self.peers.get(&addr).and_then(|p| p.token()) else {
             return;
         };
         let mut ids = [self.genesis; LOCATOR];
@@ -475,7 +615,7 @@ impl<B: Backend + 'static, V: Sync> Node<B, V> {
         let Some(locator) = Locator::new(&ids[..n]) else {
             return;
         };
-        self.probe = Some((addr, now));
+        self.probe = Some((addr, now, tip));
         self.peers.asked_headers(&addr, now);
         self.counts.forks_asked += 1;
         self.send(addr, &Message::FindFork { token, locator }, out);
@@ -483,10 +623,10 @@ impl<B: Backend + 'static, V: Sync> Node<B, V> {
 
     fn on_fork(&mut self, now: Micros, from: SocketAddrV4, height: u32, id: Digest) {
         // Only the answer to our question, from whom it was put to.
-        if self.probe.map(|p| p.0) != Some(from) || !self.peers.proven(&from) {
+        let Some((_, _, announced)) = self.probe.filter(|p| p.0 == from && self.peers.proven(&from)) else {
             self.counts.unheard += 1;
             return;
-        }
+        };
         self.probe = None;
         self.peers.seen(&from, now);
         // A block we hold, at the height it says: or it is no answer.
@@ -495,21 +635,24 @@ impl<B: Backend + 'static, V: Sync> Node<B, V> {
             self.peers.strike(&from, now);
             return;
         }
-        let Some(status) = self.peers.get(&from).and_then(|p| p.status) else {
+        // Its tip: the block it announced, or what its last ping said.
+        let Some(tip) = announced.or_else(|| self.peers.get(&from).and_then(|p| p.status).map(|s| (s.tip, s.height)))
+        else {
             return;
         };
-        if status.height <= height {
+        if tip.1 <= height {
             // Nothing past what we share: its claim was of nothing.
             self.peers.failed(&from, now);
             return;
         }
         let run = self.cfg.sync.headers as u32;
         self.aim = Some(Aim {
-            tip: status.tip,
-            height: status.height,
-            todo: (height + 1..=status.height).step_by(run as usize).collect(),
+            tip: tip.0,
+            height: tip.1,
+            todo: (height + 1..=tip.1).step_by(run as usize).collect(),
             done: BTreeMap::new(),
             next: height + 1,
+            source: from,
         });
         self.fetch_headers(now);
     }
@@ -531,11 +674,11 @@ impl<B: Backend + 'static, V: Sync> Node<B, V> {
             let count = run.min(aim.height - from + 1) as u16;
             // A peer whose chain reaches the tip aimed at, and that is
             // not at a run of headers for us already.
-            let free = self
-                .peers
-                .reaching(aim.height, now)
-                .find(|p| !self.fetches.iter().any(|f| f.from == p.addr && matches!(f.object, Object::Headers { .. })));
-            let Some(peer) = free else {
+            let idle = |addr: &SocketAddrV4| {
+                !self.fetches.iter().any(|f| f.from == *addr && matches!(f.object, Object::Headers { .. }))
+            };
+            let source = self.peers.get(&aim.source).filter(|p| self.peers.may_ask(&p.addr, now) && idle(&p.addr));
+            let Some(peer) = self.peers.reaching(aim.height, now).find(|p| idle(&p.addr)).or(source) else {
                 break;
             };
             aim.todo.remove(&from);
@@ -590,7 +733,7 @@ impl<B: Backend + 'static, V: Sync> Node<B, V> {
                     return self.headers_refused(now, from);
                 }
                 self.aim = None;
-                return;
+                return self.sync_blocks(now);
             }
         }
         self.fetch_headers(now);
@@ -604,6 +747,175 @@ impl<B: Backend + 'static, V: Sync> Node<B, V> {
         self.peers.failed(&from, now);
         self.aim = None;
         self.fetches.retain(|f| !matches!(f.object, Object::Headers { .. }));
+    }
+
+    // -- Blocks
+
+    /// "Here is a new block", from `from`.
+    fn on_block(&mut self, now: Micros, from: SocketAddrV4, header: Header, len: u32, out: Out<'_>) {
+        // Unasked: only from a peer.
+        if !self.peers.proven(&from) {
+            self.counts.unheard += 1;
+            return;
+        }
+        self.peers.seen(&from, now);
+        let id = header.hash();
+        // Its chain reaches there, whatever its last ping said.
+        self.peers.reaches(&from, header.height, id);
+        // One we have, body and all, is no news.
+        if self.chain.known(&id).ok().flatten().is_some_and(|k| !k.header_only()) || self.applying.contains(&id) {
+            return;
+        }
+        match self.chain.accept_header(&header, self.unix) {
+            Ok(_) => {
+                if self.announced.len() == ANNOUNCED {
+                    self.announced.pop_front();
+                }
+                self.announced.push_back((id, from, len));
+                self.sync_blocks(now);
+            }
+            // Its parent is unknown: we are more than a block behind it.
+            // Its headers are asked for now, without waiting for its
+            // next ping to say how far it has got.
+            Err(Error::UnknownParent) => {
+                let lately = self.probe.is_some_and(|(_, at, _)| now.saturating_sub(at) < self.cfg.sync.header_spacing);
+                if self.aim.is_none() && !lately && self.peers.may_ask(&from, now) {
+                    self.ask_fork(now, from, Some((id, header.height)), out);
+                }
+            }
+            // Not the announcer's fault, or not yet known to be.
+            Err(Error::KnownInvalid | Error::SetAside | Error::TimestampTooNew { .. } | Error::Io(_)) => {}
+            // A header that breaks a rule.
+            Err(_) => {
+                self.peers.strike(&from, now);
+            }
+        }
+    }
+
+    /// Tells every live peer but `except` of a block: its header, and
+    /// how long its body is.
+    pub(crate) fn announce(
+        &mut self,
+        now: Micros,
+        header: Header,
+        len: u32,
+        except: Option<SocketAddrV4>,
+        out: Out<'_>,
+    ) {
+        let mut all = Vec::new();
+        all.extend(self.peers.live(now).map(|p| p.addr).filter(|a| Some(*a) != except));
+        for addr in all {
+            self.counts.announced += 1;
+            self.send(addr, &Message::Block { header, len }, out);
+        }
+    }
+
+    /// The bodies the best header's branch still lacks: fetches those
+    /// not yet asked for, as many at once as may be, and gives the
+    /// first to be applied once it is here. Blocks join the chain in
+    /// order, so a body that arrives before the one below it waits.
+    fn sync_blocks(&mut self, now: Micros) {
+        let mut need = vec![self.chain.params().genesis().header; self.cfg.sync.lookahead];
+        let n = self.chain.missing_bodies(&mut need).unwrap_or(0);
+        let ids: Vec<Digest> = need[..n].iter().map(Header::hash).collect();
+        // What is held and no longer wanted is let go.
+        self.held.retain(|(id, _, _)| ids.contains(id));
+        if self.applying.is_empty()
+            && let Some(first) = ids.first()
+            && let Some(at) = self.held.iter().position(|(id, _, _)| id == first)
+        {
+            let (_, block, from) = self.held.swap_remove(at);
+            self.give(block, Some(from));
+        }
+        let most = (self.chain.params().max_block_size - HEADER_SIZE) as u32;
+        for (id, header) in ids.iter().zip(&need[..n]) {
+            let fetching = |f: &Fetching| matches!(f.object, Object::Block(_));
+            if self.fetches.iter().filter(|f| fetching(f)).count() >= self.cfg.sync.blocks {
+                break;
+            }
+            let wanted = Object::Block(*id);
+            if self.applying.contains(id)
+                || self.held.iter().any(|(held, _, _)| held == id)
+                || self.fetches.iter().any(|f| f.object == wanted)
+            {
+                continue;
+            }
+            let free = |addr: &SocketAddrV4| {
+                self.fetches.iter().filter(|f| fetching(f) && f.from == *addr).count() < self.cfg.sync.blocks_per_peer
+            };
+            // Whoever announced it, with the length it gave; else a peer
+            // whose chain holds that height, the length to be learned.
+            let told = self
+                .announced
+                .iter()
+                .rev()
+                .find(|(told, addr, _)| told == id && self.peers.may_ask(addr, now) && free(addr));
+            let source = match told {
+                Some((_, addr, len)) => Some((*addr, Some(*len).filter(|l| *l > 0 && *l <= most))),
+                None => self.peers.holders(header.height, now).find(|p| free(&p.addr)).map(|p| (p.addr, None)),
+            };
+            // In order: a body nobody holds is not to be had, and those
+            // above it could not join the chain without it.
+            let Some((addr, len)) = source else {
+                break;
+            };
+            let path = self.peers.get(&addr).map(|p| p.path).unwrap_or_default();
+            let transfer = Self::number(&self.secret, &mut self.numbers);
+            self.fetches.push(Fetching {
+                object: wanted,
+                from: addr,
+                fetch: Fetch::new(transfer, len, most, path, now),
+            });
+        }
+    }
+
+    /// A body has arrived whole from `from`.
+    fn body_arrived(&mut self, now: Micros, from: SocketAddrV4, id: Digest, body: &[u8]) {
+        let Some(known) = self.chain.known(&id).ok().flatten() else {
+            return;
+        };
+        let mut block = Vec::with_capacity(HEADER_SIZE + body.len());
+        block.extend_from_slice(&known.header.to_bytes());
+        block.extend_from_slice(body);
+        self.held.push((id, block, from));
+        self.sync_blocks(now);
+    }
+
+    /// What became of the blocks given to be applied.
+    fn applied(&mut self, now: Micros, out: Out<'_>) {
+        loop {
+            let outcome = match &mut self.applier {
+                Applier::Here(done) => done.pop_front(),
+                Applier::Thread(_, done) => done.try_recv().ok(),
+            };
+            let Some(Outcome { header, len, from, result }) = outcome else {
+                return;
+            };
+            let id = header.hash();
+            self.applying.retain(|a| *a != id);
+            match result {
+                // The chain's new last block: every peer is told, but
+                // the one it came from.
+                Ok(Applied::Extended | Applied::Reorganized { .. }) => {
+                    self.counts.blocks += 1;
+                    self.announce(now, header, len, from, out);
+                }
+                Ok(Applied::Known | Applied::Side) => {}
+                Err(e) => {
+                    self.counts.blocks_refused += 1;
+                    // A body that is not the header's, or a block that
+                    // breaks a rule: whoever served it answers for it.
+                    if let Some(from) = from
+                        && (e == Error::BadBodyCommitment || condemns(&e))
+                    {
+                        self.peers.strike(&from, now);
+                        self.peers.failed(&from, now);
+                        self.announced.retain(|(told, addr, _)| !(*told == id && *addr == from));
+                    }
+                }
+            }
+            self.sync_blocks(now);
+        }
     }
 
     // -- Objects
@@ -657,6 +969,12 @@ impl<B: Backend + 'static, V: Sync> Node<B, V> {
     }
 
     fn make(&self, object: &Object) -> Option<Vec<u8>> {
+        #[cfg(test)]
+        if let (Object::Block(id), Some((foisted, body))) = (object, &self.foist)
+            && id == foisted
+        {
+            return Some(body.clone());
+        }
         match *object {
             Object::Headers { from, count, on } => {
                 // Of the chain `on` is on, and no higher than it: so
@@ -673,7 +991,8 @@ impl<B: Backend + 'static, V: Sync> Node<B, V> {
                 headers.iter().for_each(|h| bytes.extend_from_slice(&h.to_bytes()));
                 Some(bytes)
             }
-            // Bodies and the state are not served yet.
+            Object::Block(id) => self.chain.body(&id).ok().flatten(),
+            // The state is not served yet.
             _ => None,
         }
     }
@@ -681,6 +1000,19 @@ impl<B: Backend + 'static, V: Sync> Node<B, V> {
     /// Does what the fetches under way and the chunks being served want
     /// done at `now`, and says when either next wants doing.
     fn pump(&mut self, now: Micros, out: Out<'_>) -> Micros {
+        let mut wake = self.fetch(now, out);
+        // A body that arrived may have been applied in place, and what
+        // came of that may want more fetched: until nothing does.
+        while matches!(&self.applier, Applier::Here(done) if !done.is_empty()) {
+            wake = self.fetch(now, out);
+        }
+        self.serve_some(now, out).min(wake)
+    }
+
+    /// What became of blocks applied, and what the fetches under way
+    /// want done: when a fetch next wants looking to.
+    fn fetch(&mut self, now: Micros, out: Out<'_>) -> Micros {
+        self.applied(now, out);
         let mut wake = Micros::MAX;
         let mut ranges = Ranges::new();
         let mut name = [0u8; MAX_NAME];
@@ -724,26 +1056,35 @@ impl<B: Backend + 'static, V: Sync> Node<B, V> {
             }
             i += 1;
         }
-        // The chunks asked of us: some, and then back to the rest.
+        wake
+    }
+
+    /// Sends some of the chunks asked of us, and says when there are
+    /// more to send.
+    fn serve_some(&mut self, now: Micros, out: Out<'_>) -> Micros {
         for _ in 0..SERVE_BATCH {
             match self.serve.next(now) {
                 Next::Send(x) => {
                     let SocketAddr::V4(to) = x.to else { continue };
                     let bytes = Object::decode(x.name()).ok().and_then(|o| self.object(&o));
-                    match bytes.as_deref().and_then(|b| chunk_of(b, x.index).map(|data| (b.len() as u32, data))) {
-                        Some((len, data)) => {
+                    match bytes.as_deref().map(|b| chunk_of(b, x.index).map(|data| (b.len() as u32, data))) {
+                        Some(Some((len, data))) => {
                             let chunk = Chunk { transfer: x.transfer, seq: x.seq, len, index: x.index, data };
                             self.send(to, &Message::Chunk(chunk), out);
                         }
-                        // No such object, or no such chunk of it.
+                        // No such chunk: asked for before its length was
+                        // known, past its end. The rest of what was
+                        // asked is past it too.
+                        Some(None) => self.serve.cancel(x.to, x.transfer),
+                        // No such object.
                         None => {
                             self.serve.cancel(x.to, x.transfer);
                             self.send(to, &Message::Gone(Gone { transfer: x.transfer }), out);
                         }
                     }
                 }
-                Next::Wait(at) => return wake.min(at),
-                Next::Idle => return wake,
+                Next::Wait(at) => return at,
+                Next::Idle => return Micros::MAX,
             }
         }
         // More to send: at once.
@@ -752,9 +1093,11 @@ impl<B: Backend + 'static, V: Sync> Node<B, V> {
 
     /// An object fetched whole from `from`.
     fn arrived(&mut self, now: Micros, object: Object, from: SocketAddrV4, bytes: &[u8]) {
-        // Nothing else is fetched yet.
-        if let Object::Headers { from: first, .. } = object {
-            self.headers_arrived(now, from, first, bytes)
+        match object {
+            Object::Headers { from: first, .. } => self.headers_arrived(now, from, first, bytes),
+            Object::Block(id) => self.body_arrived(now, from, id, bytes),
+            // Nothing else is fetched yet.
+            _ => {}
         }
     }
 
@@ -763,9 +1106,16 @@ impl<B: Backend + 'static, V: Sync> Node<B, V> {
     fn fetch_failed(&mut self, now: Micros, object: Object, from: SocketAddrV4) {
         self.counts.fetches_failed += 1;
         self.peers.failed(&from, now);
-        if let (Object::Headers { from: first, .. }, Some(aim)) = (object, self.aim.as_mut()) {
-            aim.todo.insert(first);
-            self.fetch_headers(now);
+        match (object, self.aim.as_mut()) {
+            (Object::Headers { from: first, .. }, Some(aim)) => {
+                aim.todo.insert(first);
+                self.fetch_headers(now);
+            }
+            (Object::Block(id), _) => {
+                self.announced.retain(|(told, addr, _)| !(*told == id && *addr == from));
+                self.sync_blocks(now);
+            }
+            _ => {}
         }
     }
 }

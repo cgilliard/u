@@ -396,6 +396,14 @@ their checks takes a strike and the range is fetched elsewhere.
 body's length; the receiver checks the header and fetches the body from
 the announcer with a transport fetch of known length.
 
+**How far back blocks can be had.** A node keeps the bodies of the
+blocks it can still undo, and below those only headers. Its status
+says from which height it holds bodies (`oldest`), and it is asked for
+none below. So a node that is further behind than its peers' bodies
+reach cannot catch up block by block at all: it has the headers, and
+takes the state whole (below). With the reference this was a choice a
+node made; here it is how every node is.
+
 **Snapshot sync.** Unchanged in shape: headers, then the block at the
 sync point and its manifest, then parts and name parts in parallel from
 every peer that can serve them. A fetch that is given up continues with

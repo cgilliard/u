@@ -774,6 +774,26 @@ fn a_block_crosses_any_line() {
     }
 }
 
+/// An object of unknown length, smaller than what is asked for blind:
+/// most of what was asked for is past its end and will never come, and
+/// if its one chunk is lost, it is that chunk that must be asked for
+/// again, not what is past the end.
+#[test]
+fn a_small_object_of_unknown_length_survives_loss() {
+    for len in [1usize, CHUNK_BYTES, 3 * CHUNK_BYTES + 5] {
+        for seed in 0..60 {
+            let mut s = Setup::new(len, seed).both(lossy(2000));
+            s.known = false;
+            let o = run(&s);
+            assert!(o.intact, "{len} bytes, seed {seed}: {:?} after {}", o.end, o.time);
+            // In a few seconds: a silence or two, each asking for the
+            // first chunk again, not a walk through everything that was
+            // asked for blind, which ends in giving up.
+            assert!(o.time <= 20 * SECOND, "{len} bytes, seed {seed}: {} {:?}", o.time, o.stats);
+        }
+    }
+}
+
 /// How fast a fetch goes is told, and it is not given up for it.
 #[test]
 fn a_slow_peer_is_reported_and_waited_for() {

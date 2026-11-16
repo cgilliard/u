@@ -19,7 +19,7 @@ fn unix() -> u64 {
 
 /// Runs `node` over `socket` until `stop` is set, then says goodbye to
 /// its peers.
-pub fn run<B: Backend + 'static, V: Sync>(
+pub fn run<B: Backend + 'static, V: crate::chain::verify::ProofVerifier + Sync>(
     node: &mut Node<B, V>,
     socket: &UdpSocket,
     stop: &AtomicBool,
@@ -35,7 +35,7 @@ pub fn run<B: Backend + 'static, V: Sync>(
 /// [`run`] without the goodbye, on a clock begun at `clock` and a
 /// calendar that says `unix`: a node run in stretches, its time going
 /// on from one to the next; or one whose headers are of another day.
-pub fn run_until<B: Backend + 'static, V: Sync>(
+pub fn run_until<B: Backend + 'static, V: crate::chain::verify::ProofVerifier + Sync>(
     node: &mut Node<B, V>,
     socket: &UdpSocket,
     stop: &AtomicBool,

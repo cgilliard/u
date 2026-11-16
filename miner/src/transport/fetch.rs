@@ -458,22 +458,38 @@ impl Fetch {
             if self.retries > MAX_RETRIES {
                 return self.fail(Why::Silent);
             }
-            // One chunk the first time; twice as many each silence after,
-            // while nothing comes: where most of everything is lost, one
-            // chunk asked for is seldom one chunk answered.
-            let probe = (1u32 << (self.retries - 1).min(6)).min(self.flying);
-            let mut front = [0u32; 64];
-            for slot in front[..probe as usize].iter_mut() {
-                *slot = self.flight.front().expect("a chunk awaited").index;
-                self.lose_front(true);
+            if self.len == 0 && self.slot[0] != 0 {
+                // While the length is not known, the first chunk is
+                // what is wanted before any other: it is the one chunk
+                // every object has, and it tells the length. (The rest
+                // of what was asked for blind may be past the object's
+                // end, and asking for that again brings nothing.)
+                let at = (self.slot[0] - 1 - self.base) as usize;
+                self.flight[at].flying = false;
+                self.slot[0] = 0;
+                self.flying -= 1;
+                self.trim();
+                self.lost.push_front(0);
+                self.probe = 1;
+            } else {
+                // One chunk the first time; twice as many each silence
+                // after, while nothing comes: where most of everything
+                // is lost, one chunk asked for is seldom one chunk
+                // answered.
+                let probe = (1u32 << (self.retries - 1).min(6)).min(self.flying);
+                let mut front = [0u32; 64];
+                for slot in front[..probe as usize].iter_mut() {
+                    *slot = self.flight.front().expect("a chunk awaited").index;
+                    self.lose_front(true);
+                }
+                // (Each went to the front of those to ask again, ahead
+                // of the one before it: back into the order they were
+                // in.)
+                for (k, i) in front[..probe as usize].iter().enumerate() {
+                    self.lost[k] = *i;
+                }
+                self.probe = probe;
             }
-            // (Each went to the front of those to ask again, ahead of
-            // the one before it: back into the order they were in.)
-            self.lost.rotate_left(0);
-            for (k, i) in front[..probe as usize].iter().enumerate() {
-                self.lost[k] = *i;
-            }
-            self.probe = probe;
             self.bring_down();
         }
         // Ask: the lost first, then what was never asked for.

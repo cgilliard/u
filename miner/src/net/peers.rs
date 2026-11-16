@@ -306,6 +306,16 @@ impl Peers {
         }
     }
 
+    /// `addr` has announced a block of this height: its chain reaches
+    /// there, though its last ping said less.
+    pub fn reaches(&mut self, addr: &SocketAddrV4, height: u32, tip: crate::hash::Digest) {
+        if let Some(status) = self.get_mut(addr).and_then(|p| p.status.as_mut())
+            && status.height < height
+        {
+            (status.height, status.tip) = (height, tip);
+        }
+    }
+
     /// Whether `addr` has answered a ping of ours.
     pub fn proven(&self, addr: &SocketAddrV4) -> bool {
         self.get(addr).is_some_and(|p| p.proven)

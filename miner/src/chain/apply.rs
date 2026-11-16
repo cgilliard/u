@@ -77,7 +77,7 @@ pub enum Applied {
 /// of the clock (later it may not be), a body that is not the header's
 /// (the header may be good, with its own body), a body not kept, the
 /// store failing.
-fn condemns(e: &Error) -> bool {
+pub(crate) fn condemns(e: &Error) -> bool {
     !matches!(
         e,
         Error::UnknownParent
@@ -515,6 +515,14 @@ pub(crate) mod tests {
         let bytes = block(chain, body);
         assert_eq!(apply(chain, &bytes), Ok(Applied::Extended));
         bytes
+    }
+
+    /// The block after `chain`'s last making one output told apart by
+    /// `tag`, not applied: as a miner hands one over. With `sound`
+    /// false its state root is not what its body gives.
+    pub(crate) fn next_block<V: ProofVerifier + Sync>(chain: &Chain<MemBackend, V>, tag: u32, sound: bool) -> Vec<u8> {
+        let body = body(&[], &[out(tag, PAY)]);
+        block_with(chain, &body, if sound { None } else { Some(d(tag)) })
     }
 
     /// Extends `chain` by `n` blocks, each making one output: `tag`

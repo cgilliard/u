@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::block::BlockRef;
-use crate::chain::apply::tests::grow;
+use crate::chain::apply::tests::{grow, next_block};
 use crate::chain::headers::tests::{NOW, easy, seed, table};
 use crate::chain::params::ChainParams;
 use crate::chain::verify::AcceptAllProofs;
@@ -17,8 +17,11 @@ const NET: [u8; 4] = *b"TEST";
 type TestChain = Chain<MemBackend, AcceptAllProofs>;
 type TestNode = Node<MemBackend, AcceptAllProofs>;
 
+/// A chain that keeps the bodies of its last `KEEP` blocks.
+const KEEP: usize = 64;
+
 fn chain_of(params: ChainParams) -> Arc<TestChain> {
-    let chain = Chain::open(MemBackend::new(), 8, params, seed(), AcceptAllProofs).unwrap();
+    let chain = Chain::open(MemBackend::new(), KEEP, params, seed(), AcceptAllProofs).unwrap();
     chain.set_dataset(table());
     Arc::new(chain)
 }
@@ -179,6 +182,7 @@ fn two_nodes_that_one_knows_of_come_to_know_each_other() {
     let (a, b) = (*w.nodes[0].peers().get(&at(1)).unwrap(), *w.nodes[1].peers().get(&at(0)).unwrap());
     let tip = w.nodes[1].chain().tip().unwrap();
     assert_eq!((a.status.unwrap().height, a.status.unwrap().tip, b.status.unwrap().height), (3, tip.hash(), 0));
+    assert_eq!((a.status.unwrap().oldest, a.status.unwrap().window), (0, 0));
     assert_eq!(a.status.unwrap().work, w.nodes[1].chain().tip_work().unwrap());
     assert!(w.nodes[1].tokens.check(&SocketAddr::V4(at(0)), a.token().unwrap()));
     assert!(w.nodes[0].tokens.check(&SocketAddr::V4(at(1)), b.token().unwrap()));
@@ -404,6 +408,8 @@ fn a_node_that_says_goodbye_is_known_at_once_to_be_gone() {
 }
 
 // -- Headers
+//
+// With `sync.blocks` at nothing where a test is of headers alone.
 
 /// Settings under which a few dozen blocks are many runs of headers.
 fn small_runs() -> Config {
@@ -418,6 +424,8 @@ fn a_node_behind_takes_the_headers_of_one_ahead() {
     grow(&chains[0], 45, 1);
     let mut w = World::with(chains, &small_runs());
     w.nodes[1].add_peer(at(0), false, 0);
+    // (Headers only, for this: nobody is asked for a body.)
+    w.nodes[1].cfg.sync.blocks = 0;
     w.run(10 * SECOND);
     let tip = w.nodes[0].chain().tip().unwrap();
     assert_eq!(w.best(1), tip);
@@ -450,6 +458,7 @@ fn headers_are_taken_from_where_two_chains_part() {
     grow(&chains[1], 3, 3);
     let mut w = World::with(chains, &small_runs());
     w.nodes[0].add_peer(at(1), false, 0);
+    w.nodes[1].cfg.sync.blocks = 0;
     w.run(10 * SECOND);
     assert_eq!(w.best(1), w.nodes[0].chain().tip().unwrap());
     // Fourteen headers, not thirty-eight: in two runs.
@@ -474,6 +483,7 @@ fn runs_of_headers_come_from_several_peers() {
         for i in 0..3 {
             w.nodes[3].add_peer(at(i), false, 0);
         }
+        w.nodes[3].cfg.sync.blocks = 0;
         w.run(60 * SECOND);
         assert_eq!(w.best(3).height, 45, "loss {loss}");
         assert_eq!(w.nodes[3].counts().headers, 45);
@@ -498,6 +508,7 @@ fn a_false_claim_of_work_does_not_hold_a_node_up() {
     w.mute = vec![1];
     w.nodes[2].add_peer(at(0), false, 0);
     w.nodes[2].add_peer(at(1), false, 0);
+    w.nodes[2].cfg.sync.blocks = 0;
     w.run(10 * SECOND);
     // Asked first, as the one claiming most, and asked again every
     // two seconds; nothing came of it.
@@ -622,7 +633,7 @@ fn headers_are_served_only_of_the_chain_named() {
 }
 
 /// Two nodes on this machine's own sockets and clock: one comes to know
-/// the other and takes its headers.
+/// the other and takes its headers and then its blocks.
 #[test]
 fn over_real_sockets() {
     use std::net::UdpSocket;
@@ -644,7 +655,7 @@ fn over_real_sockets() {
         .map(|(i, (socket, chain))| {
             let (cfg, stop) = (cfg.clone(), Arc::clone(&stop));
             std::thread::spawn(move || {
-                let mut node = Node::new(cfg, NET, chain, [i as u8 + 1; 32], 0);
+                let mut node = Node::new(cfg, NET, chain, [i as u8 + 1; 32], 0).threaded();
                 if i == 1 {
                     node.add_peer(first, true, 0);
                 }
@@ -656,11 +667,226 @@ fn over_real_sockets() {
         })
         .collect();
     let start = Instant::now();
-    while behind.best_header().unwrap().header != tip {
-        assert!(start.elapsed() < Duration::from_secs(30), "at {}", behind.best_header().unwrap().header.height);
+    while behind.tip().unwrap() != tip {
+        assert!(start.elapsed() < Duration::from_secs(60), "at {}", behind.tip().unwrap().height);
         std::thread::sleep(Duration::from_millis(20));
     }
+    // (A moment for the node to hear of the last block from the thread
+    // that applied it.)
+    std::thread::sleep(Duration::from_millis(300));
     stop.store(true, Ordering::Relaxed);
     let counts: Vec<Counts> = threads.into_iter().map(|t| t.join().unwrap()).collect();
-    assert_eq!((counts[1].fetched, counts[1].headers, counts[1].fetches_failed), (5, 45, 0));
+    // Five runs of headers and forty-five bodies, the blocks applied on
+    // a thread of their own.
+    assert_eq!((counts[1].fetched, counts[1].headers, counts[1].fetches_failed), (50, 45, 0));
+    assert_eq!((counts[1].blocks, counts[1].blocks_refused), (45, 0));
+}
+
+// -- Blocks
+
+fn tip(w: &World, i: usize) -> Header {
+    w.nodes[i].chain().tip().unwrap()
+}
+
+/// A node behind takes the blocks of one ahead: its chain and its
+/// state end as the other's.
+#[test]
+fn a_node_behind_takes_the_blocks_of_one_ahead() {
+    for loss in [0, 200] {
+        let chains = vec![chain_of(easy()), chain_of(easy())];
+        grow(&chains[0], 30, 1);
+        let mut w = World::with(chains, &small_runs());
+        w.loss = loss;
+        w.nodes[1].add_peer(at(0), false, 0);
+        w.run(40 * SECOND);
+        assert_eq!(tip(&w, 1), tip(&w, 0), "loss {loss}");
+        assert_eq!(w.nodes[1].chain().state().root(), w.nodes[0].chain().state().root());
+        let c = w.nodes[1].counts();
+        assert_eq!((c.headers, c.blocks, c.blocks_refused), (30, 30, 0), "loss {loss}");
+        assert!(w.nodes[1].held.is_empty() && w.nodes[1].applying.is_empty() && w.nodes[1].fetching() == 0);
+        if loss == 0 {
+            // Three runs of headers and thirty bodies, each once.
+            assert_eq!((c.fetched, c.fetches_failed), (33, 0));
+        }
+        // It told the other of each block as it joined, and the other,
+        // having them, fetched none.
+        assert_eq!((w.nodes[0].counts().fetched, w.nodes[0].counts().blocks), (0, 0));
+    }
+}
+
+/// A block made on one node is on all of them in a moment, fetched by
+/// each once.
+#[test]
+fn a_new_block_crosses_the_network() {
+    let mut w = World::new(8, &Config::default());
+    for i in 1..8 {
+        w.nodes[i].add_peer(at(0), true, 0);
+    }
+    w.run(20 * SECOND);
+    assert!((0..8).all(|i| w.live(i).len() == 7));
+    for round in 1..=3u32 {
+        // Made on another node each time.
+        let maker = round as usize * 2;
+        let block = next_block(w.nodes[maker].chain(), round, true);
+        w.nodes[maker].mined(block);
+        w.wake[maker] = w.now;
+        w.run(500 * MILLI);
+        let made = tip(&w, maker);
+        assert_eq!(made.height, round);
+        for i in 0..8 {
+            assert_eq!(tip(&w, i), made, "round {round}, node {i}");
+        }
+    }
+    for i in 0..8 {
+        let c = w.nodes[i].counts();
+        // Three blocks joined each chain; a node fetched those it did
+        // not make, each once, and announced each to the others.
+        let made = [2, 4, 6].contains(&i) as u64;
+        assert_eq!((c.blocks, c.blocks_refused, c.fetches_failed), (3, 0, 0), "node {i}");
+        assert_eq!(c.fetched, 3 - made, "node {i}");
+        assert!(c.announced >= 3 * 6 && c.announced <= 3 * 7, "node {i}: {}", c.announced);
+    }
+}
+
+/// A node on a branch with less work goes over to the branch with
+/// more, undoing its own blocks.
+#[test]
+fn a_node_goes_over_to_the_branch_with_more_work() {
+    let chains = vec![chain_of(easy()), chain_of(easy())];
+    let shared = grow(&chains[0], 10, 1);
+    give(&chains[1], &shared);
+    grow(&chains[0], 6, 2);
+    let own = grow(&chains[1], 2, 3);
+    let mut w = World::with(chains, &small_runs());
+    w.nodes[1].add_peer(at(0), false, 0);
+    w.run(10 * SECOND);
+    assert_eq!((tip(&w, 1), tip(&w, 1).height), (tip(&w, 0), 16));
+    assert_eq!(w.nodes[1].chain().state().root(), w.nodes[0].chain().state().root());
+    // Its own two blocks are kept, off the chain; the other never
+    // wanted them.
+    let was = BlockRef::from_bytes(&own[1]).unwrap().header().hash();
+    assert!(w.nodes[1].chain().known(&was).unwrap().is_some() && w.nodes[1].on_chain(&was).is_none());
+    assert_eq!(w.nodes[0].counts().fetched, 0);
+}
+
+/// A node that hears of a block whose parent it does not know asks for
+/// the headers at once, without waiting for the next ping to say how
+/// far the other has got.
+#[test]
+fn an_announcement_from_far_ahead_is_followed_at_once() {
+    let mut cfg = small_runs();
+    cfg.peers.target = 1;
+    let chains = vec![chain_of(easy()), chain_of(easy())];
+    let mut w = World::with(chains, &cfg);
+    w.nodes[1].add_peer(at(0), false, 0);
+    w.run(2 * SECOND);
+    // Node 0 gets seven blocks that node 1 hears nothing of.
+    w.mute = vec![0];
+    for k in 0..7 {
+        let block = next_block(w.nodes[0].chain(), 10 + k, true);
+        w.nodes[0].mined(block);
+        w.wake[0] = w.now;
+        w.run(10 * MILLI);
+    }
+    assert_eq!((tip(&w, 0).height, tip(&w, 1).height), (7, 0));
+    // The eighth it hears of: within a second it has all eight, half a
+    // minute before the next ping would have told it.
+    w.mute.clear();
+    let block = next_block(w.nodes[0].chain(), 99, true);
+    w.nodes[0].mined(block);
+    w.wake[0] = w.now;
+    w.run(SECOND);
+    assert_eq!(tip(&w, 1), tip(&w, 0));
+    // Its last ping said nothing of them: it was the announcement.
+    assert_eq!(w.nodes[1].peers().get(&at(0)).unwrap().status.unwrap().work, U256::ZERO);
+}
+
+/// A peer that serves a body that is not its header's is struck, and
+/// the body is taken from another.
+#[test]
+fn a_wrong_body_is_refused_and_fetched_elsewhere() {
+    let chains: Vec<_> = (0..3).map(|_| chain_of(easy())).collect();
+    let blocks = grow(&chains[0], 4, 1);
+    give(&chains[1], &blocks);
+    let mut w = World::with(chains, &small_runs());
+    w.nodes[0].spoil = true;
+    w.nodes[2].add_peer(at(0), false, 0);
+    w.run(5 * SECOND);
+    // Its headers were spoiled too, so nothing came of it at all.
+    assert_eq!((tip(&w, 2).height, w.best(2).height), (0, 0));
+    // Headers from the honest one; bodies asked of both.
+    w.nodes[0].spoil = false;
+    let now = w.now;
+    w.nodes[2].add_peer(at(1), false, now);
+    w.run(3 * SECOND);
+    assert_eq!(w.best(2).height, 4);
+    w.nodes[0].spoil = true;
+    w.nodes[0].served.clear();
+    w.run(20 * SECOND);
+    assert_eq!(tip(&w, 2), tip(&w, 1));
+    assert_eq!(w.nodes[2].chain().state().root(), w.nodes[1].chain().state().root());
+}
+
+/// A block that breaks a rule is refused, remembered, and held against
+/// whoever served it; told of it again, a node does not fetch it again.
+#[test]
+fn a_block_that_breaks_a_rule_is_refused_once() {
+    let mut cfg = small_runs();
+    cfg.peers.target = 1;
+    let mut w = World::new(2, &cfg);
+    w.nodes[1].add_peer(at(0), false, 0);
+    w.run(2 * SECOND);
+    // Node 0 announces, and serves, a block whose state root is not
+    // what its body gives: nothing its own chain would take.
+    let bad = next_block(w.nodes[0].chain(), 5, false);
+    let header = *BlockRef::from_bytes(&bad).unwrap().header();
+    w.nodes[0].foist = Some((header.hash(), bad[HEADER_SIZE..].to_vec()));
+    let announce = |w: &mut World| {
+        let now = w.now;
+        let mut sent = Vec::new();
+        w.nodes[0]
+            .announce(now, header, (bad.len() - HEADER_SIZE) as u32, None, &mut |to, b| sent.push((to, b.to_vec())));
+        for (to, bytes) in sent {
+            w.post(at(0), to, &bytes);
+        }
+    };
+    announce(&mut w);
+    w.run(SECOND);
+    let c = w.nodes[1].counts();
+    assert_eq!((c.fetched, c.blocks, c.blocks_refused, tip(&w, 1).height), (1, 0, 1, 0));
+    let known = w.nodes[1].chain().known(&header.hash()).unwrap().unwrap();
+    assert!(known.invalid());
+    // Told again: not fetched again.
+    announce(&mut w);
+    w.run(SECOND);
+    assert_eq!(w.nodes[1].counts().fetched, 1);
+    // And a good block after it, from the same peer, is passed over
+    // for a while: it has a strike, and failed us.
+    let now = w.now;
+    assert!(!w.nodes[1].peers().may_ask(&at(0), now));
+}
+
+/// Bodies are kept only for the blocks that can be undone. A node says
+/// from where it has them, and is asked for nothing below; one too far
+/// behind for anyone's bodies has the headers and waits for the state.
+#[test]
+fn bodies_are_asked_only_of_those_that_hold_them() {
+    let chains = vec![chain_of(easy()), chain_of(easy())];
+    grow(&chains[0], KEEP + 6, 1);
+    let mut w = World::with(chains, &small_runs());
+    w.nodes[1].add_peer(at(0), false, 0);
+    w.run(20 * SECOND);
+    let said = w.nodes[1].peers().get(&at(0)).unwrap().status.unwrap();
+    assert_eq!((said.height, said.oldest, said.window), (KEEP as u32 + 6, 7, 6));
+    // Every header, no body: the first it needs is the first block's,
+    // which nobody holds.
+    let c = w.nodes[1].counts();
+    assert_eq!((w.best(1).height, tip(&w, 1).height), (KEEP as u32 + 6, 0));
+    assert_eq!((c.headers, c.blocks, c.fetches_failed), (KEEP as u64 + 6, 0, 0));
+    assert_eq!(c.fetched, 7, "seven runs of headers, and nothing else");
+    // What a node is asked for and does not hold, it says it has not.
+    let first = w.nodes[0].chain().header_at(1).unwrap().unwrap().hash();
+    assert!(w.nodes[0].make(&Object::Block(first)).is_none());
+    let seventh = w.nodes[0].chain().header_at(7).unwrap().unwrap().hash();
+    assert!(w.nodes[0].make(&Object::Block(seventh)).is_some());
 }
