@@ -70,12 +70,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{SocketAddr, SocketAddrV4};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::config::Config;
 use super::message::{Locator, Message, Status};
 use super::object::{MAX_NAME, Object};
-use super::peers::Peers;
+use super::peers::{Peers, Totals};
 use super::snapshot::{self, Manifest};
 use super::{MAX_DATAGRAM, VERSION};
 use crate::block::{BlockRef, HEADER_SIZE, Header};
@@ -122,6 +123,24 @@ pub struct Counts {
     /// being taken as of was given up for another.
     pub states: u64,
     pub states_moved: u64,
+}
+
+impl Counts {
+    fn add(&mut self, o: &Counts) {
+        self.malformed += o.malformed;
+        self.unheard += o.unheard;
+        self.strangers += o.strangers;
+        self.sent += o.sent;
+        self.forks_asked += o.forks_asked;
+        self.fetched += o.fetched;
+        self.fetches_failed += o.fetches_failed;
+        self.headers += o.headers;
+        self.blocks += o.blocks;
+        self.blocks_refused += o.blocks_refused;
+        self.announced += o.announced;
+        self.states += o.states;
+        self.states_moved += o.states_moved;
+    }
 }
 
 /// Objects made to be served are kept while they are being asked for:
@@ -331,6 +350,136 @@ pub(crate) struct List {
     /// fetches the same, and so that how many are under way is known
     /// to all.
     fetching: Vec<(Object, SocketAddrV4)>,
+    /// How each worker's peers stand, as that worker last said: what a
+    /// decision about all of them is made on (whether anyone holds a
+    /// block, how far back anyone can hand the state over).
+    views: Vec<View>,
+}
+
+impl List {
+    fn new(workers: usize) -> List {
+        List {
+            probe: None,
+            aim: None,
+            applier: Applier::Here(VecDeque::new()),
+            outstanding: 0,
+            applying: Vec::new(),
+            held: Vec::new(),
+            join: None,
+            fetching: Vec::new(),
+            views: vec![View::default(); workers],
+        }
+    }
+}
+
+/// How one worker's peers stand.
+#[derive(Clone, Default)]
+struct View {
+    /// How many are live.
+    live: usize,
+    /// The greatest height any of them says its chain has.
+    top: u32,
+    /// What each that may be asked says of itself.
+    able: Vec<Status>,
+}
+
+impl View {
+    /// Whether one of them holds the body at `height`.
+    fn holds(&self, height: u32) -> bool {
+        self.able.iter().any(|s| s.oldest <= height && height <= s.height)
+    }
+
+    /// Whether one of them can hand over the state as of `height`.
+    fn serves(&self, height: u32) -> bool {
+        self.able.iter().any(|s| s.window <= height && s.oldest <= height && height <= s.height)
+    }
+
+    /// Whether the chain of one of them reaches `height`.
+    fn reaches(&self, height: u32) -> bool {
+        self.able.iter().any(|s| height <= s.height)
+    }
+}
+
+/// The lowest height any peer can hand the state over as of.
+fn state_reach(views: &[View]) -> Option<u32> {
+    let top = views.iter().map(|v| v.top).max().unwrap_or(0);
+    views.iter().flat_map(|v| &v.able).map(|s| s.window.max(s.oldest)).filter(|reach| *reach <= top).min()
+}
+
+/// What one worker leaves for another: about a peer that is the
+/// other's, or for every worker to do for its own.
+#[derive(Clone)]
+enum Notice {
+    /// An address to try.
+    Try(SocketAddrV4),
+    /// This peer sent what no honest peer sends.
+    Strike(SocketAddrV4),
+    /// A fetch from this peer failed: it is passed over a while.
+    Failed(SocketAddrV4),
+    /// This peer sent headers we lacked.
+    SentHeaders(SocketAddrV4),
+    /// This block is not to be had from this peer, though it said so.
+    NotFrom(Digest, SocketAddrV4),
+    /// A block joined the chain: every peer is told, but `except`.
+    Announce { header: Header, len: u32, except: Option<SocketAddrV4> },
+    /// What the node is after has changed: there may be something on
+    /// the list that a peer of yours can serve.
+    Work,
+}
+
+/// What the workers of a node share besides the list.
+struct Shared {
+    /// What is left for each worker by the others.
+    mail: Vec<Mutex<Vec<Notice>>>,
+    /// What a host's address is mixed with to find its worker: so that
+    /// nobody outside can choose addresses that are all one worker's.
+    key: u64,
+    /// The node's peers in all.
+    totals: Arc<Totals>,
+    /// How many of each worker's peers are live, as it last counted;
+    /// and which, for telling others whom the node knows.
+    live: Vec<AtomicUsize>,
+    known: Vec<Mutex<Vec<SocketAddrV4>>>,
+}
+
+impl Shared {
+    /// The worker `addr` belongs to: by its host, whatever the port.
+    fn owner(&self, addr: &SocketAddrV4) -> usize {
+        if self.mail.len() == 1 {
+            return 0;
+        }
+        // (A mix in which every bit of the address tells on every bit
+        // of the result.)
+        let mut x = (u32::from(*addr.ip()) as u64 ^ self.key).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        ((x ^ (x >> 31)) % self.mail.len() as u64) as usize
+    }
+
+    fn post(&self, worker: usize, notice: Notice) {
+        self.mail[worker].lock().unwrap_or_else(|e| e.into_inner()).push(notice);
+    }
+
+    /// Tells every worker but `but` that what the node is after has
+    /// changed: once, however often it is said before they look.
+    fn work(&self, but: usize) {
+        for worker in (0..self.mail.len()).filter(|w| *w != but) {
+            let mut mail = self.mail[worker].lock().unwrap_or_else(|e| e.into_inner());
+            if !mail.iter().any(|n| matches!(n, Notice::Work)) {
+                mail.push(Notice::Work);
+            }
+        }
+    }
+
+    fn post_others(&self, but: usize, notice: Notice) {
+        for worker in (0..self.mail.len()).filter(|w| *w != but) {
+            self.post(worker, notice.clone());
+        }
+    }
+
+    fn waiting(&self) -> bool {
+        self.mail.iter().any(|m| !m.lock().unwrap_or_else(|e| e.into_inner()).is_empty())
+    }
 }
 
 /// A run of headers.
@@ -432,7 +581,13 @@ impl Heard {
     }
 }
 
-pub struct Node<B: Backend + 'static, V> {
+/// One of a node's workers: everything the node knows and does about
+/// the hosts that are this worker's (`docs/THREADS.md`). It is given the
+/// datagrams of those hosts and nobody else's.
+pub struct Worker<B: Backend + 'static, V> {
+    /// Which of the node's workers this is.
+    me: usize,
+    shared: Arc<Shared>,
     cfg: Config,
     /// The network's four bytes.
     network: [u8; 4],
@@ -485,15 +640,27 @@ pub struct Node<B: Backend + 'static, V> {
 /// A datagram to send goes to this.
 pub type Out<'a> = &'a mut dyn FnMut(SocketAddrV4, &[u8]);
 
-impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
+impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     /// A node of the network `network` keeping `chain`, with these
     /// settings. `secret` is from the operating system's random source:
     /// the tokens this node gives, the numbers of its pings and those
     /// of its fetches come of it, and nobody is to foretell any.
-    pub fn new(cfg: Config, network: [u8; 4], chain: Arc<Chain<B, V>>, secret: [u8; 32], now: Micros) -> Node<B, V> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        cfg: Config,
+        network: [u8; 4],
+        chain: Arc<Chain<B, V>>,
+        secret: [u8; 32],
+        now: Micros,
+        me: usize,
+        shared: Arc<Shared>,
+        list: Arc<RwLock<List>>,
+    ) -> Worker<B, V> {
         let seed = u64::from_le_bytes(derive(&secret, b's', 0)[..8].try_into().unwrap());
-        Node {
-            peers: Peers::new(&cfg, seed),
+        Worker {
+            me,
+            peers: Peers::sharing(&cfg, seed, Arc::clone(&shared.totals)),
+            shared,
             budget: cfg.peers.unproven_pings,
             serve: Serve::with(cfg.serve.limits()),
             cfg,
@@ -510,16 +677,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             due: now,
             served: VecDeque::new(),
             fetches: Vec::new(),
-            list: Arc::new(RwLock::new(List {
-                probe: None,
-                aim: None,
-                applier: Applier::Here(VecDeque::new()),
-                outstanding: 0,
-                applying: Vec::new(),
-                held: Vec::new(),
-                join: None,
-                fetching: Vec::new(),
-            })),
+            list,
             announced: VecDeque::new(),
             inbox: Vec::new(),
             counts: Counts::default(),
@@ -532,55 +690,86 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         }
     }
 
-    /// Has blocks applied on a thread of their own from here on: for a
-    /// node over a socket.
-    pub fn threaded(self) -> Node<B, V>
-    where
-        Chain<B, V>: Send + Sync,
-        V: 'static,
-    {
-        let (jobs, todo) = std::sync::mpsc::channel::<Job>();
-        let (done, outcomes) = std::sync::mpsc::channel();
-        let chain = Arc::clone(&self.chain);
-        std::thread::Builder::new()
-            .name("applier".into())
-            .spawn(move || {
-                // Until the node is dropped, and its end of either with it.
-                for job in todo {
-                    // (Something is always said of a job, so that the
-                    // node knows it is done with.)
-                    let outcome = apply(&chain, job).unwrap_or(Outcome::Nothing);
-                    if done.send(outcome).is_err() {
-                        break;
-                    }
-                }
-            })
-            .expect("a thread");
-        self.write().applier = Applier::Thread(Mutex::new(jobs), Mutex::new(outcomes));
-        self
-    }
-
     /// A block made here: applied, and if it joins the chain, announced.
-    pub fn mined(&mut self, block: Vec<u8>) {
+    fn mined(&mut self, block: Vec<u8>) {
         let list = Arc::clone(&self.list);
         self.give(&mut write(&list), block, None);
     }
 
-    /// The list, to look at.
-    pub(crate) fn list(&self) -> RwLockReadGuard<'_, List> {
-        self.list.read().unwrap_or_else(|e| e.into_inner())
+    /// Tells whichever worker `addr` is of what is to be done about it:
+    /// done here and now, if it is this one's.
+    fn tell(&mut self, now: Micros, addr: SocketAddrV4, notice: Notice) {
+        match self.shared.owner(&addr) {
+            owner if owner == self.me => self.told(now, notice),
+            owner => self.shared.post(owner, notice),
+        }
     }
 
-    /// Tests: does `f` with the list in hand, as the node itself does
-    /// what it does about what to fetch.
-    #[cfg(test)]
-    pub(crate) fn with_list<T>(&mut self, f: impl FnOnce(&mut Self, &mut List) -> T) -> T {
-        let list = Arc::clone(&self.list);
-        f(self, &mut write(&list))
+    /// Live peers other than `except`, picked at random, as many as fit
+    /// one message: of the whole node's, whichever worker is asked.
+    fn sample(&mut self, except: SocketAddrV4, now: Micros) -> super::message::Addrs {
+        if self.shared.known.len() == 1 {
+            return self.peers.sample(Some(except), now);
+        }
+        // This worker's as they are now; the others' as each last said.
+        let mut all: Vec<SocketAddrV4> = self.peers.live(now).map(|p| p.addr).collect();
+        for (_, known) in self.shared.known.iter().enumerate().filter(|(w, _)| *w != self.me) {
+            all.extend_from_slice(&known.lock().unwrap_or_else(|e| e.into_inner()));
+        }
+        all.retain(|a| *a != except);
+        let mut out = super::message::Addrs::new();
+        for i in 0..all.len() {
+            let j = i + (Self::number(&self.secret, &mut self.numbers) % (all.len() - i) as u64) as usize;
+            all.swap(i, j);
+            if !out.push(all[i]) {
+                break;
+            }
+        }
+        out
     }
 
-    fn write(&self) -> RwLockWriteGuard<'_, List> {
-        write(&self.list)
+    /// Does what a notice says, of a peer of this worker's.
+    fn told(&mut self, now: Micros, notice: Notice) {
+        match notice {
+            Notice::Try(addr) => {
+                let _ = self.peers.add(addr, false, now);
+            }
+            Notice::Strike(addr) => {
+                self.peers.strike(&addr, now);
+            }
+            Notice::Failed(addr) => self.peers.failed(&addr, now),
+            Notice::SentHeaders(addr) => self.peers.headers_arrived(&addr),
+            Notice::NotFrom(id, addr) => self.announced.retain(|(told, from, _)| !(*told == id && *from == addr)),
+            // (Seen to where there is somewhere to send: `mail`.)
+            Notice::Announce { .. } | Notice::Work => {}
+        }
+    }
+
+    /// What other workers have left for this one.
+    fn mail(&mut self, now: Micros, out: Out<'_>) {
+        let notices = std::mem::take(&mut *self.shared.mail[self.me].lock().unwrap_or_else(|e| e.into_inner()));
+        for notice in notices {
+            match notice {
+                Notice::Announce { header, len, except } => self.announce(now, header, len, except, out),
+                Notice::Work => {
+                    let list = Arc::clone(&self.list);
+                    let l = &mut *write(&list);
+                    self.fetch_headers(l, now);
+                    self.sync_blocks(l, now);
+                    self.sync_state(l, now);
+                }
+                other => self.told(now, other),
+            }
+        }
+    }
+
+    /// How this worker's peers stand, for the others to see.
+    fn view(&self, l: &mut List, now: Micros) {
+        let view = &mut l.views[self.me];
+        view.live = self.peers.live(now).count();
+        view.top = self.peers.live(now).filter_map(|p| p.status).map(|s| s.height).max().unwrap_or(0);
+        view.able.clear();
+        view.able.extend(self.peers.able(now).filter_map(|p| p.status));
     }
 
     /// Gives a block to be applied.
@@ -610,33 +799,6 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
     /// Whether work given to be done on the chain is still to be heard
     /// of: whoever drives the node then looks to it again soon, without
     /// waiting for a datagram.
-    pub fn busy(&self) -> bool {
-        self.list().outstanding > 0
-    }
-
-    pub fn peers(&self) -> &Peers {
-        &self.peers
-    }
-
-    pub fn chain(&self) -> &Arc<Chain<B, V>> {
-        &self.chain
-    }
-
-    pub fn counts(&self) -> Counts {
-        self.counts
-    }
-
-    /// Objects being fetched now.
-    pub fn fetching(&self) -> usize {
-        self.fetches.len()
-    }
-
-    /// Takes `addr` as an address to try: a seed, a peer given by hand
-    /// (both kept whatever they do), or one saved from an earlier run.
-    pub fn add_peer(&mut self, addr: SocketAddrV4, seed: bool, now: Micros) -> bool {
-        self.peers.add(addr, seed, now).is_ok()
-    }
-
     /// A number nobody can foretell: for a ping, since a pong that
     /// carries it is taken to show its sender received the ping; for a
     /// fetch, since a chunk that carries it is taken to be its answer.
@@ -692,8 +854,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
     /// sees whether there are headers to catch up with. Every call:
     /// what the fetches under way and the chunks being served want
     /// done.
-    pub fn tick(&mut self, now: Micros, unix: u64, out: Out<'_>) -> Micros {
+    fn tick(&mut self, now: Micros, unix: u64, out: Out<'_>) -> Micros {
         self.unix = unix;
+        self.mail(now, out);
         if now >= self.due {
             self.due = now + self.cfg.tick;
             self.periodic(now, out);
@@ -716,7 +879,14 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             let ping = Message::Ping(self.status(&addr, number));
             self.send(addr, &ping, out);
         }
-        if self.peers.wants_more(now) && self.asked.is_none_or(|t| now.saturating_sub(t) >= self.cfg.peers.discover) {
+        // (Too few live peers: of the node, over all its workers.)
+        let mine: Vec<SocketAddrV4> = self.peers.live(now).map(|p| p.addr).collect();
+        self.shared.live[self.me].store(mine.len(), Ordering::Relaxed);
+        if self.shared.live.len() > 1 {
+            *self.shared.known[self.me].lock().unwrap_or_else(|e| e.into_inner()) = mine;
+        }
+        let live: usize = self.shared.live.iter().map(|n| n.load(Ordering::Relaxed)).sum();
+        if live < self.cfg.peers.target && self.asked.is_none_or(|t| now.saturating_sub(t) >= self.cfg.peers.discover) {
             let one = self.peers.sample(None, now).as_slice().first().copied();
             if let Some(addr) = one
                 && let Some(token) = self.peers.get(&addr).and_then(|p| p.token())
@@ -735,7 +905,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
 
     /// Takes a datagram that arrived from `from`, and says what it was
     /// and what was done about it. Call [`Node::tick`] after it.
-    pub fn handle(&mut self, now: Micros, from: SocketAddr, bytes: &[u8], out: Out<'_>) -> Heard {
+    fn handle(&mut self, now: Micros, from: SocketAddr, bytes: &[u8], out: Out<'_>) -> Heard {
         let unheard =
             |from, request| Heard { from, request, about: About::Nothing, answer: "malformed", sent: 0, sent_bytes: 0 };
         // Addresses of the older kind only (`docs/WIRE.md`, 1.1).
@@ -798,7 +968,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             Message::GetPeers { token } => {
                 if self.asked_rightly(&from, token) {
                     self.peers.seen(&from, now);
-                    let sample = self.peers.sample(Some(from), now);
+                    let sample = self.sample(from, now);
                     self.send(from, &Message::Peers(sample), out);
                 }
             }
@@ -811,7 +981,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                 }
                 self.peers.seen(&from, now);
                 for a in addrs.as_slice() {
-                    let _ = self.peers.add(*a, false, now);
+                    self.tell(now, *a, Notice::Try(*a));
                 }
             }
             Message::Goodbye { token } => {
@@ -896,7 +1066,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
 
     /// "I am going", to every live peer: when a node stops, so that
     /// they need not find it out by its silence.
-    pub fn goodbye(&mut self, now: Micros, out: Out<'_>) {
+    fn goodbye(&mut self, now: Micros, out: Out<'_>) {
         let mut all = Vec::new();
         all.extend(self.peers.live(now).filter_map(|p| p.token().map(|t| (p.addr, t))));
         for (addr, token) in all {
@@ -926,7 +1096,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         };
         // Those that claimed work and have sent nothing for it.
         self.peers.doubt_silent_claimants(best.work, now, |_| {});
+        // (Whoever was asked is its own worker's to give up on.)
         if let Some((addr, _, _)) = l.probe
+            && self.shared.owner(&addr) == self.me
             && !self.peers.may_ask(&addr, now)
         {
             l.probe = None;
@@ -999,6 +1171,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             keeping: false,
             source: from,
         });
+        self.shared.work(self.me);
         self.fetch_headers(l, now);
     }
 
@@ -1037,10 +1210,16 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                 fetch: Fetch::new(transfer, Some(len), len, peer.path, now),
             });
         }
-        // Nothing under way, and nobody to ask: the aim is let go, and
-        // another is taken from whoever claims most then.
+        // Nothing under way, and nobody to ask, of any worker's peers:
+        // the aim is let go, and another is taken from whoever claims
+        // most then. (Whoever told us of it is its own worker's to ask,
+        // and so that worker's to give up on.)
         if !l.fetching.iter().any(|f| headers(&f.0)) && !aim.todo.is_empty() {
-            l.aim = None;
+            let (height, source) = (aim.height, aim.source);
+            self.view(l, now);
+            if !l.views.iter().any(|v| v.reaches(height)) && self.shared.owner(&source) == self.me {
+                l.aim = None;
+            }
         }
     }
 
@@ -1101,7 +1280,10 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         if error {
             return self.headers_refused(l, now, from);
         }
-        self.peers.headers_arrived(&from);
+        self.tell(now, from, Notice::SentHeaders(from));
+        let Some(aim) = l.aim.as_mut() else {
+            return;
+        };
         aim.next += count;
         // The last of them is the tip that was aimed at, or the peers
         // that served them are of two minds.
@@ -1120,8 +1302,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
     /// the chain refuses: a strike, and the aim is let go. What was
     /// kept stays kept.
     fn headers_refused(&mut self, l: &mut List, now: Micros, from: SocketAddrV4) {
-        self.peers.strike(&from, now);
-        self.peers.failed(&from, now);
+        self.tell(now, from, Notice::Strike(from));
+        self.tell(now, from, Notice::Failed(from));
         l.aim = None;
         self.fetches.retain(|f| !headers(&f.object));
         l.fetching.retain(|f| !headers(&f.0));
@@ -1172,14 +1354,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
 
     /// Tells every live peer but `except` of a block: its header, and
     /// how long its body is.
-    pub(crate) fn announce(
-        &mut self,
-        now: Micros,
-        header: Header,
-        len: u32,
-        except: Option<SocketAddrV4>,
-        out: Out<'_>,
-    ) {
+    fn announce(&mut self, now: Micros, header: Header, len: u32, except: Option<SocketAddrV4>, out: Out<'_>) {
         let mut all = Vec::new();
         all.extend(self.peers.live(now).map(|p| p.addr).filter(|a| Some(*a) != except));
         for addr in all {
@@ -1274,6 +1449,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             let Some(outcome) = outcome else {
                 return;
             };
+            self.shared.work(self.me);
             l.outstanding = l.outstanding.saturating_sub(1);
             match outcome {
                 Outcome::Block { header, len, from, result } => {
@@ -1303,8 +1479,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                         // Not the part of its root, or no part at all:
                         // its sender's doing. Anything else is ours.
                         if matches!(result, Err(Error::PartRoot | Error::Malformed(_))) {
-                            self.peers.strike(&from, now);
                             join.unserved.push(from);
+                            self.tell(now, from, Notice::Strike(from));
                         }
                     }
                     self.advance_join(l, now);
@@ -1344,6 +1520,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             Ok(Applied::Extended | Applied::Reorganized { .. }) => {
                 self.counts.blocks += 1;
                 self.announce(now, header, len, from, out);
+                self.shared.post_others(self.me, Notice::Announce { header, len, except: from });
             }
             Ok(Applied::Known | Applied::Side) => {}
             Err(e) => {
@@ -1353,9 +1530,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                 if let Some(from) = from
                     && (e == Error::BadBodyCommitment || condemns(&e))
                 {
-                    self.peers.strike(&from, now);
-                    self.peers.failed(&from, now);
-                    self.announced.retain(|(told, addr, _)| !(*told == id && *addr == from));
+                    self.tell(now, from, Notice::Strike(from));
+                    self.tell(now, from, Notice::Failed(from));
+                    self.tell(now, from, Notice::NotFrom(id, from));
                 }
             }
         }
@@ -1384,7 +1561,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
     /// parts. Each piece from whichever peer's turn it is, several at
     /// once, each checked before the next is believed.
     fn sync_state(&mut self, l: &mut List, now: Micros) {
-        if l.join.is_none() && !self.begin_join(l, now) {
+        self.view(l, now);
+        if l.join.is_none() && !self.begin_join(l) {
             return;
         }
         let Some(join) = l.join.as_mut() else {
@@ -1393,6 +1571,10 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         // Who can serve it: those that can still go back to its block.
         let mut servers: Vec<SocketAddrV4> =
             self.peers.servers_of_state(join.target.height, now).map(|p| p.addr).collect();
+        // None of this worker's, but another's: theirs to ask.
+        if servers.is_empty() && l.views.iter().any(|v| v.serves(join.target.height)) {
+            return;
+        }
         if servers.is_empty() {
             // Nobody, for long enough: the block is given up for a
             // later one, and what was taken of its state that is the
@@ -1404,7 +1586,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                 l.fetching.retain(|f| !of_state(&f.0));
                 // (Begun anew, the chain goes on with what it has
                 // received: `Chain::begin_receiving`.)
-                if self.begin_join(l, now) {
+                if self.begin_join(l) {
                     self.counts.states_moved += 1;
                 }
             }
@@ -1459,7 +1641,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
 
     /// Chooses the block to take the state as of, if it is to be taken
     /// at all. True if one was chosen.
-    fn begin_join(&mut self, l: &mut List, now: Micros) -> bool {
+    fn begin_join(&mut self, l: &mut List) -> bool {
         let point = self.cfg.sync.sync_point;
         if point == 0 || l.aim.is_some() || !l.applying.is_empty() {
             return false;
@@ -1473,8 +1655,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         if !self.chain.receiving() {
             let mut first = [best];
             if self.chain.missing_bodies(&mut first).unwrap_or(0) == 0
-                || self.peers.live(now).next().is_none()
-                || self.peers.holders(first[0].height, now).next().is_some()
+                || !l.views.iter().any(|v| v.live > 0)
+                || l.views.iter().any(|v| v.holds(first[0].height))
                 || l.fetching.iter().any(|f| matches!(f.0, Object::Block(_)))
                 || !l.held.is_empty()
             {
@@ -1483,7 +1665,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         }
         // As far under the best header as is asked, if anyone can go
         // back so far; else as far back as anyone can.
-        let Some(reach) = self.peers.state_reach(now) else {
+        let Some(reach) = state_reach(&l.views) else {
             return false;
         };
         let height = best.height.saturating_sub(point).max(reach).max(1);
@@ -1642,7 +1824,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             Err(_) => {
                 if let Some((_, served)) = join.manifest.take() {
                     join.unserved.push(served);
-                    self.peers.strike(&served, now);
+                    self.tell(now, served, Notice::Strike(served));
                 }
                 join.refused += 1;
                 if join.refused >= self.cfg.sync.snapshot_attempts {
@@ -1765,7 +1947,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
     /// Fetches `object`, of `most` bytes at the most, from `from`: what
     /// comes of it is in [`Node::take_fetched`] when it has. False if
     /// `from` is no peer to ask.
-    pub fn fetch_object(&mut self, now: Micros, object: Object, from: SocketAddrV4, most: u32) -> bool {
+    fn fetch_object(&mut self, now: Micros, object: Object, from: SocketAddrV4, most: u32) -> bool {
         if !self.peers.may_ask(&from, now) {
             return false;
         }
@@ -1777,7 +1959,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
 
     /// The objects asked for with [`Node::fetch_object`] that have come
     /// whole, or been given up (no bytes), since this was last called.
-    pub fn take_fetched(&mut self) -> Vec<(Object, SocketAddrV4, Option<Vec<u8>>)> {
+    fn take_fetched(&mut self) -> Vec<(Object, SocketAddrV4, Option<Vec<u8>>)> {
         std::mem::take(&mut self.inbox)
     }
 
@@ -1886,6 +2068,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
 
     /// An object fetched whole from `from`.
     fn arrived(&mut self, l: &mut List, now: Micros, object: Object, from: SocketAddrV4, bytes: &[u8]) {
+        self.shared.work(self.me);
         if self.of_join(l, &object) {
             return self.piece_arrived(l, now, object, from, bytes);
         }
@@ -1902,6 +2085,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
     /// Of anything else: whoever asked for it is told, and decides.
     fn fetch_failed(&mut self, l: &mut List, now: Micros, object: Object, from: SocketAddrV4) {
         self.counts.fetches_failed += 1;
+        self.shared.work(self.me);
         // Of the state being taken: asked of another, and this peer
         // not again while another can be.
         if self.of_join(l, &object) {
@@ -1928,6 +2112,236 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             (Object::Headers { .. }, None) => {}
             _ => self.inbox.push((object, from, None)),
         }
+    }
+}
+
+/// A node: its workers, each with the hosts that are its own, and what
+/// they share. Every datagram is given to the worker its sender's host
+/// belongs to. (All on the caller's thread, one after another: a node
+/// of one worker is as a node always was.)
+pub struct Node<B: Backend + 'static, V> {
+    workers: Vec<Worker<B, V>>,
+    shared: Arc<Shared>,
+    list: Arc<RwLock<List>>,
+}
+
+impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
+    /// A node of the network `network` keeping `chain`, with these
+    /// settings. `secret` is from the operating system's random source:
+    /// the tokens this node gives, the numbers of its pings and those
+    /// of its fetches come of it, and nobody is to foretell any.
+    pub fn new(cfg: Config, network: [u8; 4], chain: Arc<Chain<B, V>>, secret: [u8; 32], now: Micros) -> Node<B, V> {
+        let n = cfg.workers.max(1);
+        let shared = Arc::new(Shared {
+            mail: (0..n).map(|_| Mutex::new(Vec::new())).collect(),
+            key: u64::from_le_bytes(derive(&secret, b'h', 0)[..8].try_into().unwrap()),
+            totals: Arc::new(Totals::new()),
+            live: (0..n).map(|_| AtomicUsize::new(0)).collect(),
+            known: (0..n).map(|_| Mutex::new(Vec::new())).collect(),
+        });
+        let list = Arc::new(RwLock::new(List::new(n)));
+        // What is of the whole node is divided among its workers.
+        let mut each = cfg;
+        if n > 1 {
+            each.serve.rate = (each.serve.rate / n as u32).max(1);
+            each.serve.waiting = (each.serve.waiting / n).max(each.serve.waiting_each);
+        }
+        let workers = (0..n).map(|me| {
+            // (One worker has the node's secret as it is.)
+            let secret = if n == 1 { secret } else { derive(&secret, b'w', me as u64) };
+            let (shared, list) = (Arc::clone(&shared), Arc::clone(&list));
+            Worker::new(each.clone(), network, Arc::clone(&chain), secret, now, me, shared, list)
+        });
+        Node { workers: workers.collect(), shared, list }
+    }
+
+    /// Has blocks applied on a thread of their own from here on: for a
+    /// node over a socket.
+    pub fn threaded(self) -> Node<B, V>
+    where
+        Chain<B, V>: Send + Sync,
+        V: 'static,
+    {
+        let (jobs, todo) = std::sync::mpsc::channel::<Job>();
+        let (done, outcomes) = std::sync::mpsc::channel();
+        let chain = Arc::clone(&self.workers[0].chain);
+        std::thread::Builder::new()
+            .name("applier".into())
+            .spawn(move || {
+                // Until the node is dropped, and its end of either with it.
+                for job in todo {
+                    // (Something is always said of a job, so that the
+                    // node knows it is done with.)
+                    let outcome = apply(&chain, job).unwrap_or(Outcome::Nothing);
+                    if done.send(outcome).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("a thread");
+        write(&self.list).applier = Applier::Thread(Mutex::new(jobs), Mutex::new(outcomes));
+        self
+    }
+
+    /// Tests: what is set on the first worker to make a node misbehave
+    /// holds for every worker.
+    #[cfg(test)]
+    fn hooks(&mut self) {
+        let (first, rest) = self.workers.split_first_mut().expect("a worker");
+        for w in rest {
+            (w.boast, w.spoil, w.foist) = (first.boast, first.spoil, first.foist.clone());
+            if w.cfg != first.cfg {
+                w.cfg = first.cfg.clone();
+            }
+        }
+    }
+
+    /// Tests: tells every live peer of a block.
+    #[cfg(test)]
+    pub(crate) fn announce(
+        &mut self,
+        now: Micros,
+        header: Header,
+        len: u32,
+        except: Option<SocketAddrV4>,
+        out: Out<'_>,
+    ) {
+        self.workers.iter_mut().for_each(|w| w.announce(now, header, len, except, out));
+    }
+
+    /// Tests: the peers of the worker `addr` belongs to.
+    #[cfg(test)]
+    pub(crate) fn table(&self, addr: &SocketAddrV4) -> &Peers {
+        &self.workers[self.shared.owner(addr)].peers
+    }
+
+    /// Tests: every worker's peers.
+    #[cfg(test)]
+    pub(crate) fn tables(&self) -> impl Iterator<Item = &Peers> {
+        self.workers.iter().map(|w| &w.peers)
+    }
+
+    /// The worker `addr` belongs to.
+    fn of(&mut self, addr: &SocketAddrV4) -> &mut Worker<B, V> {
+        let owner = self.shared.owner(addr);
+        &mut self.workers[owner]
+    }
+
+    /// A block made here: applied, and if it joins the chain, announced.
+    pub fn mined(&mut self, block: Vec<u8>) {
+        self.workers[0].mined(block);
+    }
+
+    /// The list, to look at.
+    pub(crate) fn list(&self) -> RwLockReadGuard<'_, List> {
+        self.list.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Tests: does `f` with the list in hand, as a worker itself does
+    /// what it does about what to fetch.
+    #[cfg(test)]
+    pub(crate) fn with_list<T>(&mut self, f: impl FnOnce(&mut Worker<B, V>, &mut List) -> T) -> T {
+        let list = Arc::clone(&self.list);
+        f(&mut self.workers[0], &mut write(&list))
+    }
+
+    /// Whether work given to be done on the chain is still to be heard
+    /// of: whoever drives the node then looks to it again soon, without
+    /// waiting for a datagram.
+    pub fn busy(&self) -> bool {
+        self.list().outstanding > 0
+    }
+
+    /// The peers of the node's first worker: all there are, of a node
+    /// of one.
+    pub fn peers(&self) -> &Peers {
+        &self.workers[0].peers
+    }
+
+    /// How many peers the node has, and how many of them are live.
+    pub fn peer_counts(&self, now: Micros) -> (usize, usize) {
+        self.workers.iter().fold((0, 0), |(all, live), w| (all + w.peers.len(), live + w.peers.live(now).count()))
+    }
+
+    pub fn chain(&self) -> &Arc<Chain<B, V>> {
+        &self.workers[0].chain
+    }
+
+    pub fn counts(&self) -> Counts {
+        let mut all = Counts::default();
+        self.workers.iter().for_each(|w| all.add(&w.counts));
+        all
+    }
+
+    /// Objects being fetched now.
+    pub fn fetching(&self) -> usize {
+        self.workers.iter().map(|w| w.fetches.len()).sum()
+    }
+
+    /// Takes `addr` as an address to try: a seed, a peer given by hand
+    /// (both kept whatever they do), or one saved from an earlier run.
+    pub fn add_peer(&mut self, addr: SocketAddrV4, seed: bool, now: Micros) -> bool {
+        self.of(&addr).peers.add(addr, seed, now).is_ok()
+    }
+
+    /// Looks to everything that is due at `now`, and says when to be
+    /// called again at the latest: sooner if a datagram arrives.
+    /// `unix` is the time by the calendar, in seconds.
+    pub fn tick(&mut self, now: Micros, unix: u64, out: Out<'_>) -> Micros {
+        #[cfg(test)]
+        self.hooks();
+        let mut wake = Micros::MAX;
+        for worker in &mut self.workers {
+            wake = wake.min(worker.tick(now, unix, out));
+        }
+        // What one worker left for another is seen to at once.
+        if self.shared.waiting() { now } else { wake }
+    }
+
+    /// Takes a datagram that arrived from `from`, and says what it was
+    /// and what was done about it. Call [`Node::tick`] after it.
+    pub fn handle(&mut self, now: Micros, from: SocketAddr, bytes: &[u8], out: Out<'_>) -> Heard {
+        let host = match from {
+            SocketAddr::V4(a) => Some(a),
+            SocketAddr::V6(a) => a.ip().to_ipv4_mapped().map(|ip| SocketAddrV4::new(ip, a.port())),
+        };
+        let owner = host.map_or(0, |a| self.shared.owner(&a));
+        self.workers[owner].handle(now, from, bytes, out)
+    }
+
+    /// "I am going", to every live peer: when a node stops, so that
+    /// they need not find it out by its silence.
+    pub fn goodbye(&mut self, now: Micros, out: Out<'_>) {
+        self.workers.iter_mut().for_each(|w| w.goodbye(now, out));
+    }
+
+    /// Fetches `object`, of `most` bytes at the most, from `from`: what
+    /// comes of it is in [`Node::take_fetched`] when it has. False if
+    /// `from` is no peer to ask.
+    pub fn fetch_object(&mut self, now: Micros, object: Object, from: SocketAddrV4, most: u32) -> bool {
+        self.of(&from).fetch_object(now, object, from, most)
+    }
+
+    /// The objects asked for with [`Node::fetch_object`] that have come
+    /// whole, or been given up (no bytes), since this was last called.
+    pub fn take_fetched(&mut self) -> Vec<(Object, SocketAddrV4, Option<Vec<u8>>)> {
+        self.workers.iter_mut().flat_map(|w| w.take_fetched()).collect()
+    }
+}
+
+/// Tests look into a node of one worker as into that worker.
+#[cfg(test)]
+impl<B: Backend + 'static, V> std::ops::Deref for Node<B, V> {
+    type Target = Worker<B, V>;
+    fn deref(&self) -> &Worker<B, V> {
+        &self.workers[0]
+    }
+}
+
+#[cfg(test)]
+impl<B: Backend + 'static, V> std::ops::DerefMut for Node<B, V> {
+    fn deref_mut(&mut self) -> &mut Worker<B, V> {
+        &mut self.workers[0]
     }
 }
 

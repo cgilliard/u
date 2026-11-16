@@ -107,8 +107,9 @@ impl Watch<'_> {
         now: Micros,
     ) {
         let Some(stats) = self.stats else { return };
-        stats.set(PEERS, node.peers().len() as u64);
-        stats.set(PEERS_LIVE, node.peers().live(now).count() as u64);
+        let (peers, live) = node.peer_counts(now);
+        stats.set(PEERS, peers as u64);
+        stats.set(PEERS_LIVE, live as u64);
         if let Ok(tip) = node.chain().tip() {
             stats.set(HEIGHT, tip.height as u64);
         }

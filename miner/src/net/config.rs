@@ -25,6 +25,9 @@ pub struct Config {
     /// How often a node looks to what passes with time: whom to ping,
     /// whom to drop, what to fetch next.
     pub tick: Micros,
+    /// Workers: each has the hosts that are its own, and is given
+    /// their datagrams (`docs/THREADS.md`).
+    pub workers: usize,
     pub peers: Peers,
     pub sync: Sync,
     pub serve: Serve,
@@ -194,7 +197,7 @@ impl Default for Serve {
 #[allow(clippy::derivable_impls)]
 impl Default for Config {
     fn default() -> Config {
-        Config { tick: SECOND, peers: Peers::default(), sync: Sync::default(), serve: Serve::default() }
+        Config { tick: SECOND, workers: 1, peers: Peers::default(), sync: Sync::default(), serve: Serve::default() }
     }
 }
 
@@ -205,6 +208,7 @@ impl Config {
         let (p, s) = (&self.peers, &self.sync);
         let need = |ok: bool, what: &'static str| if ok { Ok(()) } else { Err(Error::Setting(what)) };
         need(self.tick >= 10 * MILLI && self.tick <= 10 * SECOND, "tick is not between 10 ms and 10 s")?;
+        need(self.workers >= 1 && self.workers <= 1024, "workers is not between 1 and 1024")?;
         need(p.max >= 1, "peers.max is zero")?;
         need(p.target >= 1 && p.target <= p.max, "peers.target is not between one and peers.max")?;
         need(p.per_host >= 1, "peers.per_host is zero")?;

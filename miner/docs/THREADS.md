@@ -320,17 +320,38 @@ Each leaves the tests passing:
    peer (a worker) and the list. The simulation runs one worker. This
    is most of the work, and where the sync tests earn their keep.
 
-   *Done so far*: the list is a thing of its own behind its lock
-   (`net::node::List`): where the header sync is aiming, the bodies in
-   hand, the state being taken, the work with the applier. The node
-   takes the lock only where it decides what to fetch or hears what
-   came of it; pings, requests for chunks, chunks arriving and chunks
-   served do not touch it. *Still to do*: which objects are being
-   fetched is still read off the node's own fetches, and must be on
-   the list before two workers can share it; and the node itself is
-   not yet a worker among several.
+   *Done.* The list (`net::node::List`) holds where the header sync
+   is aiming, the bodies in hand, the state being taken, the work with
+   the applier, and what is being fetched and of whom. A worker
+   (`net::node::Worker`) holds everything about its own hosts.
+
 2. **Several workers on one thread** in the simulation, datagrams
    handed out by the hash: finds whatever still assumed one table.
+
+   *Done.* A node (`net::node::Node`) is its workers
+   (`net::config::Config::workers`; one, until step 3), and gives each
+   datagram to the worker its sender's host is of. The sync tests run
+   with four workers to a node as well as with one. What it took,
+   beyond the list:
+
+   - **Notices** between workers, left in a box for each: an address
+     to try, a strike, a peer to pass over, a block to announce, and
+     "what the node is after has changed" (so that a worker looks to
+     the list when there is something new on it, and not only by the
+     clock).
+   - **How each worker's peers stand**, on the list, as each last said:
+     whether anybody at all holds a block or can hand over a state is
+     asked of all of them, since no one worker can say.
+   - **Peers in all and of each network** in atomic counts
+     (`net::peers::Totals`); live peers in all, for whether more are to
+     be looked for; and "whom else do you know" answered from every
+     worker's live peers.
+
+   Not yet as they are to be: the chunks served a second and the
+   requests that may wait are divided evenly among the workers, not
+   drawn from one budget; and a worker takes the list's lock every
+   time it looks to its fetches, which real threads would queue on.
+
 3. **Real threads**: the receiver, the pool, the queues, the shared
    counts and budgets.
 4. **Stats and settings**: datagrams dropped at a full queue; the two

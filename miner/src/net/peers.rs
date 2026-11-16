@@ -33,6 +33,8 @@
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use super::config;
 use super::message::{Addrs, Status};
@@ -100,8 +102,48 @@ impl Peer {
 }
 
 /// The table.
+/// How many peers a node has in all, and of each network: counted over
+/// every table of the node, where its peers are kept in several, each
+/// by a thread of its own (`docs/THREADS.md`, 4.1). Counts only, each
+/// one number changed in one step: nothing is locked.
+pub struct Totals {
+    peers: AtomicUsize,
+    /// Peers that are not seeds, by the first two bytes of the address:
+    /// one count for each network there can be.
+    networks: Box<[AtomicU32]>,
+}
+
+impl Totals {
+    pub fn new() -> Totals {
+        Totals { peers: AtomicUsize::new(0), networks: (0..1 << 16).map(|_| AtomicU32::new(0)).collect() }
+    }
+
+    /// Peers in all.
+    pub fn peers(&self) -> usize {
+        self.peers.load(Ordering::Relaxed)
+    }
+
+    fn of_network(&self, addr: &SocketAddrV4) -> &AtomicU32 {
+        let [a, b, _, _] = addr.ip().octets();
+        &self.networks[(a as usize) << 8 | b as usize]
+    }
+
+    /// Peers of `addr`'s network that are not seeds.
+    pub fn network(&self, addr: &SocketAddrV4) -> usize {
+        self.of_network(addr).load(Ordering::Relaxed) as usize
+    }
+}
+
+impl Default for Totals {
+    fn default() -> Totals {
+        Totals::new()
+    }
+}
+
 pub struct Peers {
     cfg: config::Peers,
+    /// The node's peers in all, this table's among them.
+    totals: Arc<Totals>,
     /// How long a peer that failed us is passed over.
     pass_over: Micros,
     /// How long a peer may take to send a header we lack.
@@ -139,7 +181,15 @@ impl Peers {
     /// peers are sampled with: from the operating system's random
     /// source, so that which peers a node tells of cannot be foretold.
     pub fn new(cfg: &config::Config, seed: u64) -> Peers {
+        Peers::sharing(cfg, seed, Arc::new(Totals::new()))
+    }
+
+    /// [`Peers::new`], for one of a node's several tables: the limits
+    /// on peers in all and on those of one network hold over all of
+    /// them, by `totals`. (A host's peers are all in one table.)
+    pub fn sharing(cfg: &config::Config, seed: u64, totals: Arc<Totals>) -> Peers {
         Peers {
+            totals,
             cfg: cfg.peers.clone(),
             pass_over: cfg.sync.pass_over,
             header_wait: cfg.sync.header_wait,
@@ -209,14 +259,14 @@ impl Peers {
             if of_host >= self.cfg.per_host && self.stale_of_host(addr, now).is_none() {
                 return Some(Refused::Host);
             }
-            let of_network = self.of(addr, 16).filter(|p| !p.seed).count();
+            let of_network = self.totals.network(addr);
             // (One of the host's own may be about to give way to it.)
             let leaving = (of_host >= self.cfg.per_host) as usize;
             if of_network - leaving.min(of_network) >= self.cfg.per_network {
                 return Some(Refused::Network);
             }
         }
-        if self.peers.len() >= self.cfg.max && self.unproven == 0 {
+        if self.totals.peers() >= self.cfg.max && self.unproven == 0 {
             return Some(Refused::Full);
         }
         None
@@ -232,6 +282,9 @@ impl Peers {
         if let Some(p) = self.peers.get_mut(&addr) {
             // A seed from now on, and so not one a full table gives up.
             self.unproven -= (seed && !p.seed && !p.proven) as usize;
+            if seed && !p.seed {
+                self.totals.of_network(&addr).fetch_sub(1, Ordering::Relaxed);
+            }
             p.seed |= seed;
             return Ok(false);
         }
@@ -242,12 +295,16 @@ impl Peers {
                 self.remove(&old);
             }
         }
-        if self.peers.len() >= self.cfg.max {
+        if self.totals.peers() >= self.cfg.max {
             // One that never proved itself gives way, and no other.
             let old = self.peers.values().find(|p| !p.proven && !p.seed).expect("or it was refused").addr;
             self.remove(&old);
         }
         self.unproven += !seed as usize;
+        self.totals.peers.fetch_add(1, Ordering::Relaxed);
+        if !seed {
+            self.totals.of_network(&addr).fetch_add(1, Ordering::Relaxed);
+        }
         self.peers.insert(
             addr,
             Peer {
@@ -275,6 +332,10 @@ impl Peers {
     pub fn remove(&mut self, addr: &SocketAddrV4) {
         if let Some(p) = self.peers.remove(addr) {
             self.unproven -= (!p.proven && !p.seed) as usize;
+            self.totals.peers.fetch_sub(1, Ordering::Relaxed);
+            if !p.seed {
+                self.totals.of_network(addr).fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -482,6 +543,7 @@ impl Peers {
         let (silence, ban) = (self.cfg.drop_silence, self.cfg.ban);
         self.banned.retain(|_, since| now.saturating_sub(*since) < ban);
         let mut unproven = self.unproven;
+        let totals = Arc::clone(&self.totals);
         self.peers.retain(|_, p| {
             if p.seed {
                 return true;
@@ -499,6 +561,10 @@ impl Peers {
             };
             if !keep && !p.proven {
                 unproven -= 1;
+            }
+            if !keep {
+                totals.peers.fetch_sub(1, Ordering::Relaxed);
+                totals.of_network(&p.addr).fetch_sub(1, Ordering::Relaxed);
             }
             keep
         });
@@ -617,6 +683,12 @@ impl Peers {
             .map(|s| s.window.max(s.oldest))
             .filter(|reach| *reach <= self.live(now).filter_map(|p| p.status).map(|s| s.height).max().unwrap_or(0))
             .min()
+    }
+
+    /// The live peers that are not passed over: whom anything may be
+    /// asked of.
+    pub fn able(&self, now: Micros) -> impl Iterator<Item = &Peer> {
+        self.live(now).filter(move |p| !self.passed_over(p, now))
     }
 
     /// Whether `addr` may be asked for something: live, and not passed

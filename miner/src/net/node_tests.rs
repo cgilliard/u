@@ -38,6 +38,18 @@ fn at(n: usize) -> SocketAddrV4 {
     SocketAddrV4::new(Ipv4Addr::new(20 + (n / 200) as u8, (n % 200) as u8, 0, 1), 3737)
 }
 
+thread_local! {
+    /// How many workers the nodes of a [`World`] have.
+    static WORKERS: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
+}
+
+/// Runs `test` with nodes of several workers each.
+fn several(test: fn()) {
+    WORKERS.set(4);
+    test();
+    WORKERS.set(1);
+}
+
 /// Nodes and the datagrams between them: every one takes twenty
 /// milliseconds, some are lost, and one sent to an address that is no
 /// node's is kept to be looked at.
@@ -65,6 +77,8 @@ impl World {
 
     fn with(chains: Vec<Arc<TestChain>>, cfg: &Config) -> World {
         let n = chains.len();
+        // (As many workers to a node as the test is run with.)
+        let cfg = &Config { workers: WORKERS.get(), ..cfg.clone() };
         let nodes = chains.into_iter().enumerate().map(|(i, c)| Node::new(cfg.clone(), NET, c, [i as u8 + 1; 32], 0));
         World {
             nodes: nodes.collect(),
@@ -144,7 +158,7 @@ impl World {
     }
 
     fn live(&self, i: usize) -> Vec<SocketAddrV4> {
-        self.nodes[i].peers().live(self.now).map(|p| p.addr).collect()
+        self.nodes[i].tables().flat_map(|t| t.live(self.now)).map(|p| p.addr).collect()
     }
 
     fn best(&self, i: usize) -> Header {
@@ -179,7 +193,7 @@ fn two_nodes_that_one_knows_of_come_to_know_each_other() {
     assert_eq!((w.live(0), w.live(1)), (vec![at(1)], vec![at(0)]));
     // Each holds what the other says of itself, and the token the
     // other gave it; and each has timed the other.
-    let (a, b) = (*w.nodes[0].peers().get(&at(1)).unwrap(), *w.nodes[1].peers().get(&at(0)).unwrap());
+    let (a, b) = (*w.nodes[0].table(&at(1)).get(&at(1)).unwrap(), *w.nodes[1].table(&at(0)).get(&at(0)).unwrap());
     let tip = w.nodes[1].chain().tip().unwrap();
     assert_eq!((a.status.unwrap().height, a.status.unwrap().tip, b.status.unwrap().height), (3, tip.hash(), 0));
     assert_eq!((a.status.unwrap().oldest, a.status.unwrap().window), (0, 0));
@@ -207,7 +221,7 @@ fn nodes_that_know_one_seed_find_each_other() {
         // Having what they want, they ask no more, and only ping: a
         // ping and a pong to each peer every thirty seconds.
         let before: u64 = w.nodes.iter().map(|n| n.counts().sent).sum();
-        let peers: usize = (0..30).map(|i| w.nodes[i].peers().len()).sum();
+        let peers: usize = (0..30).map(|i| w.nodes[i].tables().map(|t| t.len()).sum::<usize>()).sum();
         w.run(60 * SECOND);
         let sent = w.nodes.iter().map(|n| n.counts().sent).sum::<u64>() - before;
         assert!(sent <= 2 * 2 * peers as u64 + 60, "loss {loss}: {sent} for {peers}");
@@ -251,7 +265,7 @@ fn a_forged_ping_costs_its_victim_no_more_than_the_forger() {
     assert!(w.live(0).is_empty() && w.nodes[0].peers.sample(None, now).as_slice().is_empty());
     let seconds = w.now / SECOND;
     w.run(200 * SECOND);
-    assert_eq!(w.nodes[0].peers().len(), 0);
+    assert_eq!(w.nodes[0].tables().map(|t| t.len()).sum::<usize>(), 0);
     // In all that time our pings to them were rationed: eight
     // addresses a second at the most.
     let pings = w.strays.iter().filter(|s| matches!(Message::decode(NET, &s.2), Ok(Message::Ping(_)))).count() as u64;
@@ -270,7 +284,7 @@ fn a_pong_that_answers_no_ping_of_ours_proves_nothing() {
     w.inject(at(1), 0, &Message::Pong(boast));
     w.wake[1] = Micros::MAX;
     w.run(10 * MILLI);
-    assert!(!w.nodes[0].peers().proven(&at(1)));
+    assert!(!w.nodes[0].table(&at(1)).proven(&at(1)));
     assert_eq!(w.nodes[0].counts().unheard, 1);
     // Nor does anything else from an address not proven count: a list
     // of peers to try is not taken.
@@ -279,7 +293,7 @@ fn a_pong_that_answers_no_ping_of_ours_proves_nothing() {
     w.inject(at(5), 0, &Message::Peers(addrs));
     w.wake[0] = Micros::MAX;
     w.run(10 * MILLI);
-    assert!(w.nodes[0].peers().get(&at(7)).is_none());
+    assert!(w.nodes[0].table(&at(7)).get(&at(7)).is_none());
     assert_eq!(w.nodes[0].counts().unheard, 2);
 }
 
@@ -293,7 +307,7 @@ fn a_request_is_answered_only_with_its_token() {
     w.nodes[0].add_peer(at(1), false, 0);
     w.nodes[0].add_peer(at(2), false, 0);
     w.run(SECOND);
-    let token = w.nodes[0].peers().get(&at(1)).unwrap().token().unwrap();
+    let token = w.nodes[0].table(&at(1)).get(&at(1)).unwrap().token().unwrap();
     let answers = |w: &World| w.nodes[1].counts().sent;
     // The token node 1 gave node 0: answered.
     let before = answers(&w);
@@ -301,7 +315,7 @@ fn a_request_is_answered_only_with_its_token() {
     w.run(50 * MILLI);
     assert_eq!(answers(&w), before + 1);
     // Without it, with another's, or from another address: nothing.
-    let other = w.nodes[0].peers().get(&at(2)).unwrap().token().unwrap();
+    let other = w.nodes[0].table(&at(2)).get(&at(2)).unwrap().token().unwrap();
     let locator = Locator::new(&[w.nodes[0].genesis]).unwrap();
     for (from, t) in [(at(0), 0), (at(0), other), (at(0), token ^ 1), (at(9), token)] {
         w.inject(from, 1, &Message::GetPeers { token: t });
@@ -316,7 +330,7 @@ fn a_request_is_answered_only_with_its_token() {
     w.run(50 * MILLI);
     assert_eq!(answers(&w), before + 1);
     assert_eq!(w.nodes[1].counts().unheard, 16);
-    assert!(w.nodes[1].peers().proven(&at(0)));
+    assert!(w.nodes[1].table(&at(0)).proven(&at(0)));
     // A token lasts one change of the secret, and not two: an old one
     // kept and used long after is refused. (Pings carry the new one
     // every half minute, so a peer's is never old.)
@@ -329,7 +343,7 @@ fn a_request_is_answered_only_with_its_token() {
     w.run(50 * MILLI);
     assert_eq!(w.nodes[1].counts().unheard, 17);
     // While the one its pings have brought since is good.
-    let fresh = w.nodes[0].peers().get(&at(1)).unwrap().token().unwrap();
+    let fresh = w.nodes[0].table(&at(1)).get(&at(1)).unwrap().token().unwrap();
     assert_ne!(fresh, token);
     w.inject(at(0), 1, &Message::GetPeers { token: fresh });
     w.run(50 * MILLI);
@@ -345,7 +359,10 @@ fn a_node_of_another_chain_or_version_is_answered_and_left_alone() {
     w.nodes[0].add_peer(at(1), false, 0);
     w.run(SECOND);
     // Each answered the other, and neither keeps the other.
-    assert_eq!((w.nodes[0].peers().len(), w.nodes[1].peers().len()), (0, 0));
+    assert_eq!(
+        (w.nodes[0].tables().map(|t| t.len()).sum::<usize>(), w.nodes[1].tables().map(|t| t.len()).sum::<usize>()),
+        (0, 0)
+    );
     assert!(w.nodes[0].counts().strangers >= 1 && w.nodes[1].counts().strangers >= 1);
     // A ping of another version: a pong, and nothing kept.
     let stranger = SocketAddrV4::new(Ipv4Addr::new(77, 1, 1, 1), 9);
@@ -355,7 +372,7 @@ fn a_node_of_another_chain_or_version_is_answered_and_left_alone() {
     assert!(
         matches!(Message::decode(NET, &w.strays[0].2), Ok(Message::Pong(s)) if s.nonce == 3 && s.version == VERSION)
     );
-    assert_eq!(w.nodes[0].peers().len(), 0);
+    assert_eq!(w.nodes[0].tables().map(|t| t.len()).sum::<usize>(), 0);
     // A datagram of another network, and one that is nothing: not
     // answered at all.
     let mut buf = [0u8; MAX_DATAGRAM];
@@ -373,14 +390,14 @@ fn a_node_told_its_own_address_finds_out() {
     w.nodes[0].add_peer(at(1), false, 0);
     w.run(SECOND);
     assert_eq!(w.live(0), [at(1)]);
-    assert!(w.nodes[0].peers().get(&at(0)).is_none());
+    assert!(w.nodes[0].table(&at(0)).get(&at(0)).is_none());
     // Told of again by a peer: not taken again.
     let mut addrs = Addrs::new();
     addrs.push(at(0));
     w.inject(at(1), 0, &Message::Peers(addrs));
     w.run(100 * MILLI);
     let now = w.now;
-    assert!(w.nodes[0].peers().get(&at(0)).is_none() && !w.nodes[0].add_peer(at(0), false, now));
+    assert!(w.nodes[0].table(&at(0)).get(&at(0)).is_none() && !w.nodes[0].add_peer(at(0), false, now));
 }
 
 #[test]
@@ -402,7 +419,7 @@ fn a_node_that_says_goodbye_is_known_at_once_to_be_gone() {
     w.run(30 * MILLI);
     assert!(w.live(1).is_empty() && w.live(2).is_empty());
     // Its place is kept, and when it answers a ping again it is back.
-    assert!(w.nodes[1].peers().get(&at(0)).is_some());
+    assert!(w.nodes[1].table(&at(0)).get(&at(0)).is_some());
     w.run(31 * SECOND);
     assert_eq!(w.live(1), [at(0)]);
 }
@@ -443,8 +460,8 @@ fn a_node_behind_takes_the_headers_of_one_ahead() {
     // Having them, it asks for no more; and the one ahead never asked.
     w.run(60 * SECOND);
     assert_eq!((w.nodes[1].counts().forks_asked, w.nodes[0].counts().forks_asked), (1, 0));
-    assert_eq!(w.nodes[0].peers().get(&at(1)).unwrap().delivered, 0);
-    assert_eq!(w.nodes[1].peers().get(&at(0)).unwrap().delivered, 5);
+    assert_eq!(w.nodes[0].table(&at(1)).get(&at(1)).unwrap().delivered, 0);
+    assert_eq!(w.nodes[1].table(&at(0)).get(&at(0)).unwrap().delivered, 5);
 }
 
 /// Two chains that part: the node with less work takes the headers of
@@ -487,7 +504,7 @@ fn runs_of_headers_come_from_several_peers() {
         w.run(60 * SECOND);
         assert_eq!(w.best(3).height, 45, "loss {loss}");
         assert_eq!(w.nodes[3].counts().headers, 45);
-        let served: Vec<u32> = (0..3).map(|i| w.nodes[3].peers().get(&at(i)).unwrap().delivered).collect();
+        let served: Vec<u32> = (0..3).map(|i| w.nodes[3].table(&at(i)).get(&at(i)).unwrap().delivered).collect();
         assert_eq!(served.iter().sum::<u32>(), 5, "loss {loss}");
         // From all three; where datagrams are lost, from whichever of
         // them had answered a ping by then, two at the least.
@@ -518,7 +535,7 @@ fn a_false_claim_of_work_does_not_hold_a_node_up() {
     w.run(10 * SECOND);
     assert_eq!(w.best(2), w.nodes[0].chain().tip().unwrap());
     let now = w.now;
-    assert!(!w.nodes[2].peers().may_ask(&at(1), now) && w.nodes[2].peers().may_ask(&at(0), now));
+    assert!(!w.nodes[2].table(&at(1)).may_ask(&at(1), now) && w.nodes[2].table(&at(0)).may_ask(&at(0), now));
     // And one that answers where the chains part and then has no
     // headers to show is passed over the same.
     w.mute.clear();
@@ -528,7 +545,7 @@ fn a_false_claim_of_work_does_not_hold_a_node_up() {
     w2.run(5 * SECOND);
     let now = w2.now;
     assert_eq!((w2.best(1).height, w2.nodes[1].counts().forks_asked), (0, 1));
-    assert!(!w2.nodes[1].peers().may_ask(&at(0), now));
+    assert!(!w2.nodes[1].table(&at(0)).may_ask(&at(0), now));
 }
 
 /// A peer that serves headers that are not the chain's takes a strike
@@ -549,12 +566,13 @@ fn a_peer_that_serves_wrong_headers_is_struck() {
     // One wrong run: a strike, nothing kept from it, and the aim let go.
     assert_eq!(w.best(2).height, 0);
     assert!(w.nodes[2].counts().fetched >= 1 && w.nodes[2].list().aim.is_none());
-    assert!(w.nodes[2].peers().get(&at(0)).is_some());
+    assert!(w.nodes[2].table(&at(0)).get(&at(0)).is_some());
     // Five, and its host is refused.
     w.run(60 * SECOND);
     let now = w.now;
-    assert!(w.nodes[2].peers().get(&at(0)).is_none());
-    assert_eq!(w.nodes[2].peers.add(at(0), false, now), Err(crate::net::peers::Refused::Banned));
+    assert!(w.nodes[2].table(&at(0)).get(&at(0)).is_none());
+    let refusal = w.nodes[2].table(&at(0)).refusal(&at(0), false, now);
+    assert_eq!(refusal, Some(crate::net::peers::Refused::Banned));
     assert_eq!(w.best(2).height, 0);
     // An honest peer turns up: from it they are taken.
     w.nodes[2].add_peer(at(1), false, now);
@@ -585,7 +603,7 @@ fn where_chains_part_is_believed_only_as_an_answer() {
     w.nodes[0].boast = Some(U256::MAX);
     w.mute = vec![0];
     for k in 0..5u32 {
-        assert!(w.nodes[1].peers().get(&at(0)).is_some() || k == 0, "after {k}");
+        assert!(w.nodes[1].table(&at(0)).get(&at(0)).is_some() || k == 0, "after {k}");
         w.run(2100 * MILLI);
         let lie = if k % 2 == 0 {
             Message::Fork { height: 3, id: [crate::poseidon2::Fp::new(77 + k); 8] }
@@ -938,7 +956,7 @@ fn an_announcement_from_far_ahead_is_followed_at_once() {
     w.run(SECOND);
     assert_eq!(tip(&w, 1), tip(&w, 0));
     // Its last ping said nothing of them: it was the announcement.
-    assert_eq!(w.nodes[1].peers().get(&at(0)).unwrap().status.unwrap().work, U256::ZERO);
+    assert_eq!(w.nodes[1].table(&at(0)).get(&at(0)).unwrap().status.unwrap().work, U256::ZERO);
 }
 
 /// A peer that serves a body that is not its header's is struck, and
@@ -1003,7 +1021,7 @@ fn a_block_that_breaks_a_rule_is_refused_once() {
     // And a good block after it, from the same peer, is passed over
     // for a while: it has a strike, and failed us.
     let now = w.now;
-    assert!(!w.nodes[1].peers().may_ask(&at(0), now));
+    assert!(!w.nodes[1].table(&at(0)).may_ask(&at(0), now));
 }
 
 /// Bodies are kept only for the blocks that can be undone. A node says
@@ -1019,7 +1037,7 @@ fn bodies_are_asked_only_of_those_that_hold_them() {
     let mut w = World::with(chains, &cfg);
     w.nodes[1].add_peer(at(0), false, 0);
     w.run(20 * SECOND);
-    let said = w.nodes[1].peers().get(&at(0)).unwrap().status.unwrap();
+    let said = w.nodes[1].table(&at(0)).get(&at(0)).unwrap().status.unwrap();
     assert_eq!((said.height, said.oldest, said.window), (KEEP as u32 + 6, 7, 6));
     // Every header, no body: the first it needs is the first block's,
     // which nobody holds.
@@ -1106,7 +1124,7 @@ fn a_state_is_served_in_pieces_that_check_and_make_it_whole() {
     }
     // And the state as of a block too old to go back to: a node says
     // how far back it can, in its pings.
-    let said = w.nodes[1].peers().get(&at(0)).unwrap().status.unwrap();
+    let said = w.nodes[1].table(&at(0)).get(&at(0)).unwrap().status.unwrap();
     assert_eq!((said.window, said.height), (0, 20));
 }
 
@@ -1133,8 +1151,9 @@ fn a_state_is_served_as_far_back_as_can_be_undone() {
     }
     // What is kept to be served is bounded by its bytes, not its count.
     for height in 9..40 {
-        node.object(&Object::Manifest(id(node, height))).unwrap();
-        node.object(&Object::Part { block: id(node, height), index: 0 }).unwrap();
+        let block = id(node, height);
+        node.object(&Object::Manifest(block)).unwrap();
+        node.object(&Object::Part { block, index: 0 }).unwrap();
     }
     assert!(node.served.len() == 62 && node.served.iter().map(|s| s.1.len()).sum::<usize>() <= SERVED_BYTES);
 }
@@ -1182,7 +1201,7 @@ fn a_new_node_takes_the_state_and_goes_on_from_it() {
         assert!(w.nodes[2].list().join.is_none() && !w.nodes[2].chain().receiving());
         // The state was of three parts (twenty-one thousand outputs),
         // and both peers served pieces of it.
-        let served: Vec<u32> = (0..2).map(|i| w.nodes[2].peers().get(&at(i)).unwrap().delivered).collect();
+        let served: Vec<u32> = (0..2).map(|i| w.nodes[2].table(&at(i)).get(&at(i)).unwrap().delivered).collect();
         assert!(served.iter().all(|n| *n >= 2), "loss {loss}: {served:?}");
         // It serves what it took: the block it took the state as of,
         // and the state as of its tip.
@@ -1253,7 +1272,7 @@ fn wrong_pieces_of_a_state_are_refused() {
     assert_eq!(w.nodes[2].counts().states, 1);
     // The liar is out, or passed over; the honest one is neither.
     let now = w.now;
-    assert!(!w.nodes[2].peers().may_ask(&at(1), now) && w.nodes[2].peers().may_ask(&at(0), now));
+    assert!(!w.nodes[2].table(&at(1)).may_ask(&at(1), now) && w.nodes[2].table(&at(0)).may_ask(&at(0), now));
 }
 
 /// The peers go on past the block a state is being taken as of, until
@@ -1457,4 +1476,79 @@ fn over_real_sockets_a_state_is_taken() {
     let counts: Vec<Counts> = threads.into_iter().map(|t| t.join().unwrap()).collect();
     assert_eq!(behind.state().root(), root);
     assert_eq!((counts[1].headers, counts[1].states, counts[1].blocks, counts[1].blocks_refused), (80, 1, 10, 0));
+}
+
+// -- Several workers
+
+/// What nodes of one worker do, nodes of several do: each worker with
+/// the hosts that are its own, and what is about all of them shared.
+#[test]
+fn several_workers_find_peers() {
+    several(nodes_that_know_one_seed_find_each_other);
+    several(a_node_that_says_goodbye_is_known_at_once_to_be_gone);
+}
+
+#[test]
+fn several_workers_take_headers() {
+    several(a_node_behind_takes_the_headers_of_one_ahead);
+    several(headers_are_taken_from_where_two_chains_part);
+    several(runs_of_headers_come_from_several_peers);
+    several(a_false_claim_of_work_does_not_hold_a_node_up);
+    several(a_peer_that_serves_wrong_headers_is_struck);
+}
+
+#[test]
+fn several_workers_take_blocks() {
+    several(a_node_behind_takes_the_blocks_of_one_ahead);
+    several(a_new_block_crosses_the_network);
+    several(a_node_goes_over_to_the_branch_with_more_work);
+    several(an_announcement_from_far_ahead_is_followed_at_once);
+    several(a_wrong_body_is_refused_and_fetched_elsewhere);
+    several(a_block_that_breaks_a_rule_is_refused_once);
+    several(bodies_are_asked_only_of_those_that_hold_them);
+}
+
+#[test]
+#[cfg_attr(debug_assertions, ignore = "builds long chains; run with --release")]
+fn several_workers_take_a_state() {
+    several(a_new_node_takes_the_state_and_goes_on_from_it);
+    several(a_node_long_away_takes_the_state);
+    several(the_state_is_taken_only_when_blocks_cannot_be_had);
+    several(wrong_pieces_of_a_state_are_refused);
+    several(a_state_is_gone_on_with_as_of_a_later_block);
+}
+
+/// A host is one worker's, whatever the port; hosts are spread over
+/// the workers; and the limits that are of the whole node (peers in
+/// all, peers of one network) hold over all of them.
+#[test]
+fn a_host_is_one_workers_and_the_nodes_limits_hold_over_all() {
+    let mut cfg = Config { workers: 4, ..Config::default() };
+    cfg.peers.max = 40;
+    let mut node: TestNode = Node::new(cfg, NET, chain_of(easy()), [7; 32], 0);
+    let sizes = |node: &TestNode| node.tables().map(|t| t.len()).collect::<Vec<usize>>();
+    // Four ports of one host: all in one table, and a fifth refused
+    // there (four to a host).
+    let port = |p: u16| SocketAddrV4::new(Ipv4Addr::new(30, 1, 2, 3), p);
+    assert!((1..=4).all(|p| node.add_peer(port(p), false, 0)) && !node.add_peer(port(5), false, 0));
+    assert_eq!(sizes(&node).iter().filter(|n| **n > 0).count(), 1);
+    assert_eq!(node.table(&port(1)).len(), 4);
+    // Hosts of twenty networks: on every worker.
+    let host = |k: u8| SocketAddrV4::new(Ipv4Addr::new(40, k, 0, 1), 3737);
+    assert!((0..20).all(|k| node.add_peer(host(k), false, 0)));
+    assert!(sizes(&node).iter().all(|n| *n > 0), "{:?}", sizes(&node));
+    // Twenty hosts of one network, on several workers: eight are taken.
+    let near = |k: u8| SocketAddrV4::new(Ipv4Addr::new(50, 7, k, 1), 3737);
+    let taken: Vec<u8> = (0..20).filter(|k| node.add_peer(near(*k), false, 0)).collect();
+    assert_eq!(taken.len(), 8);
+    let mut of: Vec<usize> = taken.iter().map(|k| node.shared.owner(&near(*k))).collect();
+    of.dedup();
+    assert!(of.len() > 1, "{of:?}");
+    // Thirty-two in all; and never more than forty, however many more
+    // are told of (one that never answered gives way, in its own
+    // worker's table).
+    assert_eq!(sizes(&node).iter().sum::<usize>(), 32);
+    let far = |k: u8| SocketAddrV4::new(Ipv4Addr::new(60, k, 0, 1), 3737);
+    assert_eq!((0..100).filter(|k| node.add_peer(far(*k), false, 0)).count(), 100);
+    assert_eq!((sizes(&node).iter().sum::<usize>(), node.peer_counts(0)), (40, (40, 0)));
 }
