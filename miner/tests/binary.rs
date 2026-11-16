@@ -92,7 +92,7 @@ fn a_node_starts_says_it_is_ready_and_halts_when_told() {
     assert!(said.iter().any(|l| l.ends_with(&format!("Main Log:                '{data}/tabernacle.log'"))));
     assert!(said.iter().any(|l| l.ends_with("Max Peers:               '2,000'")));
     // How many threads, as a number: one a core, nothing being said.
-    let cores = std::thread::available_parallelism().unwrap().get();
+    let cores = tabminer::parallel::cores();
     assert!(said.iter().any(|l| l.ends_with(&format!("Threads:                 '{cores}'"))), "{said:#?}");
 
     // It is ready: a datagram that is no message is taken, and has its
@@ -206,8 +206,9 @@ fn two_nodes_make_blocks_and_take_each_others() {
         // it was won, or that it came from the other.
         let main = std::fs::read_to_string(dir.join("tabernacle.log")).unwrap();
         assert!(!main.contains("Error"), "{main}");
-        let told = ["] Mining block 1 on ", "] Won block ", " hashes in ", "] Received block ", ") from 127.0.0.1:"];
-        for said in told.into_iter().chain(["] Peer 127.0.0.1:", " connected (height "]) {
+        let told = ["] Proving block 1 on ", "] Mining block 1 on ", ": proved in ", "] Won block ", " hashes in "];
+        let told = told.into_iter().chain(["] Received block ", ") from 127.0.0.1:"]);
+        for said in told.chain(["] Peer 127.0.0.1:", " connected (height "]) {
             assert!(main.contains(said), "{said}: {main}");
         }
         let _ = std::fs::remove_dir_all(dir);

@@ -19,7 +19,7 @@
 //!
 //! 1. The reward's transaction, and its witness against the state as
 //!    it is.
-//! 2. The block's proof.
+//! 2. The block's proof: what takes the time, where proofs are large.
 //! 3. The header, and a nonce whose hash meets the target: on every
 //!    thread there is, each trying its own nonces.
 
@@ -129,8 +129,9 @@ pub enum Mined {
 /// Makes the block after `chain`'s last, paying its reward to the key
 /// of hash `reward`. `unix` is the time by the calendar, in seconds,
 /// and `start` where the nonces tried begin (any number: so that two
-/// miners do not try the same). `cancel` is asked now and then whether
-/// to give up.
+/// miners do not try the same). `proved` is called when the block's
+/// proof is made, with how long that took: from then the nonce is
+/// looked for. `cancel` is asked now and then whether to give up.
 ///
 /// `dataset` is the table of the proof of work for that block's
 /// height: whole, or one that fills as it is read
@@ -141,6 +142,7 @@ pub fn mine<B: Backend + 'static, S: ItemSource + Sync>(
     reward: &Digest,
     unix: u64,
     start: u64,
+    proved: &dyn Fn(Duration),
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<Mined, Error> {
     let params = *chain.params();
@@ -210,7 +212,9 @@ pub fn mine<B: Backend + 'static, S: ItemSource + Sync>(
         return Ok(Mined::Cancelled);
     };
     body.proof = proof;
-    let proved = began.elapsed();
+    let took = began.elapsed();
+    // The proof is made: what is left is to find the nonce.
+    proved(took);
     let header = Header {
         prev_hash: tip.hash(),
         height,
@@ -228,7 +232,7 @@ pub fn mine<B: Backend + 'static, S: ItemSource + Sync>(
     };
     let header = Header { nonce, mix, ..header };
     let solved = began.elapsed();
-    Ok(Mined::Block { block: Block { header, body }.to_bytes(), header, proved, hashes, solved })
+    Ok(Mined::Block { block: Block { header, body }.to_bytes(), header, proved: took, hashes, solved })
 }
 
 /// The proof in a body kept by the chain.
@@ -387,7 +391,7 @@ mod tests {
         let (chain, dataset) = dev();
         let reward: Digest = core::array::from_fn(|i| Fp::new(1000 + i as u32));
         for height in 1..=3u32 {
-            let made = mine(&chain, &dataset, &reward, NOW, height as u64 * 1_000_003, &|| false).unwrap();
+            let made = mine(&chain, &dataset, &reward, NOW, height as u64 * 1_000_003, &|_| {}, &|| false).unwrap();
             let Mined::Block { block, header, hashes, .. } = made else { panic!("{made:?}") };
             assert!(header.height == height && hashes >= 1);
             let view = BlockRef::from_bytes(&block).unwrap();
@@ -412,7 +416,7 @@ mod tests {
         let reward: Digest = core::array::from_fn(|i| Fp::new(1000 + i as u32));
         for height in 1..=3u32 {
             let began = Instant::now();
-            let made = mine(&chain, &dataset, &reward, NOW, height as u64 * 1_000_003, &|| false).unwrap();
+            let made = mine(&chain, &dataset, &reward, NOW, height as u64 * 1_000_003, &|_| {}, &|| false).unwrap();
             let Mined::Block { block, header, proved, .. } = made else { panic!("{made:?}") };
             println!("block {height}: {} bytes, proved in {proved:?}, made in {:?}", block.len(), began.elapsed());
             let view = BlockRef::from_bytes(&block).unwrap();
@@ -435,7 +439,7 @@ mod tests {
     fn it_gives_up_when_told() {
         let (chain, dataset) = dev();
         let reward: Digest = core::array::from_fn(|i| Fp::new(1000 + i as u32));
-        assert!(matches!(mine(&chain, &dataset, &reward, NOW, 0, &|| true).unwrap(), Mined::Cancelled));
+        assert!(matches!(mine(&chain, &dataset, &reward, NOW, 0, &|_| {}, &|| true).unwrap(), Mined::Cancelled));
         // A target nothing meets: until told.
         let asked = AtomicU64::new(0);
         let cancel = || asked.fetch_add(1, Ordering::Relaxed) >= 3;

@@ -33,11 +33,12 @@ fn main() {
     let here = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
     let read = |path: &Path| std::fs::read_to_string(path);
     let configuration = match Configuration::read(&args, home.as_deref(), &here, &read) {
-        // A thread to a core, unless told how many: and from here on
-        // it is that many, so that the log says the number.
+        // A thread to a core, unless told how many (a core, not each of
+        // the two threads a core may run): and from here on it is that
+        // many, so that the log says the number.
         Ok(mut configuration) => {
             if configuration.threads == 0 {
-                configuration.threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+                configuration.threads = tabminer::parallel::cores();
             }
             configuration
         }
@@ -205,9 +206,18 @@ fn make_blocks(
             hold.behind() != Behind::No
         };
         start = start.wrapping_add(1 << 32);
-        if let Ok(tip) = hold.chain().tip() {
-            main.log(&format!("Mining block {} on {}", commas(tip.height as u64 + 1), short(&tip.hash())));
+        // Two steps, each said as it is begun: the block's proof is
+        // made, and then the nonce is looked for.
+        let on = hold.chain().tip().map(|tip| (commas(tip.height as u64 + 1), short(&tip.hash())));
+        if let Ok((height, parent)) = &on {
+            main.log(&format!("Proving block {height} on {parent}"));
         }
+        let proved = |took: Duration| {
+            if let Ok((height, parent)) = &on {
+                let took = short_seconds(took.as_millis() as u64);
+                main.log(&format!("Mining block {height} on {parent}: proved in {took}"));
+            }
+        };
         // The table grows with the chain, a year at a time: what it
         // has stays, and the rest is filled as the first was.
         let wanted = hold.chain().tip().map_or(0, |tip| pow.log_items_at(tip.height as u64 + 1));
@@ -219,13 +229,12 @@ fn make_blocks(
             fill_table(&table, kept, main);
         }
         let dataset = table.read().unwrap_or_else(|e| e.into_inner());
-        match miner::mine(hold.chain(), &*dataset, reward, socket::unix(), start, &cancel) {
-            Ok(Mined::Block { block, header, proved, hashes, solved }) => {
+        match miner::mine(hold.chain(), &*dataset, reward, socket::unix(), start, &proved, &cancel) {
+            Ok(Mined::Block { block, header, hashes, solved, .. }) => {
                 main.log(&format!(
-                    "Won block {} ({}): proved in {}, {} hashes in {}",
+                    "Won block {} ({}): {} hashes in {}",
                     commas(header.height as u64),
                     short(&header.hash()),
-                    short_seconds(proved.as_millis() as u64),
                     commas(hashes),
                     short_seconds(solved.as_millis() as u64)
                 ));

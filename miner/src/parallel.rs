@@ -15,6 +15,63 @@ pub fn set_threads(n: usize) -> bool {
     n > 0 && THREADS.set(n).is_ok()
 }
 
+/// How many cores the machine has: cores, not the threads the system
+/// counts where each core runs two. What a node uses unless told how
+/// many threads to use: a second thread on a core adds little to work
+/// that is all arithmetic, and a machine with every thread taken has
+/// none left for anything else.
+///
+/// Where the system does not say (or says it in a way not read here),
+/// the threads it counts.
+pub fn cores() -> usize {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    physical_cores().filter(|n| (1..=threads).contains(n)).unwrap_or(threads)
+}
+
+/// On Linux: the threads that share a core are listed for each
+/// (`thread_siblings_list`), the same list for each of them; so there
+/// are as many cores as there are different lists.
+#[cfg(target_os = "linux")]
+fn physical_cores() -> Option<usize> {
+    let mut cores = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir("/sys/devices/system/cpu").ok()?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // (`cpu0`, `cpu1`, ...: not `cpufreq` or `cpuidle`.)
+        if name.strip_prefix("cpu").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
+            // A thread that is switched off has no topology: not counted.
+            let Ok(siblings) = std::fs::read_to_string(entry.path().join("topology/thread_siblings_list")) else {
+                continue;
+            };
+            // (With its package: two packages number their cores alike.)
+            let package =
+                std::fs::read_to_string(entry.path().join("topology/physical_package_id")).unwrap_or_default();
+            cores.insert((package.trim().to_string(), siblings.trim().to_string()));
+        }
+    }
+    (!cores.is_empty()).then_some(cores.len())
+}
+
+/// On macOS the system says, by name.
+#[cfg(target_os = "macos")]
+fn physical_cores() -> Option<usize> {
+    unsafe extern "C" {
+        fn sysctlbyname(name: *const u8, old: *mut u8, old_len: *mut usize, new: *const u8, new_len: usize) -> i32;
+    }
+    let (mut cores, mut len) = (0i32, std::mem::size_of::<i32>());
+    // SAFETY: a name that ends in a zero byte, and room for the four
+    // bytes of the answer, its length said.
+    let ok = unsafe {
+        sysctlbyname(c"hw.physicalcpu".as_ptr().cast(), (&raw mut cores).cast(), &raw mut len, std::ptr::null(), 0)
+    };
+    (ok == 0 && cores > 0).then_some(cores as usize)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn physical_cores() -> Option<usize> {
+    None
+}
+
 /// Number of worker threads.
 pub fn threads() -> usize {
     *THREADS.get_or_init(|| {
@@ -275,5 +332,31 @@ mod tests {
             }
         });
         assert!(v.iter().enumerate().all(|(i, x)| *x == i as u32));
+    }
+}
+
+#[cfg(test)]
+mod core_tests {
+    /// As many cores as the system counts threads, or fewer: and, on
+    /// Linux, as many as its own list of processors says.
+    #[test]
+    fn cores_are_counted() {
+        let threads = std::thread::available_parallelism().unwrap().get();
+        let cores = super::cores();
+        assert!((1..=threads).contains(&cores), "{cores} of {threads}");
+        #[cfg(target_os = "linux")]
+        if let Ok(info) = std::fs::read_to_string("/proc/cpuinfo") {
+            // (Where the list says which core each processor is of.)
+            let of = |key: &str| -> Vec<&str> {
+                info.lines().filter(|l| l.starts_with(key)).filter_map(|l| l.split(':').nth(1)).map(str::trim).collect()
+            };
+            let (packages, ids) = (of("physical id"), of("core id"));
+            if !ids.is_empty() && packages.len() == ids.len() {
+                let mut pairs: Vec<_> = packages.iter().zip(&ids).collect();
+                pairs.sort();
+                pairs.dedup();
+                assert_eq!(cores, pairs.len());
+            }
+        }
     }
 }

@@ -364,8 +364,9 @@ aside, and stopping.
 ...
 [2026-11-16 08:59:49:226] Received block 5 (e6760963) from 127.0.0.1:37411
 [2026-11-16 08:59:49:226] Synced at block 5
-[2026-11-16 08:59:50:299] Mining block 6 on e6760963
-[2026-11-16 08:59:52:386] Won block 6 (e494f101): proved in 0.05s, 624,125 hashes in 1.57s
+[2026-11-16 08:59:50:299] Proving block 6 on e6760963
+[2026-11-16 08:59:50:349] Mining block 6 on e6760963: proved in 0.05s
+[2026-11-16 08:59:51:919] Won block 6 (e494f101): 624,125 hashes in 1.57s
 ```
 
 | Line | Says |
@@ -382,10 +383,11 @@ aside, and stopping.
 | `Synced at block N` | The chain that was being caught up with has been |
 | `Taking the state as of block N (id)` | The blocks cannot be had, and the state is taken whole (`as of a later block`, if the first could no longer be served) |
 | `State taken as of block N` | It has been |
-| `Mining block N on P` | A block is begun here, on the block of id P |
+| `Proving block N on P` | A block is begun here, on the block of id P: its proof is being made |
+| `Mining block N on P: proved in T` | Its proof is made, in that time, and its nonce is being looked for |
 | `Not mining: a chain ahead is coming in, to block N (id)` | Headers that have been checked show a chain two blocks or more ahead, and its blocks are waited for (4.1) |
 | `Mining again: the blocks of the chain ahead, to block N (id), have not come in T` | They were waited for long enough |
-| `Won block N (id): ...` | Its proof of work was found here: how long its proof took, how many hashes and how long its nonce |
+| `Won block N (id): H hashes in T` | Its proof of work was found here: how many hashes its nonce took, and how long |
 | `Refused block N (id) from A: why` | A block was refused (`made here`, if it was ours) |
 
 A peer gone is said when the node next looks to its peers, so up to a

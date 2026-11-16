@@ -65,7 +65,7 @@ const OPTIONS: &[(&str, &[Opt])] = &[
             Opt {
                 name: "threads",
                 takes: Takes::Value("N"),
-                help: "threads that handle requests, and threads for hashing and\nchecking proofs (default 0: one a core)",
+                help: "threads that handle requests, and threads for hashing and\nchecking proofs (default 0: one a core, counting cores and\nnot the two threads a core may run)",
             },
         ],
     ),
