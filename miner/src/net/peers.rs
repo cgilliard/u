@@ -584,6 +584,12 @@ impl Peers {
         })
     }
 
+    /// The live peers, not passed over, whose chain reaches `height`:
+    /// whom to ask for a header there.
+    pub fn reaching(&self, height: u32, now: Micros) -> impl Iterator<Item = &Peer> {
+        self.live(now).filter(move |p| !self.passed_over(p, now) && p.status.is_some_and(|s| height <= s.height))
+    }
+
     /// The live peers, not passed over, that can hand over the state as
     /// of `height` in parts.
     pub fn servers_of_state(&self, height: u32, now: Micros) -> impl Iterator<Item = &Peer> {

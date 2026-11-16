@@ -22,6 +22,9 @@ const MINUTE: Micros = 60 * SECOND;
 /// The settings. See each group.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
+    /// How often a node looks to what passes with time: whom to ping,
+    /// whom to drop, what to fetch next.
+    pub tick: Micros,
     pub peers: Peers,
     pub sync: Sync,
     pub serve: Serve,
@@ -191,7 +194,7 @@ impl Default for Serve {
 #[allow(clippy::derivable_impls)]
 impl Default for Config {
     fn default() -> Config {
-        Config { peers: Peers::default(), sync: Sync::default(), serve: Serve::default() }
+        Config { tick: SECOND, peers: Peers::default(), sync: Sync::default(), serve: Serve::default() }
     }
 }
 
@@ -201,6 +204,7 @@ impl Config {
     pub fn check(&self) -> Result<(), Error> {
         let (p, s) = (&self.peers, &self.sync);
         let need = |ok: bool, what: &'static str| if ok { Ok(()) } else { Err(Error::Setting(what)) };
+        need(self.tick >= 10 * MILLI && self.tick <= 10 * SECOND, "tick is not between 10 ms and 10 s")?;
         need(p.max >= 1, "peers.max is zero")?;
         need(p.target >= 1 && p.target <= p.max, "peers.target is not between one and peers.max")?;
         need(p.per_host >= 1, "peers.per_host is zero")?;
@@ -237,6 +241,7 @@ mod tests {
     fn the_defaults_are_what_the_document_says_and_can_be_run_with() {
         let c = Config::default();
         assert_eq!(c.check(), Ok(()));
+        assert_eq!(c.tick, SECOND);
         let (p, s) = (&c.peers, &c.sync);
         assert_eq!((p.max, p.target, p.per_host, p.per_network, p.unproven_pings), (64, 8, 4, 8, 8));
         assert_eq!((p.ping, p.first_ping_retry), (30 * SECOND, 2 * SECOND));
@@ -262,6 +267,7 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         };
+        assert!(bad(|c| c.tick = 0).contains("tick"));
         assert!(bad(|c| c.peers.max = 0).contains("peers.max"));
         assert!(bad(|c| c.peers.target = 65).contains("peers.target"));
         assert!(bad(|c| c.peers.target = 0).contains("peers.target"));

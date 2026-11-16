@@ -110,6 +110,12 @@ impl<B: Backend + 'static, V> Chain<B, V> {
         &self.verifier
     }
 
+    /// How many blocks can be undone: how far back the state can be
+    /// handed over as it was.
+    pub fn keep(&self) -> usize {
+        self.keep
+    }
+
     /// The store beneath.
     pub fn state(&self) -> &State<B> {
         &self.state

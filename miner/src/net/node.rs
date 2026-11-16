@@ -19,36 +19,53 @@
 //! 2. A request is answered only if it carries the token this node gave
 //!    its address.
 //! 3. Anything else is taken only from a peer that has answered one of
-//!    our pings.
+//!    our pings, and a chunk only for a fetch of ours, by its number.
+//!
+//! # Headers
+//!
+//! Every peer says in its pings how much work its chain has. While a
+//! live peer claims more than the best header here, its headers are
+//! fetched:
+//!
+//! 1. The peer is asked which of our blocks is the newest on its chain
+//!    ([`Message::FindFork`]): from there its chain is news to us.
+//! 2. From there to its tip, its headers are fetched as objects of up
+//!    to [`super::config::Sync::headers`] each, several at once, each
+//!    from another peer whose chain reaches that far. Every one is
+//!    named with the tip aimed at, so that all are of one chain.
+//! 3. They are checked and kept in order ([`Chain::accept_headers`]).
+//!    A peer whose headers are refused takes a strike.
+//!
+//! A peer that claims work and does not answer for it within
+//! [`super::config::Sync::header_wait`] is passed over for a while, so
+//! that a false claim cannot hold a node up.
 //!
 //! # What is here so far
 //!
-//! Finding and keeping peers: pings and pongs, "whom else do you know?"
-//! and its answer, and "I am going". What a node does about headers,
-//! blocks and the state comes on top of this.
+//! Finding and keeping peers, and headers. Bodies and the state come
+//! on top of this.
 
-use std::net::{IpAddr, SocketAddr, SocketAddrV4};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::net::{SocketAddr, SocketAddrV4};
+use std::sync::Arc;
 
 use super::config::Config;
-use super::message::{Message, Status};
+use super::message::{Locator, Message, Status};
+use super::object::{MAX_NAME, Object};
 use super::peers::Peers;
 use super::{MAX_DATAGRAM, VERSION};
+use crate::block::{HEADER_SIZE, Header};
+use crate::chain::Chain;
+use crate::chain::headers::LOCATOR;
 use crate::hash::Digest;
 use crate::sha256::Sha256;
-use crate::transport::Micros;
+use crate::store::backend::Backend;
+use crate::transport::fetch::{Fetch, Poll, Why};
+use crate::transport::serve::{Next, Serve};
 use crate::transport::token::Tokens;
+use crate::transport::wire::{Chunk, Get, Gone, Ranges};
+use crate::transport::{Micros, chunk_of};
 use crate::u256::U256;
-
-/// What a node says of its own chain, in every ping and pong: the
-/// chain's part of a [`Status`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Ours {
-    pub height: u32,
-    pub oldest: u32,
-    pub window: u32,
-    pub tip: Digest,
-    pub work: U256,
-}
 
 /// What has happened, for whoever watches a node.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -62,17 +79,53 @@ pub struct Counts {
     pub strangers: u64,
     /// Datagrams sent.
     pub sent: u64,
+    /// Times a peer was asked where its chain leaves ours.
+    pub forks_asked: u64,
+    /// Objects fetched whole, and fetches given up.
+    pub fetched: u64,
+    pub fetches_failed: u64,
+    /// Headers kept that were new.
+    pub headers: u64,
 }
 
-pub struct Node {
+/// Objects made to be served, kept while they are being asked for.
+const SERVED: usize = 16;
+/// Chunks sent in one go before the node looks to what else there is.
+const SERVE_BATCH: usize = 256;
+
+/// An object being fetched.
+struct Fetching {
+    object: Object,
+    from: SocketAddrV4,
+    fetch: Fetch,
+}
+
+/// The chain being caught up with: a tip some peer has, and its headers
+/// from where its chain leaves ours.
+struct Aim {
+    /// The tip, and its height.
+    tip: Digest,
+    height: u32,
+    /// The first heights of the runs of headers not yet asked for.
+    todo: BTreeSet<u32>,
+    /// Runs fetched and waiting for those before them: by first height,
+    /// with who served each.
+    done: BTreeMap<u32, (Vec<Header>, SocketAddrV4)>,
+    /// The first height not yet kept.
+    next: u32,
+}
+
+pub struct Node<B: Backend + 'static, V> {
     cfg: Config,
     /// The network's four bytes.
     network: [u8; 4],
     /// Its genesis block's id.
     genesis: Digest,
+    chain: Arc<Chain<B, V>>,
     peers: Peers,
     tokens: Tokens,
-    /// What the tokens' secrets and the pings' numbers are made from.
+    /// What the tokens' secrets, the pings' numbers and the fetches'
+    /// are made from.
     secret: [u8; 32],
     /// How many of each have been made.
     secrets: u64,
@@ -83,32 +136,62 @@ pub struct Node {
     budget: usize,
     /// When a peer was last asked whom else it knows.
     asked: Option<Micros>,
+    /// The time by the calendar, in seconds: what a header's time is
+    /// held against.
+    unix: u64,
+    /// When what passes with time is next looked to.
+    due: Micros,
+    serve: Serve,
+    /// Objects lately made to be served, the latest first.
+    served: VecDeque<(Object, Arc<Vec<u8>>)>,
+    fetches: Vec<Fetching>,
+    /// The peer asked where its chain leaves ours, and when.
+    probe: Option<(SocketAddrV4, Micros)>,
+    aim: Option<Aim>,
     counts: Counts,
+    /// Tests: a chain's work claimed that is not there; objects served
+    /// with a byte wrong.
+    #[cfg(test)]
+    pub(crate) boast: Option<U256>,
+    #[cfg(test)]
+    pub(crate) spoil: bool,
 }
 
 /// A datagram to send goes to this.
 pub type Out<'a> = &'a mut dyn FnMut(SocketAddrV4, &[u8]);
 
-impl Node {
-    /// A node of the network `network`, whose first block is `genesis`,
-    /// with these settings. `secret` is from the operating system's
-    /// random source: the tokens this node gives and the numbers of its
-    /// pings come of it, and nobody is to foretell either.
-    pub fn new(cfg: Config, network: [u8; 4], genesis: Digest, secret: [u8; 32], now: Micros) -> Node {
+impl<B: Backend + 'static, V: Sync> Node<B, V> {
+    /// A node of the network `network` keeping `chain`, with these
+    /// settings. `secret` is from the operating system's random source:
+    /// the tokens this node gives, the numbers of its pings and those
+    /// of its fetches come of it, and nobody is to foretell any.
+    pub fn new(cfg: Config, network: [u8; 4], chain: Arc<Chain<B, V>>, secret: [u8; 32], now: Micros) -> Node<B, V> {
         let seed = u64::from_le_bytes(derive(&secret, b's', 0)[..8].try_into().unwrap());
         Node {
             peers: Peers::new(&cfg, seed),
             budget: cfg.peers.unproven_pings,
+            serve: Serve::with(cfg.serve.limits()),
             cfg,
             network,
-            genesis,
+            genesis: chain.params().genesis().header.hash(),
+            chain,
             tokens: Tokens::new(derive(&secret, b't', 0)),
             secret,
             secrets: 0,
             numbers: 0,
             rotated: now,
             asked: None,
+            unix: 0,
+            due: now,
+            served: VecDeque::new(),
+            fetches: Vec::new(),
+            probe: None,
+            aim: None,
             counts: Counts::default(),
+            #[cfg(test)]
+            boast: None,
+            #[cfg(test)]
+            spoil: false,
         }
     }
 
@@ -116,8 +199,17 @@ impl Node {
         &self.peers
     }
 
+    pub fn chain(&self) -> &Arc<Chain<B, V>> {
+        &self.chain
+    }
+
     pub fn counts(&self) -> Counts {
         self.counts
+    }
+
+    /// Objects being fetched now.
+    pub fn fetching(&self) -> usize {
+        self.fetches.len()
     }
 
     /// Takes `addr` as an address to try: a seed, a peer given by hand
@@ -126,24 +218,32 @@ impl Node {
         self.peers.add(addr, seed, now).is_ok()
     }
 
-    /// A number for a ping: one nobody can foretell, since a pong that
-    /// carries it is taken to show its sender received the ping.
+    /// A number nobody can foretell: for a ping, since a pong that
+    /// carries it is taken to show its sender received the ping; for a
+    /// fetch, since a chunk that carries it is taken to be its answer.
     fn number(secret: &[u8; 32], numbers: &mut u64) -> u64 {
         *numbers += 1;
         u64::from_le_bytes(derive(secret, b'n', *numbers)[..8].try_into().unwrap())
     }
 
-    fn status(&self, to: &SocketAddrV4, nonce: u64, ours: &Ours) -> Status {
+    /// What this node says of itself to `to`, answering or asking with
+    /// `nonce`.
+    fn status(&self, to: &SocketAddrV4, nonce: u64) -> Status {
+        // A store that cannot be read says the least there is to say.
+        let tip = self.chain.tip().unwrap_or_else(|_| self.chain.params().genesis().header);
+        let work = self.chain.tip_work().unwrap_or(U256::ZERO);
+        #[cfg(test)]
+        let work = self.boast.unwrap_or(work);
         Status {
             nonce,
             version: VERSION,
             token: self.tokens.issue(&SocketAddr::V4(*to)),
             genesis: self.genesis,
-            height: ours.height,
-            oldest: ours.oldest,
-            window: ours.window,
-            tip: ours.tip,
-            work: ours.work,
+            height: tip.height,
+            oldest: 0,
+            window: tip.height.saturating_sub(self.chain.keep() as u32),
+            tip: tip.hash(),
+            work,
         }
     }
 
@@ -161,11 +261,26 @@ impl Node {
         ok
     }
 
-    /// What passes with time: called every second or so, and at the
-    /// start. Pings whoever is due, drops whoever has been silent too
-    /// long, looks for more peers while there are too few, and replaces
-    /// the tokens' secret when it has had its time.
-    pub fn tick(&mut self, now: Micros, ours: &Ours, out: Out<'_>) {
+    /// Looks to everything that is due at `now`, and says when to be
+    /// called again at the latest: sooner if a datagram arrives.
+    /// `unix` is the time by the calendar, in seconds.
+    ///
+    /// Every [`Config::tick`]: pings whoever is due, drops whoever has
+    /// been silent too long, looks for more peers while there are too
+    /// few, replaces the tokens' secret when it has had its time, and
+    /// sees whether there are headers to catch up with. Every call:
+    /// what the fetches under way and the chunks being served want
+    /// done.
+    pub fn tick(&mut self, now: Micros, unix: u64, out: Out<'_>) -> Micros {
+        self.unix = unix;
+        if now >= self.due {
+            self.due = now + self.cfg.tick;
+            self.periodic(now, out);
+        }
+        self.pump(now, out).min(self.due)
+    }
+
+    fn periodic(&mut self, now: Micros, out: Out<'_>) {
         if now.saturating_sub(self.rotated) >= self.cfg.serve.token_life {
             self.secrets += 1;
             self.tokens.rotate(derive(&self.secret, b't', self.secrets));
@@ -175,9 +290,9 @@ impl Node {
         self.budget = self.cfg.peers.unproven_pings;
         let mut due = Vec::new();
         let (secret, numbers) = (&self.secret, &mut self.numbers);
-        self.peers.pings_due(now, || Node::number(secret, numbers), |addr, number| due.push((addr, number)));
+        self.peers.pings_due(now, || Self::number(secret, numbers), |addr, number| due.push((addr, number)));
         for (addr, number) in due {
-            let ping = Message::Ping(self.status(&addr, number, ours));
+            let ping = Message::Ping(self.status(&addr, number));
             self.send(addr, &ping, out);
         }
         if self.peers.wants_more(now) && self.asked.is_none_or(|t| now.saturating_sub(t) >= self.cfg.peers.discover) {
@@ -189,10 +304,12 @@ impl Node {
                 self.send(addr, &Message::GetPeers { token }, out);
             }
         }
+        self.sync_headers(now, out);
     }
 
-    /// Takes a datagram that arrived from `from`.
-    pub fn handle(&mut self, now: Micros, from: SocketAddr, bytes: &[u8], ours: &Ours, out: Out<'_>) {
+    /// Takes a datagram that arrived from `from`. Call [`Node::tick`]
+    /// after it.
+    pub fn handle(&mut self, now: Micros, from: SocketAddr, bytes: &[u8], out: Out<'_>) {
         // Addresses of the older kind only (`docs/WIRE.md`, 1.1).
         let from = match from {
             SocketAddr::V4(a) => a,
@@ -206,7 +323,7 @@ impl Node {
             return;
         };
         match message {
-            Message::Ping(theirs) => self.on_ping(now, from, theirs, ours, out),
+            Message::Ping(theirs) => self.on_ping(now, from, theirs, out),
             Message::Pong(theirs) => self.on_pong(now, from, theirs),
             Message::GetPeers { token } => {
                 if self.asked_rightly(&from, token) {
@@ -232,19 +349,34 @@ impl Node {
                     self.peers.gone(&from);
                 }
             }
-            // What a node does about headers, blocks and the state is
-            // not here yet.
+            Message::FindFork { token, locator } => {
+                if self.asked_rightly(&from, token) {
+                    self.peers.seen(&from, now);
+                    let (height, id) = self.newest_of_ours(&locator);
+                    self.send(from, &Message::Fork { height, id }, out);
+                }
+            }
+            Message::Fork { height, id } => self.on_fork(now, from, height, id),
+            Message::Get(get) => self.on_get(now, from, &get),
+            Message::Chunk(chunk) => self.on_chunk(now, from, &chunk),
+            Message::Gone(gone) => {
+                match self.fetches.iter_mut().find(|f| f.from == from && f.fetch.transfer() == gone.transfer) {
+                    Some(f) => f.fetch.gone(),
+                    None => self.counts.unheard += 1,
+                }
+            }
+            // Blocks, transactions and aux leaves are not here yet.
             _ => self.counts.unheard += 1,
         }
     }
 
-    fn on_ping(&mut self, now: Micros, from: SocketAddrV4, theirs: Status, ours: &Ours, out: Out<'_>) {
+    fn on_ping(&mut self, now: Micros, from: SocketAddrV4, theirs: Status, out: Out<'_>) {
         // Another version, another chain: answered, so that the other
         // side can see why, and nothing more. (It is its pong to a ping
         // of ours, which shows it is there, that drops it.)
         if theirs.version != VERSION || theirs.genesis != self.genesis {
             self.counts.strangers += 1;
-            let pong = Message::Pong(self.status(&from, theirs.nonce, ours));
+            let pong = Message::Pong(self.status(&from, theirs.nonce));
             return self.send(from, &pong, out);
         }
         // Our own ping to this address, come back: the address is ours.
@@ -258,15 +390,15 @@ impl Node {
             // An address to try, if there is room for it.
             let _ = self.peers.add(from, false, now);
         }
-        let pong = Message::Pong(self.status(&from, theirs.nonce, ours));
+        let pong = Message::Pong(self.status(&from, theirs.nonce));
         self.send(from, &pong, out);
         // And our own ping at once, so that it need not wait its turn
         // to be proven: within what unproven addresses are allowed.
         if self.budget > 0 && !self.peers.proven(&from) {
-            let number = Node::number(&self.secret, &mut self.numbers);
+            let number = Self::number(&self.secret, &mut self.numbers);
             if self.peers.ping_now(&from, number, now) {
                 self.budget -= 1;
-                let ping = Message::Ping(self.status(&from, number, ours));
+                let ping = Message::Ping(self.status(&from, number));
                 self.send(from, &ping, out);
             }
         }
@@ -294,6 +426,348 @@ impl Node {
             self.send(addr, &Message::Goodbye { token }, out);
         }
     }
+
+    // -- Headers
+
+    /// The header of the block `id`, if it is on the chain here.
+    fn on_chain(&self, id: &Digest) -> Option<Header> {
+        let known = self.chain.known(id).ok()??;
+        (self.chain.header_at(known.header.height).ok()? == Some(known.header)).then_some(known.header)
+    }
+
+    /// The newest block of `locator` that is on the chain here: the
+    /// first block of all, if none is.
+    fn newest_of_ours(&self, locator: &Locator) -> (u32, Digest) {
+        locator.as_slice().iter().find_map(|id| self.on_chain(id).map(|h| (h.height, *id))).unwrap_or((0, self.genesis))
+    }
+
+    /// Whether there are headers to catch up with, and the next step
+    /// towards them.
+    fn sync_headers(&mut self, now: Micros, out: Out<'_>) {
+        let Ok(best) = self.chain.best_header() else {
+            return;
+        };
+        // Those that claimed work and have sent nothing for it.
+        self.peers.doubt_silent_claimants(best.work, now, |_| {});
+        if let Some((addr, _)) = self.probe
+            && !self.peers.may_ask(&addr, now)
+        {
+            self.probe = None;
+        }
+        if self.aim.is_some() {
+            return self.fetch_headers(now);
+        }
+        if self.probe.is_some_and(|(_, at)| now.saturating_sub(at) < self.cfg.sync.header_spacing) {
+            return;
+        }
+        // Ask whoever claims most where its chain leaves ours.
+        let next = self.chain.tip().map_or(0, |t| t.height + 1);
+        let Some(source) = self.peers.best_source(best.work, next, now) else {
+            return;
+        };
+        let (addr, Some(token)) = (source.addr, source.token()) else {
+            return;
+        };
+        let mut ids = [self.genesis; LOCATOR];
+        let Ok(n) = self.chain.header_locator(&mut ids) else {
+            return;
+        };
+        let Some(locator) = Locator::new(&ids[..n]) else {
+            return;
+        };
+        self.probe = Some((addr, now));
+        self.peers.asked_headers(&addr, now);
+        self.counts.forks_asked += 1;
+        self.send(addr, &Message::FindFork { token, locator }, out);
+    }
+
+    fn on_fork(&mut self, now: Micros, from: SocketAddrV4, height: u32, id: Digest) {
+        // Only the answer to our question, from whom it was put to.
+        if self.probe.map(|p| p.0) != Some(from) || !self.peers.proven(&from) {
+            self.counts.unheard += 1;
+            return;
+        }
+        self.probe = None;
+        self.peers.seen(&from, now);
+        // A block we hold, at the height it says: or it is no answer.
+        let ours = self.chain.known(&id).ok().flatten();
+        if ours.is_none_or(|k| k.header.height != height) {
+            self.peers.strike(&from, now);
+            return;
+        }
+        let Some(status) = self.peers.get(&from).and_then(|p| p.status) else {
+            return;
+        };
+        if status.height <= height {
+            // Nothing past what we share: its claim was of nothing.
+            self.peers.failed(&from, now);
+            return;
+        }
+        let run = self.cfg.sync.headers as u32;
+        self.aim = Some(Aim {
+            tip: status.tip,
+            height: status.height,
+            todo: (height + 1..=status.height).step_by(run as usize).collect(),
+            done: BTreeMap::new(),
+            next: height + 1,
+        });
+        self.fetch_headers(now);
+    }
+
+    /// Asks for the runs of headers not yet asked for, as many at once
+    /// as may be, each of another peer.
+    fn fetch_headers(&mut self, now: Micros) {
+        let Some(aim) = self.aim.as_mut() else {
+            return;
+        };
+        let (most, run) = (self.cfg.sync.header_fetches, self.cfg.sync.headers as u32);
+        // No further ahead of what is kept than can wait in memory.
+        let ahead = aim.next.saturating_add(2 * most as u32 * run);
+        loop {
+            let busy = self.fetches.iter().filter(|f| matches!(f.object, Object::Headers { .. })).count();
+            let Some(&from) = aim.todo.iter().next().filter(|h| **h < ahead && busy < most) else {
+                break;
+            };
+            let count = run.min(aim.height - from + 1) as u16;
+            // A peer whose chain reaches the tip aimed at, and that is
+            // not at a run of headers for us already.
+            let free = self
+                .peers
+                .reaching(aim.height, now)
+                .find(|p| !self.fetches.iter().any(|f| f.from == p.addr && matches!(f.object, Object::Headers { .. })));
+            let Some(peer) = free else {
+                break;
+            };
+            aim.todo.remove(&from);
+            let transfer = Self::number(&self.secret, &mut self.numbers);
+            let len = count as u32 * HEADER_SIZE as u32;
+            self.fetches.push(Fetching {
+                object: Object::Headers { from, count, on: aim.tip },
+                from: peer.addr,
+                fetch: Fetch::new(transfer, Some(len), len, peer.path, now),
+            });
+        }
+        // Nothing under way, and nobody to ask: the aim is let go, and
+        // another is taken from whoever claims most then.
+        if !self.fetches.iter().any(|f| matches!(f.object, Object::Headers { .. })) && !aim.todo.is_empty() {
+            self.aim = None;
+        }
+    }
+
+    /// A run of headers has arrived whole from `from`.
+    fn headers_arrived(&mut self, now: Micros, from: SocketAddrV4, first: u32, bytes: &[u8]) {
+        let Some(aim) = self.aim.as_mut() else {
+            return;
+        };
+        // Headers, of the heights asked for, each the child of the one
+        // before: or its sender made them up.
+        let mut headers = Vec::with_capacity(bytes.len() / HEADER_SIZE);
+        for (k, b) in bytes.chunks(HEADER_SIZE).enumerate() {
+            match Header::from_bytes(b) {
+                Ok(h)
+                    if h.height == first + k as u32
+                        && headers.last().is_none_or(|p: &Header| h.prev_hash == p.hash()) =>
+                {
+                    headers.push(h)
+                }
+                _ => return self.headers_refused(now, from),
+            }
+        }
+        aim.done.insert(first, (headers, from));
+        // Kept in order, as far as they join up.
+        while let Some((headers, from)) = aim.done.remove(&aim.next) {
+            let (new, error) = self.chain.accept_headers(&headers, self.unix, false);
+            self.counts.headers += new as u64;
+            if error.is_some() {
+                return self.headers_refused(now, from);
+            }
+            self.peers.headers_arrived(&from);
+            aim.next += headers.len() as u32;
+            // The last of them is the tip that was aimed at, or the
+            // peers that served them are of two minds.
+            if aim.next > aim.height {
+                if headers.last().map(|h| h.hash()) != Some(aim.tip) {
+                    return self.headers_refused(now, from);
+                }
+                self.aim = None;
+                return;
+            }
+        }
+        self.fetch_headers(now);
+    }
+
+    /// `from` served headers that are not what was asked for, or that
+    /// the chain refuses: a strike, and the aim is let go. What was
+    /// kept stays kept.
+    fn headers_refused(&mut self, now: Micros, from: SocketAddrV4) {
+        self.peers.strike(&from, now);
+        self.peers.failed(&from, now);
+        self.aim = None;
+        self.fetches.retain(|f| !matches!(f.object, Object::Headers { .. }));
+    }
+
+    // -- Objects
+
+    fn on_get(&mut self, now: Micros, from: SocketAddrV4, get: &Get<'_>) {
+        // A name of nothing is asked for by nobody honest.
+        if Object::decode(get.name).is_err() {
+            self.counts.malformed += 1;
+            return;
+        }
+        match self.serve.get(&self.tokens, SocketAddr::V4(from), get) {
+            Ok(()) => self.peers.seen(&from, now),
+            // Without its token, or more than may wait: not heard.
+            Err(_) => self.counts.unheard += 1,
+        }
+    }
+
+    fn on_chunk(&mut self, now: Micros, from: SocketAddrV4, chunk: &Chunk<'_>) {
+        // For a fetch of ours, from whom it was asked of, by its number.
+        let Some(f) = self.fetches.iter_mut().find(|f| f.from == from && f.fetch.transfer() == chunk.transfer) else {
+            self.counts.unheard += 1;
+            return;
+        };
+        self.peers.seen(&from, now);
+        // (A chunk no honest peer sends ends the fetch, and the fetch
+        // says so when it is next looked to.)
+        let _ = f.fetch.chunk(now, chunk);
+    }
+
+    /// The bytes of the object named, if this node has it. Kept a
+    /// while, since every chunk of it is asked for by name.
+    fn object(&mut self, object: &Object) -> Option<Arc<Vec<u8>>> {
+        if let Some(at) = self.served.iter().position(|(o, _)| o == object) {
+            let hit = self.served.remove(at).expect("it is there");
+            self.served.push_front(hit);
+            return Some(Arc::clone(&self.served[0].1));
+        }
+        let bytes = self.make(object)?;
+        #[cfg(test)]
+        let bytes = if self.spoil {
+            let mut b = bytes;
+            let at = b.len() / 2;
+            b[at] ^= 1;
+            b
+        } else {
+            bytes
+        };
+        self.served.push_front((*object, Arc::new(bytes)));
+        self.served.truncate(SERVED);
+        Some(Arc::clone(&self.served[0].1))
+    }
+
+    fn make(&self, object: &Object) -> Option<Vec<u8>> {
+        match *object {
+            Object::Headers { from, count, on } => {
+                // Of the chain `on` is on, and no higher than it: so
+                // that the name is of the same bytes whoever serves it.
+                let top = self.on_chain(&on)?;
+                if from.checked_add(count as u32 - 1)? > top.height {
+                    return None;
+                }
+                let mut headers = vec![top; count as usize];
+                if self.chain.headers_from(from, &mut headers).ok()? != count as usize {
+                    return None;
+                }
+                let mut bytes = Vec::with_capacity(count as usize * HEADER_SIZE);
+                headers.iter().for_each(|h| bytes.extend_from_slice(&h.to_bytes()));
+                Some(bytes)
+            }
+            // Bodies and the state are not served yet.
+            _ => None,
+        }
+    }
+
+    /// Does what the fetches under way and the chunks being served want
+    /// done at `now`, and says when either next wants doing.
+    fn pump(&mut self, now: Micros, out: Out<'_>) -> Micros {
+        let mut wake = Micros::MAX;
+        let mut ranges = Ranges::new();
+        let mut name = [0u8; MAX_NAME];
+        let mut i = 0;
+        while i < self.fetches.len() {
+            let (object, from) = (self.fetches[i].object, self.fetches[i].from);
+            match self.fetches[i].fetch.poll(now, &mut ranges) {
+                Poll::Ask(seq) => {
+                    // Asked with the token the peer gave us: one that has
+                    // given none, or is gone, is not asked.
+                    let Some(token) = self.peers.get(&from).and_then(|p| p.token()) else {
+                        self.fetches.swap_remove(i);
+                        self.fetch_failed(now, object, from);
+                        continue;
+                    };
+                    let n = object.encode(&mut name);
+                    let transfer = self.fetches[i].fetch.transfer();
+                    let get = Get { token, transfer, seq, name: &name[..n], ranges };
+                    self.send(from, &Message::Get(get), out);
+                    // (Again at once: there may be more to ask.)
+                    continue;
+                }
+                Poll::Wait(at) => wake = wake.min(at),
+                Poll::Done => {
+                    let done = self.fetches.swap_remove(i);
+                    self.counts.fetched += 1;
+                    self.peers.delivered(&from, done.fetch.path());
+                    let bytes = done.fetch.finish().expect("it is done");
+                    self.arrived(now, object, from, &bytes);
+                    continue;
+                }
+                Poll::Failed(why) => {
+                    let failed = self.fetches.swap_remove(i);
+                    self.peers.set_path(&from, failed.fetch.path());
+                    if why == Why::Bad {
+                        self.peers.strike(&from, now);
+                    }
+                    self.fetch_failed(now, object, from);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        // The chunks asked of us: some, and then back to the rest.
+        for _ in 0..SERVE_BATCH {
+            match self.serve.next(now) {
+                Next::Send(x) => {
+                    let SocketAddr::V4(to) = x.to else { continue };
+                    let bytes = Object::decode(x.name()).ok().and_then(|o| self.object(&o));
+                    match bytes.as_deref().and_then(|b| chunk_of(b, x.index).map(|data| (b.len() as u32, data))) {
+                        Some((len, data)) => {
+                            let chunk = Chunk { transfer: x.transfer, seq: x.seq, len, index: x.index, data };
+                            self.send(to, &Message::Chunk(chunk), out);
+                        }
+                        // No such object, or no such chunk of it.
+                        None => {
+                            self.serve.cancel(x.to, x.transfer);
+                            self.send(to, &Message::Gone(Gone { transfer: x.transfer }), out);
+                        }
+                    }
+                }
+                Next::Wait(at) => return wake.min(at),
+                Next::Idle => return wake,
+            }
+        }
+        // More to send: at once.
+        now
+    }
+
+    /// An object fetched whole from `from`.
+    fn arrived(&mut self, now: Micros, object: Object, from: SocketAddrV4, bytes: &[u8]) {
+        // Nothing else is fetched yet.
+        if let Object::Headers { from: first, .. } = object {
+            self.headers_arrived(now, from, first, bytes)
+        }
+    }
+
+    /// A fetch from `from` was given up: the peer is passed over, and
+    /// what was wanted is wanted again, of another.
+    fn fetch_failed(&mut self, now: Micros, object: Object, from: SocketAddrV4) {
+        self.counts.fetches_failed += 1;
+        self.peers.failed(&from, now);
+        if let (Object::Headers { from: first, .. }, Some(aim)) = (object, self.aim.as_mut()) {
+            aim.todo.insert(first);
+            self.fetch_headers(now);
+        }
+    }
 }
 
 /// Thirty-two bytes from the node's secret, for a purpose and a count:
@@ -308,443 +782,9 @@ fn derive(secret: &[u8; 32], purpose: u8, count: u64) -> [u8; 32] {
 
 /// The address a datagram is sent to, as the socket wants it.
 pub fn socket_addr(addr: SocketAddrV4) -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(*addr.ip()), addr.port())
+    SocketAddr::V4(addr)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::net::message::Addrs;
-    use crate::poseidon2::Fp;
-    use crate::test_util::Rng;
-    use crate::transport::{MILLI, SECOND};
-    use std::net::Ipv4Addr;
-
-    const NET: [u8; 4] = *b"TEST";
-    const GENESIS: Digest = [Fp::new(9); 8];
-
-    fn ours(height: u32) -> Ours {
-        Ours {
-            height,
-            oldest: 0,
-            window: height.saturating_sub(10),
-            tip: [Fp::new(height); 8],
-            work: U256::from_u64(height as u64),
-        }
-    }
-
-    /// The address of node `n`: each a host and a network of its own.
-    fn at(n: usize) -> SocketAddrV4 {
-        SocketAddrV4::new(Ipv4Addr::new(20 + (n / 200) as u8, (n % 200) as u8, 0, 1), 3737)
-    }
-
-    /// Nodes and the datagrams between them: every one takes twenty
-    /// milliseconds, some are lost, and one sent to an address that is
-    /// no node's is kept to be looked at.
-    struct World {
-        nodes: Vec<Node>,
-        heights: Vec<u32>,
-        now: Micros,
-        flying: Vec<(Micros, SocketAddrV4, SocketAddrV4, Vec<u8>)>,
-        /// Lost, in a thousand.
-        loss: u64,
-        rng: Rng,
-        /// To addresses that are no node's: from, to, what.
-        strays: Vec<(SocketAddrV4, SocketAddrV4, Vec<u8>)>,
-        ticks: u64,
-    }
-
-    impl World {
-        fn new(n: usize, cfg: &Config) -> World {
-            let nodes = (0..n).map(|i| Node::new(cfg.clone(), NET, GENESIS, [i as u8 + 1; 32], 0)).collect();
-            World {
-                nodes,
-                heights: (0..n as u32).map(|i| 100 + i).collect(),
-                now: 0,
-                flying: Vec::new(),
-                loss: 0,
-                rng: Rng::new(5),
-                strays: Vec::new(),
-                ticks: 0,
-            }
-        }
-
-        fn post(&mut self, from: SocketAddrV4, to: SocketAddrV4, bytes: &[u8]) {
-            if self.rng.next_u64() % 1000 >= self.loss {
-                self.flying.push((self.now + 20 * MILLI, from, to, bytes.to_vec()));
-            }
-        }
-
-        /// A datagram from `from`, which may be anyone's claim.
-        fn inject(&mut self, from: SocketAddrV4, to: usize, message: &Message<'_>) {
-            let mut buf = [0u8; MAX_DATAGRAM];
-            let n = message.encode(NET, &mut buf);
-            self.flying.push((self.now, from, at(to), buf[..n].to_vec()));
-        }
-
-        /// Ten milliseconds at a time for `time`: what has arrived is
-        /// handed over, and every second each node is told the time.
-        fn run(&mut self, time: Micros) {
-            let end = self.now + time;
-            while self.now < end {
-                let mut sent = Vec::new();
-                if self.now.is_multiple_of(SECOND) {
-                    self.ticks += 1;
-                    for (i, node) in self.nodes.iter_mut().enumerate() {
-                        node.tick(self.now, &ours(self.heights[i]), &mut |to, b| sent.push((at(i), to, b.to_vec())));
-                    }
-                }
-                let (due, later): (Vec<_>, Vec<_>) = self.flying.drain(..).partition(|d| d.0 <= self.now);
-                self.flying = later;
-                for (_, from, to, bytes) in due {
-                    match (0..self.nodes.len()).find(|&i| at(i) == to) {
-                        Some(i) => self.nodes[i].handle(
-                            self.now,
-                            SocketAddr::V4(from),
-                            &bytes,
-                            &ours(self.heights[i]),
-                            &mut |to, b| sent.push((at(i), to, b.to_vec())),
-                        ),
-                        None => self.strays.push((from, to, bytes)),
-                    }
-                }
-                for (from, to, bytes) in sent {
-                    self.post(from, to, &bytes);
-                }
-                self.now += 10 * MILLI;
-            }
-        }
-
-        fn live(&self, i: usize) -> Vec<SocketAddrV4> {
-            self.nodes[i].peers().live(self.now).map(|p| p.addr).collect()
-        }
-    }
-
-    #[test]
-    fn two_nodes_that_one_knows_of_come_to_know_each_other() {
-        let mut w = World::new(2, &Config::default());
-        assert!(w.nodes[0].add_peer(at(1), true, 0));
-        w.run(SECOND);
-        assert_eq!((w.live(0), w.live(1)), (vec![at(1)], vec![at(0)]));
-        // Each holds what the other says of itself, and the token the
-        // other gave it; and each has timed the other.
-        let (a, b) = (*w.nodes[0].peers().get(&at(1)).unwrap(), *w.nodes[1].peers().get(&at(0)).unwrap());
-        assert_eq!((a.status.unwrap().height, b.status.unwrap().height), (101, 100));
-        assert_eq!(a.status.unwrap().tip, ours(101).tip);
-        assert!(w.nodes[1].tokens.check(&SocketAddr::V4(at(0)), a.token().unwrap()));
-        assert!(w.nodes[0].tokens.check(&SocketAddr::V4(at(1)), b.token().unwrap()));
-        assert_eq!((a.path.round_trip(), b.path.round_trip()), (Some(40 * MILLI), Some(40 * MILLI)));
-        // Four datagrams did it: a ping and its pong, each way.
-        assert_eq!(w.nodes[0].counts().sent + w.nodes[1].counts().sent, 4);
-        // And each goes on hearing of the other's chain.
-        w.heights[1] = 500;
-        w.run(31 * SECOND);
-        assert_eq!(w.nodes[0].peers().get(&at(1)).unwrap().status.unwrap().height, 500);
-        assert_eq!((w.nodes[0].counts().unheard, w.nodes[0].counts().malformed), (0, 0));
-    }
-
-    /// Thirty nodes that know one seed between them: each comes to have
-    /// the peers it wants, though a fifth of all datagrams are lost.
-    #[test]
-    fn nodes_that_know_one_seed_find_each_other() {
-        for loss in [0, 200] {
-            let mut w = World::new(30, &Config::default());
-            w.loss = loss;
-            for i in 1..30 {
-                assert!(w.nodes[i].add_peer(at(0), true, 0));
-            }
-            w.run(60 * SECOND);
-            for i in 0..30 {
-                assert!(w.live(i).len() >= 8, "loss {loss}: node {i} has {}", w.live(i).len());
-            }
-            // Having what they want, they ask no more, and only ping:
-            // a ping and a pong to each peer every thirty seconds.
-            let before: u64 = w.nodes.iter().map(|n| n.counts().sent).sum();
-            let peers: usize = (0..30).map(|i| w.nodes[i].peers().len()).sum();
-            w.run(60 * SECOND);
-            let sent = w.nodes.iter().map(|n| n.counts().sent).sum::<u64>() - before;
-            assert!(sent <= 2 * 2 * peers as u64 + 60, "loss {loss}: {sent} for {peers}");
-        }
-    }
-
-    #[test]
-    fn a_forged_ping_costs_its_victim_no_more_than_the_forger() {
-        let mut w = World::new(1, &Config::default());
-        w.run(10 * MILLI);
-        let forged = |n: u16| SocketAddrV4::new(Ipv4Addr::new(99, (n / 4) as u8, 0, (n % 4) as u8 + 1), 1000 + n);
-        let status = |nonce| Status {
-            nonce,
-            version: VERSION,
-            token: 0,
-            genesis: GENESIS,
-            height: 1,
-            oldest: 0,
-            window: 0,
-            tip: GENESIS,
-            work: U256::ZERO,
-        };
-        // A hundred pings in one tick, each claiming another address.
-        for n in 0..100 {
-            w.inject(forged(n), 0, &Message::Ping(status(n as u64)));
-        }
-        w.run(500 * MILLI);
-        // Each got its pong; our own pings went to eight of them.
-        let (mut pongs, mut pings) = (0, 0);
-        for (_, _, bytes) in &w.strays {
-            match Message::decode(NET, bytes).unwrap() {
-                Message::Pong(_) => pongs += 1,
-                Message::Ping(_) => pings += 1,
-                other => panic!("{other:?}"),
-            }
-            assert_eq!(bytes.len(), 133, "as much as a ping, no more");
-        }
-        assert_eq!((pongs, pings), (100, 8));
-        // The same address again and again gets pongs, and no second
-        // ping until its turn.
-        w.strays.clear();
-        for _ in 0..50 {
-            w.inject(forged(0), 0, &Message::Ping(status(7)));
-        }
-        w.run(400 * MILLI);
-        assert_eq!(w.strays.len(), 50);
-        // None of them is anyone: none is live, none is told of, and
-        // in three minutes all are gone.
-        assert!(w.live(0).is_empty() && w.nodes[0].peers.sample(None, w.now).as_slice().is_empty());
-        // (Three minutes from when each was first pinged, and the last
-        // of the hundred had its first ping some seconds in.)
-        w.run(200 * SECOND);
-        assert_eq!(w.nodes[0].peers().len(), 0);
-        // In all that time our pings to them were rationed: eight
-        // addresses a tick at the most.
-        let pings =
-            w.strays.iter().filter(|s| matches!(Message::decode(NET, &s.2), Ok(Message::Ping(_)))).count() as u64;
-        assert!(pings <= 8 * w.ticks, "{pings}");
-    }
-
-    #[test]
-    fn a_pong_that_answers_no_ping_of_ours_proves_nothing() {
-        let mut w = World::new(2, &Config::default());
-        w.nodes[0].add_peer(at(1), false, 0);
-        // Before node 0 has pinged at all, and with a number it never
-        // sent after it has.
-        let status = Status {
-            nonce: 1,
-            version: VERSION,
-            token: 5,
-            genesis: GENESIS,
-            height: 1 << 30,
-            oldest: 0,
-            window: 0,
-            tip: GENESIS,
-            work: U256::MAX,
-        };
-        w.inject(at(1), 0, &Message::Pong(status));
-        w.run(10 * MILLI);
-        assert!(!w.nodes[0].peers().proven(&at(1)));
-        assert_eq!(w.nodes[0].counts().unheard, 1);
-        // Nor does anything else from an address not proven count:
-        // a list of peers to try is not taken.
-        let mut addrs = Addrs::new();
-        addrs.push(at(7));
-        w.inject(at(5), 0, &Message::Peers(addrs));
-        w.run(10 * MILLI);
-        assert!(w.nodes[0].peers().get(&at(7)).is_none());
-        assert_eq!(w.nodes[0].counts().unheard, 2);
-    }
-
-    #[test]
-    fn a_request_is_answered_only_with_its_token() {
-        let mut cfg = Config::default();
-        // (Content with one peer, so that nothing is sent here but
-        // pings and what the test sends.)
-        (cfg.serve.token_life, cfg.peers.target) = (60 * SECOND, 1);
-        let mut w = World::new(3, &cfg);
-        w.nodes[0].add_peer(at(1), false, 0);
-        w.nodes[0].add_peer(at(2), false, 0);
-        w.run(SECOND);
-        let token = w.nodes[0].peers().get(&at(1)).unwrap().token().unwrap();
-        let answers = |w: &World| w.nodes[1].counts().sent;
-        // The token node 1 gave node 0: answered, with whom node 1
-        // knows other than the asker.
-        let before = answers(&w);
-        w.inject(at(0), 1, &Message::GetPeers { token });
-        w.run(50 * MILLI);
-        assert_eq!(answers(&w), before + 1);
-        // Without it, with another's, or from another address: nothing.
-        let other = w.nodes[0].peers().get(&at(2)).unwrap().token().unwrap();
-        for (from, t) in [(at(0), 0), (at(0), other), (at(0), token ^ 1), (at(9), token)] {
-            w.inject(from, 1, &Message::GetPeers { token: t });
-            w.inject(from, 1, &Message::Goodbye { token: t });
-        }
-        w.run(50 * MILLI);
-        assert_eq!(answers(&w), before + 1);
-        assert_eq!(w.nodes[1].counts().unheard, 8);
-        assert!(w.nodes[1].peers().proven(&at(0)));
-        // A token lasts one change of the secret, and not two: an old
-        // one kept and used long after is refused. (Pings carry the new
-        // one every half minute, so a peer's is never old.)
-        w.run(60 * SECOND);
-        w.inject(at(0), 1, &Message::GetPeers { token });
-        w.run(50 * MILLI);
-        assert_eq!(w.nodes[1].counts().unheard, 8, "heard, the secret having changed once");
-        w.run(70 * SECOND);
-        let unheard = w.nodes[1].counts().unheard;
-        w.inject(at(0), 1, &Message::GetPeers { token });
-        w.run(50 * MILLI);
-        assert_eq!(w.nodes[1].counts().unheard, unheard + 1);
-        // While the one its pings have brought since is good.
-        let fresh = w.nodes[0].peers().get(&at(1)).unwrap().token().unwrap();
-        assert_ne!(fresh, token);
-        w.inject(at(0), 1, &Message::GetPeers { token: fresh });
-        w.run(50 * MILLI);
-        assert_eq!(w.nodes[1].counts().unheard, unheard + 1);
-    }
-
-    #[test]
-    fn a_node_of_another_chain_or_version_is_answered_and_left_alone() {
-        let mut w = World::new(2, &Config::default());
-        // Node 1 is of another chain.
-        w.nodes[1] = Node::new(Config::default(), NET, [Fp::new(8); 8], [2; 32], 0);
-        w.nodes[0].add_peer(at(1), false, 0);
-        w.run(SECOND);
-        // Each answered the other, and neither keeps the other.
-        assert_eq!((w.nodes[0].peers().len(), w.nodes[1].peers().len()), (0, 0));
-        assert!(w.nodes[0].counts().strangers >= 1 && w.nodes[1].counts().strangers >= 1);
-        // A ping of another version: a pong, and nothing kept.
-        let stranger = SocketAddrV4::new(Ipv4Addr::new(77, 1, 1, 1), 9);
-        let status = Status {
-            nonce: 3,
-            version: VERSION + 1,
-            token: 0,
-            genesis: GENESIS,
-            height: 1,
-            oldest: 0,
-            window: 0,
-            tip: GENESIS,
-            work: U256::ZERO,
-        };
-        w.inject(stranger, 0, &Message::Ping(status));
-        w.run(100 * MILLI);
-        assert_eq!(w.strays.len(), 1);
-        assert!(
-            matches!(Message::decode(NET, &w.strays[0].2), Ok(Message::Pong(s)) if s.nonce == 3 && s.version == VERSION)
-        );
-        assert_eq!(w.nodes[0].peers().len(), 0);
-        // A datagram of another network, and one that is nothing: not
-        // answered at all.
-        let mut buf = [0u8; MAX_DATAGRAM];
-        let n = Message::Ping(Status { version: VERSION, ..status }).encode(*b"ELSE", &mut buf);
-        w.flying.push((w.now, stranger, at(0), buf[..n].to_vec()));
-        w.flying.push((w.now, stranger, at(0), b"hello".to_vec()));
-        w.run(100 * MILLI);
-        assert_eq!((w.strays.len(), w.nodes[0].counts().malformed), (1, 2));
-    }
-
-    #[test]
-    fn a_node_told_its_own_address_finds_out() {
-        let mut w = World::new(2, &Config::default());
-        w.nodes[0].add_peer(at(0), true, 0);
-        w.nodes[0].add_peer(at(1), false, 0);
-        w.run(SECOND);
-        assert_eq!(w.live(0), [at(1)]);
-        assert!(w.nodes[0].peers().get(&at(0)).is_none());
-        // Told of again by a peer: not taken again.
-        let mut addrs = Addrs::new();
-        addrs.push(at(0));
-        w.inject(at(1), 0, &Message::Peers(addrs));
-        w.run(100 * MILLI);
-        assert!(w.nodes[0].peers().get(&at(0)).is_none() && !w.nodes[0].add_peer(at(0), false, w.now));
-    }
-
-    #[test]
-    fn a_node_that_says_goodbye_is_known_at_once_to_be_gone() {
-        let mut cfg = Config::default();
-        cfg.peers.target = 1;
-        let mut w = World::new(3, &cfg);
-        w.nodes[0].add_peer(at(1), false, 0);
-        w.nodes[0].add_peer(at(2), false, 0);
-        w.run(SECOND);
-        assert_eq!(w.live(1), [at(0)]);
-        let mut sent = Vec::new();
-        let now = w.now;
-        w.nodes[0].goodbye(now, &mut |to, b| sent.push((to, b.to_vec())));
-        assert_eq!(sent.len(), 2);
-        for (to, bytes) in sent {
-            w.post(at(0), to, &bytes);
-        }
-        // Node 0 stops: its datagrams are no longer handed to it. (Here
-        // it goes on running; what matters is what the others think.)
-        w.run(30 * MILLI);
-        assert!(w.live(1).is_empty() && w.live(2).is_empty());
-        // Its place is kept, and when it answers a ping again it is back.
-        assert!(w.nodes[1].peers().get(&at(0)).is_some());
-        w.run(31 * SECOND);
-        assert_eq!(w.live(1), [at(0)]);
-    }
-
-    /// Six nodes on this machine's own sockets and clock, five of them
-    /// knowing only the first: all come to know all.
-    #[test]
-    fn over_real_sockets() {
-        use std::net::UdpSocket;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        use std::time::{Duration, Instant};
-        let mut cfg = Config::default();
-        (cfg.peers.target, cfg.peers.discover) = (5, 100 * MILLI);
-        let sockets: Vec<UdpSocket> = (0..6).map(|_| UdpSocket::bind("127.0.0.1:0").unwrap()).collect();
-        let addrs: Vec<SocketAddrV4> = sockets
-            .iter()
-            .map(|s| match s.local_addr().unwrap() {
-                SocketAddr::V4(a) => a,
-                _ => unreachable!(),
-            })
-            .collect();
-        let stop = Arc::new(AtomicBool::new(false));
-        let live: Vec<Arc<AtomicUsize>> = (0..6).map(|_| Arc::new(AtomicUsize::new(0))).collect();
-        let threads: Vec<_> = sockets
-            .into_iter()
-            .enumerate()
-            .map(|(i, socket)| {
-                let (cfg, stop, live, seed) = (cfg.clone(), Arc::clone(&stop), Arc::clone(&live[i]), addrs[0]);
-                std::thread::spawn(move || {
-                    let mut node = Node::new(cfg, NET, GENESIS, [i as u8 + 1; 32], 0);
-                    if i != 0 {
-                        node.add_peer(seed, true, 0);
-                    }
-                    // In short runs, so that what the node holds can be
-                    // looked at between them.
-                    let clock = Instant::now();
-                    while !stop.load(Ordering::Relaxed) {
-                        let pause = AtomicBool::new(false);
-                        std::thread::scope(|s| {
-                            s.spawn(|| {
-                                std::thread::sleep(Duration::from_millis(100));
-                                pause.store(true, Ordering::Relaxed);
-                            });
-                            crate::net::socket::run_until(
-                                &mut node,
-                                &socket,
-                                &|| ours(100 + i as u32),
-                                &pause,
-                                Duration::from_millis(50),
-                                clock,
-                            )
-                            .unwrap();
-                        });
-                        live.store(node.peers().live(clock.elapsed().as_micros() as Micros).count(), Ordering::Relaxed);
-                    }
-                })
-            })
-            .collect();
-        let start = Instant::now();
-        while live.iter().any(|l| l.load(Ordering::Relaxed) < 5) {
-            assert!(start.elapsed() < Duration::from_secs(30), "{:?}", live);
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        stop.store(true, Ordering::Relaxed);
-        for t in threads {
-            t.join().unwrap();
-        }
-    }
-}
+#[path = "node_tests.rs"]
+mod tests;

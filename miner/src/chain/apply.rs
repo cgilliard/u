@@ -419,7 +419,7 @@ fn corrupt(what: &'static str) -> Error {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::block::{Block, BlockOutput, Body};
     use crate::chain::headers::tests::{NOW, easy, seed, table};
@@ -515,6 +515,13 @@ mod tests {
         let bytes = block(chain, body);
         assert_eq!(apply(chain, &bytes), Ok(Applied::Extended));
         bytes
+    }
+
+    /// Extends `chain` by `n` blocks, each making one output: `tag`
+    /// tells one run of blocks from another on the same parent. The
+    /// blocks, whole.
+    pub(crate) fn grow<V: ProofVerifier + Sync>(chain: &Chain<MemBackend, V>, n: usize, tag: u32) -> Vec<Vec<u8>> {
+        (0..n).map(|i| extend(chain, &body(&[], &[out(tag * 100_000 + i as u32, PAY)]))).collect()
     }
 
     fn status<V>(chain: &Chain<MemBackend, V>, bytes: &[u8]) -> Option<Status> {
