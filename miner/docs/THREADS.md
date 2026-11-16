@@ -7,9 +7,10 @@ handled on every core.
 
 - Requests are handled by a pool of workers, one a core.
 - Each datagram goes to the worker that owns its sender, chosen by the
-  sender's address **and port**. Two nodes on one machine are two
-  peers, with nothing to do with each other, and need not fall on the
-  same worker.
+  sender's **address** (not its port). So everything about one host,
+  whatever its ports, is one worker's: its peers, how many of them
+  there are, and whether it is banned. Several nodes on one machine all
+  fall on one worker, which is accepted.
 - One thread reads the port and hands datagrams out. Portable, standard
   library only.
 - A worker does everything for its peers itself. It does not block.
@@ -17,10 +18,10 @@ handled on every core.
 - There is no coordinator thread.
 - A worker's queue that is full drops the datagram. The main log says
   so and the stats count it.
-- A ban is of a host, every port of it. Other workers may learn of it
-  a moment late.
+- A ban is of a host, every port of it, kept by the worker that owns
+  the host. No other worker needs to know.
 - No more than four peers of one host (`--max-peers-per-host`), counted
-  over all workers.
+  by that worker.
 - Options: `--threads` and `--request-queue-size`.
 
 Section 4 (what the workers share) is **proposed**. Nothing here is
@@ -53,7 +54,7 @@ handed to that worker.
                           +--> worker 0 --+
  port --> receiver --hash-+--> worker 1 --+--> port (each sends for itself)
           (reads, hashes  +--> worker 2 --+
-           address:port)  +--> worker 3 --+
+           the address)   +--> worker 3 --+
                                   |
                           blocks, headers, parts
                                   v
@@ -72,7 +73,7 @@ is not who reads the datagram but who owns the state it touches.
 
 Reads the port, and for each datagram:
 
-1. hashes the sender's address and port to a worker;
+1. hashes the sender's address to a worker;
 2. puts the datagram on that worker's queue.
 
 A worker's queue is a bounded queue with a lock of its own: the
@@ -104,10 +105,11 @@ can choose addresses that all fall on one worker.
 
 ### 3.2 The workers (`--threads`, one a core unless set)
 
-A worker owns, for the peers that hash to it:
+A worker owns, for the hosts that hash to it, and every peer of them:
 
 - the peer's entry: when it was last heard from, whether it has proven
-  its address, its status as it last told it, and its strikes;
+  its address, its status as it last told it, its strikes; how many
+  peers its host has, and whether the host is banned;
 - what it has asked of us: its queue of chunks to be served;
 - what we are fetching from it: the fetches, and the path's measure of
   the line (round trip, window).
@@ -117,7 +119,7 @@ It does everything for those peers:
 - handles their datagrams from start to finish, and sends the answers
   on the port itself (sending on one socket from many threads is safe);
 - pings them, drops them when they go silent, strikes them, and bans
-  their host (section 5);
+  their host;
 - asks them whom else they know;
 - fetches from them, and serves them.
 
@@ -161,12 +163,13 @@ Three things are about all of them:
 `--max-peers` is of the whole node. An atomic count: a worker adds one
 to admit a peer, and gives it back if that went over.
 
-The limits on peers of one host and of one network
-(`--max-peers-per-host`, `--max-peers-per-network`) count across
-workers, since two ports of one host may be on two workers. They keep
-one machine from filling the table (**decided**: they stay). A small
-table of counts by host and by network, behind a lock taken only when a
-peer is admitted or dropped, which is rare.
+`--max-peers-per-host` is the owning worker's own count: nothing
+shared.
+
+`--max-peers-per-network` (peers of one /16) counts across workers,
+since the hosts of one network are on many. A small table of counts by
+network, behind a lock taken only when a peer is admitted or dropped,
+which is rare.
 
 ### 4.2 What to fetch, and from whom
 
@@ -208,16 +211,11 @@ and to the worker whose peer sent it.
 
 A peer that sends what no honest peer sends is struck by its worker,
 and after `--ban-strikes` its **host** is banned for `--ban-seconds`:
-every port of it, on every worker. Were a ban of one port only, a bad
-peer would be back on the next port at once.
+every port of it. Were a ban of one port only, a bad peer would be back
+on the next port at once.
 
-The bans are one list the workers share, behind a lock, with a number
-beside it that goes up whenever the list changes. Each worker keeps its
-own copy of the list and checks that against every datagram, with no
-lock; it looks at the number (one atomic read) and takes the list
-afresh only when the number has moved. So a ban holds at once on the
-worker that made it, and on the others from their next datagram or
-timer: a moment late, which is fine.
+Every port of a host is the same worker's, so the ban is that worker's
+own: it holds at once, and nothing is shared or sent.
 
 ---
 
