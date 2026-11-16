@@ -326,6 +326,28 @@ pub(crate) struct List {
     pub(crate) held: Vec<(Digest, Vec<u8>, SocketAddrV4)>,
     /// The state being taken whole from others, if one is.
     pub(crate) join: Option<Join>,
+    /// What is being fetched, and of whom: whoever begins a fetch of
+    /// something the node is after says so here, so that nobody else
+    /// fetches the same, and so that how many are under way is known
+    /// to all.
+    fetching: Vec<(Object, SocketAddrV4)>,
+}
+
+/// A run of headers.
+fn headers(object: &Object) -> bool {
+    matches!(object, Object::Headers { .. })
+}
+
+/// A piece of a state, but for its block.
+fn of_state(object: &Object) -> bool {
+    matches!(object, Object::Manifest(_) | Object::Roots { .. } | Object::Part { .. } | Object::Names { .. })
+}
+
+/// Takes `object` of `from` off what is being fetched.
+fn fetched(fetching: &mut Vec<(Object, SocketAddrV4)>, object: &Object, from: &SocketAddrV4) {
+    if let Some(at) = fetching.iter().position(|(o, a)| o == object && a == from) {
+        fetching.swap_remove(at);
+    }
 }
 
 /// What a datagram was, and what was done about it: for whoever keeps
@@ -496,6 +518,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                 applying: Vec::new(),
                 held: Vec::new(),
                 join: None,
+                fetching: Vec::new(),
             })),
             announced: VecDeque::new(),
             inbox: Vec::new(),
@@ -989,7 +1012,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         // No further ahead of what is kept than can wait in memory.
         let ahead = aim.next.saturating_add(2 * most as u32 * run);
         loop {
-            let busy = self.fetches.iter().filter(|f| matches!(f.object, Object::Headers { .. })).count();
+            let busy = l.fetching.iter().filter(|f| headers(&f.0)).count();
             let Some(&from) = aim.todo.iter().next().filter(|h| **h < ahead && busy < most) else {
                 break;
             };
@@ -1006,15 +1029,17 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             aim.todo.remove(&from);
             let transfer = Self::number(&self.secret, &mut self.numbers);
             let len = count as u32 * HEADER_SIZE as u32;
+            let object = Object::Headers { from, count, on: aim.tip };
+            l.fetching.push((object, peer.addr));
             self.fetches.push(Fetching {
-                object: Object::Headers { from, count, on: aim.tip },
+                object,
                 from: peer.addr,
                 fetch: Fetch::new(transfer, Some(len), len, peer.path, now),
             });
         }
         // Nothing under way, and nobody to ask: the aim is let go, and
         // another is taken from whoever claims most then.
-        if !self.fetches.iter().any(|f| matches!(f.object, Object::Headers { .. })) && !aim.todo.is_empty() {
+        if !l.fetching.iter().any(|f| headers(&f.0)) && !aim.todo.is_empty() {
             l.aim = None;
         }
     }
@@ -1098,7 +1123,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         self.peers.strike(&from, now);
         self.peers.failed(&from, now);
         l.aim = None;
-        self.fetches.retain(|f| !matches!(f.object, Object::Headers { .. }));
+        self.fetches.retain(|f| !headers(&f.object));
+        l.fetching.retain(|f| !headers(&f.0));
     }
 
     // -- Blocks
@@ -1186,13 +1212,13 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         let most = (self.chain.params().max_block_size - HEADER_SIZE) as u32;
         for (id, header) in ids.iter().zip(&need[..n]) {
             let fetching = |f: &Fetching| matches!(f.object, Object::Block(_));
-            if self.fetches.iter().filter(|f| fetching(f)).count() >= self.cfg.sync.blocks {
+            if l.fetching.iter().filter(|f| matches!(f.0, Object::Block(_))).count() >= self.cfg.sync.blocks {
                 break;
             }
             let wanted = Object::Block(*id);
             if l.applying.contains(id)
                 || l.held.iter().any(|(held, _, _)| held == id)
-                || self.fetches.iter().any(|f| f.object == wanted)
+                || l.fetching.iter().any(|f| f.0 == wanted)
             {
                 continue;
             }
@@ -1217,6 +1243,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             };
             let path = self.peers.get(&addr).map(|p| p.path).unwrap_or_default();
             let transfer = Self::number(&self.secret, &mut self.numbers);
+            l.fetching.push((wanted, addr));
             self.fetches.push(Fetching {
                 object: wanted,
                 from: addr,
@@ -1373,12 +1400,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             let since = *join.orphaned.get_or_insert(now);
             if now.saturating_sub(since) >= self.cfg.sync.header_wait {
                 l.join = None;
-                self.fetches.retain(|f| {
-                    !matches!(
-                        f.object,
-                        Object::Manifest(_) | Object::Roots { .. } | Object::Part { .. } | Object::Names { .. }
-                    )
-                });
+                self.fetches.retain(|f| !of_state(&f.object));
+                l.fetching.retain(|f| !of_state(&f.0));
                 // (Begun anew, the chain goes on with what it has
                 // received: `Chain::begin_receiving`.)
                 if self.begin_join(l, now) {
@@ -1418,22 +1441,18 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             wanted.retain(|(object, _)| !join.putting.contains(object));
         }
         for (object, most) in wanted {
-            let under_way = self.fetches.iter().filter(|f| f.object != object).filter(|f| {
-                matches!(
-                    f.object,
-                    Object::Manifest(_) | Object::Roots { .. } | Object::Part { .. } | Object::Names { .. }
-                )
-            });
+            let under_way = l.fetching.iter().filter(|f| f.0 != object && of_state(&f.0));
             if under_way.count() >= self.cfg.sync.parts {
                 break;
             }
-            if self.fetches.iter().any(|f| f.object == object) {
+            if l.fetching.iter().any(|f| f.0 == object) {
                 continue;
             }
             join.turn = join.turn.wrapping_add(1);
             let from = servers[join.turn % servers.len()];
             let path = self.peers.get(&from).map(|p| p.path).unwrap_or_default();
             let transfer = Self::number(&self.secret, &mut self.numbers);
+            l.fetching.push((object, from));
             self.fetches.push(Fetching { object, from, fetch: Fetch::new(transfer, None, most, path, now) });
         }
     }
@@ -1456,7 +1475,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             if self.chain.missing_bodies(&mut first).unwrap_or(0) == 0
                 || self.peers.live(now).next().is_none()
                 || self.peers.holders(first[0].height, now).next().is_some()
-                || self.fetches.iter().any(|f| matches!(f.object, Object::Block(_)))
+                || l.fetching.iter().any(|f| matches!(f.0, Object::Block(_)))
                 || !l.held.is_empty()
             {
                 return false;
@@ -1796,6 +1815,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                     // given none, or is gone, is not asked.
                     let Some(token) = self.peers.get(&from).and_then(|p| p.token()) else {
                         self.fetches.swap_remove(i);
+                        fetched(&mut l.fetching, &object, &from);
                         self.fetch_failed(l, now, object, from);
                         continue;
                     };
@@ -1809,6 +1829,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                 Poll::Wait(at) => wake = wake.min(at),
                 Poll::Done => {
                     let done = self.fetches.swap_remove(i);
+                    fetched(&mut l.fetching, &object, &from);
                     self.counts.fetched += 1;
                     self.peers.delivered(&from, done.fetch.path());
                     let bytes = done.fetch.finish().expect("it is done");
@@ -1817,6 +1838,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                 }
                 Poll::Failed(why) => {
                     let failed = self.fetches.swap_remove(i);
+                    fetched(&mut l.fetching, &object, &from);
                     self.peers.set_path(&from, failed.fetch.path());
                     if why == Why::Bad {
                         self.peers.strike(&from, now);
