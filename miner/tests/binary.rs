@@ -77,7 +77,8 @@ fn a_node_starts_says_it_is_ready_and_halts_when_told() {
     assert!(said[0][26..].starts_with("Server started ") && said[0].ends_with(" UTC"), "{said:#?}");
     assert_eq!((&said[1], &said[said.len() - 2]), (&rule, &rule));
     assert_eq!(&said[2][26..], format!("UDP Server Listening on: '{listen}'"));
-    assert!(said.contains(&format!("{}Main Log:                '{data}/tabernacle.log'", &said[2][..26])));
+    // (By its end: the lines are not all of one millisecond.)
+    assert!(said.iter().any(|l| l.ends_with(&format!("Main Log:                '{data}/tabernacle.log'"))));
     assert!(said.iter().any(|l| l.ends_with("Max Peers:               '2,000'")));
     // How many threads, as a number: one a core, nothing being said.
     let cores = std::thread::available_parallelism().unwrap().get();
