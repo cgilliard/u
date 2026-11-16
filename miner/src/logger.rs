@@ -36,7 +36,24 @@
 //!
 //! A line is never split between two files. If two files are put aside
 //! within one minute, the second and later have a count after the
-//! minute (`..._10_00_2.log`), so that none is written over.
+//! minute (`..._10_00_02.log`, `..._10_00_03.log`), so that none is
+//! written over. Files put aside are never deleted here: that is for
+//! whoever keeps the machine.
+//!
+//! # The first line of a file
+//!
+//! Every file begins with a line saying what it is and when it was
+//! begun: the log's name (the file's, without its directory) and the
+//! moment, to the second:
+//!
+//! ```text
+//! tabernacle.log_02_03_2026_10_30_04
+//! (month, day, year, hour, minute, second)
+//! ```
+//!
+//! So a file put aside still says which log it was and when it began,
+//! whatever it has been renamed to. A file that holds nothing but that
+//! line is not put aside: there is nothing in it to keep.
 //!
 //! # A log must not bring the node down
 //!
@@ -112,6 +129,16 @@ impl Moment {
     pub fn rotated(&self) -> String {
         format!("_R_{:02}_{:02}_{:04}_{:02}_{:02}", self.month, self.day, self.year, self.hour, self.minute)
     }
+
+    /// What goes after a log's name in the first line of a file begun
+    /// at this moment: `_02_03_2026_10_30_04` (month, day, year, hour,
+    /// minute, second).
+    pub fn begun(&self) -> String {
+        format!(
+            "_{:02}_{:02}_{:04}_{:02}_{:02}_{:02}",
+            self.month, self.day, self.year, self.hour, self.minute, self.second
+        )
+    }
 }
 
 /// The clock: milliseconds since the start of 1970.
@@ -125,8 +152,10 @@ struct Inner {
     /// The file being written to; none if it could not be opened after
     /// the last was put aside, and is to be tried again.
     file: Option<File>,
-    /// Bytes in it.
+    /// Bytes in it, its first line among them.
     size: u64,
+    /// Whether it holds anything but its first line.
+    written: bool,
     /// When it began to be written to, by this logger.
     since: u64,
 }
@@ -146,23 +175,38 @@ impl Logger {
     ///
     /// A file found there counts as begun now: how long it had been
     /// written to before is not known. What it holds counts towards
-    /// its size.
+    /// its size. A new file is given its first line.
     pub fn open(path: impl Into<PathBuf>, rotation: Rotation) -> io::Result<Logger> {
         Logger::with_clock(path, rotation, Box::new(system_clock))
     }
 
     fn with_clock(path: impl Into<PathBuf>, rotation: Rotation, clock: Clock) -> io::Result<Logger> {
-        let path = path.into();
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let size = file.metadata()?.len();
-        let since = clock();
-        Ok(Logger {
-            path,
+        let logger = Logger {
+            path: path.into(),
             rotation,
             clock,
-            inner: Mutex::new(Inner { file: Some(file), size, since }),
+            inner: Mutex::new(Inner { file: None, size: 0, written: false, since: 0 }),
             failures: AtomicU64::new(0),
-        })
+        };
+        let now = (logger.clock)();
+        logger.begin(&mut logger.lock(), now)?;
+        Ok(logger)
+    }
+
+    /// Opens the file to be written to, at `now`: added to if it is
+    /// there and holds anything, and given its first line if not.
+    fn begin(&self, inner: &mut Inner, now: u64) -> io::Result<()> {
+        let mut file = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        let size = file.metadata()?.len();
+        (inner.size, inner.written, inner.since) = (size, size > 0, now);
+        if size == 0 {
+            let name = self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let first = format!("{name}{}\n", Moment::of(now).begun());
+            file.write_all(first.as_bytes())?;
+            inner.size = first.len() as u64;
+        }
+        inner.file = Some(file);
+        Ok(())
     }
 
     /// The file being written to.
@@ -203,14 +247,14 @@ impl Logger {
     pub fn rotate_if_due(&self) {
         let now = (self.clock)();
         let mut inner = self.lock();
-        if inner.size > 0 && self.aged(&inner, now) {
+        if inner.written && self.aged(&inner, now) {
             self.rotate_locked(&mut inner, now);
         }
     }
 
     /// Puts the file aside now, whatever its age and size, and begins a
-    /// new one. The name it was given: none if it held nothing (an
-    /// empty file is not worth keeping) or could not be renamed.
+    /// new one. The name it was given: none if it held nothing but its
+    /// first line (not worth keeping) or could not be renamed.
     pub fn rotate(&self) -> Option<PathBuf> {
         let now = (self.clock)();
         let mut inner = self.lock();
@@ -234,23 +278,22 @@ impl Logger {
     fn write(&self, now: u64, text: &str) {
         let mut inner = self.lock();
         let over = self.rotation.max_size > 0 && inner.size + text.len() as u64 > self.rotation.max_size;
-        // (An empty file is not put aside: for its age there is nothing
-        // to keep, and a line too long for any file goes into this one.)
-        if inner.size > 0 && (over || self.aged(&inner, now)) {
+        // (A file with nothing in it but its first line is not put
+        // aside: for its age there is nothing to keep, and a line too
+        // long for any file goes into this one.)
+        if inner.written && (over || self.aged(&inner, now)) {
             self.rotate_locked(&mut inner, now);
         }
-        if inner.file.is_none() {
-            match OpenOptions::new().create(true).append(true).open(&self.path) {
-                Ok(file) => {
-                    inner.size = file.metadata().map_or(0, |m| m.len());
-                    inner.since = now;
-                    inner.file = Some(file);
-                }
-                Err(e) => return self.failed("opened", &e),
-            }
+        if inner.file.is_none()
+            && let Err(e) = self.begin(&mut inner, now)
+        {
+            return self.failed("opened", &e);
         }
         match inner.file.as_mut().expect("opened above").write_all(text.as_bytes()) {
-            Ok(()) => inner.size += text.len() as u64,
+            Ok(()) => {
+                inner.size += text.len() as u64;
+                inner.written = true;
+            }
             Err(e) => self.failed("written to", &e),
         }
     }
@@ -262,14 +305,14 @@ impl Logger {
         let stem = self.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let ending = self.path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
         let named = |count: u32| {
-            let count = if count == 1 { String::new() } else { format!("_{count}") };
+            let count = if count == 1 { String::new() } else { format!("_{count:02}") };
             self.path.with_file_name(format!("{stem}{}{count}{ending}", moment.rotated()))
         };
         (1..).map(named).find(|p| !p.exists()).expect("some count is free")
     }
 
     fn rotate_locked(&self, inner: &mut Inner, now: u64) -> Option<PathBuf> {
-        if inner.size == 0 {
+        if !inner.written {
             inner.since = now;
             return None;
         }
@@ -282,13 +325,8 @@ impl Logger {
             // The same file goes on being written to.
             self.failed("put aside", e);
         }
-        match OpenOptions::new().create(true).append(true).open(&self.path) {
-            Ok(file) => {
-                inner.size = file.metadata().map_or(0, |m| m.len());
-                inner.since = now;
-                inner.file = Some(file);
-            }
-            Err(e) => self.failed("opened", &e),
+        if let Err(e) = self.begin(inner, now) {
+            self.failed("opened", &e);
         }
         renamed.ok().map(|()| aside)
     }
@@ -387,6 +425,9 @@ mod tests {
         // Month, day, year, hour, minute.
         assert_eq!(Moment::of(T).rotated(), "_R_10_17_2026_19_49");
         assert_eq!(Moment::of(1_770_112_800_000).rotated(), "_R_02_03_2026_10_00");
+        // Month, day, year, hour, minute, second.
+        assert_eq!(Moment::of(1_770_114_604_000).begun(), "_02_03_2026_10_30_04");
+        assert_eq!(Moment::of(T).begun(), "_10_17_2026_19_49_31");
     }
 
     #[test]
@@ -402,18 +443,21 @@ mod tests {
         log.log("");
         assert_eq!(
             dir.read("tabernacle.log"),
-            "[2026-10-17 19:49:31:471] started\n\
+            "tabernacle.log_10_17_2026_19_49_31\n\
+             [2026-10-17 19:49:31:471] started\n\
              peers 14 blocks 3\n\
              [2026-10-17 19:49:33:000] a line\nof two lines\n\
              [2026-10-17 19:49:33:000] to the terminal as well\n\
              [2026-10-17 19:49:33:000] \n"
         );
         assert_eq!((log.failures(), dir.files()), (0, vec!["tabernacle.log".to_string()]));
-        // Opened again, it is added to.
+        // Opened again, it is added to: it has its first line already.
         drop(log);
         let log = Logger::open(dir.0.join("tabernacle.log"), Rotation::default()).unwrap();
         log.log_no_header("again");
-        assert!(dir.read("tabernacle.log").ends_with("[2026-10-17 19:49:33:000] \nagain\n"));
+        let text = dir.read("tabernacle.log");
+        assert!(text.ends_with("[2026-10-17 19:49:33:000] \nagain\n"));
+        assert_eq!(text.matches("tabernacle.log_").count(), 1);
     }
 
     #[test]
@@ -422,30 +466,44 @@ mod tests {
         let (now, clock) = clock(T);
         let rotation = Rotation { max_age: 0, max_size: 100 };
         let log = Logger::with_clock(dir.0.join("node.log"), rotation, clock).unwrap();
-        // Forty bytes a line: two fit in a hundred, a third does not.
-        let line = |n: u32| format!("{n:039}");
+        // Each file begins with its first line, of twenty-nine bytes;
+        // of lines of thirty, two more fit in a hundred and a third
+        // does not.
+        let first = "node.log_10_17_2026_19_49_31\n";
+        let line = |n: u32| format!("{n:029}");
         for n in 0..5 {
             log.log_no_header(&line(n));
         }
-        assert_eq!(dir.files(), ["node.log", "node_R_10_17_2026_19_49.log", "node_R_10_17_2026_19_49_2.log"]);
+        assert_eq!(dir.files(), ["node.log", "node_R_10_17_2026_19_49.log", "node_R_10_17_2026_19_49_02.log"]);
         // No line is lost, none is split, and they are in order: the
         // first put aside, then the second, then the file itself.
         let all =
-            [dir.read("node_R_10_17_2026_19_49.log"), dir.read("node_R_10_17_2026_19_49_2.log"), dir.read("node.log")];
-        assert_eq!(all.iter().map(|f| f.len()).collect::<Vec<_>>(), [80, 80, 40]);
-        assert_eq!(all.concat(), (0..5).map(|n| line(n) + "\n").collect::<String>());
+            [dir.read("node_R_10_17_2026_19_49.log"), dir.read("node_R_10_17_2026_19_49_02.log"), dir.read("node.log")];
+        assert_eq!(all.iter().map(|f| f.len()).collect::<Vec<_>>(), [89, 89, 59]);
+        assert!(all.iter().all(|f| f.starts_with(first)));
+        let lines: String = all.iter().map(|f| &f[first.len()..]).collect();
+        assert_eq!(lines, (0..5).map(|n| line(n) + "\n").collect::<String>());
+        // A third in the same minute, and a tenth, are counted with two
+        // digits as every other number in the name is.
+        for n in 5..25 {
+            log.log_no_header(&line(n));
+        }
+        assert!(dir.files().contains(&"node_R_10_17_2026_19_49_03.log".to_string()));
+        assert!(dir.files().contains(&"node_R_10_17_2026_19_49_10.log".to_string()));
         // Another minute, another name.
         now.store(T + 60_000, Ordering::Relaxed);
-        log.log_no_header(&line(5));
-        log.log_no_header(&line(6));
+        log.log_no_header(&line(25));
+        log.log_no_header(&line(26));
         assert!(dir.files().contains(&"node_R_10_17_2026_19_50.log".to_string()));
+        // A file begun then says so in its first line.
+        assert!(dir.read("node.log").starts_with("node.log_10_17_2026_19_50_31\n"));
         // A line longer than any file may be is written all the same, to
         // a file of its own.
         let long = "x".repeat(300);
         log.log_no_header(&long);
-        assert_eq!(dir.read("node.log"), format!("{long}\n"));
+        assert_eq!(dir.read("node.log"), format!("node.log_10_17_2026_19_50_31\n{long}\n"));
         log.log_no_header("after");
-        assert_eq!(dir.read("node.log"), "after\n");
+        assert_eq!(dir.read("node.log"), "node.log_10_17_2026_19_50_31\nafter\n");
         assert_eq!(log.failures(), 0);
     }
 
@@ -464,17 +522,18 @@ mod tests {
         log.log("the next hour");
         assert_eq!(dir.files(), ["stats.log", "stats_R_10_17_2026_20_49.log"]);
         assert!(dir.read("stats_R_10_17_2026_20_49.log").ends_with("within the hour\n"));
-        assert_eq!(dir.read("stats.log"), "[2026-10-17 20:49:31:471] the next hour\n");
+        assert_eq!(dir.read("stats.log"), "stats.log_10_17_2026_20_49_31\n[2026-10-17 20:49:31:471] the next hour\n");
         // A quiet log is put aside when it is looked to, though nothing
-        // is written; an empty one is not.
+        // is written; one with nothing in it but its first line is not.
         now.store(T + 2 * 3_600_000, Ordering::Relaxed);
         log.rotate_if_due();
         assert_eq!(dir.files().len(), 3);
-        assert_eq!(dir.read("stats.log"), "");
+        assert_eq!(dir.read("stats.log"), "stats.log_10_17_2026_21_49_31\n");
         now.store(T + 9 * 3_600_000, Ordering::Relaxed);
         log.rotate_if_due();
         log.log("after a long quiet");
-        assert_eq!(dir.files().len(), 3, "an empty file was not worth keeping");
+        assert_eq!(dir.files().len(), 3, "a file of one line was not worth keeping");
+        assert!(dir.read("stats.log").starts_with("stats.log_10_17_2026_21_49_31\n[2026-10-18 04:49:31:471] after"));
         // And when asked to, whatever its age.
         assert!(log.rotate().is_some_and(|p| p.ends_with("stats_R_10_18_2026_04_49.log")));
         assert_eq!(log.rotate(), None);
@@ -488,6 +547,7 @@ mod tests {
         log.log_no_header("one");
         assert!(log.rotate().is_some());
         assert_eq!(dir.files(), ["requests", "requests_R_10_17_2026_19_49"]);
+        assert_eq!(dir.read("requests_R_10_17_2026_19_49"), "requests_10_17_2026_19_49_31\none\n");
     }
 
     #[test]
@@ -517,7 +577,9 @@ mod tests {
         for path in &paths {
             let text = std::fs::read_to_string(path).unwrap();
             assert!(text.len() <= 20_000 && text.ends_with('\n'));
-            for line in text.lines() {
+            let mut of_file = text.lines();
+            assert!(of_file.next().unwrap().starts_with("busy.log_"));
+            for line in of_file {
                 assert!(line.starts_with('[') && line.ends_with(&"=".repeat(20)), "{line}");
                 let words: Vec<&str> = line.split(' ').collect();
                 seen[words[3].parse::<usize>().unwrap()].push(words[5].parse::<u32>().unwrap());
