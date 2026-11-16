@@ -37,7 +37,7 @@ use crate::error::Error;
 use crate::hash::Digest;
 use crate::name_air::NameWitness;
 use crate::output::{Output, Sig};
-use crate::pow::{Dataset, Nonce, hashimoto, nonce_from_u64};
+use crate::pow::{ItemSource, Nonce, hashimoto, nonce_from_u64};
 use crate::store::backend::Backend;
 use crate::transaction::UnsignedTransaction;
 
@@ -131,9 +131,13 @@ pub enum Mined {
 /// and `start` where the nonces tried begin (any number: so that two
 /// miners do not try the same). `cancel` is asked now and then whether
 /// to give up.
-pub fn mine<B: Backend + 'static>(
+///
+/// `dataset` is the table of the proof of work for that block's
+/// height: whole, or one that fills as it is read
+/// ([`crate::pow::LazyDataset`]).
+pub fn mine<B: Backend + 'static, S: ItemSource + Sync>(
     chain: &Chain<B, AggregateVerifier>,
-    dataset: &Dataset<'_>,
+    dataset: &S,
     reward: &Digest,
     unix: u64,
     start: u64,
@@ -270,8 +274,8 @@ fn before<B: Backend + 'static>(
 /// that goes in the header beside it, and how many were tried: on
 /// every thread there is, the nonces from `start` dealt out among
 /// them. None if `cancel` said to give up first.
-pub fn solve(
-    dataset: &Dataset<'_>,
+pub fn solve<S: ItemSource + Sync>(
+    dataset: &S,
     header_hash: &Digest,
     target: &Target,
     start: u64,
@@ -354,7 +358,7 @@ mod tests {
     use crate::chain::apply::Applied;
     use crate::chain::params::ChainParams;
     use crate::poseidon2::Fp;
-    use crate::pow::SeedText;
+    use crate::pow::{Dataset, SeedText};
     use crate::store::testing::MemBackend;
 
     /// 2026-06-01, after the dev network's genesis.

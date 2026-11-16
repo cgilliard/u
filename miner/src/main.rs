@@ -8,8 +8,8 @@
 
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use tabminer::aggregate::{AggregateVerifier, AggregatorParams, Genesis};
@@ -18,13 +18,13 @@ use tabminer::chain::params::ChainParams;
 use tabminer::configuration::{Configuration, Network, hex};
 use tabminer::interrupt;
 use tabminer::logger::Logger;
-use tabminer::logger::fmt::{commas, seconds, short_seconds};
+use tabminer::logger::fmt::{bytes, commas, seconds, short_seconds};
 use tabminer::logger::queued::Queued;
 use tabminer::logger::stats::{Stats, StatsLog};
 use tabminer::miner::{self, HoldOff, Mined, Now};
 use tabminer::net::node::{Behind, Event, Handle, Node};
 use tabminer::net::socket::{self, Watch};
-use tabminer::pow::{Dataset, SeedText};
+use tabminer::pow::{Dataset, ItemSource, LazyDataset, SeedText};
 use tabminer::store::backend::FileBackend;
 
 fn main() {
@@ -130,11 +130,27 @@ fn short(id: &tabminer::hash::Digest) -> String {
 /// catching up with a chain ahead of its own.
 fn make_blocks(
     hold: &Handle<FileBackend, AggregateVerifier>,
-    dataset: &Dataset<'static>,
+    seed: SeedText<'static>,
+    kept: &Path,
     reward: &tabminer::hash::Digest,
-    main: &Logger,
+    main: &Arc<Logger>,
     stats: &Stats,
 ) {
+    // The table of the proof of work, for the height blocks are now
+    // made at: what a file of it from an earlier run holds, and the
+    // rest filled as it is read, and by a thread that does nothing
+    // else until it is whole.
+    let pow = hold.chain().params().pow;
+    let size = |log_items: u32| bytes(tabminer::pow::table_bytes(log_items));
+    let next = hold.chain().tip().map_or(1, |tip| tip.height as u64 + 1);
+    let table = match LazyDataset::open(&seed, pow.log_items_at(next), kept) {
+        Ok(table) => Arc::new(RwLock::new(table)),
+        Err(e) => {
+            let needed = size(pow.log_items_at(next));
+            return main.log(&format!("Error: no blocks are made: the table of the proof of work ({needed}): {e}"));
+        }
+    };
+    fill_table(&table, kept, main);
     // Where this miner's nonces begin: its own, as likely as not.
     let mut start = [0u8; 8];
     let _ = tabminer::random::fill(&mut start);
@@ -192,7 +208,18 @@ fn make_blocks(
         if let Ok(tip) = hold.chain().tip() {
             main.log(&format!("Mining block {} on {}", commas(tip.height as u64 + 1), short(&tip.hash())));
         }
-        match miner::mine(hold.chain(), dataset, reward, socket::unix(), start, &cancel) {
+        // The table grows with the chain, a year at a time: what it
+        // has stays, and the rest is filled as the first was.
+        let wanted = hold.chain().tip().map_or(0, |tip| pow.log_items_at(tip.height as u64 + 1));
+        if table.read().unwrap_or_else(|e| e.into_inner()).log_items() < wanted {
+            main.log(&format!("The table of the proof of work grows to {}", size(wanted)));
+            if let Err(e) = table.write().unwrap_or_else(|e| e.into_inner()).grow(wanted) {
+                return main.log(&format!("Error: no more blocks are made: the table of the proof of work: {e}"));
+            }
+            fill_table(&table, kept, main);
+        }
+        let dataset = table.read().unwrap_or_else(|e| e.into_inner());
+        match miner::mine(hold.chain(), &*dataset, reward, socket::unix(), start, &cancel) {
             Ok(Mined::Block { block, header, proved, hashes, solved }) => {
                 main.log(&format!(
                     "Won block {} ({}): proved in {}, {} hashes in {}",
@@ -220,14 +247,48 @@ fn make_blocks(
     }
 }
 
+/// Fills what is missing of the table of the proof of work, on a thread
+/// of its own, and keeps it in the file `kept` when it is whole: so
+/// that the next run begins with it. (Blocks are made meanwhile: what
+/// they read of the table is filled as they read it.)
+fn fill_table(table: &Arc<RwLock<LazyDataset<'static>>>, kept: &Path, main: &Arc<Logger>) {
+    let (table, kept, told) = (Arc::clone(table), kept.to_path_buf(), Arc::clone(main));
+    let fill = move || {
+        let main = told;
+        let table = table.read().unwrap_or_else(|e| e.into_inner());
+        if table.is_complete() {
+            return;
+        }
+        let whole = tabminer::pow::table_bytes(table.log_items());
+        let there = whole / table.pairs() as u64 * table.filled() as u64;
+        main.log(&format!("Making the table of the proof of work: {} of {} are there", bytes(there), bytes(whole)));
+        let began = Instant::now();
+        table.fill();
+        main.log(&format!(
+            "The table of the proof of work is whole: made in {}",
+            seconds(began.elapsed().as_millis() as u64)
+        ));
+        match table.save(&kept) {
+            Ok(()) => main.log(&format!("The table of the proof of work is kept in '{}'", kept.display())),
+            Err(e) => main
+                .log(&format!("Error: the table of the proof of work could not be kept in '{}': {e}", kept.display())),
+        }
+    };
+    if let Err(e) = std::thread::Builder::new().name("pow table".into()).spawn(fill) {
+        main.log(&format!("Error: the table of the proof of work is not being made ahead: {e}"));
+    }
+}
+
 /// Runs the node: it returns only with why it could not start, or
 /// could not go on. Told to stop, the program ends where that is
 /// heard ([`interrupt::halt_when_told`]).
 fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::convert::Infallible, String> {
-    // Blocks are made only on the dev networks, for now: mainnet's
-    // table of the proof of work is not built in.
-    if c.mine && c.network == Network::Mainnet {
-        return Err(format!("mining on the {} network is not built yet: give --no-mine", c.network.name()));
+    // On mainnet the rewards of blocks made here need somewhere to go:
+    // there is no wallet yet to make a key for them.
+    if c.mine && c.network == Network::Mainnet && c.reward.is_none() {
+        return Err(
+            "making blocks on mainnet needs --reward-key (the key their rewards are paid to), or --no-mine".into()
+        );
     }
     if c.network != Network::Mainnet && !cfg!(feature = "dev") {
         return Err(format!("this build has no {} network: it is built with --features dev", c.network.name()));
@@ -269,15 +330,12 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
         .map_err(|e| format!("cannot open the store {}: {e}", store.display()))?;
     // The table of the proof of work, where the network's is built in:
     // headers are checked against it, and blocks made with it.
-    let dataset = Dataset::built_in(&seed).map(Arc::new);
-    if let Some(dataset) = &dataset {
-        chain.set_dataset(Arc::clone(dataset));
+    if let Some(dataset) = Dataset::built_in(&seed) {
+        chain.set_dataset(Arc::new(dataset));
     }
-    let mining = match (c.mine, dataset) {
-        (false, _) => None,
-        (true, Some(dataset)) => Some((dataset, c.reward.unwrap_or(DEV_REWARD))),
-        (true, None) => return Err("there is no table of the proof of work to make blocks with".into()),
-    };
+    // Blocks are made with a table of their own, which fills as it is
+    // read and is kept in the data directory from one run to the next.
+    let mining = c.mine.then(|| (seed, c.data_dir.join("pow.table"), c.reward.unwrap_or(DEV_REWARD)));
 
     // The port.
     let socket = UdpSocket::bind(c.listen).map_err(|e| format!("cannot listen on {}: {e}", c.listen))?;
@@ -321,11 +379,11 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
             }
         }));
     }
-    if let Some((dataset, reward)) = mining {
+    if let Some((seed, table, reward)) = mining {
         let (main, stats) = (Arc::clone(&main), Arc::clone(&stats));
         std::thread::Builder::new()
             .name("miner".into())
-            .spawn(move || make_blocks(&hold, &dataset, &reward, &main, &stats))
+            .spawn(move || make_blocks(&hold, seed, &table, &reward, &main, &stats))
             .map_err(threads)?;
     }
 

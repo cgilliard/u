@@ -426,22 +426,44 @@ begun again whenever that changes, and not while the node is catching
 up with a chain ahead of its own. A block made is given to the node,
 which applies it and tells its peers.
 
-**So far, on the two dev networks** (a build with `--features dev`),
-and a block carries its reward and nothing else:
+A block carries its reward and nothing else, so far: there is no pool
+of transactions yet.
 
-- `--network dev`: a block about every second, its proof checked
-  directly.
-- `--network dev-recursive`: a block about every ten seconds, its proof
-  made the mainnet way at the smallest parameters: each builds on the
-  proof of the block before, which is taken from the chain (the proof
-  from that block's body, and what it speaks to made again from the
-  body and the header before it). Proving a block takes some seconds.
-- `--reward-key HEX`: the hash of the key rewards are paid to. Without
-  it, on the dev networks, they are paid to a key nobody has.
-- On mainnet a node that is not given `--no-mine` says that mining
-  there is not built yet, and does not start: mainnet's table of the
-  proof of work is not built into the program, and is not yet made
-  when a node starts.
+- **Mainnet** (`tabminer --reward-key HEX`): a block's proof builds on
+  the proof of the block before, which is taken from the chain (the
+  proof from that block's body, and what it speaks to made again from
+  the body and the header before it). `--reward-key` is the hash of the
+  key the rewards are paid to, as 64 hex digits; it must be given,
+  since there is no wallet yet to make one.
+- `--network dev-recursive` (a build with `--features dev`): the same,
+  at the smallest parameters; a block about every ten seconds.
+- `--network dev` (the same build): a block about every second, its
+  proof checked directly.
+- On the dev networks, without `--reward-key`, rewards are paid to a
+  key nobody has.
+
+**The table of the proof of work.** A miner hashes against a table: 1.1
+GB on mainnet (it doubles each year, to 32 GB), 64 KB and built in on
+the dev networks. Its memory is taken when the node starts making
+blocks. What is read of it is filled as it is read, so blocks are made
+from the first moment; a thread fills the rest, and when it is whole it
+is kept in `pow.table` in the data directory, for the next run to begin
+with. The main log says so:
+
+```
+Making the table of the proof of work: 0 B of 1.1 GB are there
+The table of the proof of work is whole: made in 617.66 seconds
+The table of the proof of work is kept in '/home/chris/.tabernacle/tabminer/pow.table'
+```
+
+**What it takes**, as measured on one machine of twelve threads, the
+node alone on it:
+
+| | Mainnet | dev-recursive | dev |
+|---|---|---|---|
+| The table, made once | about ten minutes, blocks being proven meanwhile | built in | built in |
+| Proving a block | about 55 seconds (two to three minutes while the table is being made) | 6 to 10 seconds | under a tenth of a second |
+| Checking a block | a fraction of a second | | |
 
 ### 4.1 When a node does not make blocks
 
@@ -488,9 +510,8 @@ chain, and those it made (`Mined`).
 
 ## 5. Still to do
 
-1. **Mining on mainnet**: the table of the proof of work, made once
-   and kept in the data directory; a key for the rewards (there is no
-   wallet); transactions in blocks.
+1. **A wallet**, so that rewards need no key given by hand; and
+   **transactions in blocks**.
 2. **What is left of `THREADS.md`** (its 8.3).
 3. **The peers file and the built-in seeds.** `--peer` and `--seed` are
    what a node begins from today.

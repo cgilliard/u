@@ -44,6 +44,17 @@ fn help_is_no_failure_and_an_unknown_option_is() {
     assert_eq!(said, format!("Error: unknown configuration option: '--prot'\n\n{text}"));
     assert!(unknown.stdout.is_empty());
     assert!(!dir.exists());
+
+    // On mainnet, making blocks needs a key for their rewards: without
+    // one a node says so in a line, and does not start.
+    let keyless = Command::new(TABMINER).args(["--data-dir", &data]).output().unwrap();
+    assert!(matches!(keyless.status.code(), Some(-1 | 255)));
+    let said = String::from_utf8(keyless.stderr).unwrap();
+    assert_eq!(
+        said,
+        "Error: making blocks on mainnet needs --reward-key (the key their rewards are paid to), or --no-mine\n"
+    );
+    assert!(!dir.exists());
 }
 
 /// A node that starts says how it is configured and then, in the very
