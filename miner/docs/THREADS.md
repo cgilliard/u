@@ -319,6 +319,16 @@ Each leaves the tests passing:
 1. **Split the node in place**, still on one thread: what is about one
    peer (a worker) and the list. The simulation runs one worker. This
    is most of the work, and where the sync tests earn their keep.
+
+   *Done so far*: the list is a thing of its own behind its lock
+   (`net::node::List`): where the header sync is aiming, the bodies in
+   hand, the state being taken, the work with the applier. The node
+   takes the lock only where it decides what to fetch or hears what
+   came of it; pings, requests for chunks, chunks arriving and chunks
+   served do not touch it. *Still to do*: which objects are being
+   fetched is still read off the node's own fetches, and must be on
+   the list before two workers can share it; and the node itself is
+   not yet a worker among several.
 2. **Several workers on one thread** in the simulation, datagrams
    handed out by the hash: finds whatever still assumed one table.
 3. **Real threads**: the receiver, the pool, the queues, the shared

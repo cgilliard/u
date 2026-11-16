@@ -70,7 +70,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{SocketAddr, SocketAddrV4};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::config::Config;
 use super::message::{Locator, Message, Status};
@@ -244,12 +244,12 @@ fn apply<B: Backend + 'static, V: ProofVerifier + Sync>(chain: &Chain<B, V>, job
 /// done in place, so that a run is the same every time.
 enum Applier {
     Here(VecDeque<Outcome>),
-    Thread(std::sync::mpsc::Sender<Job>, std::sync::mpsc::Receiver<Outcome>),
+    Thread(Mutex<std::sync::mpsc::Sender<Job>>, Mutex<std::sync::mpsc::Receiver<Outcome>>),
 }
 
 /// A state being taken whole from other nodes, in place of the blocks
 /// nobody holds any more ([`crate::chain::receive`]).
-struct Join {
+pub(crate) struct Join {
     /// The block it is the state after.
     target: Header,
     id: Digest,
@@ -284,7 +284,7 @@ struct Join {
 
 /// The chain being caught up with: a tip some peer has, and its headers
 /// from where its chain leaves ours.
-struct Aim {
+pub(crate) struct Aim {
     /// The tip, and its height.
     tip: Digest,
     height: u32,
@@ -300,6 +300,32 @@ struct Aim {
     /// Who told us of it: asked for its headers though its last ping
     /// said its chain was shorter.
     source: SocketAddrV4,
+}
+
+/// What the node is after, and what is being done about it: the chain
+/// being caught up with, the bodies in hand, the state being taken,
+/// and the work given to be done on the chain.
+///
+/// This is all that is about no one peer (`docs/THREADS.md`, 4.2). It
+/// is behind a lock, taken where a decision about what to fetch is
+/// made or what came of one is heard: not to answer a ping, take a
+/// chunk or serve one.
+pub(crate) struct List {
+    /// The peer asked where its chain leaves ours, when, and the block
+    /// it announced that made us ask, with its height: its tip, as far
+    /// as we know, though its last ping said less.
+    probe: Option<(SocketAddrV4, Micros, Option<(Digest, u32)>)>,
+    pub(crate) aim: Option<Aim>,
+    applier: Applier,
+    /// Work given to be done and not yet heard of.
+    outstanding: usize,
+    /// Blocks given to be applied and not yet heard of.
+    pub(crate) applying: Vec<Digest>,
+    /// Bodies fetched and waiting for the blocks before them: the
+    /// block whole, and who served it.
+    pub(crate) held: Vec<(Digest, Vec<u8>, SocketAddrV4)>,
+    /// The state being taken whole from others, if one is.
+    pub(crate) join: Option<Join>,
 }
 
 /// What a datagram was, and what was done about it: for whoever keeps
@@ -414,27 +440,14 @@ pub struct Node<B: Backend + 'static, V> {
     /// Objects lately made to be served, the latest first.
     served: VecDeque<(Object, Arc<Vec<u8>>)>,
     fetches: Vec<Fetching>,
-    /// The peer asked where its chain leaves ours, when, and the block
-    /// it announced that made us ask, with its height: its tip, as far
-    /// as we know, though its last ping said less.
-    probe: Option<(SocketAddrV4, Micros, Option<(Digest, u32)>)>,
-    aim: Option<Aim>,
-    applier: Applier,
-    /// Work given to be done and not yet heard of.
-    outstanding: usize,
-    /// Blocks given to be applied and not yet heard of.
-    applying: Vec<Digest>,
-    /// Bodies fetched and waiting for the blocks before them: the
-    /// block whole, and who served it.
-    held: Vec<(Digest, Vec<u8>, SocketAddrV4)>,
+    /// What is about no one peer.
+    list: Arc<RwLock<List>>,
     /// Who announced which block, and how long its body is: the newest
     /// last.
     announced: VecDeque<(Digest, SocketAddrV4, u32)>,
     /// What came of the fetches asked for from outside
     /// ([`Node::fetch_object`]).
     inbox: Vec<(Object, SocketAddrV4, Option<Vec<u8>>)>,
-    /// The state being taken whole from others, if one is.
-    join: Option<Join>,
     counts: Counts,
     /// Tests: a chain's work claimed that is not there; objects served
     /// with a byte wrong.
@@ -475,15 +488,17 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             due: now,
             served: VecDeque::new(),
             fetches: Vec::new(),
-            probe: None,
-            aim: None,
-            applier: Applier::Here(VecDeque::new()),
-            outstanding: 0,
-            applying: Vec::new(),
-            held: Vec::new(),
+            list: Arc::new(RwLock::new(List {
+                probe: None,
+                aim: None,
+                applier: Applier::Here(VecDeque::new()),
+                outstanding: 0,
+                applying: Vec::new(),
+                held: Vec::new(),
+                join: None,
+            })),
             announced: VecDeque::new(),
             inbox: Vec::new(),
-            join: None,
             counts: Counts::default(),
             #[cfg(test)]
             boast: None,
@@ -496,7 +511,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
 
     /// Has blocks applied on a thread of their own from here on: for a
     /// node over a socket.
-    pub fn threaded(mut self) -> Node<B, V>
+    pub fn threaded(self) -> Node<B, V>
     where
         Chain<B, V>: Send + Sync,
         V: 'static,
@@ -518,35 +533,53 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                 }
             })
             .expect("a thread");
-        self.applier = Applier::Thread(jobs, outcomes);
+        self.write().applier = Applier::Thread(Mutex::new(jobs), Mutex::new(outcomes));
         self
     }
 
     /// A block made here: applied, and if it joins the chain, announced.
     pub fn mined(&mut self, block: Vec<u8>) {
-        self.give(block, None);
+        let list = Arc::clone(&self.list);
+        self.give(&mut write(&list), block, None);
+    }
+
+    /// The list, to look at.
+    pub(crate) fn list(&self) -> RwLockReadGuard<'_, List> {
+        self.list.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Tests: does `f` with the list in hand, as the node itself does
+    /// what it does about what to fetch.
+    #[cfg(test)]
+    pub(crate) fn with_list<T>(&mut self, f: impl FnOnce(&mut Self, &mut List) -> T) -> T {
+        let list = Arc::clone(&self.list);
+        f(self, &mut write(&list))
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, List> {
+        write(&self.list)
     }
 
     /// Gives a block to be applied.
-    fn give(&mut self, block: Vec<u8>, from: Option<SocketAddrV4>) {
+    fn give(&mut self, l: &mut List, block: Vec<u8>, from: Option<SocketAddrV4>) {
         let Ok(header) = BlockRef::from_bytes(&block).map(|b| *b.header()) else {
             return;
         };
-        self.applying.push(header.hash());
-        self.work(Job::Block { block, from, unix: self.unix });
+        l.applying.push(header.hash());
+        self.work(l, Job::Block { block, from, unix: self.unix });
     }
 
     /// Gives work to be done on the chain: what comes of it is heard
     /// in [`Node::applied`].
-    fn work(&mut self, job: Job) {
-        self.outstanding += 1;
-        match &mut self.applier {
+    fn work(&mut self, l: &mut List, job: Job) {
+        l.outstanding += 1;
+        match &mut l.applier {
             Applier::Here(done) => match apply(&self.chain, job) {
                 Some(outcome) => done.push_back(outcome),
-                None => self.outstanding -= 1,
+                None => l.outstanding -= 1,
             },
             Applier::Thread(jobs, _) => {
-                let _ = jobs.send(job);
+                let _ = jobs.get_mut().unwrap_or_else(|e| e.into_inner()).send(job);
             }
         }
     }
@@ -555,7 +588,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
     /// of: whoever drives the node then looks to it again soon, without
     /// waiting for a datagram.
     pub fn busy(&self) -> bool {
-        self.outstanding > 0
+        self.list().outstanding > 0
     }
 
     pub fn peers(&self) -> &Peers {
@@ -669,9 +702,12 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                 self.send(addr, &Message::GetPeers { token }, out);
             }
         }
-        self.sync_headers(now, out);
-        self.sync_blocks(now);
-        self.sync_state(now);
+        // What there is to catch up with: with the list in hand.
+        let list = Arc::clone(&self.list);
+        let l = &mut *write(&list);
+        self.sync_headers(l, now, out);
+        self.sync_blocks(l, now);
+        self.sync_state(l, now);
     }
 
     /// Takes a datagram that arrived from `from`, and says what it was
@@ -767,8 +803,14 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                     self.send(from, &Message::Fork { height, id }, out);
                 }
             }
-            Message::Fork { height, id } => self.on_fork(now, from, height, id),
-            Message::Block { header, len } => self.on_block(now, from, header, len, out),
+            Message::Fork { height, id } => {
+                let list = Arc::clone(&self.list);
+                self.on_fork(&mut write(&list), now, from, height, id)
+            }
+            Message::Block { header, len } => {
+                let list = Arc::clone(&self.list);
+                self.on_block(&mut write(&list), now, from, header, len, out)
+            }
             Message::Get(get) => self.on_get(now, from, &get),
             Message::Chunk(chunk) => self.on_chunk(now, from, &chunk),
             Message::Gone(gone) => {
@@ -855,21 +897,21 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
 
     /// Whether there are headers to catch up with, and the next step
     /// towards them.
-    fn sync_headers(&mut self, now: Micros, out: Out<'_>) {
+    fn sync_headers(&mut self, l: &mut List, now: Micros, out: Out<'_>) {
         let Ok(best) = self.chain.best_header() else {
             return;
         };
         // Those that claimed work and have sent nothing for it.
         self.peers.doubt_silent_claimants(best.work, now, |_| {});
-        if let Some((addr, _, _)) = self.probe
+        if let Some((addr, _, _)) = l.probe
             && !self.peers.may_ask(&addr, now)
         {
-            self.probe = None;
+            l.probe = None;
         }
-        if self.aim.is_some() {
-            return self.fetch_headers(now);
+        if l.aim.is_some() {
+            return self.fetch_headers(l, now);
         }
-        if self.probe.is_some_and(|(_, at, _)| now.saturating_sub(at) < self.cfg.sync.header_spacing) {
+        if l.probe.is_some_and(|(_, at, _)| now.saturating_sub(at) < self.cfg.sync.header_spacing) {
             return;
         }
         // Ask whoever claims most where its chain leaves ours.
@@ -878,12 +920,12 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             return;
         };
         let addr = source.addr;
-        self.ask_fork(now, addr, None, out);
+        self.ask_fork(l, now, addr, None, out);
     }
 
     /// Asks `addr` where its chain leaves ours. `tip` is the block it
     /// announced, if that is why.
-    fn ask_fork(&mut self, now: Micros, addr: SocketAddrV4, tip: Option<(Digest, u32)>, out: Out<'_>) {
+    fn ask_fork(&mut self, l: &mut List, now: Micros, addr: SocketAddrV4, tip: Option<(Digest, u32)>, out: Out<'_>) {
         let Some(token) = self.peers.get(&addr).and_then(|p| p.token()) else {
             return;
         };
@@ -894,19 +936,19 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         let Some(locator) = Locator::new(&ids[..n]) else {
             return;
         };
-        self.probe = Some((addr, now, tip));
+        l.probe = Some((addr, now, tip));
         self.peers.asked_headers(&addr, now);
         self.counts.forks_asked += 1;
         self.send(addr, &Message::FindFork { token, locator }, out);
     }
 
-    fn on_fork(&mut self, now: Micros, from: SocketAddrV4, height: u32, id: Digest) {
+    fn on_fork(&mut self, l: &mut List, now: Micros, from: SocketAddrV4, height: u32, id: Digest) {
         // Only the answer to our question, from whom it was put to.
-        let Some((_, _, announced)) = self.probe.filter(|p| p.0 == from && self.peers.proven(&from)) else {
+        let Some((_, _, announced)) = l.probe.filter(|p| p.0 == from && self.peers.proven(&from)) else {
             self.counts.unheard += 1;
             return;
         };
-        self.probe = None;
+        l.probe = None;
         self.peers.seen(&from, now);
         // A block we hold, at the height it says: or it is no answer.
         let ours = self.chain.known(&id).ok().flatten();
@@ -925,7 +967,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             return;
         }
         let run = self.cfg.sync.headers as u32;
-        self.aim = Some(Aim {
+        l.aim = Some(Aim {
             tip: tip.0,
             height: tip.1,
             todo: (height + 1..=tip.1).step_by(run as usize).collect(),
@@ -934,13 +976,13 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             keeping: false,
             source: from,
         });
-        self.fetch_headers(now);
+        self.fetch_headers(l, now);
     }
 
     /// Asks for the runs of headers not yet asked for, as many at once
     /// as may be, each of another peer.
-    fn fetch_headers(&mut self, now: Micros) {
-        let Some(aim) = self.aim.as_mut() else {
+    fn fetch_headers(&mut self, l: &mut List, now: Micros) {
+        let Some(aim) = l.aim.as_mut() else {
             return;
         };
         let (most, run) = (self.cfg.sync.header_fetches, self.cfg.sync.headers as u32);
@@ -973,13 +1015,13 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         // Nothing under way, and nobody to ask: the aim is let go, and
         // another is taken from whoever claims most then.
         if !self.fetches.iter().any(|f| matches!(f.object, Object::Headers { .. })) && !aim.todo.is_empty() {
-            self.aim = None;
+            l.aim = None;
         }
     }
 
     /// A run of headers has arrived whole from `from`.
-    fn headers_arrived(&mut self, now: Micros, from: SocketAddrV4, first: u32, bytes: &[u8]) {
-        let Some(aim) = self.aim.as_mut() else {
+    fn headers_arrived(&mut self, l: &mut List, now: Micros, from: SocketAddrV4, first: u32, bytes: &[u8]) {
+        let Some(aim) = l.aim.as_mut() else {
             return;
         };
         // Headers, of the heights asked for, each the child of the one
@@ -993,37 +1035,46 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                 {
                     headers.push(h)
                 }
-                _ => return self.headers_refused(now, from),
+                _ => return self.headers_refused(l, now, from),
             }
         }
         aim.done.insert(first, (headers, from));
-        self.keep_headers();
-        self.fetch_headers(now);
+        self.keep_headers(l);
+        self.fetch_headers(l, now);
     }
 
     /// Gives the next run of headers to be checked and kept, if it is
     /// here and none is being: in order, one at a time.
-    fn keep_headers(&mut self) {
-        let Some(aim) = self.aim.as_mut().filter(|aim| !aim.keeping) else {
+    fn keep_headers(&mut self, l: &mut List) {
+        let Some(aim) = l.aim.as_mut().filter(|aim| !aim.keeping) else {
             return;
         };
         if let Some((headers, from)) = aim.done.remove(&aim.next) {
             aim.keeping = true;
             let first = aim.next;
-            self.work(Job::Headers { first, headers, from, unix: self.unix });
+            self.work(l, Job::Headers { first, headers, from, unix: self.unix });
         }
     }
 
     /// A run of headers has been checked and kept, or refused.
-    fn headers_kept(&mut self, now: Micros, first: u32, count: u32, last: Digest, from: SocketAddrV4, error: bool) {
+    fn headers_kept(
+        &mut self,
+        l: &mut List,
+        now: Micros,
+        first: u32,
+        count: u32,
+        last: Digest,
+        from: SocketAddrV4,
+        error: bool,
+    ) {
         // Of the aim there is now, at the place it has got to: or it
         // was let go meanwhile, and this is of no account.
-        let Some(aim) = self.aim.as_mut().filter(|aim| aim.keeping && aim.next == first) else {
+        let Some(aim) = l.aim.as_mut().filter(|aim| aim.keeping && aim.next == first) else {
             return;
         };
         aim.keeping = false;
         if error {
-            return self.headers_refused(now, from);
+            return self.headers_refused(l, now, from);
         }
         self.peers.headers_arrived(&from);
         aim.next += count;
@@ -1031,29 +1082,29 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         // that served them are of two minds.
         if aim.next > aim.height {
             if last != aim.tip {
-                return self.headers_refused(now, from);
+                return self.headers_refused(l, now, from);
             }
-            self.aim = None;
-            return self.sync_blocks(now);
+            l.aim = None;
+            return self.sync_blocks(l, now);
         }
-        self.keep_headers();
-        self.fetch_headers(now);
+        self.keep_headers(l);
+        self.fetch_headers(l, now);
     }
 
     /// `from` served headers that are not what was asked for, or that
     /// the chain refuses: a strike, and the aim is let go. What was
     /// kept stays kept.
-    fn headers_refused(&mut self, now: Micros, from: SocketAddrV4) {
+    fn headers_refused(&mut self, l: &mut List, now: Micros, from: SocketAddrV4) {
         self.peers.strike(&from, now);
         self.peers.failed(&from, now);
-        self.aim = None;
+        l.aim = None;
         self.fetches.retain(|f| !matches!(f.object, Object::Headers { .. }));
     }
 
     // -- Blocks
 
     /// "Here is a new block", from `from`.
-    fn on_block(&mut self, now: Micros, from: SocketAddrV4, header: Header, len: u32, out: Out<'_>) {
+    fn on_block(&mut self, l: &mut List, now: Micros, from: SocketAddrV4, header: Header, len: u32, out: Out<'_>) {
         // Unasked: only from a peer.
         if !self.peers.proven(&from) {
             self.counts.unheard += 1;
@@ -1064,7 +1115,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         // Its chain reaches there, whatever its last ping said.
         self.peers.reaches(&from, header.height, id);
         // One we have, body and all, is no news.
-        if self.chain.known(&id).ok().flatten().is_some_and(|k| !k.header_only()) || self.applying.contains(&id) {
+        if self.chain.known(&id).ok().flatten().is_some_and(|k| !k.header_only()) || l.applying.contains(&id) {
             return;
         }
         match self.chain.accept_header(&header, self.unix) {
@@ -1073,15 +1124,15 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                     self.announced.pop_front();
                 }
                 self.announced.push_back((id, from, len));
-                self.sync_blocks(now);
+                self.sync_blocks(l, now);
             }
             // Its parent is unknown: we are more than a block behind it.
             // Its headers are asked for now, without waiting for its
             // next ping to say how far it has got.
             Err(Error::UnknownParent) => {
-                let lately = self.probe.is_some_and(|(_, at, _)| now.saturating_sub(at) < self.cfg.sync.header_spacing);
-                if self.aim.is_none() && !lately && self.peers.may_ask(&from, now) {
-                    self.ask_fork(now, from, Some((id, header.height)), out);
+                let lately = l.probe.is_some_and(|(_, at, _)| now.saturating_sub(at) < self.cfg.sync.header_spacing);
+                if l.aim.is_none() && !lately && self.peers.may_ask(&from, now) {
+                    self.ask_fork(l, now, from, Some((id, header.height)), out);
                 }
             }
             // Not the announcer's fault, or not yet known to be.
@@ -1115,7 +1166,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
     /// not yet asked for, as many at once as may be, and gives the
     /// first to be applied once it is here. Blocks join the chain in
     /// order, so a body that arrives before the one below it waits.
-    fn sync_blocks(&mut self, now: Micros) {
+    fn sync_blocks(&mut self, l: &mut List, now: Micros) {
         // While the state is being taken, no block can join.
         if self.chain.receiving() {
             return;
@@ -1124,13 +1175,13 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         let n = self.chain.missing_bodies(&mut need).unwrap_or(0);
         let ids: Vec<Digest> = need[..n].iter().map(Header::hash).collect();
         // What is held and no longer wanted is let go.
-        self.held.retain(|(id, _, _)| ids.contains(id));
-        if self.applying.is_empty()
+        l.held.retain(|(id, _, _)| ids.contains(id));
+        if l.applying.is_empty()
             && let Some(first) = ids.first()
-            && let Some(at) = self.held.iter().position(|(id, _, _)| id == first)
+            && let Some(at) = l.held.iter().position(|(id, _, _)| id == first)
         {
-            let (_, block, from) = self.held.swap_remove(at);
-            self.give(block, Some(from));
+            let (_, block, from) = l.held.swap_remove(at);
+            self.give(l, block, Some(from));
         }
         let most = (self.chain.params().max_block_size - HEADER_SIZE) as u32;
         for (id, header) in ids.iter().zip(&need[..n]) {
@@ -1139,8 +1190,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                 break;
             }
             let wanted = Object::Block(*id);
-            if self.applying.contains(id)
-                || self.held.iter().any(|(held, _, _)| held == id)
+            if l.applying.contains(id)
+                || l.held.iter().any(|(held, _, _)| held == id)
                 || self.fetches.iter().any(|f| f.object == wanted)
             {
                 continue;
@@ -1175,49 +1226,51 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
     }
 
     /// A body has arrived whole from `from`.
-    fn body_arrived(&mut self, now: Micros, from: SocketAddrV4, id: Digest, body: &[u8]) {
+    fn body_arrived(&mut self, l: &mut List, now: Micros, from: SocketAddrV4, id: Digest, body: &[u8]) {
         let Some(known) = self.chain.known(&id).ok().flatten() else {
             return;
         };
         let mut block = Vec::with_capacity(HEADER_SIZE + body.len());
         block.extend_from_slice(&known.header.to_bytes());
         block.extend_from_slice(body);
-        self.held.push((id, block, from));
-        self.sync_blocks(now);
+        l.held.push((id, block, from));
+        self.sync_blocks(l, now);
     }
 
     /// What became of the blocks given to be applied.
-    fn applied(&mut self, now: Micros, out: Out<'_>) {
+    fn applied(&mut self, l: &mut List, now: Micros, out: Out<'_>) {
         loop {
-            let outcome = match &mut self.applier {
+            let outcome = match &mut l.applier {
                 Applier::Here(done) => done.pop_front(),
-                Applier::Thread(_, done) => done.try_recv().ok(),
+                Applier::Thread(_, done) => done.get_mut().unwrap_or_else(|e| e.into_inner()).try_recv().ok(),
             };
             let Some(outcome) = outcome else {
                 return;
             };
-            self.outstanding = self.outstanding.saturating_sub(1);
+            l.outstanding = l.outstanding.saturating_sub(1);
             match outcome {
-                Outcome::Block { header, len, from, result } => self.block_applied(now, header, len, from, result, out),
+                Outcome::Block { header, len, from, result } => {
+                    self.block_applied(l, now, header, len, from, result, out)
+                }
                 Outcome::Headers { first, count, last, from, new, error } => {
                     self.counts.headers += new as u64;
-                    self.headers_kept(now, first, count, last, from, error.is_some());
+                    self.headers_kept(l, now, first, count, last, from, error.is_some());
                 }
                 Outcome::Nothing => {}
-                Outcome::Checked { target, result } => self.state_block_checked(now, target, result),
+                Outcome::Checked { target, result } => self.state_block_checked(l, now, target, result),
                 Outcome::Begun { target, result } => {
-                    if let Some(join) = self.join.as_mut().filter(|j| j.id == target) {
+                    if let Some(join) = l.join.as_mut().filter(|j| j.id == target) {
                         join.beginning = false;
                         match result {
                             Ok(()) => join.begun = true,
-                            Err(_) => self.join = None,
+                            Err(_) => l.join = None,
                         }
                     }
-                    self.advance_join(now);
+                    self.advance_join(l, now);
                 }
                 Outcome::Piece { object, from, result } => {
-                    if self.of_join(&object)
-                        && let Some(join) = self.join.as_mut()
+                    if self.of_join(l, &object)
+                        && let Some(join) = l.join.as_mut()
                     {
                         join.putting.retain(|o| *o != object);
                         // Not the part of its root, or no part at all:
@@ -1227,19 +1280,19 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                             join.unserved.push(from);
                         }
                     }
-                    self.advance_join(now);
+                    self.advance_join(l, now);
                 }
                 Outcome::Finished { target, result } => {
-                    if self.join.as_ref().is_some_and(|j| j.id == target) {
+                    if l.join.as_ref().is_some_and(|j| j.id == target) {
                         // Whole, or not: either way this taking is over.
                         // (Not whole, the chain is receiving still, and
                         // another is begun when time is next looked to.)
-                        self.join = None;
+                        l.join = None;
                         if result.is_ok() {
                             self.counts.states += 1;
                         }
                     }
-                    self.sync_blocks(now);
+                    self.sync_blocks(l, now);
                 }
             }
         }
@@ -1248,6 +1301,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
     /// What became of a block given to be applied.
     fn block_applied(
         &mut self,
+        l: &mut List,
         now: Micros,
         header: Header,
         len: u32,
@@ -1256,7 +1310,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         out: Out<'_>,
     ) {
         let id = header.hash();
-        self.applying.retain(|a| *a != id);
+        l.applying.retain(|a| *a != id);
         match result {
             // The chain's new last block: every peer is told, but the
             // one it came from.
@@ -1278,14 +1332,14 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                 }
             }
         }
-        self.sync_blocks(now);
+        self.sync_blocks(l, now);
     }
 
     // -- The state, taken whole
 
     /// Whether `object` is a piece of the state being taken.
-    fn of_join(&self, object: &Object) -> bool {
-        let Some(join) = &self.join else {
+    fn of_join(&self, l: &List, object: &Object) -> bool {
+        let Some(join) = &l.join else {
             return false;
         };
         match object {
@@ -1302,11 +1356,11 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
     /// state; the block's proof; the roots of the state's parts; the
     /// parts. Each piece from whichever peer's turn it is, several at
     /// once, each checked before the next is believed.
-    fn sync_state(&mut self, now: Micros) {
-        if self.join.is_none() && !self.begin_join(now) {
+    fn sync_state(&mut self, l: &mut List, now: Micros) {
+        if l.join.is_none() && !self.begin_join(l, now) {
             return;
         }
-        let Some(join) = self.join.as_mut() else {
+        let Some(join) = l.join.as_mut() else {
             return;
         };
         // Who can serve it: those that can still go back to its block.
@@ -1318,7 +1372,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             // same in the later one's is kept.
             let since = *join.orphaned.get_or_insert(now);
             if now.saturating_sub(since) >= self.cfg.sync.header_wait {
-                self.join = None;
+                l.join = None;
                 self.fetches.retain(|f| {
                     !matches!(
                         f.object,
@@ -1327,7 +1381,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                 });
                 // (Begun anew, the chain goes on with what it has
                 // received: `Chain::begin_receiving`.)
-                if self.begin_join(now) {
+                if self.begin_join(l, now) {
                     self.counts.states_moved += 1;
                 }
             }
@@ -1386,9 +1440,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
 
     /// Chooses the block to take the state as of, if it is to be taken
     /// at all. True if one was chosen.
-    fn begin_join(&mut self, now: Micros) -> bool {
+    fn begin_join(&mut self, l: &mut List, now: Micros) -> bool {
         let point = self.cfg.sync.sync_point;
-        if point == 0 || self.aim.is_some() || !self.applying.is_empty() {
+        if point == 0 || l.aim.is_some() || !l.applying.is_empty() {
             return false;
         }
         let Ok(best) = self.chain.best_header().map(|k| k.header) else {
@@ -1403,7 +1457,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                 || self.peers.live(now).next().is_none()
                 || self.peers.holders(first[0].height, now).next().is_some()
                 || self.fetches.iter().any(|f| matches!(f.object, Object::Block(_)))
-                || !self.held.is_empty()
+                || !l.held.is_empty()
             {
                 return false;
             }
@@ -1436,7 +1490,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         if !matches!(self.chain.confirm_work(&best, height), Ok(Ok(_))) {
             return false;
         }
-        self.join = Some(Join {
+        l.join = Some(Join {
             id: target.hash(),
             target,
             block: None,
@@ -1457,8 +1511,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
     }
 
     /// A piece of the state being taken has arrived whole from `from`.
-    fn piece_arrived(&mut self, now: Micros, object: Object, from: SocketAddrV4, bytes: &[u8]) {
-        let Some(join) = self.join.as_mut() else {
+    fn piece_arrived(&mut self, l: &mut List, now: Micros, object: Object, from: SocketAddrV4, bytes: &[u8]) {
+        let Some(join) = l.join.as_mut() else {
             return;
         };
         // What a piece is checked against, and what is done with one
@@ -1497,7 +1551,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             // given to be done, and heard of later.
             Object::Part { .. } | Object::Names { .. } => {
                 join.putting.push(object);
-                self.work(Job::Piece { object, bytes: bytes.to_vec(), from });
+                self.work(l, Job::Piece { object, bytes: bytes.to_vec(), from });
                 return;
             }
             _ => true,
@@ -1506,12 +1560,12 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             self.peers.strike(&from, now);
             join.unserved.push(from);
         }
-        self.advance_join(now);
+        self.advance_join(l, now);
     }
 
     /// The steps of taking a state that follow from what is in hand.
-    fn advance_join(&mut self, now: Micros) {
-        let Some(join) = self.join.as_mut() else {
+    fn advance_join(&mut self, l: &mut List, now: Micros) {
+        let Some(join) = l.join.as_mut() else {
             return;
         };
         // The block and the top of its state: the block's proof, held to
@@ -1522,7 +1576,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         {
             join.checking = true;
             let job = Job::Check { block: block.clone(), next: manifest.next };
-            return self.work(job);
+            return self.work(l, job);
         }
         // Every range's roots: the state can begin to be received.
         if join.checked
@@ -1538,7 +1592,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                 parts: join.roots.values().flatten().copied().collect(),
                 name_parts: manifest.name_parts.clone(),
             };
-            return self.work(job);
+            return self.work(l, job);
         }
         // Every part: the chain is to be made whole, at the block.
         if join.begun
@@ -1549,15 +1603,15 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         {
             join.finishing = true;
             let job = Job::Finish { target: join.id, body: block[HEADER_SIZE..].to_vec() };
-            return self.work(job);
+            return self.work(l, job);
         }
-        self.sync_state(now);
+        self.sync_state(l, now);
     }
 
     /// The block a state is to be taken as of has been checked by its
     /// proof, or refused.
-    fn state_block_checked(&mut self, now: Micros, target: Digest, result: Result<(), Error>) {
-        let Some(join) = self.join.as_mut().filter(|j| j.id == target && j.checking) else {
+    fn state_block_checked(&mut self, l: &mut List, now: Micros, target: Digest, result: Result<(), Error>) {
+        let Some(join) = l.join.as_mut().filter(|j| j.id == target && j.checking) else {
             return;
         };
         join.checking = false;
@@ -1573,12 +1627,12 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                 }
                 join.refused += 1;
                 if join.refused >= self.cfg.sync.snapshot_attempts {
-                    self.join = None;
+                    l.join = None;
                     return;
                 }
             }
         }
-        self.advance_join(now);
+        self.advance_join(l, now);
     }
 
     // -- Objects
@@ -1711,19 +1765,25 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
     /// Does what the fetches under way and the chunks being served want
     /// done at `now`, and says when either next wants doing.
     fn pump(&mut self, now: Micros, out: Out<'_>) -> Micros {
-        let mut wake = self.fetch(now, out);
-        // A body that arrived may have been applied in place, and what
-        // came of that may want more fetched: until nothing does.
-        while matches!(&self.applier, Applier::Here(done) if !done.is_empty()) {
-            wake = self.fetch(now, out);
-        }
+        let list = Arc::clone(&self.list);
+        let wake = {
+            let l = &mut *write(&list);
+            let mut wake = self.fetch(l, now, out);
+            // A body that arrived may have been applied in place, and
+            // what came of that may want more fetched: until nothing
+            // does.
+            while matches!(&l.applier, Applier::Here(done) if !done.is_empty()) {
+                wake = self.fetch(l, now, out);
+            }
+            wake
+        };
         self.serve_some(now, out).min(wake)
     }
 
     /// What became of blocks applied, and what the fetches under way
     /// want done: when a fetch next wants looking to.
-    fn fetch(&mut self, now: Micros, out: Out<'_>) -> Micros {
-        self.applied(now, out);
+    fn fetch(&mut self, l: &mut List, now: Micros, out: Out<'_>) -> Micros {
+        self.applied(l, now, out);
         let mut wake = Micros::MAX;
         let mut ranges = Ranges::new();
         let mut name = [0u8; MAX_NAME];
@@ -1736,7 +1796,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                     // given none, or is gone, is not asked.
                     let Some(token) = self.peers.get(&from).and_then(|p| p.token()) else {
                         self.fetches.swap_remove(i);
-                        self.fetch_failed(now, object, from);
+                        self.fetch_failed(l, now, object, from);
                         continue;
                     };
                     let n = object.encode(&mut name);
@@ -1752,7 +1812,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                     self.counts.fetched += 1;
                     self.peers.delivered(&from, done.fetch.path());
                     let bytes = done.fetch.finish().expect("it is done");
-                    self.arrived(now, object, from, &bytes);
+                    self.arrived(l, now, object, from, &bytes);
                     continue;
                 }
                 Poll::Failed(why) => {
@@ -1761,7 +1821,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                     if why == Why::Bad {
                         self.peers.strike(&from, now);
                     }
-                    self.fetch_failed(now, object, from);
+                    self.fetch_failed(l, now, object, from);
                     continue;
                 }
             }
@@ -1803,13 +1863,13 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
     }
 
     /// An object fetched whole from `from`.
-    fn arrived(&mut self, now: Micros, object: Object, from: SocketAddrV4, bytes: &[u8]) {
-        if self.of_join(&object) {
-            return self.piece_arrived(now, object, from, bytes);
+    fn arrived(&mut self, l: &mut List, now: Micros, object: Object, from: SocketAddrV4, bytes: &[u8]) {
+        if self.of_join(l, &object) {
+            return self.piece_arrived(l, now, object, from, bytes);
         }
         match object {
-            Object::Headers { from: first, .. } => self.headers_arrived(now, from, first, bytes),
-            Object::Block(id) => self.body_arrived(now, from, id, bytes),
+            Object::Headers { from: first, .. } => self.headers_arrived(l, now, from, first, bytes),
+            Object::Block(id) => self.body_arrived(l, now, from, id, bytes),
             // Asked for by whoever drives this node.
             _ => self.inbox.push((object, from, Some(bytes.to_vec()))),
         }
@@ -1818,12 +1878,12 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
     /// A fetch from `from` was given up. Of headers or a body: the peer
     /// is passed over, and what was wanted is wanted again, of another.
     /// Of anything else: whoever asked for it is told, and decides.
-    fn fetch_failed(&mut self, now: Micros, object: Object, from: SocketAddrV4) {
+    fn fetch_failed(&mut self, l: &mut List, now: Micros, object: Object, from: SocketAddrV4) {
         self.counts.fetches_failed += 1;
         // Of the state being taken: asked of another, and this peer
         // not again while another can be.
-        if self.of_join(&object) {
-            if let Some(join) = self.join.as_mut() {
+        if self.of_join(l, &object) {
+            if let Some(join) = l.join.as_mut() {
                 join.unserved.push(from);
             }
             // (Asked again when time is next looked to, not at once: if
@@ -1834,19 +1894,24 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         if matches!(object, Object::Headers { .. } | Object::Block(_)) {
             self.peers.failed(&from, now);
         }
-        match (object, self.aim.as_mut()) {
+        match (object, l.aim.as_mut()) {
             (Object::Headers { from: first, .. }, Some(aim)) => {
                 aim.todo.insert(first);
-                self.fetch_headers(now);
+                self.fetch_headers(l, now);
             }
             (Object::Block(id), _) => {
                 self.announced.retain(|(told, addr, _)| !(*told == id && *addr == from));
-                self.sync_blocks(now);
+                self.sync_blocks(l, now);
             }
             (Object::Headers { .. }, None) => {}
             _ => self.inbox.push((object, from, None)),
         }
     }
+}
+
+/// The list, to change: whoever held it and failed left it as it was.
+fn write(list: &RwLock<List>) -> RwLockWriteGuard<'_, List> {
+    list.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Thirty-two bytes from the node's secret, for a purpose and a count:

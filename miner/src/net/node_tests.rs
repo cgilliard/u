@@ -433,7 +433,7 @@ fn a_node_behind_takes_the_headers_of_one_ahead() {
     // (four of ten and one of five), none given up.
     let c = w.nodes[1].counts();
     assert_eq!((c.forks_asked, c.fetched, c.fetches_failed, c.headers), (1, 5, 0, 45));
-    assert!(w.nodes[1].aim.is_none() && w.nodes[1].fetching() == 0);
+    assert!(w.nodes[1].list().aim.is_none() && w.nodes[1].fetching() == 0);
     // Headers only: its chain is where it was, and the bodies are
     // what it lacks.
     assert_eq!(w.nodes[1].chain().tip().unwrap().height, 0);
@@ -548,7 +548,7 @@ fn a_peer_that_serves_wrong_headers_is_struck() {
     w.run(4 * SECOND);
     // One wrong run: a strike, nothing kept from it, and the aim let go.
     assert_eq!(w.best(2).height, 0);
-    assert!(w.nodes[2].counts().fetched >= 1 && w.nodes[2].aim.is_none());
+    assert!(w.nodes[2].counts().fetched >= 1 && w.nodes[2].list().aim.is_none());
     assert!(w.nodes[2].peers().get(&at(0)).is_some());
     // Five, and its host is refused.
     w.run(60 * SECOND);
@@ -577,7 +577,7 @@ fn where_chains_part_is_believed_only_as_an_answer() {
     w.inject(at(9), 1, &Message::Fork { height: 0, id: genesis });
     w.wake = vec![Micros::MAX; 2];
     w.run(10 * MILLI);
-    assert_eq!((w.nodes[1].counts().unheard, w.nodes[1].aim.is_none()), (2, true));
+    assert_eq!((w.nodes[1].counts().unheard, w.nodes[1].list().aim.is_none()), (2, true));
     // Node 0 claims much and its true answers are lost; what arrives
     // in their place names a block nobody has, or the first block at
     // a height that is not its own.
@@ -594,7 +594,7 @@ fn where_chains_part_is_believed_only_as_an_answer() {
         };
         w.inject(at(0), 1, &lie);
         w.run(50 * MILLI);
-        assert!(w.nodes[1].aim.is_none() && w.best(1).height == 0);
+        assert!(w.nodes[1].list().aim.is_none() && w.best(1).height == 0);
     }
     let now = w.now;
     assert_eq!(w.nodes[1].peers.add(at(0), false, now), Err(crate::net::peers::Refused::Banned));
@@ -841,7 +841,9 @@ fn a_node_behind_takes_the_blocks_of_one_ahead() {
         assert_eq!(w.nodes[1].chain().state().root(), w.nodes[0].chain().state().root());
         let c = w.nodes[1].counts();
         assert_eq!((c.headers, c.blocks, c.blocks_refused), (30, 30, 0), "loss {loss}");
-        assert!(w.nodes[1].held.is_empty() && w.nodes[1].applying.is_empty() && w.nodes[1].fetching() == 0);
+        assert!(
+            w.nodes[1].list().held.is_empty() && w.nodes[1].list().applying.is_empty() && w.nodes[1].fetching() == 0
+        );
         if loss == 0 {
             // Three runs of headers and thirty bodies, each once.
             assert_eq!((c.fetched, c.fetches_failed), (33, 0));
@@ -1177,7 +1179,7 @@ fn a_new_node_takes_the_state_and_goes_on_from_it() {
         // Eighty headers; the state once, as of block seventy; and the
         // ten blocks after it.
         assert_eq!((c.headers, c.states, c.states_moved, c.blocks, c.blocks_refused), (80, 1, 0, 10, 0), "loss {loss}");
-        assert!(w.nodes[2].join.is_none() && !w.nodes[2].chain().receiving());
+        assert!(w.nodes[2].list().join.is_none() && !w.nodes[2].chain().receiving());
         // The state was of three parts (twenty-one thousand outputs),
         // and both peers served pieces of it.
         let served: Vec<u32> = (0..2).map(|i| w.nodes[2].peers().get(&at(i)).unwrap().delivered).collect();
@@ -1303,66 +1305,67 @@ fn each_piece_of_a_state_is_checked_as_it_arrives() {
     w.run(10 * SECOND);
     let now = w.now;
     let (id, target) = {
-        let join = w.nodes[1].join.as_ref().unwrap();
+        let list = w.nodes[1].list();
+        let join = list.join.as_ref().unwrap();
         (join.id, join.target)
     };
     assert_eq!(target.height, 70);
     let (liar, honest) = (at(7), at(0));
     let made = |w: &mut World, object: Object| w.nodes[0].make(&object).unwrap();
-    let unserved = |w: &World| w.nodes[1].join.as_ref().unwrap().unserved.clone();
+    let unserved = |w: &World| w.nodes[1].list().join.as_ref().unwrap().unserved.clone();
     // A manifest of another block's state, well formed: not this one's.
     let other = w.nodes[0].chain().header_at(71).unwrap().unwrap().hash();
     let wrong = made(&mut w, Object::Manifest(other));
-    w.nodes[1].piece_arrived(now, Object::Manifest(id), liar, &wrong);
-    w.nodes[1].applied(now, &mut |_, _| {});
-    assert!(w.nodes[1].join.as_ref().unwrap().manifest.is_none());
+    w.nodes[1].with_list(|n, l| n.piece_arrived(l, now, Object::Manifest(id), liar, &wrong));
+    w.nodes[1].with_list(|n, l| n.applied(l, now, &mut |_, _| {}));
+    assert!(w.nodes[1].list().join.as_ref().unwrap().manifest.is_none());
     assert_eq!(unserved(&w), [liar]);
     // The block with another's body.
     let body = w.nodes[0].chain().body(&other).unwrap().unwrap();
-    w.nodes[1].piece_arrived(now, Object::Block(id), liar, &body);
-    w.nodes[1].applied(now, &mut |_, _| {});
-    assert!(w.nodes[1].join.as_ref().unwrap().block.is_none());
+    w.nodes[1].with_list(|n, l| n.piece_arrived(l, now, Object::Block(id), liar, &body));
+    w.nodes[1].with_list(|n, l| n.applied(l, now, &mut |_, _| {}));
+    assert!(w.nodes[1].list().join.as_ref().unwrap().block.is_none());
     // The true ones: the block's proof is checked, and the roots are
     // what is wanted next.
     let (manifest, body) = (made(&mut w, Object::Manifest(id)), w.nodes[0].chain().body(&id).unwrap().unwrap());
-    w.nodes[1].piece_arrived(now, Object::Manifest(id), honest, &manifest);
-    w.nodes[1].applied(now, &mut |_, _| {});
-    w.nodes[1].piece_arrived(now, Object::Block(id), honest, &body);
-    w.nodes[1].applied(now, &mut |_, _| {});
-    assert!(w.nodes[1].join.as_ref().unwrap().checked && !w.nodes[1].chain().receiving());
+    w.nodes[1].with_list(|n, l| n.piece_arrived(l, now, Object::Manifest(id), honest, &manifest));
+    w.nodes[1].with_list(|n, l| n.applied(l, now, &mut |_, _| {}));
+    w.nodes[1].with_list(|n, l| n.piece_arrived(l, now, Object::Block(id), honest, &body));
+    w.nodes[1].with_list(|n, l| n.applied(l, now, &mut |_, _| {}));
+    assert!(w.nodes[1].list().join.as_ref().unwrap().checked && !w.nodes[1].chain().receiving());
     // Roots of another block's range: not this manifest's.
     let wrong = made(&mut w, Object::Roots { block: other, index: 0 });
-    w.nodes[1].piece_arrived(now, Object::Roots { block: id, index: 0 }, liar, &wrong);
-    w.nodes[1].applied(now, &mut |_, _| {});
-    assert!(w.nodes[1].join.as_ref().unwrap().roots.is_empty());
+    w.nodes[1].with_list(|n, l| n.piece_arrived(l, now, Object::Roots { block: id, index: 0 }, liar, &wrong));
+    w.nodes[1].with_list(|n, l| n.applied(l, now, &mut |_, _| {}));
+    assert!(w.nodes[1].list().join.as_ref().unwrap().roots.is_empty());
     assert_eq!(unserved(&w).len(), 3);
     let roots = made(&mut w, Object::Roots { block: id, index: 0 });
-    w.nodes[1].piece_arrived(now, Object::Roots { block: id, index: 0 }, honest, &roots);
-    w.nodes[1].applied(now, &mut |_, _| {});
+    w.nodes[1].with_list(|n, l| n.piece_arrived(l, now, Object::Roots { block: id, index: 0 }, honest, &roots));
+    w.nodes[1].with_list(|n, l| n.applied(l, now, &mut |_, _| {}));
     assert!(w.nodes[1].chain().receiving());
     let (missing, _) = w.nodes[1].chain().missing_parts().unwrap();
     assert_eq!(missing, [0, 1, 2]);
     // A part of another block's state; a part with a byte changed; a
     // part that is no part at all.
     let wrong = made(&mut w, Object::Part { block: other, index: 2 });
-    w.nodes[1].piece_arrived(now, Object::Part { block: id, index: 2 }, liar, &wrong);
-    w.nodes[1].applied(now, &mut |_, _| {});
+    w.nodes[1].with_list(|n, l| n.piece_arrived(l, now, Object::Part { block: id, index: 2 }, liar, &wrong));
+    w.nodes[1].with_list(|n, l| n.applied(l, now, &mut |_, _| {}));
     let mut part = made(&mut w, Object::Part { block: id, index: 1 });
     part[100] ^= 1;
-    w.nodes[1].piece_arrived(now, Object::Part { block: id, index: 1 }, liar, &part);
-    w.nodes[1].applied(now, &mut |_, _| {});
-    w.nodes[1].piece_arrived(now, Object::Part { block: id, index: 0 }, liar, b"nothing");
-    w.nodes[1].applied(now, &mut |_, _| {});
+    w.nodes[1].with_list(|n, l| n.piece_arrived(l, now, Object::Part { block: id, index: 1 }, liar, &part));
+    w.nodes[1].with_list(|n, l| n.applied(l, now, &mut |_, _| {}));
+    w.nodes[1].with_list(|n, l| n.piece_arrived(l, now, Object::Part { block: id, index: 0 }, liar, b"nothing"));
+    w.nodes[1].with_list(|n, l| n.applied(l, now, &mut |_, _| {}));
     assert_eq!(w.nodes[1].chain().missing_parts().unwrap().0, [0, 1, 2]);
     assert_eq!(unserved(&w).len(), 6);
     assert!(unserved(&w).iter().all(|a| *a == liar));
     // The true parts: the state is whole, at the block.
     for index in [0u64, 1, 2] {
         let part = made(&mut w, Object::Part { block: id, index });
-        w.nodes[1].piece_arrived(now, Object::Part { block: id, index }, honest, &part);
-        w.nodes[1].applied(now, &mut |_, _| {});
+        w.nodes[1].with_list(|n, l| n.piece_arrived(l, now, Object::Part { block: id, index }, honest, &part));
+        w.nodes[1].with_list(|n, l| n.applied(l, now, &mut |_, _| {}));
     }
-    assert!(w.nodes[1].join.is_none() && !w.nodes[1].chain().receiving());
+    assert!(w.nodes[1].list().join.is_none() && !w.nodes[1].chain().receiving());
     assert_eq!((tip(&w, 1), w.nodes[1].chain().state().root()), (target, target.state_root));
     assert_eq!(w.nodes[1].counts().states, 1);
 }
