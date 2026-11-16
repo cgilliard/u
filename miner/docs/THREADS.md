@@ -215,7 +215,35 @@ Blocks must join the chain in order though they arrive in any, from
 any worker: the applier holds a body until the block before it is in,
 as the node does today.
 
-### 4.3 The rest
+### 4.3 Nobody polls
+
+A worker waits on its queue. What comes off it is a datagram, or a
+**notice** from another thread, put there the same way:
+
+| Notice | From | The worker then |
+|---|---|---|
+| There is more on the list | Whoever put it there (a worker, or the applier) | Looks whether a peer of its own can serve any of it |
+| A block joined the chain | The applier, to every worker | Tells its peers of the block |
+| What came of something you fetched | The applier, to the worker that fetched it | Strikes its peer if it was bad |
+| An address to try | A worker that was told of it | Pings it |
+
+The worker that found the node was behind (A, say) does not wait for
+anything and is told nothing in particular: its part ended when it
+wrote on the list. When a block another worker fetched joins the chain,
+A hears as every worker does.
+
+The list is kept filled the same way: when the applier takes a block
+in, it takes that item off the list, puts on the next that is wanted,
+and sends the notice.
+
+A notice is never dropped for a full queue: notices are few, and have
+room of their own.
+
+(A worker does also wake by the clock, for what is about time itself:
+a ping that is due, a chunk to ask for again, the pace of what it
+serves. That is a timer, not a look to see whether something changed.)
+
+### 4.4 The rest
 
 | Shared | How |
 |---|---|
