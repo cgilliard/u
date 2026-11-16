@@ -1176,25 +1176,31 @@ fn each_piece_of_a_state_is_checked_as_it_arrives() {
     let other = w.nodes[0].chain().header_at(71).unwrap().unwrap().hash();
     let wrong = made(&mut w, Object::Manifest(other));
     w.nodes[1].piece_arrived(now, Object::Manifest(id), liar, &wrong);
+    w.nodes[1].applied(now, &mut |_, _| {});
     assert!(w.nodes[1].join.as_ref().unwrap().manifest.is_none());
     assert_eq!(unserved(&w), [liar]);
     // The block with another's body.
     let body = w.nodes[0].chain().body(&other).unwrap().unwrap();
     w.nodes[1].piece_arrived(now, Object::Block(id), liar, &body);
+    w.nodes[1].applied(now, &mut |_, _| {});
     assert!(w.nodes[1].join.as_ref().unwrap().block.is_none());
     // The true ones: the block's proof is checked, and the roots are
     // what is wanted next.
     let (manifest, body) = (made(&mut w, Object::Manifest(id)), w.nodes[0].chain().body(&id).unwrap().unwrap());
     w.nodes[1].piece_arrived(now, Object::Manifest(id), honest, &manifest);
+    w.nodes[1].applied(now, &mut |_, _| {});
     w.nodes[1].piece_arrived(now, Object::Block(id), honest, &body);
+    w.nodes[1].applied(now, &mut |_, _| {});
     assert!(w.nodes[1].join.as_ref().unwrap().checked && !w.nodes[1].chain().receiving());
     // Roots of another block's range: not this manifest's.
     let wrong = made(&mut w, Object::Roots { block: other, index: 0 });
     w.nodes[1].piece_arrived(now, Object::Roots { block: id, index: 0 }, liar, &wrong);
+    w.nodes[1].applied(now, &mut |_, _| {});
     assert!(w.nodes[1].join.as_ref().unwrap().roots.is_empty());
     assert_eq!(unserved(&w).len(), 3);
     let roots = made(&mut w, Object::Roots { block: id, index: 0 });
     w.nodes[1].piece_arrived(now, Object::Roots { block: id, index: 0 }, honest, &roots);
+    w.nodes[1].applied(now, &mut |_, _| {});
     assert!(w.nodes[1].chain().receiving());
     let (missing, _) = w.nodes[1].chain().missing_parts().unwrap();
     assert_eq!(missing, [0, 1, 2]);
@@ -1202,10 +1208,13 @@ fn each_piece_of_a_state_is_checked_as_it_arrives() {
     // part that is no part at all.
     let wrong = made(&mut w, Object::Part { block: other, index: 2 });
     w.nodes[1].piece_arrived(now, Object::Part { block: id, index: 2 }, liar, &wrong);
+    w.nodes[1].applied(now, &mut |_, _| {});
     let mut part = made(&mut w, Object::Part { block: id, index: 1 });
     part[100] ^= 1;
     w.nodes[1].piece_arrived(now, Object::Part { block: id, index: 1 }, liar, &part);
+    w.nodes[1].applied(now, &mut |_, _| {});
     w.nodes[1].piece_arrived(now, Object::Part { block: id, index: 0 }, liar, b"nothing");
+    w.nodes[1].applied(now, &mut |_, _| {});
     assert_eq!(w.nodes[1].chain().missing_parts().unwrap().0, [0, 1, 2]);
     assert_eq!(unserved(&w).len(), 6);
     assert!(unserved(&w).iter().all(|a| *a == liar));
@@ -1213,6 +1222,7 @@ fn each_piece_of_a_state_is_checked_as_it_arrives() {
     for index in [0u64, 1, 2] {
         let part = made(&mut w, Object::Part { block: id, index });
         w.nodes[1].piece_arrived(now, Object::Part { block: id, index }, honest, &part);
+        w.nodes[1].applied(now, &mut |_, _| {});
     }
     assert!(w.nodes[1].join.is_none() && !w.nodes[1].chain().receiving());
     assert_eq!((tip(&w, 1), w.nodes[1].chain().state().root()), (target, target.state_root));
@@ -1260,4 +1270,50 @@ fn a_node_restarted_while_taking_a_state_goes_on() {
     assert_eq!((c.states, c.states_moved, c.blocks), (1, 0, 10));
     assert_eq!(had.map(|t| t.0), Some(70));
     assert_eq!(c.fetched, 1 + 1 + 1 + 2 + 10, "{c:?}");
+}
+
+/// Over this machine's own sockets and clock, with the work on the
+/// chain done on a thread of its own: a new node takes the state from
+/// one ahead, and the blocks after it.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "builds long chains; run with --release")]
+fn over_real_sockets_a_state_is_taken() {
+    use std::net::UdpSocket;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    let mut cfg = joining();
+    cfg.tick = 50 * MILLI;
+    let (ahead, _) = long_chain(KEEP + 16);
+    let chains = vec![ahead, chain_of(easy())];
+    let (target, root) = (chains[0].tip().unwrap(), chains[0].state().root());
+    let sockets: Vec<UdpSocket> = (0..2).map(|_| UdpSocket::bind("127.0.0.1:0").unwrap()).collect();
+    let SocketAddr::V4(first) = sockets[0].local_addr().unwrap() else { unreachable!() };
+    let stop = Arc::new(AtomicBool::new(false));
+    let behind = Arc::clone(&chains[1]);
+    let threads: Vec<_> = sockets
+        .into_iter()
+        .zip(chains)
+        .enumerate()
+        .map(|(i, (socket, chain))| {
+            let (cfg, stop) = (cfg.clone(), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut node = Node::new(cfg, NET, chain, [i as u8 + 1; 32], 0).threaded();
+                if i == 1 {
+                    node.add_peer(first, true, 0);
+                }
+                crate::net::socket::run_until(&mut node, &socket, &stop, Instant::now(), &|| NOW).unwrap();
+                node.counts()
+            })
+        })
+        .collect();
+    let start = Instant::now();
+    while behind.receiving() || behind.tip().unwrap() != target {
+        assert!(start.elapsed() < Duration::from_secs(60), "receiving: {}", behind.receiving());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    stop.store(true, Ordering::Relaxed);
+    let counts: Vec<Counts> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    assert_eq!(behind.state().root(), root);
+    assert_eq!((counts[1].headers, counts[1].states, counts[1].blocks, counts[1].blocks_refused), (80, 1, 10, 0));
 }

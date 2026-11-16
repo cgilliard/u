@@ -54,7 +54,9 @@ pub fn run_until<B: Backend + 'static, V: crate::chain::verify::ProofVerifier + 
         let wake = node.tick(t, unix(), &mut out);
         // Until the node wants to be called, a twentieth of a second at
         // the most (to see `stop`), or a datagram comes.
-        let wait = wake.saturating_sub(t).clamp(50, 50_000);
+        // Sooner while work given to the applier is still to be heard of.
+        let most = if node.busy() { 1_000 } else { 50_000 };
+        let wait = wake.saturating_sub(t).clamp(50, most);
         socket.set_read_timeout(Some(Duration::from_micros(wait)))?;
         // Nothing in time, or the machine's own complaint about a
         // datagram we sent, is no datagram.
