@@ -18,11 +18,11 @@ use tabminer::chain::params::ChainParams;
 use tabminer::configuration::{Configuration, Network, hex};
 use tabminer::interrupt;
 use tabminer::logger::Logger;
-use tabminer::logger::fmt::{commas, short_seconds};
+use tabminer::logger::fmt::{commas, seconds, short_seconds};
 use tabminer::logger::queued::Queued;
 use tabminer::logger::stats::{Stats, StatsLog};
-use tabminer::miner::{self, Mined};
-use tabminer::net::node::{Event, Handle, Node};
+use tabminer::miner::{self, HoldOff, Mined, Now};
+use tabminer::net::node::{Behind, Event, Handle, Node};
 use tabminer::net::socket::{self, Watch};
 use tabminer::pow::{Dataset, SeedText};
 use tabminer::store::backend::FileBackend;
@@ -139,13 +139,55 @@ fn make_blocks(
     let mut start = [0u8; 8];
     let _ = tabminer::random::fill(&mut start);
     let mut start = u64::from_le_bytes(start);
+    let mut hold_off = HoldOff::new(hold.chain().params().schedule.block_time.max(1) as u64);
     loop {
         let seen = hold.moves();
-        if hold.behind() {
-            hold.wait_moved(seen, Duration::from_secs(1));
-            continue;
+        // Not while the state is being taken; and not, for a while,
+        // while a chain known to be ahead of ours is coming in.
+        let ahead = match hold.behind() {
+            Behind::State => {
+                hold.wait_moved(seen, Duration::from_secs(1));
+                continue;
+            }
+            Behind::Blocks { best, height } => Some((best, height)),
+            Behind::No => None,
+        };
+        match (hold_off.ask(ahead.map(|(best, _)| best), Instant::now()), ahead) {
+            (Now::Wait { first }, Some((best, height))) => {
+                if first {
+                    main.log(&format!(
+                        "Not mining: a chain ahead is coming in, to block {} ({})",
+                        commas(height as u64),
+                        short(&best)
+                    ));
+                }
+                hold.wait_moved(seen, Duration::from_secs(1));
+                continue;
+            }
+            (Now::MineAnyway { first: true }, Some((best, height))) => main.log(&format!(
+                "Mining again: the blocks of the chain ahead, to block {} ({}), have not come in {}",
+                commas(height as u64),
+                short(&best),
+                seconds(hold_off.limit().as_millis() as u64)
+            )),
+            _ => {}
         }
-        let cancel = || hold.moves() != seen;
+        // Given up when the chain has another last block; or when a
+        // chain ahead turns up that is to be waited for (looked for a
+        // few times a second, not at every hash).
+        let watch = ahead.is_none();
+        let looked = std::sync::Mutex::new(Instant::now());
+        let cancel = || {
+            if hold.moves() != seen {
+                return true;
+            }
+            let mut looked = looked.lock().unwrap_or_else(|e| e.into_inner());
+            if !watch || looked.elapsed() < Duration::from_millis(250) {
+                return false;
+            }
+            *looked = Instant::now();
+            hold.behind() != Behind::No
+        };
         start = start.wrapping_add(1 << 32);
         if let Ok(tip) = hold.chain().tip() {
             main.log(&format!("Mining block {} on {}", commas(tip.height as u64 + 1), short(&tip.hash())));

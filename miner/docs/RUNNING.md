@@ -380,11 +380,13 @@ aside, and stopping.
 | `Taking the state as of block N (id)` | The blocks cannot be had, and the state is taken whole (`as of a later block`, if the first could no longer be served) |
 | `State taken as of block N` | It has been |
 | `Mining block N on P` | A block is begun here, on the block of id P |
+| `Not mining: a chain ahead is coming in, to block N (id)` | Headers that have been checked show a chain two blocks or more ahead, and its blocks are waited for (4.1) |
+| `Mining again: the blocks of the chain ahead, to block N (id), have not come in T` | They were waited for long enough |
 | `Won block N (id): ...` | Its proof of work was found here: how long its proof took, how many hashes and how long its nonce |
 | `Refused block N (id) from A: why` | A block was refused (`made here`, if it was ours) |
 
-A peer come or gone is said when the node next looks to its peers, so
-up to a tick after it happened.
+A peer gone is said when the node next looks to its peers, so up to a
+tick after it happened.
 
 ### 3.4 Stopping
 
@@ -432,6 +434,37 @@ nothing else:
   `--no-mine` says that mining there is not built yet, and does not
   start: their blocks' proofs build on the proof of the block before,
   which the chain does not keep yet.
+
+### 4.1 When a node does not make blocks
+
+A block made on a chain about to be replaced is work thrown away, so a
+node that is well behind waits. But only on what it has checked, and
+not for ever:
+
+- **While the state is being taken whole**, no blocks are made: there
+  is no chain here to build on.
+- **While headers that have been checked show a chain two blocks or
+  more ahead** whose blocks are still coming, none are made. A peer's
+  word that its chain has more work stops nothing: it is asked for its
+  headers, and blocks go on being made until those are here with their
+  work in them. Else whoever cared to say so could stop a node.
+- **One block ahead, or another block at the same height, stops
+  nothing.** It may take long to arrive, it may not be what its header
+  says, and a block of no more work than ours replaces nothing.
+- **A chain ahead is waited for three blocks' time** (thirty minutes on
+  mainnet; ten seconds at the least), counted from when its last
+  header was last heard of. Then blocks are made again, and go on
+  being made until a chain ahead with another last header is known of.
+
+Waiting wrongly costs the network a miner; making blocks wrongly costs
+the miner its own work and nobody else anything. So where it is not
+clear, blocks are made.
+
+Whatever came of a block made here (it is the chain's last, another
+got there first, it was refused) is heard at once, and the next is
+begun on whatever the chain's last then is.
+
+### 4.2 Trying it
 
 Two nodes to try it with:
 

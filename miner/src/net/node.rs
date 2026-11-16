@@ -1196,6 +1196,13 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         if theirs.version != VERSION || theirs.genesis != self.genesis {
             self.counts.strangers += 1;
             self.peers.remove(&from);
+            return;
+        }
+        // Live from now, if it was not: said at once, before anything
+        // that is done because it is.
+        if let Err(place) = self.was_live.binary_search(&from) {
+            self.was_live.insert(place, from);
+            self.shared.say(Event::PeerConnected { peer: from, height: theirs.height });
         }
     }
 
@@ -2589,6 +2596,21 @@ impl<B: Backend + 'static, V> Clone for Handle<B, V> {
     }
 }
 
+/// How a node stands to the best chain it knows of, for whoever makes
+/// blocks ([`Handle::behind`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Behind {
+    /// Not behind, or by one block that is still to come.
+    No,
+    /// Headers that have been checked, their work in them, show a
+    /// chain two blocks or more ahead of ours, whose blocks are still
+    /// to come: its last header, and how high it is.
+    Blocks { best: Digest, height: u32 },
+    /// The state is being taken whole: there is no chain here to
+    /// build on until it has been.
+    State,
+}
+
 /// What a [`Handle`] reads.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Standing {
@@ -2620,24 +2642,27 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
         self.shared.wake(0);
     }
 
-    /// Whether the node is catching up with a chain ahead of its own:
-    /// a block made now would be made on what is about to be replaced.
+    /// Whether the node is behind a chain it knows of, as far as that
+    /// matters to whoever makes blocks ([`Behind`]).
     ///
-    /// Only where it is well behind: headers of a chain ahead are being
-    /// taken, or the state is, or more than one block of the best chain
-    /// it knows of is still to come. One block known of and not yet
-    /// here is no reason to stop: it may take long to arrive, it may
-    /// not be what its header says, and a block of no more work than
-    /// ours (another found at the same height) replaces nothing.
-    pub fn behind(&self) -> bool {
-        {
-            let l = self.list.read().unwrap_or_else(|e| e.into_inner());
-            if l.aim.is_some() || l.join.is_some() {
-                return true;
-            }
+    /// Only what has been checked counts. A peer that says its chain
+    /// has more work has said so and no more: it is asked for its
+    /// headers, and until headers with their work in them are here the
+    /// node is behind nothing. Else whoever cared to say so could stop
+    /// a node from making blocks.
+    pub fn behind(&self) -> Behind {
+        if self.chain.receiving() || self.list.read().unwrap_or_else(|e| e.into_inner()).join.is_some() {
+            return Behind::State;
         }
+        // One block known of and not yet here is no reason to stop: it
+        // may take long to arrive, it may not be what its header says,
+        // and a block of no more work than ours (another found at the
+        // same height) replaces nothing.
         let mut next = [self.chain.params().genesis().header; 2];
-        self.chain.receiving() || self.chain.missing_bodies(&mut next).unwrap_or(0) > 1
+        match (self.chain.missing_bodies(&mut next), self.chain.best_header()) {
+            (Ok(n), Ok(best)) if n > 1 => Behind::Blocks { best: best.header.hash(), height: best.header.height },
+            _ => Behind::No,
+        }
     }
 
     /// How many times the chain has had a new last block here.

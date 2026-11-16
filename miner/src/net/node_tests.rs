@@ -1537,7 +1537,8 @@ fn a_node_says_what_happens_to_it() {
     w.nodes[0].goodbye(now, &mut |to, bytes: &[u8]| sent.push((to, bytes.to_vec())));
     sent.iter().for_each(|(to, bytes)| w.post(at(0), *to, bytes));
     w.run(2 * SECOND);
-    assert_eq!(said.lock().unwrap().last(), Some(&Event::PeerLost { peer: at(0) }));
+    // (It is still there, in fact, and is soon found again.)
+    assert!(said.lock().unwrap().contains(&Event::PeerLost { peer: at(0) }));
 }
 
 /// A block of no more work than the chain's is kept on a side branch,
@@ -1547,7 +1548,7 @@ fn a_node_says_what_happens_to_it() {
 /// branch to come is not behind: it goes on making its own.
 #[test]
 fn a_block_on_a_side_branch_is_said_and_holds_nobody_up() {
-    use crate::net::node::Event;
+    use crate::net::node::{Behind, Event};
     let chains = vec![chain_of(easy()), chain_of(easy())];
     // Two blocks at the first height: the node has one, and makes the other.
     let rival = next_block(&chains[1], 1, true);
@@ -1558,7 +1559,7 @@ fn a_block_on_a_side_branch_is_said_and_holds_nobody_up() {
     let heard = Arc::clone(&said);
     let hold = w.nodes[0].hold();
     hold.on_event(Box::new(move |event| heard.lock().unwrap().push(event.clone())));
-    assert_eq!((hold.moves(), hold.settled(), hold.behind()), (0, 0, false));
+    assert_eq!((hold.moves(), hold.settled(), hold.behind()), (0, 0, Behind::No));
     hold.mined(ours.clone(), NOW);
     w.run(SECOND);
     let header = *BlockRef::from_bytes(&ours).unwrap().header();
@@ -1569,9 +1570,9 @@ fn a_block_on_a_side_branch_is_said_and_holds_nobody_up() {
     // The other node, at the first block still, is told of a block at
     // the first height by a peer: one block to come is not being behind.
     let far = w.nodes[1].hold();
-    assert!(!far.behind());
+    assert_eq!(far.behind(), Behind::No);
     w.nodes[1].chain().accept_header(&header, NOW).unwrap();
-    assert!(!far.behind());
+    assert_eq!(far.behind(), Behind::No);
 }
 
 /// A node that learns nothing from asking whom its peer knows asks
@@ -1589,6 +1590,42 @@ fn asking_whom_a_peer_knows_backs_off_while_nothing_comes_of_it() {
     let (early, late) = (asked(&w, 0, 30 * SECOND), asked(&w, 120 * SECOND, 240 * SECOND));
     assert!((8..=14).contains(&early), "{early}");
     assert!((6..=10).contains(&late), "{late}");
+}
+
+/// A node is behind, for whoever makes blocks, only by what it has
+/// checked: a peer's word that its chain has more work stops nobody,
+/// and nor does asking for its headers. Headers kept that show a chain
+/// two blocks ahead do, until its blocks are here.
+#[test]
+fn a_node_is_behind_only_by_headers_it_has_checked() {
+    use crate::net::node::Behind;
+    let chains = vec![chain_of(easy()), chain_of(easy())];
+    let blocks = grow(&chains[0], 5, 1);
+    let mut w = World::with(chains, &small_runs());
+    let hold = w.nodes[1].hold();
+    // A peer that claims the most work there can be, and sends nothing
+    // for it: asked where its chain leaves ours, and its headers asked
+    // for; and all the while the node is behind nothing.
+    w.nodes[0].boast = Some(U256::MAX);
+    w.mute.push(0);
+    w.nodes[1].add_peer(at(0), false, 0);
+    let mut asked = false;
+    for _ in 0..40 {
+        w.run(500 * MILLI);
+        asked |= w.nodes[1].counts().forks_asked > 0;
+        assert_eq!(hold.behind(), Behind::No);
+    }
+    assert!(asked);
+    // Its headers, checked and kept: five blocks ahead, none here yet.
+    let headers: Vec<Header> = blocks.iter().map(|b| *BlockRef::from_bytes(b).unwrap().header()).collect();
+    let (kept, refused) = w.nodes[1].chain().accept_headers(&headers, NOW, false);
+    assert!(kept == 5 && refused.is_none());
+    assert_eq!(hold.behind(), Behind::Blocks { best: headers[4].hash(), height: 5 });
+    // Its blocks come in: with one to go the node is behind no longer.
+    give(w.nodes[1].chain(), &blocks[..3]);
+    assert_eq!(hold.behind(), Behind::Blocks { best: headers[4].hash(), height: 5 });
+    give(w.nodes[1].chain(), &blocks[3..4]);
+    assert_eq!(hold.behind(), Behind::No);
 }
 
 // -- Several workers

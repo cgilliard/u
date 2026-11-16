@@ -38,6 +38,79 @@ use crate::pow::{Dataset, Nonce, hashimoto, nonce_from_u64};
 use crate::store::backend::Backend;
 use crate::transaction::UnsignedTransaction;
 
+/// Whether to make blocks now, or to wait for a chain ahead of ours to
+/// come in ([`HoldOff::ask`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Now {
+    /// Make blocks.
+    Mine,
+    /// Wait: `first` when this is the first time of asking that it is
+    /// so, of this chain ahead.
+    Wait { first: bool },
+    /// Make blocks though a chain ahead is known of: its blocks have
+    /// not come in the time allowed. `first` as above.
+    MineAnyway { first: bool },
+}
+
+/// When a node that knows of a chain ahead of its own stops making
+/// blocks, and for how long.
+///
+/// A block made on a chain about to be replaced is work thrown away,
+/// so a node well behind waits. But a node that waits for ever for
+/// blocks that do not come makes none: so it waits only so long for
+/// the blocks of any one chain ahead (by its last header), and then
+/// goes on making its own until a chain ahead with another last header
+/// is known of. Waiting wrongly costs the network a miner; making
+/// blocks wrongly costs the miner its own work, and no one else
+/// anything.
+pub struct HoldOff {
+    /// How long the blocks of a chain ahead are waited for.
+    limit: Duration,
+    /// The chain ahead being waited for, by its last header, and since
+    /// when.
+    waiting: Option<(Digest, Instant)>,
+    /// The chain ahead that was waited for long enough.
+    given_up: Option<Digest>,
+}
+
+impl HoldOff {
+    /// For a network whose blocks are `block_time` seconds apart: three
+    /// blocks' time is waited, ten seconds at the least.
+    pub fn new(block_time: u64) -> HoldOff {
+        HoldOff { limit: Duration::from_secs((3 * block_time).max(10)), waiting: None, given_up: None }
+    }
+
+    pub fn limit(&self) -> Duration {
+        self.limit
+    }
+
+    /// What to do at `now`, where the best chain known of that is two
+    /// blocks or more ahead of ours ends in the header `ahead`: none,
+    /// if there is none.
+    pub fn ask(&mut self, ahead: Option<Digest>, now: Instant) -> Now {
+        let Some(ahead) = ahead else {
+            (self.waiting, self.given_up) = (None, None);
+            return Now::Mine;
+        };
+        if self.given_up == Some(ahead) {
+            return Now::MineAnyway { first: false };
+        }
+        match self.waiting {
+            Some((chain, since)) if chain == ahead => {
+                if now.duration_since(since) < self.limit {
+                    return Now::Wait { first: false };
+                }
+                (self.waiting, self.given_up) = (None, Some(ahead));
+                Now::MineAnyway { first: true }
+            }
+            _ => {
+                self.waiting = Some((ahead, now));
+                Now::Wait { first: true }
+            }
+        }
+    }
+}
+
 /// What came of trying to make a block.
 #[derive(Debug)]
 pub enum Mined {
@@ -176,6 +249,46 @@ pub fn solve(
     });
     let (nonce, mix) = found.into_inner().unwrap_or_else(|e| e.into_inner())?;
     Some((nonce, mix, tried.into_inner()))
+}
+
+#[cfg(test)]
+mod hold_off {
+    use super::*;
+    use crate::poseidon2::Fp;
+
+    /// A chain ahead is waited for so long, and no longer; another
+    /// chain ahead is waited for afresh; and with none ahead, blocks
+    /// are made.
+    #[test]
+    fn a_chain_ahead_is_waited_for_so_long_and_no_longer() {
+        let chain = |n: u32| -> Digest { [Fp::new(n); 8] };
+        let mut hold = HoldOff::new(600);
+        assert_eq!(hold.limit(), Duration::from_secs(1800));
+        assert_eq!(HoldOff::new(1).limit(), Duration::from_secs(10));
+        let t = Instant::now();
+        let at = |seconds: u64| t + Duration::from_secs(seconds);
+        assert_eq!(hold.ask(None, at(0)), Now::Mine);
+        // A chain ahead: waited for, until the time allowed is up.
+        assert_eq!(hold.ask(Some(chain(1)), at(10)), Now::Wait { first: true });
+        assert_eq!(hold.ask(Some(chain(1)), at(1000)), Now::Wait { first: false });
+        assert_eq!(hold.ask(Some(chain(1)), at(1809)), Now::Wait { first: false });
+        assert_eq!(hold.ask(Some(chain(1)), at(1810)), Now::MineAnyway { first: true });
+        // From then on blocks are made, however long it stays ahead.
+        assert_eq!(hold.ask(Some(chain(1)), at(1811)), Now::MineAnyway { first: false });
+        assert_eq!(hold.ask(Some(chain(1)), at(99_999)), Now::MineAnyway { first: false });
+        // It grows (another last header): that is news, and waited for.
+        assert_eq!(hold.ask(Some(chain(2)), at(100_000)), Now::Wait { first: true });
+        assert_eq!(hold.ask(Some(chain(2)), at(100_500)), Now::Wait { first: false });
+        // Its blocks come: nothing is ahead, and blocks are made.
+        assert_eq!(hold.ask(None, at(100_600)), Now::Mine);
+        // The same chain ahead again later is waited for again.
+        assert_eq!(hold.ask(Some(chain(2)), at(100_700)), Now::Wait { first: true });
+        // A chain ahead that keeps growing is waited for each time it
+        // does, the time allowed counted from when it last did.
+        assert_eq!(hold.ask(Some(chain(3)), at(102_000)), Now::Wait { first: true });
+        assert_eq!(hold.ask(Some(chain(3)), at(103_700)), Now::Wait { first: false });
+        assert_eq!(hold.ask(Some(chain(3)), at(103_800)), Now::MineAnyway { first: true });
+    }
 }
 
 #[cfg(all(test, feature = "dev"))]
