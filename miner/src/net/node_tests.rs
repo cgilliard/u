@@ -68,6 +68,8 @@ struct World {
     mute: Vec<usize>,
     /// Times the nodes were told the time.
     ticks: u64,
+    /// What each datagram a node took was, and when.
+    log: Vec<(Micros, &'static str)>,
 }
 
 impl World {
@@ -90,6 +92,7 @@ impl World {
             strays: Vec::new(),
             mute: Vec::new(),
             ticks: 0,
+            log: Vec::new(),
         }
     }
 
@@ -121,9 +124,10 @@ impl World {
                 for (_, from, to, bytes) in due {
                     match (0..self.nodes.len()).find(|&i| at(i) == to) {
                         Some(i) => {
-                            self.nodes[i].handle(self.now, SocketAddr::V4(from), &bytes, &mut |to, b| {
+                            let heard = self.nodes[i].handle(self.now, SocketAddr::V4(from), &bytes, &mut |to, b| {
                                 sent.push((i, to, b.to_vec()))
                             });
+                            self.log.push((self.now, heard.request));
                             self.wake[i] = self.now;
                         }
                         None => self.strays.push((from, to, bytes)),
@@ -1516,7 +1520,7 @@ fn a_node_says_what_happens_to_it() {
     ];
     for block in &blocks {
         let header = *BlockRef::from_bytes(block).unwrap().header();
-        wanted.push(Event::Block { header, from: Some(at(0)), undone: 0 });
+        wanted.push(Event::Block { header, from: Some(at(0)), undone: 0, taken: 1 });
     }
     wanted.push(Event::Synced { height: 12 });
     assert_eq!(*said.lock().unwrap(), wanted);
@@ -1527,13 +1531,64 @@ fn a_node_says_what_happens_to_it() {
     let header = *BlockRef::from_bytes(&mine).unwrap().header();
     w.nodes[1].mined(mine);
     w.run(SECOND);
-    assert_eq!(*said.lock().unwrap(), [Event::Block { header, from: None, undone: 0 }]);
+    assert_eq!(*said.lock().unwrap(), [Event::Block { header, from: None, undone: 0, taken: 1 }]);
     let now = w.now;
     let mut sent = Vec::new();
     w.nodes[0].goodbye(now, &mut |to, bytes: &[u8]| sent.push((to, bytes.to_vec())));
     sent.iter().for_each(|(to, bytes)| w.post(at(0), *to, bytes));
     w.run(2 * SECOND);
     assert_eq!(said.lock().unwrap().last(), Some(&Event::PeerLost { peer: at(0) }));
+}
+
+/// A block of no more work than the chain's is kept on a side branch,
+/// and said to be: the chain is as it was. One made here that comes to
+/// that is heard of all the same, so that whoever made it does not
+/// wait for the chain to move. And a node with one block of a rival
+/// branch to come is not behind: it goes on making its own.
+#[test]
+fn a_block_on_a_side_branch_is_said_and_holds_nobody_up() {
+    use crate::net::node::Event;
+    let chains = vec![chain_of(easy()), chain_of(easy())];
+    // Two blocks at the first height: the node has one, and makes the other.
+    let rival = next_block(&chains[1], 1, true);
+    let ours = next_block(&chains[0], 2, true);
+    give(&chains[0], std::slice::from_ref(&rival));
+    let mut w = World::with(chains, &small_runs());
+    let said = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let heard = Arc::clone(&said);
+    let hold = w.nodes[0].hold();
+    hold.on_event(Box::new(move |event| heard.lock().unwrap().push(event.clone())));
+    assert_eq!((hold.moves(), hold.settled(), hold.behind()), (0, 0, false));
+    hold.mined(ours.clone(), NOW);
+    w.run(SECOND);
+    let header = *BlockRef::from_bytes(&ours).unwrap().header();
+    assert_eq!(*said.lock().unwrap(), [Event::Side { header, from: None }]);
+    // Heard of, though the chain did not move.
+    assert_eq!((hold.moves(), hold.settled()), (0, 1));
+    assert_eq!(tip(&w, 0), *BlockRef::from_bytes(&rival).unwrap().header());
+    // The other node, at the first block still, is told of a block at
+    // the first height by a peer: one block to come is not being behind.
+    let far = w.nodes[1].hold();
+    assert!(!far.behind());
+    w.nodes[1].chain().accept_header(&header, NOW).unwrap();
+    assert!(!far.behind());
+}
+
+/// A node that learns nothing from asking whom its peer knows asks
+/// less and less often, down to as seldom as it pings.
+#[test]
+fn asking_whom_a_peer_knows_backs_off_while_nothing_comes_of_it() {
+    let mut w = World::new(2, &Config::default());
+    w.nodes[1].add_peer(at(0), true, 0);
+    // The nodes know only each other: every answer is of nobody new.
+    let asked = |w: &World, from: Micros, to: Micros| {
+        w.log.iter().filter(|(at, kind)| *kind == "get-peers" && (from..to).contains(at)).count()
+    };
+    w.run(240 * SECOND);
+    // Each of the two asks: at 1, 2, 4, 8, 16 seconds apart, then 30.
+    let (early, late) = (asked(&w, 0, 30 * SECOND), asked(&w, 120 * SECOND, 240 * SECOND));
+    assert!((8..=14).contains(&early), "{early}");
+    assert!((6..=10).contains(&late), "{late}");
 }
 
 // -- Several workers

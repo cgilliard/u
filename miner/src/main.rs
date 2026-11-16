@@ -84,13 +84,27 @@ fn said(event: &Event) -> Option<String> {
         Event::HeadersRefused { peer } => format!("Headers from {peer} refused"),
         // (A block made here that joins the chain was said when won.)
         Event::Block { from: None, undone: 0, .. } => return None,
-        Event::Block { header, from, undone } => {
-            let undone = match undone {
-                0 => String::new(),
-                1 => ", 1 block undone".to_string(),
-                k => format!(", {} blocks undone", n(*k)),
-            };
-            format!("Received block {} ({}) {}{undone}", n(header.height), short(&header.hash()), whose(from))
+        Event::Block { header, from, undone: 0, .. } => {
+            format!("Received block {} ({}) {}", n(header.height), short(&header.hash()), whose(from))
+        }
+        // The chain went over to another branch.
+        Event::Block { header, from, undone, taken } => {
+            let blocks = |k: u32| if k == 1 { "1 block".to_string() } else { format!("{} blocks", n(k)) };
+            format!(
+                "Reorganized to block {} ({}) {}: {} undone, {} taken, above block {}",
+                n(header.height),
+                short(&header.hash()),
+                whose(from),
+                blocks(*undone),
+                blocks(*taken),
+                n(header.height - taken)
+            )
+        }
+        Event::Side { header, from: None } => {
+            format!("Block {} ({}) made here is on a side branch", n(header.height), short(&header.hash()))
+        }
+        Event::Side { header, from: Some(from) } => {
+            format!("Received block {} ({}) from {from}, on a side branch", n(header.height), short(&header.hash()))
         }
         Event::BlockRefused { header, from, why } => {
             format!("Refused block {} ({}) {}: {why}", n(header.height), short(&header.hash()), whose(from))
@@ -147,9 +161,12 @@ fn make_blocks(
                     short_seconds(solved.as_millis() as u64)
                 ));
                 stats.add(socket::MINED, 1);
+                // Until what came of it is heard: it is the chain's
+                // last, or another got there first. Either way the next
+                // is begun at once, on whatever the last then is.
+                let settled = hold.settled();
                 hold.mined(block, socket::unix());
-                // Until it has joined the chain (or another has).
-                hold.wait_moved(seen, Duration::from_secs(10));
+                hold.wait_settled(settled, Duration::from_secs(10));
             }
             Ok(Mined::Cancelled) => {}
             Ok(Mined::Finished) => return,

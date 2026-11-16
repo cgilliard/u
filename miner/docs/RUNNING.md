@@ -373,7 +373,9 @@ aside, and stopping.
 | `Syncing headers N to M from A` | A chain ahead of ours is being caught up with |
 | `Headers synced to M` | Its headers are kept |
 | `Headers from A refused` | They were not what they should be |
-| `Received block N (id) from A` | A block of a peer's became the chain's last; `, K blocks undone` if ours gave way to its branch |
+| `Received block N (id) from A` | A block of a peer's became the chain's last |
+| `Received block N (id) from A, on a side branch` | A block of a peer's was kept, on a branch with no more work than the chain's: the chain is as it was. (`Block N (id) made here is on a side branch`, if it was ours: another got there first) |
+| `Reorganized to block N (id) from A: K blocks undone, M blocks taken, above block F` | The chain went over to another branch: K of its blocks gave way to M of that branch, the two parting above block F |
 | `Synced at block N` | The chain that was being caught up with has been |
 | `Taking the state as of block N (id)` | The blocks cannot be had, and the state is taken whole (`as of a later block`, if the first could no longer be served) |
 | `State taken as of block N` | It has been |

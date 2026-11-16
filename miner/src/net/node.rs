@@ -451,6 +451,8 @@ pub(crate) struct Shared {
     threaded: AtomicBool,
     /// Blocks that have joined the chain here.
     blocks: AtomicU64,
+    /// Blocks made here of which what came of them has been heard.
+    settled: AtomicU64,
     /// Wakes a worker that is waiting, where each waits on a thread of
     /// its own ([`super::socket`]): called when something is left for
     /// it, so that nobody has to look to see whether anything was.
@@ -485,8 +487,13 @@ pub enum Event {
     /// This peer's headers were not what they should be.
     HeadersRefused { peer: SocketAddrV4 },
     /// A block is the chain's new last: from this peer, or made here.
-    /// `undone` blocks of ours gave way to its branch.
-    Block { header: Header, from: Option<SocketAddrV4>, undone: u32 },
+    /// If the chain went over to its branch to take it, `undone` blocks
+    /// of ours gave way, and `taken` of that branch are the chain's
+    /// now (this one the last of them); else none and one.
+    Block { header: Header, from: Option<SocketAddrV4>, undone: u32, taken: u32 },
+    /// A block was kept on a branch with no more work than the chain's:
+    /// the chain is as it was. From this peer, or made here.
+    Side { header: Header, from: Option<SocketAddrV4> },
     /// A block was refused, and why: from this peer, or made here.
     BlockRefused { header: Header, from: Option<SocketAddrV4>, why: String },
     /// The chain that was being caught up with has been.
@@ -706,6 +713,10 @@ pub struct Worker<B: Backend + 'static, V> {
     budget: usize,
     /// When a peer was last asked whom else it knows.
     asked: Option<Micros>,
+    /// How long until it is asked again, and how many peers the node
+    /// knew when it last was.
+    ask_gap: Micros,
+    ask_knew: usize,
     /// The time by the calendar, in seconds: what a header's time is
     /// held against.
     unix: u64,
@@ -773,6 +784,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             numbers: 0,
             rotated: now,
             asked: None,
+            ask_gap: 0,
+            ask_knew: 0,
             unix: 0,
             due: now,
             served: VecDeque::new(),
@@ -998,11 +1011,21 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             *self.shared.known[self.me].lock().unwrap_or_else(|e| e.into_inner()) = mine;
         }
         let live: usize = self.shared.live.iter().map(|n| n.load(Ordering::Relaxed)).sum();
-        if live < self.cfg.peers.target && self.asked.is_none_or(|t| now.saturating_sub(t) >= self.cfg.peers.discover) {
+        if live < self.cfg.peers.target && self.asked.is_none_or(|t| now.saturating_sub(t) >= self.ask_gap) {
             let one = self.peers.sample(None, now).as_slice().first().copied();
             if let Some(addr) = one
                 && let Some(token) = self.peers.get(&addr).and_then(|p| p.token())
             {
+                // Asked again half as soon each time nothing came of
+                // the asking (the node knows no more peers than it
+                // did), down to as seldom as it pings; and as soon as
+                // at first once something does.
+                let knows = self.shared.totals.peers();
+                self.ask_gap = match self.asked.is_some() && knows == self.ask_knew {
+                    true => (2 * self.ask_gap).min(self.cfg.peers.ping.max(self.cfg.peers.discover)),
+                    false => self.cfg.peers.discover,
+                };
+                self.ask_knew = knows;
                 self.asked = Some(now);
                 self.send(addr, &Message::GetPeers { token }, out);
             }
@@ -1633,6 +1656,13 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     ) {
         let id = header.hash();
         l.applying.retain(|a| *a != id);
+        // What came of a block made here, whatever it was: whoever made
+        // it is waiting to know.
+        if from.is_none() {
+            self.shared.settled.fetch_add(1, Ordering::Relaxed);
+            drop(self.shared.moved.0.lock().unwrap_or_else(|e| e.into_inner()));
+            self.shared.moved.1.notify_all();
+        }
         match result {
             // The chain's new last block: every peer is told, but the
             // one it came from.
@@ -1642,11 +1672,11 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 // (Whoever waits for the chain to move is told.)
                 drop(self.shared.moved.0.lock().unwrap_or_else(|e| e.into_inner()));
                 self.shared.moved.1.notify_all();
-                let undone = match result {
-                    Ok(Applied::Reorganized { unwound, .. }) => unwound,
-                    _ => 0,
+                let (undone, taken) = match result {
+                    Ok(Applied::Reorganized { fork_height, unwound }) => (unwound, header.height - fork_height),
+                    _ => (0, 1),
                 };
-                self.shared.say(Event::Block { header, from, undone });
+                self.shared.say(Event::Block { header, from, undone, taken });
                 // Caught up, if a chain ahead was being caught up with.
                 let mut first = [header];
                 if l.syncing
@@ -1660,7 +1690,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 self.announce(now, header, len, from, out);
                 self.shared.post_others(self.me, Notice::Announce { header, len, except: from });
             }
-            Ok(Applied::Known | Applied::Side) => {}
+            Ok(Applied::Side) => self.shared.say(Event::Side { header, from }),
+            Ok(Applied::Known) => {}
             Err(e) => {
                 self.counts.blocks_refused += 1;
                 self.shared.say(Event::BlockRefused { header, from, why: e.to_string() });
@@ -2296,6 +2327,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             ready: AtomicUsize::new(0),
             threaded: AtomicBool::new(false),
             blocks: AtomicU64::new(0),
+            settled: AtomicU64::new(0),
             waker: RwLock::new(None),
             turn: AtomicUsize::new(0),
             moved: (Mutex::new(()), std::sync::Condvar::new()),
@@ -2590,15 +2622,22 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
 
     /// Whether the node is catching up with a chain ahead of its own:
     /// a block made now would be made on what is about to be replaced.
+    ///
+    /// Only where it is well behind: headers of a chain ahead are being
+    /// taken, or the state is, or more than one block of the best chain
+    /// it knows of is still to come. One block known of and not yet
+    /// here is no reason to stop: it may take long to arrive, it may
+    /// not be what its header says, and a block of no more work than
+    /// ours (another found at the same height) replaces nothing.
     pub fn behind(&self) -> bool {
         {
             let l = self.list.read().unwrap_or_else(|e| e.into_inner());
-            if l.aim.is_some() || l.join.is_some() || !l.held.is_empty() || !l.fetching.is_empty() {
+            if l.aim.is_some() || l.join.is_some() {
                 return true;
             }
         }
-        let mut first = [self.chain.params().genesis().header];
-        self.chain.receiving() || self.chain.missing_bodies(&mut first).unwrap_or(0) > 0
+        let mut next = [self.chain.params().genesis().header; 2];
+        self.chain.receiving() || self.chain.missing_bodies(&mut next).unwrap_or(0) > 1
     }
 
     /// How many times the chain has had a new last block here.
@@ -2611,6 +2650,19 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
     pub fn wait_moved(&self, seen: u64, most: std::time::Duration) {
         let guard = self.shared.moved.0.lock().unwrap_or_else(|e| e.into_inner());
         let _ = self.shared.moved.1.wait_timeout_while(guard, most, |_| self.moves() == seen);
+    }
+
+    /// How many blocks made here have been heard of: joined the chain,
+    /// kept on a side branch, or refused.
+    pub fn settled(&self) -> u64 {
+        self.shared.settled.load(Ordering::Relaxed)
+    }
+
+    /// Waits until more than `seen` blocks made here have been heard
+    /// of, or for `most`.
+    pub fn wait_settled(&self, seen: u64, most: std::time::Duration) {
+        let guard = self.shared.moved.0.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self.shared.moved.1.wait_timeout_while(guard, most, |_| self.settled() == seen);
     }
 
     pub fn chain(&self) -> &Arc<Chain<B, V>> {
