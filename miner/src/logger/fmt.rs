@@ -52,6 +52,14 @@ pub fn seconds(millis: u64) -> String {
     }
 }
 
+/// A length of time in few letters: `10s`, `1s`, `0.25s`.
+pub fn short_seconds(millis: u64) -> String {
+    match millis % 1000 {
+        0 => format!("{}s", millis / 1000),
+        _ => format!("{}s", decimal(millis as f64 / 1000.0, 2)),
+    }
+}
+
 /// `text`, and then `fill` until it is `width` wide: one `fill` at the
 /// least, so that what follows never runs into it.
 pub fn column(text: &str, width: usize, fill: char) -> String {
@@ -77,6 +85,7 @@ mod tests {
         assert_eq!(bytes(3_000_000_000), "3.0 GB");
         assert_eq!([uptime(0), uptime(7), uptime(3661)], ["0:00:00", "0:00:07", "1:01:01"]);
         assert_eq!([uptime(1_080_000), uptime(1_080_060)], ["300:00:00", "300:01:00"]);
+        assert_eq!([short_seconds(10_000), short_seconds(1000), short_seconds(250)], ["10s", "1s", "0.25s"]);
         assert_eq!(
             [seconds(5000), seconds(1000), seconds(250), seconds(60_000)],
             ["5 seconds", "1 second", "0.25 seconds", "60 seconds"]

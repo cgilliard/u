@@ -9,19 +9,19 @@
 //! ```text
 //! Uptime: 300:00:00         Requests_______BytesSent_________PeersLive
 //! [2026-10-17 19:30:44:000] 3,000          1,000,003         14
-//! Interval (10 seconds)     43             1,030             13
-//! Interval (10 seconds)     51             1,224             15
-//! Interval (10 seconds)     48             1,152             15
-//! Interval (10 seconds)     40             960               14
-//! Interval (10 seconds)     62             1,488             16
-//! Interval (10 seconds)     89             2,136             15
+//! 10s ending 19:30:54:      3              100               13
+//! 10s ending 19:31:04:      4              105               15
+//! 10s ending 19:31:14:      5              200               12
+//! 10s ending 19:31:24:      10             1,000             12
+//! 10s ending 19:31:34:      1              900               15
+//! 10s ending 19:31:44:      0              30                15
 //! Uptime: 300:01:00         Requests_______BytesSent_________PeersLive
-//! [2026-10-17 19:31:44:000] 3,333          1,007,993         15
-//! Interval (10 seconds)     43             1,030             13
+//! [2026-10-17 19:31:44:000] 3,023          1,002,338         15
+//! 10s ending 19:31:54:      43             1,030             13
 //! ```
 //!
 //! * Every ten seconds (unless set otherwise): what happened in those
-//!   seconds.
+//!   seconds, after how long they were and the time they ended at.
 //! * Every minute (unless set otherwise), after the interval's line
 //!   that ends it: the columns' names, with how long the node has been
 //!   up, and under them the whole since it started, with the time.
@@ -32,7 +32,7 @@
 //! interval's line how many there were in it, and in a line of the
 //! whole how many there have been in all. The two agree: a whole is the
 //! whole before it and the intervals between them, added up. (In the
-//! lines above, 3,000 and the six intervals' 333 are 3,333.) The same
+//! lines above, 3,000 and the six intervals' 23 are 3,023.) The same
 //! reading of the numbers is used for the last interval's line and the
 //! whole that follows it, so that this is exact, and the two are
 //! written at one moment.
@@ -52,7 +52,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use super::fmt::{column, commas, seconds, uptime};
+use super::fmt::{column, commas, short_seconds, uptime};
 use super::{Logger, Moment};
 
 /// What kind of number a stat is.
@@ -135,11 +135,14 @@ impl Stats {
         self.line(&moment.header(), ' ', |i| commas(now[i]))
     }
 
-    /// What happened in an interval of `millis`, from the stats as they
-    /// were `before` it to as they are `now`:
-    /// `Interval (5 seconds)      43             1,030             13`.
-    pub fn interval(&self, millis: u64, before: &[u64], now: &[u64]) -> String {
-        self.line(&format!("Interval ({})", seconds(millis)), ' ', |i| match self.names[i].1 {
+    /// What happened in the interval of `millis` that ended at
+    /// `moment`, from the stats as they were `before` it to as they
+    /// are `now`:
+    /// `10s ending 19:30:54:      3              100               13`.
+    pub fn interval(&self, millis: u64, moment: &Moment, before: &[u64], now: &[u64]) -> String {
+        let first =
+            format!("{} ending {:02}:{:02}:{:02}:", short_seconds(millis), moment.hour, moment.minute, moment.second);
+        self.line(&first, ' ', |i| match self.names[i].1 {
             Kind::Level => commas(now[i]),
             Kind::Count | Kind::Bytes => commas(now[i].saturating_sub(before[i])),
         })
@@ -225,7 +228,7 @@ fn write(logger: &Logger, stats: &Stats, every: Every, stop: &(Mutex<bool>, Cond
             // What happened since the last line, as a last interval of
             // whatever length it was; and the whole.
             if now > last_at {
-                logger.write_at(now, &stats.interval(now - last_at, &last, &values));
+                logger.write_at(now, &stats.interval(now - last_at, &Moment::of(now), &last, &values));
             }
             return whole(now, &values);
         }
@@ -233,7 +236,7 @@ fn write(logger: &Logger, stats: &Stats, every: Every, stop: &(Mutex<bool>, Cond
         if now < due {
             continue;
         }
-        logger.write_at(now, &stats.interval(interval, &last, &values));
+        logger.write_at(now, &stats.interval(interval, &Moment::of(now), &last, &values));
         written += 1;
         if written.is_multiple_of(to_a_whole) {
             whole(now, &values);
@@ -255,36 +258,35 @@ mod tests {
         Stats::new(&[("Requests", Kind::Count), ("BytesSent", Kind::Bytes), ("PeersLive", Kind::Level)])
     }
 
-    /// The lines of `docs/stat_sample.log`.
+    /// The lines of the sample (`docs`), with these columns' widths.
     #[test]
     fn the_lines_are_in_columns() {
         let s = stats();
         let lines = [
             s.names(300 * 3600),
             s.whole(&Moment::of(T), &[3000, 1_000_003, 14]),
-            s.interval(5000, &[3000, 1_000_003, 14], &[3043, 1_001_033, 13]),
-            s.interval(5000, &[3043, 1_001_033, 13], &[3086, 1_002_063, 15]),
+            s.interval(10_000, &Moment::of(T + 10_000), &[3000, 1_000_003, 14], &[3003, 1_000_103, 13]),
+            s.interval(10_000, &Moment::of(T + 20_000), &[3003, 1_000_103, 13], &[3007, 1_000_208, 15]),
+            s.interval(10_000, &Moment::of(T + 60_000), &[3023, 1_002_308, 15], &[3023, 1_002_338, 15]),
             s.names(300 * 3600 + 60),
-            s.whole(&Moment::of(T + 60_000), &[3333, 1_300_000, 15]),
+            s.whole(&Moment::of(T + 60_000), &[3023, 1_002_338, 15]),
         ];
         assert_eq!(
             lines.concat(),
             "Uptime: 300:00:00         Requests_______BytesSent_________PeersLive\n\
              [2026-10-17 19:30:44:000] 3,000          1,000,003         14\n\
-             Interval (5 seconds)      43             1,030             13\n\
-             Interval (5 seconds)      43             1,030             15\n\
+             10s ending 19:30:54:      3              100               13\n\
+             10s ending 19:31:04:      4              105               15\n\
+             10s ending 19:31:44:      0              30                15\n\
              Uptime: 300:01:00         Requests_______BytesSent_________PeersLive\n\
-             [2026-10-17 19:31:44:000] 3,333          1,300,000         15\n"
+             [2026-10-17 19:31:44:000] 3,023          1,002,338         15\n"
         );
         // Each column begins at the same place in every line, and no
         // line ends in spaces.
         for line in lines.iter().map(|l| l.trim_end_matches('\n')) {
             assert!(!line.ends_with(' '));
             for at in [26, 41, 59] {
-                assert!(
-                    line.is_char_boundary(at) && &line[at - 1..at] != "," && !line[at..].starts_with([' ', '_']),
-                    "{line}"
-                );
+                assert!(&line[at - 1..at] != "," && !line[at..].starts_with([' ', '_']), "{line}");
             }
         }
     }
@@ -303,10 +305,10 @@ mod tests {
         );
         // A number too wide for its column moves the rest of its line
         // over, and is not run into.
-        let line = s.interval(250, &[0; 4], &[u64::MAX, 5, 12_345_678_901_234, 1]);
+        let line = s.interval(250, &Moment::of(T), &[0; 4], &[u64::MAX, 5, 12_345_678_901_234, 1]);
         assert_eq!(
             line,
-            "Interval (0.25 seconds)   18,446,744,073,709,551,615 5                        12,345,678,901,234 1\n"
+            "0.25s ending 19:30:44:    18,446,744,073,709,551,615 5                        12,345,678,901,234 1\n"
         );
     }
 
@@ -364,9 +366,8 @@ mod tests {
                 assert!(wholes == 0 || since_whole == 3 || (last && since_whole <= 3), "{since_whole}\n{text}");
                 (since_whole, wholes, at) = (0, wholes + 1, at + 2);
             } else {
-                assert_eq!(words[0], "Interval", "{}", lines[at]);
-                // (Its last word but two: the label is of two words or
-                // three.)
+                assert_eq!((words[1], words.len()), ("ending", 6), "{}", lines[at]);
+                assert!(words[2].len() == 9 && words[2].ends_with(':'), "{}", lines[at]);
                 let n = words.len();
                 requests += number(words[n - 3]);
                 bytes += number(words[n - 2]);
@@ -378,7 +379,7 @@ mod tests {
         // The last whole is everything.
         assert_eq!((requests, bytes), (4000, 96_000));
         assert!(wholes >= 3, "{text}");
-        assert!(lines.iter().filter(|l| l.starts_with("Interval (0.03 seconds) ")).count() >= 6, "{text}");
+        assert!(lines.iter().filter(|l| l.starts_with("0.03s ending ")).count() >= 6, "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

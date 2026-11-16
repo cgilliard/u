@@ -227,23 +227,24 @@ there are, and how wide, follows from what the node counts.)
 ```
 Uptime: 300:00:00         Requests_______BytesSent_________PeersLive
 [2026-10-17 19:30:44:000] 3,000          1,000,003         14
-Interval (10 seconds)     43             1,030             13
-Interval (10 seconds)     51             1,224             15
-Interval (10 seconds)     48             1,152             15
-Interval (10 seconds)     40             960               14
-Interval (10 seconds)     62             1,488             16
-Interval (10 seconds)     89             2,136             15
+10s ending 19:30:54:      3              100               13
+10s ending 19:31:04:      4              105               15
+10s ending 19:31:14:      5              200               12
+10s ending 19:31:24:      10             1,000             12
+10s ending 19:31:34:      1              900               15
+10s ending 19:31:44:      0              30                15
 Uptime: 300:01:00         Requests_______BytesSent_________PeersLive
-[2026-10-17 19:31:44:000] 3,333          1,007,993         15
-Interval (10 seconds)     43             1,030             13
+[2026-10-17 19:31:44:000] 3,023          1,002,338         15
+10s ending 19:31:54:      43             1,030             13
 ```
 
-- **Every ten seconds** (a setting): what happened in those seconds.
+- **Every ten seconds** (a setting): what happened in those seconds,
+  after how long they were and the time they ended at.
 - **Every minute** (a setting): the columns' names, with how long the
   node has been up, and under them the whole since it started, with
   the time. So six interval lines come between two wholes.
 - **Counted numbers add up.** A whole is the whole before it and the
-  intervals between: above, 3,000 and the six intervals' 333 are 3,333.
+  intervals between: above, 3,000 and the six intervals' 23 are 3,023.
   The last interval's line and the whole after it are written at the
   same moment from one reading of the numbers, so this is exact.
 - **Levels do not.** Peers live is, in every line, what it was at that
