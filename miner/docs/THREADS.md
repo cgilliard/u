@@ -167,9 +167,10 @@ to admit a peer, and gives it back if that went over.
 shared.
 
 `--max-peers-per-network` (peers of one /16) counts across workers,
-since the hosts of one network are on many. A small table of counts by
-network, behind a lock taken only when a peer is admitted or dropped,
-which is rare.
+since the hosts of one network are on many. There are 65,536 such
+networks, so it is an array of that many atomic counts (64 KB), one a
+network: a worker adds one to admit a peer and gives it back if that
+went over. No lock.
 
 ### 4.2 What to fetch, and from whom
 
