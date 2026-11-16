@@ -825,7 +825,7 @@ fn over_real_sockets_requests_are_logged_and_counted() {
         (0..2).map(|i| std::fs::read_to_string(dir.join(format!("request{i}.log"))).unwrap()).collect();
     // The one ahead was pinged and asked for headers and blocks, and
     // every line says who asked, how long it took and what was done.
-    let served: Vec<&str> = logs[0].lines().skip(1).collect();
+    let served: Vec<&str> = logs[0].lines().collect();
     let asked = |what: &str| served.iter().filter(|l| l.contains(what)).count();
     assert!(asked(" ping height 0 (") >= 1 && asked(") -> pong (") >= 1, "{}", logs[0]);
     assert!(asked(" get headers, ") >= 1 && asked(" get block, ") >= 12, "{}", logs[0]);

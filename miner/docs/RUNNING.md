@@ -181,14 +181,15 @@ tabernacle.log  ->  tabernacle_R_02_03_2026_10_00.log     month, day, year, hour
 - Files put aside are never deleted by the node: that is for whoever
   keeps the machine.
 
-Every file begins with a line saying which log it is and when it was
-begun, to the second:
+A file put aside begins with a line saying which log it is and when it
+was begun, to the second:
 
 ```
 tabernacle.log_02_03_2026_10_30_04
 ```
 
-A file that holds nothing but that line is not put aside.
+The file being written to has no such line: it is the log's lines and
+nothing else. A file that holds nothing is not put aside.
 
 ### 2.4 The request log's queue
 
@@ -241,20 +242,20 @@ In columns, a line at a time. Under each whole a rule is drawn, to set
 it off from the intervals that follow.
 
 ```
-Uptime: 0:00:00           Requests___AvgLatency(us)_Peers_PeersLive_Height_Blocks_Mined
+Uptime: 0:00:00           Packets____AvgLatency(us)_Peers_PeersLive_Height_Blocks_Mined
 [2026-11-16 08:21:55:624] 0          -              0     0         0      0      0
 ---------------------------------------------------------------------------------------
 10s ending 08:22:05:      18         12.4           1     1         3      3      3
 10s ending 08:22:15:      156        12.9           1     1         5      2      0
 ...
-Uptime: 0:01:00           Requests___AvgLatency(us)_Peers_PeersLive_Height_Blocks_Mined
+Uptime: 0:01:00           Packets____AvgLatency(us)_Peers_PeersLive_Height_Blocks_Mined
 [2026-11-16 08:22:55:624] 174        12.8           1     1         5      5      3
 ---------------------------------------------------------------------------------------
 ```
 
 | Column | Is |
 |---|---|
-| Requests | Datagrams taken, chunks too (counted) |
+| Packets | Datagrams taken, of every kind (counted): the requests of the request log, and the chunks of what the node itself is fetching, of which a block is some seventy and more |
 | AvgLatency(us) | What taking one took, in microseconds, on average: of the interval in an interval's line, of the whole run in a whole's. `-` where there were none |
 | Peers, PeersLive | Peers known, and those heard from lately (levels) |
 | Height | The chain's height (level) |

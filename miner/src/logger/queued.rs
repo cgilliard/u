@@ -187,7 +187,7 @@ mod tests {
     }
 
     fn lines(path: &std::path::Path) -> Vec<String> {
-        std::fs::read_to_string(path).unwrap().lines().skip(1).map(String::from).collect()
+        std::fs::read_to_string(path).unwrap().lines().map(String::from).collect()
     }
 
     #[test]
@@ -269,7 +269,7 @@ mod tests {
         let rotation = Rotation { max_age: 0, max_size: 200 };
         let logger = Logger::open(dir.join("request.log"), rotation).unwrap().report_rotations_to(Arc::clone(&main));
         let log = Queued::start(logger, 1000, Arc::clone(&main)).unwrap();
-        for n in 0..20 {
+        for n in 0..30 {
             log.log_no_header(&format!("a request of some length, number {n:04}"));
         }
         log.flush();

@@ -105,7 +105,7 @@ fn a_node_starts_says_it_is_ready_and_halts_when_told() {
     // it halted is in the main log, after what the terminal was told.
     assert_eq!(lines.count(), 0);
     let main = std::fs::read_to_string(dir.join("tabernacle.log")).unwrap();
-    let logged: Vec<&str> = main.lines().skip(1).collect();
+    let logged: Vec<&str> = main.lines().collect();
     assert_eq!(logged[..said.len()], said.iter().map(String::as_str).collect::<Vec<_>>());
     assert_eq!(logged.len(), said.len() + 1);
     assert!(logged[said.len()].ends_with("] Received shut down signal, halting!"));

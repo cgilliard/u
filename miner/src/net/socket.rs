@@ -41,7 +41,7 @@ pub fn unix() -> u64 {
 /// The numbers a node keeps of itself for its stats log, in the order
 /// of their columns.
 pub const STATS: &[(&str, Kind)] = &[
-    ("Requests", Kind::Count),
+    ("Packets", Kind::Count),
     ("AvgLatency(us)", Kind::Average(REQUESTS)),
     ("Dropped", Kind::Count),
     ("BytesIn", Kind::Bytes),
@@ -57,7 +57,7 @@ pub const STATS: &[(&str, Kind)] = &[
 /// this wide; the rest are counted all the same.
 ///
 /// ```text
-/// Uptime: 0:00:00           Requests___AvgLatency(us)_Peers_PeersLive_Height_Blocks_Mined
+/// Uptime: 0:00:00           Packets____AvgLatency(us)_Peers_PeersLive_Height_Blocks_Mined
 /// ```
 pub fn stats() -> Stats {
     Stats::new(STATS).showing(&[

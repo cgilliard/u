@@ -452,7 +452,7 @@ mod tests {
         adding.join().unwrap();
         drop(log);
         let text = std::fs::read_to_string(dir.join("stats.log")).unwrap();
-        let lines: Vec<&str> = text.lines().skip(1).collect();
+        let lines: Vec<&str> = text.lines().collect();
         let number = |word: &str| word.replace(',', "").parse::<u64>().unwrap();
         // The lines in order: what is expected of a whole from the one
         // before it and the intervals since.

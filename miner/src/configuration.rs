@@ -1257,7 +1257,7 @@ mod tests {
         c.announce(&main);
         Configuration::ready(&main);
         let text = std::fs::read_to_string(&c.main_log).unwrap();
-        let lines: Vec<&str> = text.lines().skip(1).collect();
+        let lines: Vec<&str> = text.lines().collect();
         // The time it started, a rule, the configuration, a rule, ready.
         assert!(lines[0][26..].starts_with("Server started ") && lines[0].ends_with(" UTC"), "{}", lines[0]);
         assert_eq!((lines[1], lines[lines.len() - 2]), ("-".repeat(105).as_str(), "-".repeat(105).as_str()));

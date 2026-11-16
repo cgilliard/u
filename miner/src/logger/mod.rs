@@ -40,20 +40,22 @@
 //! written over. Files put aside are never deleted here: that is for
 //! whoever keeps the machine.
 //!
-//! # The first line of a file
+//! # The first line of a file put aside
 //!
-//! Every file begins with a line saying what it is and when it was
-//! begun: the log's name (the file's, without its directory) and the
-//! moment, to the second:
+//! A file put aside begins with a line saying what it is and when it
+//! was begun: the log's name (the file's, without its directory) and
+//! the moment, to the second:
 //!
 //! ```text
 //! tabernacle.log_02_03_2026_10_30_04
 //! (month, day, year, hour, minute, second)
 //! ```
 //!
-//! So a file put aside still says which log it was and when it began,
-//! whatever it has been renamed to. A file that holds nothing but that
-//! line is not put aside: there is nothing in it to keep.
+//! So it still says which log it was and when it began, whatever name
+//! it has been given. The file being written to has no such line: it is
+//! the log's lines and nothing else. (The line is put in when the file
+//! is put aside, by copying the file in under it.) A file that holds
+//! nothing is not put aside: there is nothing in it to keep.
 //!
 //! # The logs of a node
 //!
@@ -186,9 +188,9 @@ struct Inner {
     /// The file being written to; none if it could not be opened after
     /// the last was put aside, and is to be tried again.
     file: Option<File>,
-    /// Bytes in it, its first line among them.
+    /// Bytes in it.
     size: u64,
-    /// Whether it holds anything but its first line.
+    /// Whether it holds anything.
     written: bool,
     /// When it began to be written to, by this logger.
     since: u64,
@@ -213,7 +215,7 @@ impl Logger {
     ///
     /// A file found there counts as begun now: how long it had been
     /// written to before is not known. What it holds counts towards
-    /// its size. A new file is given its first line.
+    /// its size.
     pub fn open(path: impl Into<PathBuf>, rotation: Rotation) -> io::Result<Logger> {
         Logger::with_clock(path, rotation, Box::new(system_clock))
     }
@@ -234,19 +236,37 @@ impl Logger {
     }
 
     /// Opens the file to be written to, at `now`: added to if it is
-    /// there and holds anything, and given its first line if not.
+    /// there, made if it is not.
     fn begin(&self, inner: &mut Inner, now: u64) -> io::Result<()> {
-        let mut file = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&self.path)?;
         let size = file.metadata()?.len();
         (inner.size, inner.written, inner.since) = (size, size > 0, now);
-        if size == 0 {
-            let name = self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let first = format!("{name}{}\n", Moment::of(now).begun());
-            file.write_all(first.as_bytes())?;
-            inner.size = first.len() as u64;
-        }
         inner.file = Some(file);
         Ok(())
+    }
+
+    /// Puts what the log's file holds into `aside`, under a first line
+    /// that says which log it is and when the file was begun
+    /// (`request.log_02_03_2026_10_30_04`), and empties the log's file.
+    ///
+    /// The line is of the file put aside only: the file being written
+    /// to is lines of the log and nothing else. So the file cannot
+    /// simply be given another name: it is copied in under the line.
+    /// If that fails, nothing is lost: what there is of `aside` is
+    /// removed and the log's file is left as it was.
+    fn set_aside(&self, aside: &Path, begun: u64) -> io::Result<()> {
+        let name = self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let copy = || -> io::Result<()> {
+            let mut to = OpenOptions::new().write(true).create_new(true).open(aside)?;
+            to.write_all(format!("{name}{}\n", Moment::of(begun).begun()).as_bytes())?;
+            io::copy(&mut std::fs::File::open(&self.path)?, &mut to)?;
+            to.sync_all()
+        };
+        if let Err(e) = copy() {
+            let _ = std::fs::remove_file(aside);
+            return Err(e);
+        }
+        std::fs::remove_file(&self.path)
     }
 
     /// Has each file this log puts aside told of in `main`, by the name
@@ -366,7 +386,7 @@ impl Logger {
     fn write(&self, now: u64, text: &str) {
         let mut inner = self.lock();
         let over = self.rotation.max_size > 0 && inner.size + text.len() as u64 > self.rotation.max_size;
-        // (A file with nothing in it but its first line is not put
+        // (A file with nothing in it is not put
         // aside: for its age there is nothing to keep, and a line too
         // long for any file goes into this one.)
         if inner.written && (over || self.aged(&inner, now)) {
@@ -404,11 +424,11 @@ impl Logger {
             inner.since = now;
             return None;
         }
-        // Closed before it is renamed: some systems will not rename a
+        // Closed before it is removed: some systems will not remove a
         // file that is open.
         inner.file = None;
         let aside = self.aside(&Moment::of(now));
-        let renamed = std::fs::rename(&self.path, &aside);
+        let renamed = self.set_aside(&aside, inner.since);
         if let Err(e) = &renamed {
             // The same file goes on being written to.
             self.failed("put aside", e);
@@ -536,21 +556,21 @@ mod tests {
         log.log("");
         assert_eq!(
             dir.read("tabernacle.log"),
-            "tabernacle.log_10_17_2026_19_49_31\n\
-             [2026-10-17 19:49:31:471] started\n\
+            "[2026-10-17 19:49:31:471] started\n\
              peers 14 blocks 3\n\
              [2026-10-17 19:49:33:000] a line\nof two lines\n\
              [2026-10-17 19:49:33:000] to the terminal as well\n\
              [2026-10-17 19:49:33:000] \n"
         );
         assert_eq!((log.failures(), dir.files()), (0, vec!["tabernacle.log".to_string()]));
-        // Opened again, it is added to: it has its first line already.
+        // Opened again, it is added to. (The file being written to has
+        // nothing in it but the log's lines.)
         drop(log);
         let log = Logger::open(dir.0.join("tabernacle.log"), Rotation::default()).unwrap();
         log.log_no_header("again");
         let text = dir.read("tabernacle.log");
         assert!(text.ends_with("[2026-10-17 19:49:33:000] \nagain\n"));
-        assert_eq!(text.matches("tabernacle.log_").count(), 1);
+        assert_eq!(text.matches("tabernacle.log_").count(), 0);
     }
 
     #[test]
@@ -559,44 +579,46 @@ mod tests {
         let (now, clock) = clock(T);
         let rotation = Rotation { max_age: 0, max_size: 100 };
         let log = Logger::with_clock(dir.0.join("node.log"), rotation, clock).unwrap();
-        // Each file begins with its first line, of twenty-nine bytes;
-        // of lines of thirty, two more fit in a hundred and a third
+        // Of lines of thirty bytes, three fit in a hundred and a fourth
         // does not.
         let first = "node.log_10_17_2026_19_49_31\n";
         let line = |n: u32| format!("{n:029}");
+        let lines = |from: u32, to: u32| (from..to).map(|n| line(n) + "\n").collect::<String>();
         for n in 0..5 {
             log.log_no_header(&line(n));
         }
-        assert_eq!(dir.files(), ["node.log", "node_R_10_17_2026_19_49.log", "node_R_10_17_2026_19_49_02.log"]);
-        // No line is lost, none is split, and they are in order: the
-        // first put aside, then the second, then the file itself.
-        let all =
-            [dir.read("node_R_10_17_2026_19_49.log"), dir.read("node_R_10_17_2026_19_49_02.log"), dir.read("node.log")];
-        assert_eq!(all.iter().map(|f| f.len()).collect::<Vec<_>>(), [89, 89, 59]);
-        assert!(all.iter().all(|f| f.starts_with(first)));
-        let lines: String = all.iter().map(|f| &f[first.len()..]).collect();
-        assert_eq!(lines, (0..5).map(|n| line(n) + "\n").collect::<String>());
-        // A third in the same minute, and a tenth, are counted with two
+        assert_eq!(dir.files(), ["node.log", "node_R_10_17_2026_19_49.log"]);
+        // No line is lost, none is split, and they are in order: what
+        // was put aside, then the file itself. The file put aside says
+        // in its first line which log it is and when it was begun; the
+        // file being written to is the log's lines and nothing else.
+        assert_eq!(dir.read("node_R_10_17_2026_19_49.log"), format!("{first}{}", lines(0, 3)));
+        assert_eq!(dir.read("node.log"), lines(3, 5));
+        // A second in the same minute, and a tenth, are counted with two
         // digits as every other number in the name is.
-        for n in 5..25 {
+        for n in 5..32 {
             log.log_no_header(&line(n));
         }
-        assert!(dir.files().contains(&"node_R_10_17_2026_19_49_03.log".to_string()));
+        assert_eq!(dir.read("node_R_10_17_2026_19_49_02.log"), format!("{first}{}", lines(3, 6)));
         assert!(dir.files().contains(&"node_R_10_17_2026_19_49_10.log".to_string()));
-        // Another minute, another name.
+        // Another minute, another name: and the file begun then says
+        // so, when it is put aside in its turn.
         now.store(T + 60_000, Ordering::Relaxed);
-        log.log_no_header(&line(25));
-        log.log_no_header(&line(26));
-        assert!(dir.files().contains(&"node_R_10_17_2026_19_50.log".to_string()));
-        // A file begun then says so in its first line.
-        assert!(dir.read("node.log").starts_with("node.log_10_17_2026_19_50_31\n"));
+        log.log_no_header(&line(32));
+        log.log_no_header(&line(33));
+        assert_eq!(dir.read("node_R_10_17_2026_19_50.log"), format!("{first}{}", lines(30, 33)));
         // A line longer than any file may be is written all the same, to
         // a file of its own.
         let long = "x".repeat(300);
         log.log_no_header(&long);
-        assert_eq!(dir.read("node.log"), format!("node.log_10_17_2026_19_50_31\n{long}\n"));
+        assert_eq!(dir.read("node.log"), format!("{long}\n"));
+        assert_eq!(
+            dir.read("node_R_10_17_2026_19_50_02.log"),
+            format!("node.log_10_17_2026_19_50_31\n{}", lines(33, 34))
+        );
         log.log_no_header("after");
-        assert_eq!(dir.read("node.log"), "node.log_10_17_2026_19_50_31\nafter\n");
+        assert_eq!(dir.read("node.log"), "after\n");
+        assert_eq!(dir.read("node_R_10_17_2026_19_50_03.log"), format!("node.log_10_17_2026_19_50_31\n{long}\n"));
         assert_eq!(log.failures(), 0);
     }
 
@@ -614,19 +636,20 @@ mod tests {
         now.store(T + 3_600_000, Ordering::Relaxed);
         log.log("the next hour");
         assert_eq!(dir.files(), ["stats.log", "stats_R_10_17_2026_20_49.log"]);
-        assert!(dir.read("stats_R_10_17_2026_20_49.log").ends_with("within the hour\n"));
-        assert_eq!(dir.read("stats.log"), "stats.log_10_17_2026_20_49_31\n[2026-10-17 20:49:31:471] the next hour\n");
+        let aside = dir.read("stats_R_10_17_2026_20_49.log");
+        assert!(aside.starts_with("stats.log_10_17_2026_19_49_31\n[") && aside.ends_with("within the hour\n"));
+        assert_eq!(dir.read("stats.log"), "[2026-10-17 20:49:31:471] the next hour\n");
         // A quiet log is put aside when it is looked to, though nothing
-        // is written; one with nothing in it but its first line is not.
+        // is written; one with nothing in it is not.
         now.store(T + 2 * 3_600_000, Ordering::Relaxed);
         log.rotate_if_due();
         assert_eq!(dir.files().len(), 3);
-        assert_eq!(dir.read("stats.log"), "stats.log_10_17_2026_21_49_31\n");
+        assert_eq!(dir.read("stats.log"), "");
         now.store(T + 9 * 3_600_000, Ordering::Relaxed);
         log.rotate_if_due();
         log.log("after a long quiet");
-        assert_eq!(dir.files().len(), 3, "a file of one line was not worth keeping");
-        assert!(dir.read("stats.log").starts_with("stats.log_10_17_2026_21_49_31\n[2026-10-18 04:49:31:471] after"));
+        assert_eq!(dir.files().len(), 3, "a file of nothing was not worth keeping");
+        assert!(dir.read("stats.log").starts_with("[2026-10-18 04:49:31:471] after"));
         // And when asked to, whatever its age.
         assert!(log.rotate().is_some_and(|p| p.ends_with("stats_R_10_18_2026_04_49.log")));
         assert_eq!(log.rotate(), None);
@@ -644,20 +667,19 @@ mod tests {
             Logger::with_clock(dir.0.join("request.log"), rotation, Box::new(move || read.load(Ordering::Relaxed)))
                 .unwrap()
                 .report_rotations_to(Arc::clone(&main));
-        for n in 0..3 {
+        for n in 0..5 {
             requests.log_no_header(&format!("request {n:020}"));
             now.fetch_add(1000, Ordering::Relaxed);
         }
         assert_eq!(
             dir.read("main.log"),
-            "main.log_10_17_2026_19_49_31\n\
-             [2026-10-17 19:49:32:471] request.log rotated to request_R_10_17_2026_19_49.log\n\
-             [2026-10-17 19:49:33:471] request.log rotated to request_R_10_17_2026_19_49_02.log\n"
+            "[2026-10-17 19:49:33:471] request.log rotated to request_R_10_17_2026_19_49.log\n\
+             [2026-10-17 19:49:35:471] request.log rotated to request_R_10_17_2026_19_49_02.log\n"
         );
-        // Its own files are put aside without a word: the file begun
-        // says when in its first line.
-        assert!(main.rotate().is_some());
-        assert_eq!(dir.read("main.log"), "main.log_10_17_2026_19_49_34\n");
+        // Its own files are put aside without a word.
+        let aside = main.rotate().unwrap();
+        assert_eq!(dir.read("main.log"), "");
+        assert!(std::fs::read_to_string(aside).unwrap().starts_with("main.log_10_17_2026_19_49_31\n["));
     }
 
     #[test]
@@ -697,10 +719,13 @@ mod tests {
         let mut lines = 0;
         for path in &paths {
             let text = std::fs::read_to_string(path).unwrap();
-            assert!(text.len() <= 20_000 && text.ends_with('\n'));
-            let mut of_file = text.lines();
-            assert!(of_file.next().unwrap().starts_with("busy.log_"));
-            for line in of_file {
+            // A file put aside has its first line, over and above what a
+            // file may hold; the one being written to has none.
+            let aside = text.starts_with("busy.log_");
+            assert_eq!(aside, *path != dir.0.join("busy.log"));
+            let first = if aside { text.find('\n').unwrap() + 1 } else { 0 };
+            assert!(text.len() - first <= 20_000 && (text.is_empty() || text.ends_with('\n')));
+            for line in text[first..].lines() {
                 assert!(line.starts_with('[') && line.ends_with(&"=".repeat(20)), "{line}");
                 let words: Vec<&str> = line.split(' ').collect();
                 seen[words[3].parse::<usize>().unwrap()].push(words[5].parse::<u32>().unwrap());
