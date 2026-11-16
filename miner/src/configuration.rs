@@ -74,6 +74,11 @@ const OPTIONS: &[(&str, &[Opt])] = &[
         &[
             Opt { name: "no-mine", takes: Takes::Nothing, help: "follow the chain without mining" },
             Opt {
+                name: "prebuild-table",
+                takes: Takes::Nothing,
+                help: "make the whole table of the proof of work before any block\nis made, and not while blocks are made (it is kept in the\ndata directory either way, and made only once)",
+            },
+            Opt {
                 name: "reward-key",
                 takes: Takes::Value("HEX"),
                 help: "the key the rewards of blocks made here are paid to:\nits hash, as 64 hex digits",
@@ -362,6 +367,9 @@ pub struct Configuration {
     /// checking proofs; zero for one a core.
     pub threads: usize,
     pub mine: bool,
+    /// Whether the table of the proof of work is made whole before any
+    /// block is.
+    pub prebuild_table: bool,
     /// The hash of the key rewards are paid to, if one was given.
     pub reward: Option<crate::hash::Digest>,
     pub listen: SocketAddrV4,
@@ -714,6 +722,7 @@ impl Configuration {
             data_dir,
             threads: count("threads", 0)?.unwrap_or(0),
             mine: !given.flag("no-mine"),
+            prebuild_table: given.flag("prebuild-table"),
             reward,
             listen,
             peers,
@@ -741,7 +750,11 @@ impl Configuration {
         let limit = |n: u64, unit: &str| if n == 0 { "no limit".to_string() } else { format!("{} {unit}", commas(n)) };
         let mut lines: Vec<(&str, String)> = vec![("UDP Server Listening on", self.listen.to_string())];
         lines.extend(self.files.iter().map(|file| ("Configuration File", file.display().to_string())));
-        lines.extend([("Network", self.network.name().to_string()), ("Mining", yes(self.mine))]);
+        lines.extend([
+            ("Network", self.network.name().to_string()),
+            ("Mining", yes(self.mine)),
+            ("Prebuild Table", yes(self.prebuild_table)),
+        ]);
         lines.extend(self.reward.iter().map(|key| ("Reward Key", hex(&crate::poseidon2::digest_to_bytes(key)))));
         lines.extend([
             ("Threads", if self.threads == 0 { "one a core".to_string() } else { commas(self.threads as u64) }),
@@ -869,6 +882,7 @@ mod tests {
     fn nothing_given_is_every_default() {
         let c = read(&[]).unwrap();
         assert_eq!((c.network, c.mine, c.threads, c.keep), (Network::Mainnet, true, 0, 1008));
+        assert!(!c.prebuild_table && read(&["--prebuild-table"]).unwrap().prebuild_table);
         assert_eq!(c.listen.to_string(), "0.0.0.0:3737");
         assert_eq!(c.data_dir, Path::new("/home/chris/.tabernacle/tabminer"));
         assert_eq!(c.main_log, Path::new("/home/chris/.tabernacle/tabminer/tabernacle.log"));

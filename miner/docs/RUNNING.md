@@ -447,15 +447,35 @@ of transactions yet.
 **The table of the proof of work.** A miner hashes against a table: 1.1
 GB on mainnet (it doubles each year, to 32 GB), 64 KB and built in on
 the dev networks. Its memory is taken when the node starts making
-blocks. What is read of it is filled as it is read, so blocks are made
-from the first moment; a thread fills the rest, and when it is whole it
-is kept in `pow.table` in the data directory, for the next run to begin
-with. The main log says so:
+blocks.
+
+- **It is made once, and kept.** When it is whole it is written to
+  `pow.table` in the data directory, and every later run reads it from
+  there and says so.
+- **Unless told otherwise it is made while blocks are**: what is read
+  of it is filled as it is read, so blocks are made from the first
+  moment, and a thread fills the rest. Until it is whole, looking for a
+  nonce is slow (each hash has to make what it reads), and the first
+  block after genesis, which needs some 65,000 hashes where later ones
+  need a few hundred, can take many minutes.
+- **`--prebuild-table`** makes it whole first, with every thread, and
+  only then makes blocks.
+
+The main log says how it goes, at every twentieth:
 
 ```
-Making the table of the proof of work: 0 B of 1.1 GB are there
+Making the table of the proof of work: 0 B of 1.1 GB are there. This may take a while
+The table of the proof of work: 5% (53.7 MB of 1.1 GB)
+...
+The table of the proof of work: 95% (1.0 GB of 1.1 GB)
 The table of the proof of work is whole: made in 617.66 seconds
 The table of the proof of work is kept in '/home/chris/.tabernacle/tabminer/pow.table'
+```
+
+and on a later run:
+
+```
+The table of the proof of work (1.1 GB) was read from '/home/chris/.tabernacle/tabminer/pow.table'
 ```
 
 **What it takes**, as measured on one machine of twelve threads, the

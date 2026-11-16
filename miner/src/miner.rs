@@ -37,7 +37,7 @@ use crate::error::Error;
 use crate::hash::Digest;
 use crate::name_air::NameWitness;
 use crate::output::{Output, Sig};
-use crate::pow::{ItemSource, Nonce, hashimoto, nonce_from_u64};
+use crate::pow::{ItemSource, LazyDataset, Nonce, hashimoto, nonce_from_u64};
 use crate::store::backend::Backend;
 use crate::transaction::UnsignedTransaction;
 
@@ -112,6 +112,31 @@ impl HoldOff {
             }
         }
     }
+}
+
+/// Fills what is missing of `table`, on every thread there is, and says
+/// how far it has got: `progress` is called with each twentieth of the
+/// table that has come to be there (5, 10, ... 95 in a hundred), as
+/// that is seen, the table being looked at every `look`. A table
+/// filled faster than it is looked at passes some of them by.
+pub fn fill_table(table: &LazyDataset<'_>, look: Duration, progress: &(dyn Fn(u32) + Sync)) {
+    let twentieths = || (table.filled() * 20 / table.pairs()) as u32;
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            table.fill();
+            done.store(true, Ordering::Release);
+        });
+        let mut said = twentieths();
+        while !done.load(Ordering::Acquire) {
+            std::thread::sleep(look);
+            let now = twentieths();
+            if now > said && now < 20 {
+                said = now;
+                progress(5 * now);
+            }
+        }
+    });
 }
 
 /// What came of trying to make a block.
@@ -318,6 +343,26 @@ pub fn solve<S: ItemSource + Sync>(
 mod hold_off {
     use super::*;
     use crate::poseidon2::Fp;
+
+    /// A table is filled whole, and how far it has got is said in
+    /// twentieths, each once and in order, none of them the last.
+    #[test]
+    fn a_table_is_filled_and_says_how_far_it_has_got() {
+        let seed = crate::pow::SeedText::new(crate::pow::PowParams {
+            log_dataset_items: 12,
+            max_log_dataset_items: 12,
+            ..crate::pow::PowParams::MAINNET
+        });
+        let table = LazyDataset::new(&seed, 12).unwrap();
+        let said = Mutex::new(Vec::new());
+        fill_table(&table, Duration::from_micros(200), &|percent| said.lock().unwrap().push(percent));
+        assert!(table.is_complete());
+        let said = said.into_inner().unwrap();
+        assert!(said.windows(2).all(|w| w[0] < w[1]), "{said:?}");
+        assert!(said.iter().all(|p| p % 5 == 0 && (5..=95).contains(p)), "{said:?}");
+        // Whole already: nothing to fill, nothing to say.
+        fill_table(&table, Duration::from_micros(200), &|_| panic!("nothing was to be said"));
+    }
 
     /// A chain ahead is waited for so long, and no longer; another
     /// chain ahead is waited for afresh; and with none ahead, blocks

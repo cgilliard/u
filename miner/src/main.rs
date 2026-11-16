@@ -133,6 +133,7 @@ fn make_blocks(
     hold: &Handle<FileBackend, AggregateVerifier>,
     seed: SeedText<'static>,
     kept: &Path,
+    prebuild: bool,
     reward: &tabminer::hash::Digest,
     main: &Arc<Logger>,
     stats: &Stats,
@@ -151,7 +152,12 @@ fn make_blocks(
             return main.log(&format!("Error: no blocks are made: the table of the proof of work ({needed}): {e}"));
         }
     };
-    fill_table(&table, kept, main);
+    // What a file kept from an earlier run gave, if it gave the whole.
+    if Dataset::built_in(&seed).is_none() && table.read().unwrap_or_else(|e| e.into_inner()).is_complete() {
+        let whole = size(pow.log_items_at(next));
+        main.log(&format!("The table of the proof of work ({whole}) was read from '{}'", kept.display()));
+    }
+    fill_table(&table, kept, main, prebuild);
     // Where this miner's nonces begin: its own, as likely as not.
     let mut start = [0u8; 8];
     let _ = tabminer::random::fill(&mut start);
@@ -226,7 +232,7 @@ fn make_blocks(
             if let Err(e) = table.write().unwrap_or_else(|e| e.into_inner()).grow(wanted) {
                 return main.log(&format!("Error: no more blocks are made: the table of the proof of work: {e}"));
             }
-            fill_table(&table, kept, main);
+            fill_table(&table, kept, main, prebuild);
         }
         let dataset = table.read().unwrap_or_else(|e| e.into_inner());
         match miner::mine(hold.chain(), &*dataset, reward, socket::unix(), start, &proved, &cancel) {
@@ -260,8 +266,8 @@ fn make_blocks(
 /// of its own, and keeps it in the file `kept` when it is whole: so
 /// that the next run begins with it. (Blocks are made meanwhile: what
 /// they read of the table is filled as they read it.)
-fn fill_table(table: &Arc<RwLock<LazyDataset<'static>>>, kept: &Path, main: &Arc<Logger>) {
-    // Said here, before the thread is begun: so that it is always said
+fn fill_table(table: &Arc<RwLock<LazyDataset<'static>>>, kept: &Path, main: &Arc<Logger>, first: bool) {
+    // Said here, before any thread is begun: so that it is always said
     // before what the caller goes on to say.
     {
         let table = table.read().unwrap_or_else(|e| e.into_inner());
@@ -270,24 +276,39 @@ fn fill_table(table: &Arc<RwLock<LazyDataset<'static>>>, kept: &Path, main: &Arc
         }
         let whole = tabminer::pow::table_bytes(table.log_items());
         let there = whole / table.pairs() as u64 * table.filled() as u64;
-        main.log(&format!("Making the table of the proof of work: {} of {} are there", bytes(there), bytes(whole)));
+        main.log(&format!(
+            "Making the table of the proof of work: {} of {} are there. This may take a while{}",
+            bytes(there),
+            bytes(whole),
+            if first { ": no blocks are made until it is whole" } else { "" }
+        ));
     }
-    let (table, kept, told) = (Arc::clone(table), kept.to_path_buf(), Arc::clone(main));
+    let (shared, kept, told) = (Arc::clone(table), kept.to_path_buf(), Arc::clone(main));
     let fill = move || {
         let main = told;
-        let table = table.read().unwrap_or_else(|e| e.into_inner());
+        let table = shared.read().unwrap_or_else(|e| e.into_inner());
+        let whole = tabminer::pow::table_bytes(table.log_items());
         let began = Instant::now();
-        table.fill();
+        // How far it has got, at every twentieth.
+        miner::fill_table(&table, Duration::from_millis(500), &|percent| {
+            let there = bytes(whole / 100 * percent as u64);
+            main.log(&format!("The table of the proof of work: {percent}% ({there} of {})", bytes(whole)));
+        });
         main.log(&format!(
             "The table of the proof of work is whole: made in {}",
             seconds(began.elapsed().as_millis() as u64)
         ));
+        // Kept, for the next run to begin with.
         match table.save(&kept) {
             Ok(()) => main.log(&format!("The table of the proof of work is kept in '{}'", kept.display())),
             Err(e) => main
                 .log(&format!("Error: the table of the proof of work could not be kept in '{}': {e}", kept.display())),
         }
     };
+    // Before any block is made, if so set; else beside the making of them.
+    if first {
+        return fill();
+    }
     if let Err(e) = std::thread::Builder::new().name("pow table".into()).spawn(fill) {
         main.log(&format!("Error: the table of the proof of work is not being made ahead: {e}"));
     }
@@ -394,10 +415,10 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
         }));
     }
     if let Some((seed, table, reward)) = mining {
-        let (main, stats) = (Arc::clone(&main), Arc::clone(&stats));
+        let (main, stats, prebuild) = (Arc::clone(&main), Arc::clone(&stats), c.prebuild_table);
         std::thread::Builder::new()
             .name("miner".into())
-            .spawn(move || make_blocks(&hold, seed, &table, &reward, &main, &stats))
+            .spawn(move || make_blocks(&hold, seed, &table, prebuild, &reward, &main, &stats))
             .map_err(threads)?;
     }
 
