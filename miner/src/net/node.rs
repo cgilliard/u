@@ -68,6 +68,7 @@ use super::config::Config;
 use super::message::{Locator, Message, Status};
 use super::object::{MAX_NAME, Object};
 use super::peers::Peers;
+use super::snapshot::{self, Manifest};
 use super::{MAX_DATAGRAM, VERSION};
 use crate::block::{BlockRef, HEADER_SIZE, Header};
 use crate::chain::Chain;
@@ -111,8 +112,11 @@ pub struct Counts {
     pub announced: u64,
 }
 
-/// Objects made to be served, kept while they are being asked for.
-const SERVED: usize = 16;
+/// Objects made to be served are kept while they are being asked for:
+/// so many bytes of them, the latest made or asked for first. Every
+/// chunk is asked for by its object's name, and a part of the state
+/// takes reading back through the blocks since to make.
+const SERVED_BYTES: usize = 32 << 20;
 /// Chunks sent in one go before the node looks to what else there is.
 const SERVE_BATCH: usize = 256;
 
@@ -221,6 +225,9 @@ pub struct Node<B: Backend + 'static, V> {
     /// Who announced which block, and how long its body is: the newest
     /// last.
     announced: VecDeque<(Digest, SocketAddrV4, u32)>,
+    /// What came of the fetches asked for from outside
+    /// ([`Node::fetch_object`]).
+    inbox: Vec<(Object, SocketAddrV4, Option<Vec<u8>>)>,
     counts: Counts,
     /// Tests: a chain's work claimed that is not there; objects served
     /// with a byte wrong.
@@ -267,6 +274,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             applying: Vec::new(),
             held: Vec::new(),
             announced: VecDeque::new(),
+            inbox: Vec::new(),
             counts: Counts::default(),
             #[cfg(test)]
             boast: None,
@@ -964,7 +972,15 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             bytes
         };
         self.served.push_front((*object, Arc::new(bytes)));
-        self.served.truncate(SERVED);
+        // The oldest go, down to what may be kept: but never the one
+        // just made.
+        let mut kept = 0;
+        let fit = self.served.iter().take_while(|(_, b)| {
+            kept += b.len();
+            kept <= SERVED_BYTES
+        });
+        let keep = fit.count().max(1);
+        self.served.truncate(keep);
         Some(Arc::clone(&self.served[0].1))
     }
 
@@ -992,9 +1008,47 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                 Some(bytes)
             }
             Object::Block(id) => self.chain.body(&id).ok().flatten(),
-            // The state is not served yet.
+            // The state as of a block of the chain that can still be
+            // gone back to, in its pieces (`super::snapshot`).
+            Object::Manifest(block) => Some(Manifest::of(&self.past(&block)?).encode()),
+            Object::Roots { block, index } => snapshot::encode_roots(&self.past(&block)?, index),
+            Object::Part { block, index } => {
+                let past = self.past(&block)?;
+                let outputs = past.part(index).ok().filter(|o| !o.is_empty())?;
+                Some(snapshot::encode_part(&outputs, &past.commits(index).ok()?))
+            }
+            Object::Names { block, index } => {
+                let records = self.past(&block)?.names_part(index).ok().filter(|r| !r.is_empty())?;
+                Some(snapshot::encode_names(&records))
+            }
+            // Nothing else is served yet.
             _ => None,
         }
+    }
+
+    /// The state as of the block `block`, if that is a block of the
+    /// chain here recent enough to go back to.
+    fn past(&self, block: &Digest) -> Option<crate::store::state::Past<'_, B>> {
+        self.chain.state().past(self.on_chain(block)?.height).ok()
+    }
+
+    /// Fetches `object`, of `most` bytes at the most, from `from`: what
+    /// comes of it is in [`Node::take_fetched`] when it has. False if
+    /// `from` is no peer to ask.
+    pub fn fetch_object(&mut self, now: Micros, object: Object, from: SocketAddrV4, most: u32) -> bool {
+        if !self.peers.may_ask(&from, now) {
+            return false;
+        }
+        let path = self.peers.get(&from).map(|p| p.path).unwrap_or_default();
+        let transfer = Self::number(&self.secret, &mut self.numbers);
+        self.fetches.push(Fetching { object, from, fetch: Fetch::new(transfer, None, most, path, now) });
+        true
+    }
+
+    /// The objects asked for with [`Node::fetch_object`] that have come
+    /// whole, or been given up (no bytes), since this was last called.
+    pub fn take_fetched(&mut self) -> Vec<(Object, SocketAddrV4, Option<Vec<u8>>)> {
+        std::mem::take(&mut self.inbox)
     }
 
     /// Does what the fetches under way and the chunks being served want
@@ -1096,16 +1150,19 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         match object {
             Object::Headers { from: first, .. } => self.headers_arrived(now, from, first, bytes),
             Object::Block(id) => self.body_arrived(now, from, id, bytes),
-            // Nothing else is fetched yet.
-            _ => {}
+            // Asked for by whoever drives this node.
+            _ => self.inbox.push((object, from, Some(bytes.to_vec()))),
         }
     }
 
-    /// A fetch from `from` was given up: the peer is passed over, and
-    /// what was wanted is wanted again, of another.
+    /// A fetch from `from` was given up. Of headers or a body: the peer
+    /// is passed over, and what was wanted is wanted again, of another.
+    /// Of anything else: whoever asked for it is told, and decides.
     fn fetch_failed(&mut self, now: Micros, object: Object, from: SocketAddrV4) {
         self.counts.fetches_failed += 1;
-        self.peers.failed(&from, now);
+        if matches!(object, Object::Headers { .. } | Object::Block(_)) {
+            self.peers.failed(&from, now);
+        }
         match (object, self.aim.as_mut()) {
             (Object::Headers { from: first, .. }, Some(aim)) => {
                 aim.todo.insert(first);
@@ -1115,7 +1172,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
                 self.announced.retain(|(told, addr, _)| !(*told == id && *addr == from));
                 self.sync_blocks(now);
             }
-            _ => {}
+            (Object::Headers { .. }, None) => {}
+            _ => self.inbox.push((object, from, None)),
         }
     }
 }

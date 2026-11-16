@@ -890,3 +890,108 @@ fn bodies_are_asked_only_of_those_that_hold_them() {
     let seventh = w.nodes[0].chain().header_at(7).unwrap().unwrap().hash();
     assert!(w.nodes[0].make(&Object::Block(seventh)).is_some());
 }
+
+// -- The state, in pieces
+
+/// The state as of a block is served in pieces, each checked against
+/// the one above it, and the pieces put together are that state: what
+/// a joining node does, by hand.
+#[test]
+fn a_state_is_served_in_pieces_that_check_and_make_it_whole() {
+    use crate::net::snapshot::{Manifest, decode_part, decode_roots};
+    use crate::store::receive::{Receiving, Target};
+    let mut cfg = small_runs();
+    // (Nothing fetched but what the test asks for.)
+    (cfg.sync.blocks, cfg.peers.target) = (0, 1);
+    let chains = vec![chain_of(easy()), chain_of(easy())];
+    grow(&chains[0], 20, 1);
+    let mut w = World::with(chains, &cfg);
+    w.nodes[1].add_peer(at(0), false, 0);
+    w.run(3 * SECOND);
+    // As of a block some way back, which the headers vouch for.
+    let header =
+        w.nodes[1].chain().known(&w.nodes[0].chain().header_at(15).unwrap().unwrap().hash()).unwrap().unwrap().header;
+    let block = header.hash();
+    let fetch = |w: &mut World, object: Object, most: usize| -> Option<Vec<u8>> {
+        let now = w.now;
+        assert!(w.nodes[1].fetch_object(now, object, at(0), most as u32));
+        w.wake[1] = now;
+        w.run(SECOND);
+        let mut got = w.nodes[1].take_fetched();
+        assert_eq!(got.len(), 1);
+        let (what, from, bytes) = got.remove(0);
+        assert_eq!((what, from), (object, at(0)));
+        bytes
+    };
+    // The manifest, against the header.
+    let bytes = fetch(&mut w, Object::Manifest(block), snapshot::MAX_MANIFEST).unwrap();
+    let manifest = Manifest::decode(&bytes).unwrap();
+    assert!(manifest.check(&header.state_root));
+    assert_eq!((manifest.next, manifest.ranges.len(), manifest.name_parts.len()), (15, 1, 0));
+    // Each range's roots, against the manifest.
+    let mut parts = Vec::new();
+    for (range, root) in &manifest.ranges {
+        let bytes = fetch(&mut w, Object::Roots { block, index: *range }, snapshot::MAX_ROOTS).unwrap();
+        parts.extend(decode_roots(&bytes, *range, root).unwrap());
+    }
+    assert_eq!(parts.len(), 1);
+    // Each part, against its root: the store checks that as it keeps it.
+    let target = Target { height: header.height, block, state_root: header.state_root, next: manifest.next };
+    let mut receiving = Receiving::open(MemBackend::new(), target, &parts, &manifest.name_parts).unwrap();
+    for index in receiving.missing() {
+        let bytes = fetch(&mut w, Object::Part { block, index }, snapshot::MAX_PART).unwrap();
+        let (outputs, commits) = decode_part(&bytes, index).unwrap();
+        assert_eq!(outputs.len(), 15);
+        // A part with an output's amount changed is not the part.
+        let mut wrong = outputs.clone();
+        wrong[3].1.amount += 1;
+        assert_eq!(receiving.put_with(index, &wrong, &commits), Err(Error::PartRoot));
+        receiving.put_with(index, &outputs, &commits).unwrap();
+    }
+    let state = receiving.finish(KEEP).unwrap();
+    assert_eq!((state.root(), state.tip()), (header.state_root, (15, block)));
+    // What there is none of, the peer says it has not: a range and a
+    // part that hold nothing, a part of the names, the state as of a
+    // block it does not have or that is not on its chain.
+    for object in [
+        Object::Roots { block, index: 1 },
+        Object::Part { block, index: 1 },
+        Object::Names { block, index: 0 },
+        Object::Manifest([crate::poseidon2::Fp::new(1); 8]),
+    ] {
+        assert_eq!(fetch(&mut w, object, 1 << 20), None, "{object:?}");
+    }
+    // And the state as of a block too old to go back to: a node says
+    // how far back it can, in its pings.
+    let said = w.nodes[1].peers().get(&at(0)).unwrap().status.unwrap();
+    assert_eq!((said.window, said.height), (0, 20));
+}
+
+/// A state can be handed over as of the blocks a node can still undo,
+/// and it says in its pings from which.
+#[test]
+fn a_state_is_served_as_far_back_as_can_be_undone() {
+    let chain = chain_of(easy());
+    grow(&chain, KEEP + 9, 1);
+    let mut w = World::with(vec![chain], &Config::default());
+    let node = &mut w.nodes[0];
+    let id = |n: &TestNode, h: u32| n.chain().header_at(h).unwrap().unwrap().hash();
+    let said = node.status(&at(1), 0);
+    assert_eq!((said.height, said.window, said.oldest), (KEEP as u32 + 9, 9, 10));
+    for (height, served) in [(8, false), (9, true), (40, true), (KEEP as u32 + 9, true)] {
+        let made = node.make(&Object::Manifest(id(node, height)));
+        assert_eq!(made.is_some(), served, "as of {height}");
+        if let Some(bytes) = made {
+            let header = node.chain().header_at(height).unwrap().unwrap();
+            let manifest = snapshot::Manifest::decode(&bytes).unwrap();
+            assert!(manifest.check(&header.state_root));
+            assert_eq!(manifest.next, height as u64);
+        }
+    }
+    // What is kept to be served is bounded by its bytes, not its count.
+    for height in 9..40 {
+        node.object(&Object::Manifest(id(node, height))).unwrap();
+        node.object(&Object::Part { block: id(node, height), index: 0 }).unwrap();
+    }
+    assert!(node.served.len() == 62 && node.served.iter().map(|s| s.1.len()).sum::<usize>() <= SERVED_BYTES);
+}
