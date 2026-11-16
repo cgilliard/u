@@ -22,7 +22,7 @@ use tabminer::logger::fmt::{commas, short_seconds};
 use tabminer::logger::queued::Queued;
 use tabminer::logger::stats::{Stats, StatsLog};
 use tabminer::miner::{self, Mined};
-use tabminer::net::node::{Handle, Node};
+use tabminer::net::node::{Event, Handle, Node};
 use tabminer::net::socket::{self, Watch};
 use tabminer::pow::{Dataset, SeedText};
 use tabminer::store::backend::FileBackend;
@@ -65,6 +65,46 @@ fn main() {
 /// Where the dev network's rewards go when no key is given: to a key
 /// nobody has. They are for trying the network, not for keeping.
 const DEV_REWARD: tabminer::hash::Digest = [tabminer::poseidon2::Fp::ZERO; 8];
+
+/// What the main log says of something that happened to the node, if
+/// anything.
+fn said(event: &Event) -> Option<String> {
+    let n = |height: u32| commas(height as u64);
+    let whose = |from: &Option<std::net::SocketAddrV4>| {
+        from.map_or_else(|| "made here".to_string(), |from| format!("from {from}"))
+    };
+    Some(match event {
+        Event::PeerConnected { peer, height } => format!("Peer {peer} connected (height {})", n(*height)),
+        Event::PeerLost { peer } => format!("Peer {peer} lost"),
+        Event::Banned { peer } => format!("Banned {}: it sent what no honest peer sends, too often", peer.ip()),
+        Event::HeadersWanted { from, to, peer } => {
+            format!("Syncing headers {} to {} from {peer}", n(*from), n(*to))
+        }
+        Event::HeadersKept { height } => format!("Headers synced to {}", n(*height)),
+        Event::HeadersRefused { peer } => format!("Headers from {peer} refused"),
+        // (A block made here that joins the chain was said when won.)
+        Event::Block { from: None, undone: 0, .. } => return None,
+        Event::Block { header, from, undone } => {
+            let undone = match undone {
+                0 => String::new(),
+                1 => ", 1 block undone".to_string(),
+                k => format!(", {} blocks undone", n(*k)),
+            };
+            format!("Received block {} ({}) {}{undone}", n(header.height), short(&header.hash()), whose(from))
+        }
+        Event::BlockRefused { header, from, why } => {
+            format!("Refused block {} ({}) {}: {why}", n(header.height), short(&header.hash()), whose(from))
+        }
+        Event::Synced { height } => format!("Synced at block {}", n(*height)),
+        Event::StateWanted { height, id, again: false } => {
+            format!("Taking the state as of block {} ({})", n(*height), short(id))
+        }
+        Event::StateWanted { height, id, again: true } => {
+            format!("Taking the state as of a later block, {} ({})", n(*height), short(id))
+        }
+        Event::StateTaken { height } => format!("State taken as of block {}", n(*height)),
+    })
+}
 
 /// The first of a block's id, as the logs say it.
 fn short(id: &tabminer::hash::Digest) -> String {
@@ -215,20 +255,10 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     // node runs.
     {
         let main = Arc::clone(&main);
-        hold.on_received(Box::new(move |header, from| {
-            main.log(&format!(
-                "Received block {} ({}) from {from}",
-                commas(header.height as u64),
-                short(&header.hash())
-            ));
-        }));
-    }
-    {
-        let main = Arc::clone(&main);
-        hold.on_refused(Box::new(move |header, from, why| {
-            let whose = from.map_or_else(|| "made here".to_string(), |from| format!("from {from}"));
-            let (height, id) = (commas(header.height as u64), short(&header.hash()));
-            main.log(&format!("Refused block {height} ({id}) {whose}: {why}"));
+        hold.on_event(Box::new(move |event| {
+            if let Some(line) = said(event) {
+                main.log(&line);
+            }
         }));
     }
     if let Some((dataset, reward)) = mining {

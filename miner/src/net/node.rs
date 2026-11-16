@@ -354,6 +354,9 @@ pub(crate) struct List {
     /// decision about all of them is made on (whether anyone holds a
     /// block, how far back anyone can hand the state over).
     views: Vec<View>,
+    /// A chain ahead of ours is being caught up with: said when it is
+    /// begun, and when it has been.
+    syncing: bool,
 }
 
 impl List {
@@ -368,6 +371,7 @@ impl List {
             join: None,
             fetching: Vec::new(),
             views: vec![View::default(); workers],
+            syncing: false,
         }
     }
 }
@@ -453,12 +457,8 @@ pub(crate) struct Shared {
     waker: RwLock<Option<Waker>>,
     /// Whose turn it is to hear of work done on the chain.
     turn: AtomicUsize,
-    /// Called with each block of a peer's that becomes the chain's
-    /// last, and who served it: for whoever keeps a record.
-    received: RwLock<Option<Received>>,
-    /// Called with each block refused, who served it (nobody, if it
-    /// was made here), and why.
-    refused: RwLock<Option<Refused>>,
+    /// Told of each thing that happens that a log would say.
+    told: RwLock<Option<Told>>,
     /// Told whenever the chain has a new last block (`blocks` counts
     /// them): for whoever waits for that.
     moved: (Mutex<()>, std::sync::Condvar),
@@ -466,11 +466,40 @@ pub(crate) struct Shared {
     by_port: AtomicBool,
 }
 
-/// Told of a block that joined the chain, and the peer it came from.
-pub type Received = Box<dyn Fn(&Header, SocketAddrV4) + Send + Sync>;
+/// Something that happened to a node that whoever keeps its log would
+/// say: a peer come or gone, the chain being caught up with, a block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// A peer is live: it answered, and says its chain is this high.
+    PeerConnected { peer: SocketAddrV4, height: u32 },
+    /// A peer is live no longer: silent too long, gone, or refused.
+    PeerLost { peer: SocketAddrV4 },
+    /// A peer's host is refused: it sent what no honest peer sends
+    /// once too often.
+    Banned { peer: SocketAddrV4 },
+    /// A chain ahead of ours is being caught up with: these headers
+    /// are wanted, as this peer has them.
+    HeadersWanted { from: u32, to: u32, peer: SocketAddrV4 },
+    /// Those headers are kept, to this height.
+    HeadersKept { height: u32 },
+    /// This peer's headers were not what they should be.
+    HeadersRefused { peer: SocketAddrV4 },
+    /// A block is the chain's new last: from this peer, or made here.
+    /// `undone` blocks of ours gave way to its branch.
+    Block { header: Header, from: Option<SocketAddrV4>, undone: u32 },
+    /// A block was refused, and why: from this peer, or made here.
+    BlockRefused { header: Header, from: Option<SocketAddrV4>, why: String },
+    /// The chain that was being caught up with has been.
+    Synced { height: u32 },
+    /// The state is being taken whole, as of this block; `again` if in
+    /// place of an earlier one that nobody can serve any more.
+    StateWanted { height: u32, id: Digest, again: bool },
+    /// The state has been taken, as of the block of this height.
+    StateTaken { height: u32 },
+}
 
-/// Told of a block that was refused, who served it, and why.
-pub type Refused = Box<dyn Fn(&Header, Option<SocketAddrV4>, &Error) + Send + Sync>;
+/// Told of each [`Event`].
+pub type Told = Box<dyn Fn(&Event) + Send + Sync>;
 
 /// Wakes the worker of this number.
 pub(crate) type Waker = Box<dyn Fn(usize) + Send + Sync>;
@@ -497,6 +526,13 @@ impl Shared {
     fn post(&self, worker: usize, notice: Notice) {
         self.mail[worker].lock().unwrap_or_else(|e| e.into_inner()).push(notice);
         self.wake(worker);
+    }
+
+    /// Says what happened, to whoever keeps a record.
+    fn say(&self, event: Event) {
+        if let Some(told) = &*self.told.read().unwrap_or_else(|e| e.into_inner()) {
+            told(&event);
+        }
     }
 
     /// Wakes `worker`, if workers wait.
@@ -679,6 +715,8 @@ pub struct Worker<B: Backend + 'static, V> {
     /// Objects lately made to be served, the latest first.
     served: VecDeque<(Object, Arc<Vec<u8>>)>,
     fetches: Vec<Fetching>,
+    /// The peers that were live when that was last looked to.
+    was_live: Vec<SocketAddrV4>,
     /// What is about no one peer.
     list: Arc<RwLock<List>>,
     /// Who announced which block, and how long its body is: the newest
@@ -739,6 +777,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             due: now,
             served: VecDeque::new(),
             fetches: Vec::new(),
+            was_live: Vec::new(),
             list,
             announced: VecDeque::new(),
             inbox: Vec::new(),
@@ -790,6 +829,16 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         out
     }
 
+    /// A strike against a peer of this worker's: and if it was one too
+    /// many, its host is refused, and that is said.
+    fn strike(&mut self, addr: &SocketAddrV4, now: Micros) -> bool {
+        let banned = self.peers.strike(addr, now);
+        if banned {
+            self.shared.say(Event::Banned { peer: *addr });
+        }
+        banned
+    }
+
     /// Does what a notice says, of a peer of this worker's.
     fn told(&mut self, now: Micros, notice: Notice) {
         match notice {
@@ -797,7 +846,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 let _ = self.peers.add(addr, false, now);
             }
             Notice::Strike(addr) => {
-                self.peers.strike(&addr, now);
+                self.strike(&addr, now);
             }
             Notice::Failed(addr) => self.peers.failed(&addr, now),
             Notice::SentHeaders(addr) => self.peers.headers_arrived(&addr),
@@ -934,6 +983,16 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         }
         // (Too few live peers: of the node, over all its workers.)
         let mine: Vec<SocketAddrV4> = self.peers.live(now).map(|p| p.addr).collect();
+        // Who is live that was not, and who was that is not: said.
+        // (Both in the order of their addresses.)
+        for peer in mine.iter().filter(|a| self.was_live.binary_search(a).is_err()) {
+            let height = self.peers.get(peer).and_then(|p| p.status).map_or(0, |s| s.height);
+            self.shared.say(Event::PeerConnected { peer: *peer, height });
+        }
+        for peer in self.was_live.iter().filter(|a| mine.binary_search(a).is_err()) {
+            self.shared.say(Event::PeerLost { peer: *peer });
+        }
+        self.was_live.clone_from(&mine);
         self.shared.live[self.me].store(mine.len(), Ordering::Relaxed);
         if self.shared.live.len() > 1 {
             *self.shared.known[self.me].lock().unwrap_or_else(|e| e.into_inner()) = mine;
@@ -1201,7 +1260,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         // A block we hold, at the height it says: or it is no answer.
         let ours = self.chain.known(&id).ok().flatten();
         if ours.is_none_or(|k| k.header.height != height) {
-            self.peers.strike(&from, now);
+            self.strike(&from, now);
             return;
         }
         // Its tip: the block it announced, or what its last ping said.
@@ -1224,6 +1283,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             keeping: false,
             source: from,
         });
+        l.syncing = true;
+        self.shared.say(Event::HeadersWanted { from: height + 1, to: tip.1, peer: from });
         self.shared.work(self.me);
         self.fetch_headers(l, now);
     }
@@ -1344,6 +1405,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             if last != aim.tip {
                 return self.headers_refused(l, now, from);
             }
+            self.shared.say(Event::HeadersKept { height: aim.height });
             l.aim = None;
             return self.sync_blocks(l, now);
         }
@@ -1357,6 +1419,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     fn headers_refused(&mut self, l: &mut List, now: Micros, from: SocketAddrV4) {
         self.tell(now, from, Notice::Strike(from));
         self.tell(now, from, Notice::Failed(from));
+        self.shared.say(Event::HeadersRefused { peer: from });
         l.aim = None;
         self.fetches.retain(|f| !headers(&f.object));
         l.fetching.retain(|f| !headers(&f.0));
@@ -1400,7 +1463,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             Err(Error::KnownInvalid | Error::SetAside | Error::TimestampTooNew { .. } | Error::Io(_)) => {}
             // A header that breaks a rule.
             Err(_) => {
-                self.peers.strike(&from, now);
+                self.strike(&from, now);
             }
         }
     }
@@ -1544,9 +1607,11 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                         // Whole, or not: either way this taking is over.
                         // (Not whole, the chain is receiving still, and
                         // another is begun when time is next looked to.)
+                        let height = l.join.as_ref().map_or(0, |j| j.target.height);
                         l.join = None;
                         if result.is_ok() {
                             self.counts.states += 1;
+                            self.shared.say(Event::StateTaken { height });
                         }
                     }
                     self.sync_blocks(l, now);
@@ -1577,10 +1642,20 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 // (Whoever waits for the chain to move is told.)
                 drop(self.shared.moved.0.lock().unwrap_or_else(|e| e.into_inner()));
                 self.shared.moved.1.notify_all();
-                if let (Some(from), Some(told)) =
-                    (from, &*self.shared.received.read().unwrap_or_else(|e| e.into_inner()))
+                let undone = match result {
+                    Ok(Applied::Reorganized { unwound, .. }) => unwound,
+                    _ => 0,
+                };
+                self.shared.say(Event::Block { header, from, undone });
+                // Caught up, if a chain ahead was being caught up with.
+                let mut first = [header];
+                if l.syncing
+                    && l.aim.is_none()
+                    && l.join.is_none()
+                    && self.chain.missing_bodies(&mut first).unwrap_or(0) == 0
                 {
-                    told(&header, from);
+                    l.syncing = false;
+                    self.shared.say(Event::Synced { height: header.height });
                 }
                 self.announce(now, header, len, from, out);
                 self.shared.post_others(self.me, Notice::Announce { header, len, except: from });
@@ -1588,9 +1663,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             Ok(Applied::Known | Applied::Side) => {}
             Err(e) => {
                 self.counts.blocks_refused += 1;
-                if let Some(told) = &*self.shared.refused.read().unwrap_or_else(|e| e.into_inner()) {
-                    told(&header, from, &e);
-                }
+                self.shared.say(Event::BlockRefused { header, from, why: e.to_string() });
                 // A body that is not the header's, or a block that
                 // breaks a rule: whoever served it answers for it.
                 if let Some(from) = from
@@ -1628,8 +1701,13 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     /// once, each checked before the next is believed.
     fn sync_state(&mut self, l: &mut List, now: Micros) {
         self.view(l, now);
-        if l.join.is_none() && !self.begin_join(l) {
-            return;
+        if l.join.is_none() {
+            if !self.begin_join(l) {
+                return;
+            }
+            if let Some(j) = &l.join {
+                self.shared.say(Event::StateWanted { height: j.target.height, id: j.id, again: false });
+            }
         }
         let Some(join) = l.join.as_mut() else {
             return;
@@ -1654,6 +1732,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 // received: `Chain::begin_receiving`.)
                 if self.begin_join(l) {
                     self.counts.states_moved += 1;
+                    if let Some(j) = &l.join {
+                        self.shared.say(Event::StateWanted { height: j.target.height, id: j.id, again: true });
+                    }
                 }
             }
             return;
@@ -1757,6 +1838,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         if !matches!(self.chain.confirm_work(&best, height), Ok(Ok(_))) {
             return false;
         }
+        l.syncing = true;
         l.join = Some(Join {
             id: target.hash(),
             target,
@@ -1824,7 +1906,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             _ => true,
         };
         if !good {
-            self.peers.strike(&from, now);
+            self.strike(&from, now);
             join.unserved.push(from);
         }
         self.advance_join(l, now);
@@ -2096,7 +2178,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     fetched(&mut l.fetching, &object, &from);
                     self.peers.set_path(&from, failed.fetch.path());
                     if why == Why::Bad {
-                        self.peers.strike(&from, now);
+                        self.strike(&from, now);
                     }
                     self.fetch_failed(l, now, object, from);
                     continue;
@@ -2217,8 +2299,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             waker: RwLock::new(None),
             turn: AtomicUsize::new(0),
             moved: (Mutex::new(()), std::sync::Condvar::new()),
-            received: RwLock::new(None),
-            refused: RwLock::new(None),
+            told: RwLock::new(None),
             #[cfg(test)]
             by_port: AtomicBool::new(false),
         });
@@ -2536,17 +2617,11 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
         &self.chain
     }
 
-    /// Has `told` called with each block of a peer's that becomes the
-    /// chain's last, and who served it. (On the thread of the worker
-    /// that hears of it: it is to be quick.)
-    pub fn on_received(&self, told: Received) {
-        *self.shared.received.write().unwrap_or_else(|e| e.into_inner()) = Some(told);
-    }
-
-    /// Has `told` called with each block that is refused, who served it
-    /// (nobody, if it was made here), and why.
-    pub fn on_refused(&self, told: Refused) {
-        *self.shared.refused.write().unwrap_or_else(|e| e.into_inner()) = Some(told);
+    /// Has `told` called with each thing that happens to the node that
+    /// a log would say. (On the thread of the worker it happens to: it
+    /// is to be quick.)
+    pub fn on_event(&self, told: Told) {
+        *self.shared.told.write().unwrap_or_else(|e| e.into_inner()) = Some(told);
     }
 }
 

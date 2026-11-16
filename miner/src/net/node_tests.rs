@@ -1495,6 +1495,47 @@ fn sockets_state(workers: usize) {
     assert_eq!((counts[1].headers, counts[1].states, counts[1].blocks, counts[1].blocks_refused), (80, 1, 10, 0));
 }
 
+/// What happens to a node is said, in order, to whoever keeps its
+/// log: a peer found, its headers wanted and kept, each block as it
+/// joins the chain, and that the chain has been caught up with.
+#[test]
+fn a_node_says_what_happens_to_it() {
+    use crate::net::node::Event;
+    let chains = vec![chain_of(easy()), chain_of(easy())];
+    let blocks = grow(&chains[0], 12, 1);
+    let mut w = World::with(chains, &small_runs());
+    let said = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let heard = Arc::clone(&said);
+    w.nodes[1].hold().on_event(Box::new(move |event| heard.lock().unwrap().push(event.clone())));
+    w.nodes[1].add_peer(at(0), false, 0);
+    w.run(20 * SECOND);
+    let mut wanted = vec![
+        Event::PeerConnected { peer: at(0), height: 12 },
+        Event::HeadersWanted { from: 1, to: 12, peer: at(0) },
+        Event::HeadersKept { height: 12 },
+    ];
+    for block in &blocks {
+        let header = *BlockRef::from_bytes(block).unwrap().header();
+        wanted.push(Event::Block { header, from: Some(at(0)), undone: 0 });
+    }
+    wanted.push(Event::Synced { height: 12 });
+    assert_eq!(*said.lock().unwrap(), wanted);
+    // A block of its own is said as made here; and when its peer says
+    // goodbye, that it is lost.
+    said.lock().unwrap().clear();
+    let mine = next_block(w.nodes[1].chain(), 7, true);
+    let header = *BlockRef::from_bytes(&mine).unwrap().header();
+    w.nodes[1].mined(mine);
+    w.run(SECOND);
+    assert_eq!(*said.lock().unwrap(), [Event::Block { header, from: None, undone: 0 }]);
+    let now = w.now;
+    let mut sent = Vec::new();
+    w.nodes[0].goodbye(now, &mut |to, bytes: &[u8]| sent.push((to, bytes.to_vec())));
+    sent.iter().for_each(|(to, bytes)| w.post(at(0), *to, bytes));
+    w.run(2 * SECOND);
+    assert_eq!(said.lock().unwrap().last(), Some(&Event::PeerLost { peer: at(0) }));
+}
+
 // -- Several workers
 
 /// What nodes of one worker do, nodes of several do: each worker with

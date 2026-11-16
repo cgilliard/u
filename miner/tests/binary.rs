@@ -195,7 +195,8 @@ fn two_nodes_make_blocks_and_take_each_others() {
         // it was won, or that it came from the other.
         let main = std::fs::read_to_string(dir.join("tabernacle.log")).unwrap();
         assert!(!main.contains("Error"), "{main}");
-        for said in ["] Mining block 1 on ", "] Won block ", " hashes in ", "] Received block ", ") from 127.0.0.1:"] {
+        let told = ["] Mining block 1 on ", "] Won block ", " hashes in ", "] Received block ", ") from 127.0.0.1:"];
+        for said in told.into_iter().chain(["] Peer 127.0.0.1:", " connected (height "]) {
             assert!(main.contains(said), "{said}: {main}");
         }
         let _ = std::fs::remove_dir_all(dir);

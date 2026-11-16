@@ -349,21 +349,40 @@ and the node exits with -1:
 
 ### 3.3 After that
 
-The main log holds what happens to the chain here, errors, critical
-events, each file of another log put aside, and stopping. Of blocks:
+The main log holds what happens to the node: its peers, the chain it is
+catching up with, its blocks; and errors, each file of another log put
+aside, and stopping.
 
 ```
-[2026-11-16 08:21:57:444] Mining block 4 on 52ce1949
-[2026-11-16 08:22:02:094] Received block 4 (81c45e28) from 127.0.0.1:37412
-[2026-11-16 08:22:02:095] Mining block 5 on 81c45e28
-[2026-11-16 08:22:09:092] Won block 6 (e494f101): proved in 0.05s, 624,125 hashes in 5.57s
+[2026-11-16 08:59:48:978] Peer 127.0.0.1:37411 connected (height 5)
+[2026-11-16 08:59:48:978] Syncing headers 1 to 5 from 127.0.0.1:37411
+[2026-11-16 08:59:48:980] Headers synced to 5
+[2026-11-16 08:59:49:177] Received block 1 (39baef5c) from 127.0.0.1:37411
+...
+[2026-11-16 08:59:49:226] Received block 5 (e6760963) from 127.0.0.1:37411
+[2026-11-16 08:59:49:226] Synced at block 5
+[2026-11-16 08:59:50:299] Mining block 6 on e6760963
+[2026-11-16 08:59:52:386] Won block 6 (e494f101): proved in 0.05s, 624,125 hashes in 1.57s
 ```
 
-- **Mining block N on P**: a block is begun, on the block of id P.
-- **Won block N (id)**: its proof of work was found here, with how long
-  its proof took, and how many hashes and how long its nonce.
-- **Received block N (id) from peer**: a block of a peer's became the
-  chain's last.
+| Line | Says |
+|---|---|
+| `Peer A connected (height N)` | A peer answered and is live; its chain is that high |
+| `Peer A lost` | It is live no longer: silent too long, gone, or refused |
+| `Banned HOST: ...` | A host sent what no honest peer sends once too often, and is refused |
+| `Syncing headers N to M from A` | A chain ahead of ours is being caught up with |
+| `Headers synced to M` | Its headers are kept |
+| `Headers from A refused` | They were not what they should be |
+| `Received block N (id) from A` | A block of a peer's became the chain's last; `, K blocks undone` if ours gave way to its branch |
+| `Synced at block N` | The chain that was being caught up with has been |
+| `Taking the state as of block N (id)` | The blocks cannot be had, and the state is taken whole (`as of a later block`, if the first could no longer be served) |
+| `State taken as of block N` | It has been |
+| `Mining block N on P` | A block is begun here, on the block of id P |
+| `Won block N (id): ...` | Its proof of work was found here: how long its proof took, how many hashes and how long its nonce |
+| `Refused block N (id) from A: why` | A block was refused (`made here`, if it was ours) |
+
+A peer come or gone is said when the node next looks to its peers, so
+up to a tick after it happened.
 
 ### 3.4 Stopping
 
