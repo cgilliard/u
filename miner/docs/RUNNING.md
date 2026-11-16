@@ -148,119 +148,103 @@ parts of a state.
 
 ---
 
-## 2. What a node says while it runs
+## 2. The logs
 
-### 2.1 The node reports events; something else writes them down
+**Decided, and built** (`src/logger`), but for what goes in the request
+and stats logs and the settings' names, which come with the node.
 
-The node proper (`net::node`) touches no socket and no clock, and it
-should not touch a log file either. It reports what happened as
-values:
+### 2.1 Three logs
 
-```rust
-enum Event {
-    PeerProven { addr, height },
-    PeerDropped { addr, why },
-    PeerBanned { addr, strikes },
-    HeadersKept { from, count, height },
-    BlockJoined { height, id, from },
-    BlockRefused { height, id, from, why },
-    Reorganized { from_height, to_height, undone },
-    StateBegun { height, parts },
-    StateWhole { height },
-    ...
-}
-```
+| Log | Holds | Written by |
+|---|---|---|
+| Main | How the node was started and with what settings; then only errors, critical events and stopping; and each time another log's file was put aside, under what name | Whoever calls it, on their own thread |
+| Request | Each request the node is asked | A thread of its own, from a queue |
+| Stats | How the node is doing: every few seconds for those seconds, every minute for the whole since it started | A thread of its own |
 
-and whoever drives it turns them into lines. Three things follow:
-
-- The tests can say "exactly these events happened", which is firmer
-  than counting, and nothing they assert on is a sentence that might
-  be reworded.
-- Wording, level and format are decided in one place.
-- Something other than a log (a status command, a wallet's display)
-  can listen to the same events later.
-
-The reference builds a sentence with `format!` at each of some two
-hundred places and writes it straight out.
+There are no levels. What is logged is always logged.
 
 ### 2.2 A line
 
 ```
-2026-11-15T20:24:51.203Z info  sync   block 88213 joined (3fa9c1e2), from 203.0.113.7:3737
+[2026-10-17 19:49:31:471] the line
 ```
 
-- The time, in UTC, to the millisecond: a log is compared with other
-  nodes' logs.
-- The level: `error`, `warn`, `info`, `debug`, `trace`.
-- The area: `node`, `peers`, `sync`, `chain`, `store`, `serve`.
-- What happened, as a short sentence. Block ids are shortened to eight
-  characters; addresses are written whole.
+The time is UTC. Three ways to write:
 
-One event, one line. Nothing is spread over several.
+- `log`: the line with the time before it.
+- `log_no_header`: the line as it is, for a log laid out by whoever
+  writes it.
+- `log_all`: `log`, and the same line to the terminal (standard error).
+  The startup messages and the settings are written this way, so that
+  how a run was configured is on the screen and in the file.
 
-### 2.3 What is said at each level
+### 2.3 Rotation
 
-| Level | Shown by default | What |
-|---|---|---|
-| `error` | yes | The node cannot go on, or something is broken that it cannot mend: the store fails, the port cannot be bound |
-| `warn` | yes | Something is wrong and the node goes on: a block refused, a peer banned, a state's block given up for a later one |
-| `info` | yes | What someone running a node wants to see scroll by: section 2.4 |
-| `debug` | no | Each thing fetched and served, each peer taken and dropped, each strike |
-| `trace` | no | Each datagram |
-
-`log.level` sets the least level shown. It can be set for one area:
-`log.level.sync = debug`.
-
-### 2.4 What `info` is, exactly
-
-A node that is keeping up says about one line a block:
+A log's file is put aside, and a new one begun, when either of two
+settings is passed: the longest it may be written to (an hour, say) or
+the most it may hold (a mebibyte, say).
 
 ```
-info  sync   block 88213 joined (3fa9c1e2), from 203.0.113.7:3737
+tabernacle.log  ->  tabernacle_R_02_03_2026_10_00.log     month, day, year, hour, minute
+                    tabernacle_R_02_03_2026_10_00_02.log  a second one in that minute
 ```
 
-A node that is catching up says where it has got to every ten seconds,
-not once per thing fetched:
+- Every number in a name has two digits (the year four).
+- A line is never split between two files.
+- A quiet log is put aside on time though nothing is being written.
+- Files put aside are never deleted by the node: that is for whoever
+  keeps the machine.
+
+Every file begins with a line saying which log it is and when it was
+begun, to the second:
 
 ```
-info  sync   headers: 412,000 of 880,000, from 6 peers
-info  sync   state as of block 879,856: 1,204 of 165,300 parts (0.7%), from 14 peers, 9.2 MB/s
-info  sync   blocks: 879,901 of 880,000
+tabernacle.log_02_03_2026_10_30_04
 ```
 
-And once a minute, whatever it is doing, one line of where it stands:
+A file that holds nothing but that line is not put aside.
+
+### 2.4 The request log's queue
+
+Whoever answers a request does not wait for the disk: the line goes on
+a queue with the time it was said, and the log's own thread writes it.
+The queue's size is a setting. When it is full, lines are dropped, not
+waited for, and the main log says so, once a second at the most while
+it goes on:
 
 ```
-info  node   tip 88213 (3fa9c1e2), best header 88213, 14 peers live of 37 known, serving 3
+[2026-10-17 19:49:31:471] request.log: queue full (10000 lines), 3912 lines dropped so far
 ```
 
-Besides those: starting and stopping (section 3), a reorganisation,
-the state taken whole, and the count of live peers falling under or
-rising to what is wanted.
-
-### 2.5 The same thing over and over
-
-A peer that sends bad datagrams sends many. A line about one peer's
-trouble is written once, and then at most once in ten minutes with how
-often it happened since:
+### 2.5 The stats log
 
 ```
-warn  peers  203.0.113.7:3737 sent a datagram that is no message (212 times in 10 minutes)
+[2026-10-17 19:49:35:000] last 5.0 s
+    requests                 1,204           240.8 /s
+    bytes sent         105,735,600            21.1 MB/s
+    peers live                  14
+[2026-10-17 19:50:00:000] since start, 2 h 14 m 05 s
+    requests            41,022,117         5,099.1 /s
+    bytes sent       9,812,004,551             1.2 MB/s
+    peers live                  14
 ```
 
-### 2.6 Where the lines go
+How often each kind of block is written is a setting (five seconds and
+a minute unless set otherwise). The whole is written once more when the
+node stops.
 
-- **To the terminal**, if the node was started from one.
-- **To a file** in the data directory, always: `tabminer.log`. When it
-  reaches 20 MB it becomes `tabminer.log.1`, the old `.1` becomes
-  `.2`, and so on to five; the oldest is deleted.
+### 2.6 Nothing here stops the node
 
-Both, when both apply. The reference writes to the file or the
-terminal, never both, by a flag.
+A line that cannot be written is counted, and the first failure is said
+once on the terminal. If the log's directory goes and comes back, so
+does the log.
 
-### 2.7 What is never written
+### 2.7 Still to settle
 
-Tokens, the node's secret, and anything of a wallet's keys.
+- Which requests are logged, and what a request's line holds.
+- Which numbers the stats log shows.
+- The settings for each log (file name, rotation age and size, queue
+  size, the two stats intervals).
 
 ---
 

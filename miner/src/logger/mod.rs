@@ -55,6 +55,25 @@
 //! whatever it has been renamed to. A file that holds nothing but that
 //! line is not put aside: there is nothing in it to keep.
 //!
+//! # The logs of a node
+//!
+//! * The **main** log: how the node was started and with what settings,
+//!   then only what is wrong or what matters (an error, a critical
+//!   event, stopping), and each time one of the other logs' files was
+//!   put aside, with the name it was given
+//!   ([`Logger::report_rotations_to`]). It is written by whoever calls
+//!   it, on their own thread: there is little of it, and what there is
+//!   should be in the file before anything else happens.
+//! * The **request** log: what the node was asked. There is a great
+//!   deal of it, and whoever answers a request must not wait on a disk
+//!   for it: it is written by a thread of its own, from a queue of a
+//!   size that is set ([`queued::Queued`]). A queue that overflows
+//!   drops lines, and says so in the main log.
+//! * The **stats** log: how the node is doing, every few seconds for
+//!   those seconds and every minute for the whole time since it
+//!   started, laid out to be read ([`stats`]). Also a thread of its
+//!   own.
+//!
 //! # A log must not bring the node down
 //!
 //! Nothing here returns an error or panics once the log is open. A line
@@ -67,6 +86,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub mod queued;
+pub mod stats;
 
 /// When a log's file is put aside for a new one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,6 +189,8 @@ pub struct Logger {
     clock: Clock,
     inner: Mutex<Inner>,
     failures: AtomicU64,
+    /// Told of each file put aside: the name it was given.
+    on_rotate: Option<Box<dyn Fn(&Path) + Send + Sync>>,
 }
 
 impl Logger {
@@ -187,6 +211,7 @@ impl Logger {
             clock,
             inner: Mutex::new(Inner { file: None, size: 0, written: false, since: 0 }),
             failures: AtomicU64::new(0),
+            on_rotate: None,
         };
         let now = (logger.clock)();
         logger.begin(&mut logger.lock(), now)?;
@@ -207,6 +232,32 @@ impl Logger {
         }
         inner.file = Some(file);
         Ok(())
+    }
+
+    /// Has each file this log puts aside told of in `main`, by the name
+    /// it was given: so that the main log says where the others' lines
+    /// of any time are to be found.
+    pub fn report_rotations_to(mut self, main: std::sync::Arc<Logger>) -> Logger {
+        let name = self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        self.on_rotate = Some(Box::new(move |aside: &Path| {
+            let aside = aside.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            main.log(&format!("{name} rotated to {aside}"));
+        }));
+        self
+    }
+
+    /// The time by this log's clock: milliseconds since the start of
+    /// 1970.
+    pub fn now(&self) -> u64 {
+        (self.clock)()
+    }
+
+    /// Writes `text`, a line or several with their ends, as of the
+    /// moment `now`: for a line whose time was taken when it was said
+    /// and that is written later ([`queued`]), and for lines laid out
+    /// by whoever writes them ([`stats`]).
+    pub fn write_at(&self, now: u64, text: &str) {
+        self.write(now, text);
     }
 
     /// The file being written to.
@@ -328,7 +379,11 @@ impl Logger {
         if let Err(e) = self.begin(inner, now) {
             self.failed("opened", &e);
         }
-        renamed.ok().map(|()| aside)
+        let aside = renamed.ok().map(|()| aside)?;
+        if let Some(tell) = &self.on_rotate {
+            tell(&aside);
+        }
+        Some(aside)
     }
 }
 
@@ -537,6 +592,34 @@ mod tests {
         // And when asked to, whatever its age.
         assert!(log.rotate().is_some_and(|p| p.ends_with("stats_R_10_18_2026_04_49.log")));
         assert_eq!(log.rotate(), None);
+    }
+
+    /// The main log is told of every file another log puts aside.
+    #[test]
+    fn the_main_log_says_where_the_others_went() {
+        let dir = Dir::new("main");
+        let (now, main_clock) = clock(T);
+        let read = Arc::clone(&now);
+        let main = Arc::new(Logger::with_clock(dir.0.join("main.log"), Rotation::default(), main_clock).unwrap());
+        let rotation = Rotation { max_age: 0, max_size: 60 };
+        let requests =
+            Logger::with_clock(dir.0.join("request.log"), rotation, Box::new(move || read.load(Ordering::Relaxed)))
+                .unwrap()
+                .report_rotations_to(Arc::clone(&main));
+        for n in 0..3 {
+            requests.log_no_header(&format!("request {n:020}"));
+            now.fetch_add(1000, Ordering::Relaxed);
+        }
+        assert_eq!(
+            dir.read("main.log"),
+            "main.log_10_17_2026_19_49_31\n\
+             [2026-10-17 19:49:32:471] request.log rotated to request_R_10_17_2026_19_49.log\n\
+             [2026-10-17 19:49:33:471] request.log rotated to request_R_10_17_2026_19_49_02.log\n"
+        );
+        // Its own files are put aside without a word: the file begun
+        // says when in its first line.
+        assert!(main.rotate().is_some());
+        assert_eq!(dir.read("main.log"), "main.log_10_17_2026_19_49_34\n");
     }
 
     #[test]
