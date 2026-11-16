@@ -9,26 +9,42 @@
 //! ```text
 //! Uptime: 300:00:00         Requests_______BytesSent_________PeersLive
 //! [2026-10-17 19:30:44:000] 3,000          1,000,003         14
-//! Interval (5 seconds)      43             1,030             13
-//! Interval (5 seconds)      43             1,030             15
+//! Interval (10 seconds)     43             1,030             13
+//! Interval (10 seconds)     51             1,224             15
+//! Interval (10 seconds)     48             1,152             15
+//! Interval (10 seconds)     40             960               14
+//! Interval (10 seconds)     62             1,488             16
+//! Interval (10 seconds)     89             2,136             15
 //! Uptime: 300:01:00         Requests_______BytesSent_________PeersLive
-//! [2026-10-17 19:31:44:000] 3,333          1,300,000         15
-//! Interval (5 seconds)      43             1,030             13
+//! [2026-10-17 19:31:44:000] 3,333          1,007,993         15
+//! Interval (10 seconds)     43             1,030             13
 //! ```
 //!
-//! * Every minute (unless set otherwise): the columns' names, with how
-//!   long the node has been up, and under them the whole since it
-//!   started, with the time.
-//! * Every five seconds (unless set otherwise): what happened in those
+//! * Every ten seconds (unless set otherwise): what happened in those
 //!   seconds.
+//! * Every minute (unless set otherwise), after the interval's line
+//!   that ends it: the columns' names, with how long the node has been
+//!   up, and under them the whole since it started, with the time.
 //!
-//! A number that is counted (requests, bytes) shows in a line of the
-//! whole how many there have been, and in an interval's line how many
-//! there were in it. A number that is a level (peers live) shows in
-//! both what it is at that moment.
+//! # What the numbers are
 //!
-//! The names and the whole are written in one piece, so that nothing
-//! comes between them.
+//! A number that is **counted** (requests, bytes) shows in an
+//! interval's line how many there were in it, and in a line of the
+//! whole how many there have been in all. The two agree: a whole is the
+//! whole before it and the intervals between them, added up. (In the
+//! lines above, 3,000 and the six intervals' 333 are 3,333.) The same
+//! reading of the numbers is used for the last interval's line and the
+//! whole that follows it, so that this is exact, and the two are
+//! written at one moment.
+//!
+//! A number that is a **level** (peers live) is not added up: it shows,
+//! in every line, what it was at that moment.
+//!
+//! Intervals are counted from when the node started, not each from the
+//! one before, so they do not drift: so many of them make a whole (six,
+//! as set by default), always. When the node stops, what happened since
+//! the last interval's line is written as a last, shorter interval,
+//! and then the whole, so that the last whole adds up as every other.
 
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -137,14 +153,16 @@ pub struct Every {
     /// milliseconds.
     pub interval: u64,
     /// How often the names and the whole since the start are, in
-    /// milliseconds.
+    /// milliseconds: taken to the nearest whole number of intervals,
+    /// one at the least.
     pub summary: u64,
 }
 
 impl Default for Every {
-    /// Every five seconds, and the whole every minute.
+    /// Every ten seconds, and the whole every minute: six intervals to
+    /// a whole.
     fn default() -> Every {
-        Every { interval: 5_000, summary: 60_000 }
+        Every { interval: 10_000, summary: 60_000 }
     }
 }
 
@@ -180,34 +198,45 @@ impl Drop for StatsLog {
 }
 
 fn write(logger: &Logger, stats: &Stats, every: Every, stop: &(Mutex<bool>, Condvar)) {
-    let (interval, summary) = (every.interval.max(1), every.summary.max(1));
+    let interval = every.interval.max(1);
+    // So many intervals to a whole.
+    let to_a_whole = ((every.summary + interval / 2) / interval).max(1);
     let started = logger.now();
     let whole = |now: u64, values: &[u64]| {
         let up = now.saturating_sub(started) / 1000;
         logger.write_at(now, &(stats.names(up) + &stats.whole(&Moment::of(now), values)));
     };
-    let (mut last, mut last_at, mut summed_at) = (stats.read(), started, started);
+    // The stats as of the last interval's line, when that was, and how
+    // many intervals have been written.
+    let (mut last, mut last_at, mut written) = (stats.read(), started, 0u64);
     whole(started, &last);
     loop {
-        // Until the next time, or until told to stop.
+        // Until the next interval is over, counted from the start, or
+        // until told to stop.
+        let due = started + (written + 1) * interval;
         let stopped = stop.0.lock().unwrap_or_else(|e| e.into_inner());
-        let wait = Duration::from_millis(interval.saturating_sub(logger.now().saturating_sub(last_at)).max(1));
+        let wait = Duration::from_millis(due.saturating_sub(logger.now()).max(1));
         let (stopped, _) =
             stop.1.wait_timeout_while(stopped, wait, |stopped| !*stopped).unwrap_or_else(|e| e.into_inner());
+        // One reading, for the interval's line and for the whole that
+        // may follow it: so that the wholes add up.
         let (now, values) = (logger.now(), stats.read());
         if *stopped {
+            // What happened since the last line, as a last interval of
+            // whatever length it was; and the whole.
+            if now > last_at {
+                logger.write_at(now, &stats.interval(now - last_at, &last, &values));
+            }
             return whole(now, &values);
         }
         drop(stopped);
-        if now.saturating_sub(last_at) < interval {
+        if now < due {
             continue;
         }
-        // (Its length as set, not as it fell to the millisecond: the
-        // line says which interval it is, and they are all the one.)
         logger.write_at(now, &stats.interval(interval, &last, &values));
-        if now.saturating_sub(summed_at) >= summary {
+        written += 1;
+        if written.is_multiple_of(to_a_whole) {
             whole(now, &values);
-            summed_at = now;
         }
         logger.rotate_if_due();
         (last, last_at) = (values, now);
@@ -281,43 +310,75 @@ mod tests {
         );
     }
 
-    /// The thread writes the names and the whole at once, what happened
-    /// in each interval, the names and the whole again every so often,
-    /// and once more when it is stopped.
+    /// The thread writes the names and the whole at once, then so many
+    /// intervals to each whole, and every whole is the one before it
+    /// and the intervals between, added up: to the last, written when
+    /// it is stopped.
     #[test]
-    fn the_stats_are_written_as_often_as_set() {
+    fn the_wholes_are_the_intervals_added_up() {
         let dir = std::env::temp_dir().join(format!("tabminer-stats-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let stats = Arc::new(stats());
         let logger = Logger::open(dir.join("stats.log"), Rotation::default()).unwrap();
-        let log = StatsLog::start(logger, Arc::clone(&stats), Every { interval: 40, summary: 150 }).unwrap();
-        for _ in 0..10 {
-            stats.add(0, 30);
-            stats.add(1, 4000);
-            stats.set(2, 9);
-            std::thread::sleep(Duration::from_millis(35));
-        }
+        // Three intervals to a whole.
+        let log = StatsLog::start(logger, Arc::clone(&stats), Every { interval: 30, summary: 90 }).unwrap();
+        let adding = {
+            let stats = Arc::clone(&stats);
+            std::thread::spawn(move || {
+                for n in 0..4000u64 {
+                    stats.add(0, 1);
+                    stats.add(1, 24);
+                    stats.set(2, 9 + n % 5);
+                    if n % 10 == 0 {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            })
+        };
+        adding.join().unwrap();
         drop(log);
         let text = std::fs::read_to_string(dir.join("stats.log")).unwrap();
         let lines: Vec<&str> = text.lines().skip(1).collect();
-        // It begins with the names and the whole, which is little yet.
-        assert!(lines[0].starts_with("Uptime: 0:00:00 "));
-        assert!(lines[0].ends_with("Requests_______BytesSent_________PeersLive"));
-        assert!(lines[1].starts_with('[') && lines[1].split_whitespace().count() == 5, "{}", lines[1]);
-        // (How many of each, on a machine that may be busy, is not to
-        // be counted on: some, and no more than there was time for.)
-        let intervals: Vec<&&str> = lines.iter().filter(|l| l.starts_with("Interval (0.04 seconds) ")).collect();
-        let wholes = lines.iter().filter(|l| l.starts_with("Uptime: ")).count();
-        assert!((2..=10).contains(&intervals.len()), "{text}");
-        assert!((2..=5).contains(&wholes), "{text}");
-        assert_eq!(lines.len(), intervals.len() + 2 * wholes);
-        // The last word is the whole, and it is the whole.
-        let last: Vec<&str> = lines[lines.len() - 1].split_whitespace().skip(2).collect();
-        assert_eq!(last, ["300", "40,000", "9"]);
-        // The intervals add up to no more than it.
-        let counted: u64 = intervals.iter().map(|l| l.split_whitespace().nth(3).unwrap().parse::<u64>().unwrap()).sum();
-        assert!((30..=300).contains(&counted), "{counted}");
+        let number = |word: &str| word.replace(',', "").parse::<u64>().unwrap();
+        // The lines in order: what is expected of a whole from the one
+        // before it and the intervals since.
+        let (mut requests, mut bytes, mut since_whole, mut wholes) = (0u64, 0u64, 0, 0);
+        let mut at = 0;
+        while at < lines.len() {
+            let words: Vec<&str> = lines[at].split_whitespace().collect();
+            if lines[at].starts_with("Uptime: ") {
+                assert!(lines[at].ends_with("Requests_______BytesSent_________PeersLive"));
+                let whole: Vec<&str> = lines[at + 1].split_whitespace().collect();
+                assert!(whole[0].starts_with('[') && whole.len() == 5, "{}", lines[at + 1]);
+                // (The first is whatever there was when the thread began:
+                // from it on, each is the one before and what came between.)
+                if wholes == 0 {
+                    (requests, bytes) = (number(whole[2]), number(whole[3]));
+                }
+                assert_eq!((number(whole[2]), number(whole[3])), (requests, bytes), "the whole at line {at}\n{text}");
+                // Three intervals to a whole: but before the first,
+                // which has none, and the last, which has what there
+                // was time for and one shorter.
+                let last = at + 2 == lines.len();
+                assert!(wholes == 0 || since_whole == 3 || (last && since_whole <= 3), "{since_whole}\n{text}");
+                (since_whole, wholes, at) = (0, wholes + 1, at + 2);
+            } else {
+                assert_eq!(words[0], "Interval", "{}", lines[at]);
+                // (Its last word but two: the label is of two words or
+                // three.)
+                let n = words.len();
+                requests += number(words[n - 3]);
+                bytes += number(words[n - 2]);
+                // A level is what it was then, and is not added up.
+                assert!((9..14).contains(&number(words[n - 1])));
+                (since_whole, at) = (since_whole + 1, at + 1);
+            }
+        }
+        // The last whole is everything.
+        assert_eq!((requests, bytes), (4000, 96_000));
+        assert!(wholes >= 3, "{text}");
+        assert!(lines.iter().filter(|l| l.starts_with("Interval (0.03 seconds) ")).count() >= 6, "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

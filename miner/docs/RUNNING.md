@@ -221,32 +221,44 @@ as the disk takes its lines, and the log goes on.
 
 ### 2.5 The stats log
 
-In columns, a line at a time (`docs/stat_sample.log`):
+In columns, a line at a time. (The columns here are an example: which
+there are, and how wide, follows from what the node counts.)
 
 ```
 Uptime: 300:00:00         Requests_______BytesSent_________PeersLive
 [2026-10-17 19:30:44:000] 3,000          1,000,003         14
-Interval (5 seconds)      43             1,030             13
-Interval (5 seconds)      43             1,030             15
+Interval (10 seconds)     43             1,030             13
+Interval (10 seconds)     51             1,224             15
+Interval (10 seconds)     48             1,152             15
+Interval (10 seconds)     40             960               14
+Interval (10 seconds)     62             1,488             16
+Interval (10 seconds)     89             2,136             15
 Uptime: 300:01:00         Requests_______BytesSent_________PeersLive
-[2026-10-17 19:31:44:000] 3,333          1,300,000         15
-Interval (5 seconds)      43             1,030             13
+[2026-10-17 19:31:44:000] 3,333          1,007,993         15
+Interval (10 seconds)     43             1,030             13
 ```
 
-- Every minute (a setting): the columns' names, with how long the node
-  has been up, and under them the whole since it started, with the
-  time.
-- Every five seconds (a setting): what happened in those seconds.
-- A counted number shows the whole in the one and the interval's share
-  in the other; a level (peers live) shows what it is at that moment in
-  both.
+- **Every ten seconds** (a setting): what happened in those seconds.
+- **Every minute** (a setting): the columns' names, with how long the
+  node has been up, and under them the whole since it started, with
+  the time. So six interval lines come between two wholes.
+- **Counted numbers add up.** A whole is the whole before it and the
+  intervals between: above, 3,000 and the six intervals' 333 are 3,333.
+  The last interval's line and the whole after it are written at the
+  same moment from one reading of the numbers, so this is exact.
+- **Levels do not.** Peers live is, in every line, what it was at that
+  moment.
+- Intervals are counted from when the node started, not each from the
+  one before, so they do not drift.
+- When the node stops, what happened since the last interval's line is
+  written as a last, shorter interval, and then the whole: the last
+  whole adds up as every other.
 - A column is as wide as its name and its numbers need. A number too
   wide for its column moves the rest of that line over.
 
-The whole is written once when the node starts and once more when it
-stops. Numbers and times are written by the same few functions in every
-log (`logger::fmt`): commas between thousands, bytes in the unit that
-fits, uptime as hours, minutes and seconds.
+Numbers and times are written by the same few functions in every log
+(`logger::fmt`): commas between thousands, bytes in the unit that fits,
+uptime as hours, minutes and seconds.
 
 ### 2.6 Nothing here stops the node
 
