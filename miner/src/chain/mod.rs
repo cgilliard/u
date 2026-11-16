@@ -65,7 +65,10 @@ pub struct Chain<B: Backend + 'static, V> {
 
 impl<B: Backend + 'static, V> Chain<B, V> {
     /// Opens the chain kept in `backend`, or begins it: an empty store
-    /// is given the network's genesis. A store that holds another
+    /// is given the network's genesis. A store whose state was being
+    /// received from other nodes when it was last closed is opened as
+    /// it was: with its headers, and without a state until that is
+    /// gone on with ([`Chain::receiving`]). A store that holds another
     /// genesis is refused ([`Error::WrongGenesis`]). `keep` is how many
     /// blocks can be undone ([`crate::store::state`]); `seed` must be the
     /// text of `params.pow`.
@@ -77,24 +80,38 @@ impl<B: Backend + 'static, V> Chain<B, V> {
         verifier: V,
     ) -> Result<Self, Error> {
         assert_eq!(*seed.params(), params.pow, "the seed text is the network's");
-        let state = State::open(backend, keep)?;
         let genesis = params.genesis().header;
         let id = genesis.hash();
-        let there = {
-            let snap = state.snapshot()?;
-            snap.blocks().at(snap.pages(), 0)?
+        let store = match crate::store::receive::open(backend, keep)? {
+            crate::store::receive::Opened::Whole(state) => {
+                let there = {
+                    let snap = state.snapshot()?;
+                    snap.blocks().at(snap.pages(), 0)?
+                };
+                match there {
+                    Some(found) if found == id => {}
+                    Some(_) => return Err(Error::WrongGenesis),
+                    None => state.write_blocks(|txn, blocks| {
+                        let known = Known { header: genesis, work: U256::ZERO, status: Status::Valid };
+                        blocks.put_entry(txn, &known.entry())?;
+                        blocks.set_at(txn, 0, Some(id))
+                    })?,
+                }
+                Store::Whole(state)
+            }
+            // The node stopped while it was taking its state from
+            // others: it has the blocks it knew of and what it had
+            // received, and goes on from there.
+            crate::store::receive::Opened::Receiving(receiving) => {
+                let (blocks, file) = receiving.blocks();
+                if blocks.at(file, 0)? != Some(id) {
+                    return Err(Error::WrongGenesis);
+                }
+                Store::Receiving(receiving)
+            }
         };
-        match there {
-            Some(found) if found == id => {}
-            Some(_) => return Err(Error::WrongGenesis),
-            None => state.write_blocks(|txn, blocks| {
-                let known = Known { header: genesis, work: U256::ZERO, status: Status::Valid };
-                blocks.put_entry(txn, &known.entry())?;
-                blocks.set_at(txn, 0, Some(id))
-            })?,
-        }
         Ok(Chain {
-            store: RwLock::new(Store::Whole(state)),
+            store: RwLock::new(store),
             keep,
             params,
             seed,
@@ -154,6 +171,19 @@ impl<B: Backend + 'static, V> Chain<B, V> {
     /// headers, and no blocks join it, until it is whole.
     pub fn receiving(&self) -> bool {
         matches!(&*self.store(), Store::Receiving(_))
+    }
+
+    /// Tests: the store's bytes as they would be after a crash.
+    #[cfg(test)]
+    pub(crate) fn image(&self) -> Vec<u8>
+    where
+        B: crate::store::testing::Imaged,
+    {
+        match &*self.store() {
+            Store::Whole(state) => state.file().backend().bytes(),
+            Store::Receiving(receiving) => receiving.blocks().1.backend().bytes(),
+            Store::Gone => panic!("no store"),
+        }
     }
 
     /// Changes the blocks known of, whichever the store is.

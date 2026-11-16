@@ -1109,9 +1109,20 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         if height > best.height {
             return false;
         }
-        let Ok(Some(target)) = self.chain.ancestor(&best, height) else {
+        let Ok(Some(mut target)) = self.chain.ancestor(&best, height) else {
             return false;
         };
+        // A state that was being received already (the node stopped
+        // and started while it was): as of the same block, if that can
+        // still be had, so that nothing received is asked for again.
+        if let Some((was, id)) = self.chain.receiving_as_of()
+            && (reach..=best.height).contains(&was)
+            && let Ok(Some(same)) = self.chain.ancestor(&best, was)
+            && same.hash() == id
+        {
+            target = same;
+        }
+        let height = target.height;
         // The work of that header and of those after it in full: no
         // proof to come vouches for it.
         if !matches!(self.chain.confirm_work(&best, height), Ok(Ok(_))) {

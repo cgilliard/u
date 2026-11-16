@@ -229,3 +229,14 @@ impl Backend for Counting {
         self.file.read_many(reads)
     }
 }
+
+/// A backend whose bytes can be taken as they would be after a crash.
+pub(crate) trait Imaged {
+    fn bytes(&self) -> Vec<u8>;
+}
+
+impl Imaged for MemBackend {
+    fn bytes(&self) -> Vec<u8> {
+        self.image(Lost::All)
+    }
+}

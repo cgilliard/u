@@ -272,6 +272,15 @@ impl<B: Backend + 'static> State<B> {
         Ok(state)
     }
 
+    /// [`State::open`], of a file opened already and found to hold a
+    /// state ([`super::receive::open`]).
+    pub(super) fn open_file(file: PageFile<B>, keep: usize) -> io::Result<State<B>> {
+        let meta = Meta::read(&file, &file.root())?;
+        let state = State::with(Arc::new(file), meta, keep);
+        state.start()?;
+        Ok(state)
+    }
+
     /// Starts the thread that rebuilds the map, if it is not whole.
     fn start(&self) -> io::Result<()> {
         if !self.file.is_sealed() {

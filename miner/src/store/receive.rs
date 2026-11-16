@@ -98,6 +98,10 @@ pub struct Receiving<B: Backend + 'static> {
     /// The same of the names.
     want_names: BTreeMap<u32, Part>,
     have_names: BTreeMap<u32, Part>,
+    /// Whether the roots wanted are known. They are not kept in the
+    /// file: a state whose receiving was cut short is opened without
+    /// them ([`open`]), and they are to be asked for again.
+    known: bool,
 }
 
 impl<B: Backend + 'static> Receiving<B> {
@@ -202,6 +206,7 @@ impl<B: Backend + 'static> Receiving<B> {
             have: BTreeMap::new(),
             want_names: BTreeMap::new(),
             have_names: BTreeMap::new(),
+            known: true,
         };
         txn.commit(&this.record())?;
         this.want = parts.iter().copied().collect();
@@ -249,6 +254,7 @@ impl<B: Backend + 'static> Receiving<B> {
                     have: BTreeMap::new(),
                     want_names: BTreeMap::new(),
                     have_names: BTreeMap::new(),
+                    known: false,
                 };
                 (lost, e)
             })
@@ -295,6 +301,7 @@ impl<B: Backend + 'static> Receiving<B> {
             have_names: names.parts(&*file, name_level)?.into_iter().collect(),
             want: parts.iter().copied().collect(),
             want_names: name_parts.iter().copied().collect(),
+            known: true,
             file,
             target,
             outputs,
@@ -343,6 +350,14 @@ impl<B: Backend + 'static> Receiving<B> {
         &self.target
     }
 
+    /// Whether the roots of the state's parts are known: not, in a
+    /// state opened again after its receiving was cut short, until it
+    /// is gone on with ([`Receiving::retarget`]). Until then nothing
+    /// can be put, and it cannot be finished.
+    pub fn roots_known(&self) -> bool {
+        self.known
+    }
+
     /// The parts of the outputs still to be put, ascending.
     pub fn missing(&self) -> Vec<u64> {
         self.want.iter().filter(|(i, root)| self.have.get(i) != Some(root)).map(|(i, _)| *i).collect()
@@ -369,6 +384,9 @@ impl<B: Backend + 'static> Receiving<B> {
     /// that none is left out cannot be known, and need not be
     /// ([`super::commits`]).
     pub fn put_with(&mut self, index: u64, outputs: &[(u64, Record)], commits: &[(u64, Digest)]) -> Result<(), Error> {
+        if !self.known {
+            return Err(Error::PartsMissing);
+        }
         let is_commit = |(position, hash): &(u64, Digest)| {
             outputs.binary_search_by_key(position, |o| o.0).is_ok_and(|i| {
                 let record = &outputs[i].1;
@@ -397,6 +415,9 @@ impl<B: Backend + 'static> Receiving<B> {
     /// as of the block, ascending by key
     /// ([`super::state::Past::names_part`]). As [`Receiving::put`].
     pub fn put_names(&mut self, index: u32, records: &[NameRecord]) -> Result<(), Error> {
+        if !self.known {
+            return Err(Error::PartsMissing);
+        }
         let Some(want) = self.want_names.get(&index) else { return Err(Error::PartRoot) };
         let sound = records.windows(2).all(|w| w[0].key() < w[1].key())
             && records.iter().all(|r| r.key() >> self.name_level == index as Key);
@@ -413,7 +434,7 @@ impl<B: Backend + 'static> Receiving<B> {
     /// on, at the block, with no block to undo. `keep` is the length of
     /// its window. [`Error::PartsMissing`] if parts are still to be put.
     pub fn finish(self, keep: usize) -> Result<State<B>, Error> {
-        if self.have != self.want || self.have_names != self.want_names {
+        if !self.known || self.have != self.want || self.have_names != self.want_names {
             return Err(Error::PartsMissing);
         }
         // Every part was checked, so this is the root unless the file
@@ -509,6 +530,61 @@ impl<B: Backend + 'static> Receiving<B> {
         };
         Ok(())
     }
+}
+
+/// What a file was found to hold.
+pub enum Opened<B: Backend + 'static> {
+    /// A state.
+    Whole(State<B>),
+    /// A state whose receiving was cut short: what was received is
+    /// kept, and the blocks known of. The roots of its parts are to be
+    /// asked for again ([`Receiving::roots_known`]).
+    Receiving(Receiving<B>),
+}
+
+/// Opens the file of `backend`, whichever it holds: a state (or
+/// nothing, which is the state before any block), or one that was
+/// being received when the node stopped. `keep` is the length of a
+/// state's window.
+pub fn open<B: Backend + 'static>(backend: B, keep: usize) -> Result<Opened<B>, Error> {
+    let file = PageFile::open_or_create(backend)?;
+    let Some(target) = pending(&file)? else {
+        return Ok(Opened::Whole(State::open_file(file, keep)?));
+    };
+    let (outputs, names, blocks, commits) = {
+        let root = file.root();
+        let b = root.payload();
+        let names_at = 37 + Outputs::BYTES;
+        (
+            Outputs::from_bytes(&b[37..names_at])?,
+            Names::from_bytes(&b[names_at..BLOCKS_AT])?,
+            Blocks::from_bytes(&b[BLOCKS_AT..COMMITS_AT])?,
+            Commits::from_bytes(&b[COMMITS_AT..COMMITS_AT + Commits::BYTES])?,
+        )
+    };
+    // What of the file is in use is all the tries reach.
+    if !file.is_sealed() {
+        outputs.mark(&file)?;
+        names.mark(&file)?;
+        blocks.mark(&file)?;
+        commits.mark(&file)?;
+        file.seal();
+    }
+    Ok(Opened::Receiving(Receiving {
+        have: outputs.parts(&file, PART_LEVEL)?.into_iter().collect(),
+        have_names: names.parts(&file, NAME_PART_LEVEL)?.into_iter().collect(),
+        want: BTreeMap::new(),
+        want_names: BTreeMap::new(),
+        known: false,
+        file: Arc::new(file),
+        target,
+        outputs,
+        names,
+        blocks,
+        commits,
+        level: PART_LEVEL,
+        name_level: NAME_PART_LEVEL,
+    }))
 }
 
 /// The block a file's state is being received as of, if it is: what a

@@ -160,6 +160,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Chain<B, V> {
     /// The parts of the outputs, and of the names, still to be put.
     pub fn missing_parts(&self) -> Result<(Vec<u64>, Vec<u32>), Error> {
         match &*self.store() {
+            // (Not known, of a state opened again after its receiving
+            // was cut short, until it is begun again.)
+            Store::Receiving(r) if !r.roots_known() => Err(Error::PartsMissing),
             Store::Receiving(r) => Ok((r.missing(), r.missing_names())),
             _ => Err(Error::Receiving),
         }
@@ -199,7 +202,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Chain<B, V> {
             }
         };
         let (missing, missing_names) = (receiving.missing(), receiving.missing_names());
-        if !missing.is_empty() || !missing_names.is_empty() {
+        if !receiving.roots_known() || !missing.is_empty() || !missing_names.is_empty() {
             *store = Store::Receiving(receiving);
             return Err(Error::PartsMissing);
         }
@@ -439,5 +442,56 @@ mod tests {
         assert_eq!(node.check_state_block(&BlockRef::from_bytes(&other).unwrap(), 6), Err(Error::BadBodyCommitment));
         let stranger = grow(&ahead, 1, 9);
         assert_eq!(node.check_state_block(&BlockRef::from_bytes(&stranger[0]).unwrap(), 7), Err(Error::UnknownParent));
+    }
+
+    /// A node that stops while it is taking a state is, when it starts
+    /// again, where it was: its headers, what it had received, and no
+    /// state until it has gone on to the end.
+    #[test]
+    fn a_state_being_received_survives_a_restart() {
+        let ahead = open(64);
+        let blocks = crate::chain::apply::tests::grow_wide(&ahead, 12, 2500, 1);
+        let headers = headers_of(&blocks);
+        let node = open(64);
+        assert_eq!(node.accept_headers(&headers, NOW, false), (12, None));
+        let handed = hand_over(&ahead, 10);
+        assert_eq!(handed.parts.len(), 4);
+        node.begin_receiving(&headers[9], handed.next, &handed.parts, &handed.name_parts).unwrap();
+        // Two of the four parts, and then it stops.
+        for (index, outputs, commits) in &handed.outputs[..2] {
+            node.put_part(*index, outputs, commits).unwrap();
+        }
+        let again = Chain::open(MemBackend::from_image(node.image()), 64, easy(), seed(), AcceptAllProofs).unwrap();
+        again.set_dataset(table());
+        // Receiving still, as of the same block; the headers are there.
+        assert!(again.receiving());
+        assert_eq!(again.receiving_as_of(), Some((10, headers[9].hash())));
+        assert_eq!(again.best_header().unwrap().header, headers[11]);
+        assert_eq!((again.tip().unwrap().height, again.whole().err()), (0, Some(Error::Receiving)));
+        // Headers go on being taken.
+        let more = headers_of(&grow(&ahead, 2, 2));
+        assert_eq!(again.accept_headers(&more, NOW, false), (2, None));
+        // What the parts' roots are is not kept: until they are had
+        // again, nothing can be put and it cannot be finished.
+        assert_eq!(again.missing_parts().err(), Some(Error::PartsMissing));
+        let (index, outputs, commits) = &handed.outputs[2];
+        assert_eq!(again.put_part(*index, outputs, commits), Err(Error::PartsMissing));
+        assert_eq!(again.finish_receiving(&[]).err(), Some(Error::PartsMissing));
+        assert!(again.receiving());
+        // Begun again with the roots: only what it had not got is
+        // wanted.
+        again.begin_receiving(&headers[9], handed.next, &handed.parts, &handed.name_parts).unwrap();
+        assert_eq!(again.missing_parts().unwrap().0, [handed.parts[2].0, handed.parts[3].0]);
+        take(&again, &handed, &blocks[9]);
+        assert_eq!((again.tip().unwrap(), again.state().root()), (headers[9], headers[9].state_root));
+        // And opened once more it is a chain like any other.
+        let whole = Chain::open(MemBackend::from_image(again.image()), 64, easy(), seed(), AcceptAllProofs).unwrap();
+        assert!(!whole.receiving());
+        assert_eq!(whole.tip().unwrap(), headers[9]);
+        // A store that was receiving another network's chain is not
+        // this one's.
+        let other = crate::chain::params::ChainParams { genesis_timestamp: easy().genesis_timestamp + 1, ..easy() };
+        let refused = Chain::open(MemBackend::from_image(node.image()), 64, other, seed(), AcceptAllProofs);
+        assert_eq!(refused.err(), Some(Error::WrongGenesis));
     }
 }

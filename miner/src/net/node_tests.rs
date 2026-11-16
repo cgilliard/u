@@ -1218,3 +1218,46 @@ fn each_piece_of_a_state_is_checked_as_it_arrives() {
     assert_eq!((tip(&w, 1), w.nodes[1].chain().state().root()), (target, target.state_root));
     assert_eq!(w.nodes[1].counts().states, 1);
 }
+
+/// A node that stops while it is taking a state and starts again goes
+/// on from what it had: as of the same block, asking again for nothing
+/// it had received.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "builds long chains; run with --release")]
+fn a_node_restarted_while_taking_a_state_goes_on() {
+    let (ahead, _) = long_chain(KEEP + 16);
+    let mut w = World::with(vec![ahead, chain_of(easy())], &joining());
+    w.nodes[1].add_peer(at(0), false, 0);
+    // Until one of the state's three parts is in, and the others are
+    // on their way.
+    w.nodes[1].cfg.sync.parts = 1;
+    for _ in 0..2000 {
+        w.run(5 * MILLI);
+        if w.nodes[1].chain().missing_parts().is_ok_and(|m| m.0.len() == 2) {
+            break;
+        }
+    }
+    assert_eq!(w.nodes[1].chain().missing_parts().unwrap().0.len(), 2);
+    let had = w.nodes[1].chain().receiving_as_of();
+    // It stops: what was on its way is lost, and what it knew of its
+    // peers. It starts again on what its store holds.
+    let image = w.nodes[1].chain().image();
+    let chain = Chain::open(MemBackend::from_image(image), KEEP, easy(), seed(), AcceptAllProofs).unwrap();
+    chain.set_dataset(table());
+    assert!(chain.receiving());
+    let now = w.now;
+    w.flying.clear();
+    w.nodes[1] = Node::new(joining(), NET, Arc::new(chain), [9; 32], now);
+    w.nodes[1].add_peer(at(0), false, now);
+    w.wake[1] = now;
+    w.run(60 * SECOND);
+    assert_eq!(tip(&w, 1), tip(&w, 0));
+    assert_eq!(w.nodes[1].chain().state().root(), w.nodes[0].chain().state().root());
+    let c = w.nodes[1].counts();
+    // The same block; the block, the manifest and the roots again (they
+    // are not kept), the two parts it lacked, and the ten blocks after:
+    // not the part it had.
+    assert_eq!((c.states, c.states_moved, c.blocks), (1, 0, 10));
+    assert_eq!(had.map(|t| t.0), Some(70));
+    assert_eq!(c.fetched, 1 + 1 + 1 + 2 + 10, "{c:?}");
+}
