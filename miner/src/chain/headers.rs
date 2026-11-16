@@ -262,19 +262,22 @@ impl<B: Backend + 'static, V> Chain<B, V> {
 
     /// The header a block's id names, with what is known of it.
     pub fn known(&self, id: &Digest) -> Result<Option<Known>, Error> {
-        let snap = self.state.snapshot()?;
+        let store = self.store();
+        let snap = store.view()?;
         self.known_in(snap.pages(), snap.blocks(), id)
     }
 
     /// The header of the chain's block at `height`.
     pub fn header_at(&self, height: u32) -> Result<Option<Header>, Error> {
-        let snap = self.state.snapshot()?;
+        let store = self.store();
+        let snap = store.view()?;
         self.header_at_in(snap.pages(), snap.blocks(), height)
     }
 
     /// The header of the last block of the chain.
     pub fn tip(&self) -> Result<Header, Error> {
-        let snap = self.state.snapshot()?;
+        let store = self.store();
+        let snap = store.view()?;
         self.header_at_in(snap.pages(), snap.blocks(), snap.tip().0)?.ok_or_else(|| corrupt("the tip has no header"))
     }
 
@@ -301,7 +304,8 @@ impl<B: Backend + 'static, V> Chain<B, V> {
     /// The earliest time a block after `parent` may carry: one past the
     /// median time of the blocks ending at `parent`.
     pub fn earliest_timestamp(&self, parent: &Header) -> Result<u64, Error> {
-        let snap = self.state.snapshot()?;
+        let store = self.store();
+        let snap = store.view()?;
         Ok(self.times_in(snap.pages(), snap.blocks(), parent)?.median() + 1)
     }
 
@@ -352,7 +356,8 @@ impl<B: Backend + 'static, V> Chain<B, V> {
 
     /// Target the block after `parent` must meet.
     pub fn expected_target(&self, parent: &Header) -> Result<Target, Error> {
-        let snap = self.state.snapshot()?;
+        let store = self.store();
+        let snap = store.view()?;
         let first = self.anchor_in(snap.pages(), snap.blocks(), parent)?;
         Ok(self.target_from(parent, first.as_ref()))
     }
@@ -389,7 +394,8 @@ impl<B: Backend + 'static, V> Chain<B, V> {
     /// The most-work header known, with its work: the tip, or a header
     /// kept ahead of it.
     pub fn best_header(&self) -> Result<Known, Error> {
-        let snap = self.state.snapshot()?;
+        let store = self.store();
+        let snap = store.view()?;
         let tip = self.tip_in(snap.pages(), snap.blocks(), snap.tip().0)?;
         self.best_in(snap.pages(), snap.blocks(), &tip)
     }
@@ -430,7 +436,8 @@ impl<B: Backend + 'static, V: Sync> Chain<B, V> {
         let mut before: Vec<Option<Before>> = Vec::with_capacity(headers.len());
         let mut kept: Vec<bool> = Vec::with_capacity(headers.len());
         {
-            let snap = self.state.snapshot()?;
+            let store = self.store();
+            let snap = store.view()?;
             let (pages, blocks) = (snap.pages(), snap.blocks());
             // The branch as far as the header before: its times, and its
             // block 1.
@@ -460,9 +467,9 @@ impl<B: Backend + 'static, V: Sync> Chain<B, V> {
             kept[i] || if defer_work { h.quick_pow_check(&b.target) } else { self.full_pow(h, &b.target) }
         });
         let status = if defer_work { Status::WorkPending } else { Status::HeaderOnly };
-        let tip_height = self.state.tip().0;
+        let tip_height = self.store().view()?.tip().0;
         let (mut new, mut stop) = (0, None);
-        self.state.write_blocks(|txn, blocks| {
+        self.write_blocks(|txn, blocks| {
             let tip = self.tip_in(txn, blocks, tip_height)?;
             let (mut best, mut moved) = (self.best_in(txn, blocks, &tip)?, false);
             // The header before in the run, as it is kept now.
@@ -529,7 +536,8 @@ impl<B: Backend + 'static, V: Sync> Chain<B, V> {
     pub fn confirm_work(&self, best: &Header, from: u32) -> Result<Result<usize, (u32, Digest)>, Error> {
         let mut pending: Vec<(Header, Target)> = Vec::new();
         {
-            let snap = self.state.snapshot()?;
+            let store = self.store();
+            let snap = store.view()?;
             let (pages, blocks) = (snap.pages(), snap.blocks());
             let mut h = *best;
             while h.height >= from && h.height > 0 {
@@ -553,7 +561,7 @@ impl<B: Backend + 'static, V: Sync> Chain<B, V> {
         let ok: Vec<bool> =
             crate::parallel::par_map_min(pending.len(), 1, |i| self.full_pow(&pending[i].0, &pending[i].1));
         let bad = ok.iter().position(|ok| !ok);
-        self.state.write_blocks(|txn, blocks| {
+        self.write_blocks(|txn, blocks| {
             for (i, (h, _)) in pending.iter().enumerate() {
                 let known = self
                     .known_in(txn, blocks, &h.hash())?
@@ -619,7 +627,8 @@ impl<B: Backend + 'static, V> Chain<B, V> {
     /// after it are marked as it is, the best header is the tip again
     /// until another is offered, and there is nothing to fetch.
     pub fn missing_bodies(&self, out: &mut [Header]) -> Result<usize, Error> {
-        let snap = self.state.snapshot()?;
+        let store = self.store();
+        let snap = store.view()?;
         let (pages, blocks) = (snap.pages(), snap.blocks());
         let (mut n, mut at) = (0, 0u32);
         while n < out.len() {
@@ -628,6 +637,8 @@ impl<B: Backend + 'static, V> Chain<B, V> {
             let known = self.known_in(pages, blocks, &id)?.ok_or_else(|| corrupt("a planned block has no header"))?;
             if known.invalid() {
                 drop(snap);
+                // (And the store itself: what follows writes to it.)
+                drop(store);
                 self.unplan_from(height, known.status)?;
                 return Ok(0);
             }
@@ -646,7 +657,7 @@ impl<B: Backend + 'static, V> Chain<B, V> {
     /// at `height`: what is planned above it goes the same way, so that
     /// a peer offering those headers again cannot make them the best.
     fn unplan_from(&self, height: u32, status: Status) -> Result<(), Error> {
-        self.state.write_blocks(|txn, blocks| {
+        self.write_blocks(|txn, blocks| {
             let mut at = height.saturating_add(1);
             while let Some(h) = blocks.next_planned(txn, at)? {
                 let id = blocks.planned_at(txn, h)?.ok_or_else(|| corrupt("the plan lacks a height it has"))?;
@@ -666,7 +677,8 @@ impl<B: Backend + 'static, V> Chain<B, V> {
         if height > from.height {
             return Ok(None);
         }
-        let snap = self.state.snapshot()?;
+        let store = self.store();
+        let snap = store.view()?;
         let mut h = *from;
         while h.height > height {
             match self.header_in(snap.pages(), snap.blocks(), &h.prev_hash)? {
@@ -681,7 +693,8 @@ impl<B: Backend + 'static, V> Chain<B, V> {
     /// ancestors at distances that double, then genesis. At most
     /// [`LOCATOR`] ids, written to `out`; returns how many.
     pub fn locator(&self, out: &mut [Digest; LOCATOR]) -> Result<usize, Error> {
-        let snap = self.state.snapshot()?;
+        let store = self.store();
+        let snap = store.view()?;
         let (mut n, mut step, mut h) = (0, 1u32, snap.tip().0);
         loop {
             let id = snap.blocks().at(snap.pages(), h)?.ok_or_else(|| corrupt("the chain lacks a height"))?;
@@ -721,7 +734,8 @@ impl<B: Backend + 'static, V> Chain<B, V> {
     /// the chain, oldest first, into `out`: without a match, those after
     /// genesis. Returns how many.
     pub fn headers_after(&self, locator: &[Digest], out: &mut [Header]) -> Result<usize, Error> {
-        let snap = self.state.snapshot()?;
+        let store = self.store();
+        let snap = store.view()?;
         let (pages, blocks) = (snap.pages(), snap.blocks());
         let mut from = 0u32;
         for id in locator {
@@ -743,7 +757,8 @@ impl<B: Backend + 'static, V> Chain<B, V> {
 
     /// The chain's headers from `height` on, into `out`: how many.
     pub fn headers_from(&self, height: u32, out: &mut [Header]) -> Result<usize, Error> {
-        let snap = self.state.snapshot()?;
+        let store = self.store();
+        let snap = store.view()?;
         let mut n = 0;
         while n < out.len() && height as u64 + n as u64 <= snap.tip().0 as u64 {
             let h = self.header_at_in(snap.pages(), snap.blocks(), height + n as u32)?;

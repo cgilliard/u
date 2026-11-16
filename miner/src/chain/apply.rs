@@ -118,14 +118,14 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Chain<B, V> {
         // The blocks to mark if the branch fails: from the one that
         // failed on. The block itself if nothing else is said.
         let mut failed: Vec<Digest> = vec![id];
-        let result = self.state.session(|session| self.apply_in(session, block, now, &mut failed));
+        let result = self.whole()?.session(|session| self.apply_in(session, block, now, &mut failed));
         let status = match &result {
             Err(Error::NoUndoRecord) => Some(Status::Aside),
             Err(e) if condemns(e) => Some(Status::Invalid),
             _ => None,
         };
         if let Some(status) = status {
-            self.state.write_blocks(|txn, blocks| {
+            self.write_blocks(|txn, blocks| {
                 for bad in &failed {
                     // The block itself was not kept: its header is, now.
                     let header = match self.known_in(txn, blocks, bad)? {
@@ -368,7 +368,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Chain<B, V> {
     /// a miner writes in the header it then mines. Nothing is changed.
     pub fn state_root_after(&self, body: &BodyRef<'_>) -> Result<Digest, Error> {
         let mut root = None;
-        let tried: Result<(), Error> = self.state.session(|session| {
+        let tried: Result<(), Error> = self.whole()?.session(|session| {
             let height = session.tip().0 + 1;
             let edit = self.edit(session, body, height)?;
             let (after, _) = session.apply(&BlockEdit {
@@ -396,7 +396,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Chain<B, V> {
 impl<B: Backend + 'static, V> Chain<B, V> {
     /// The body of the block of id `id`, if it is kept.
     pub fn body(&self, id: &Digest) -> Result<Option<Vec<u8>>, Error> {
-        let snap = self.state.snapshot()?;
+        let store = self.store();
+        let snap = store.view()?;
         let (pages, blocks): (_, &Blocks) = (snap.pages(), snap.blocks());
         let Some(known) = self.known_in(pages, blocks, id)? else { return Ok(None) };
         Ok(blocks.body(pages, known.header.height, id)?)
@@ -404,7 +405,8 @@ impl<B: Backend + 'static, V> Chain<B, V> {
 
     /// The work of the chain as far as its last block.
     pub fn tip_work(&self) -> Result<U256, Error> {
-        let snap = self.state.snapshot()?;
+        let store = self.store();
+        let snap = store.view()?;
         Ok(self.tip_known(snap.pages(), snap.blocks(), snap.tip().0)?.work)
     }
 
@@ -556,10 +558,12 @@ pub(crate) mod tests {
         let mut headers = [genesis; 4];
         assert_eq!(chain.headers_after(&[genesis.hash()], &mut headers).unwrap(), 2);
         assert_eq!(headers[..2], [header_of(&b1), header_of(&b2)]);
-        let snap = chain.state().snapshot().unwrap();
+        let state = chain.state();
+        let snap = state.snapshot().unwrap();
         assert!(!snap.is_unspent(0).unwrap() && snap.is_unspent(1).unwrap() && snap.is_unspent(2).unwrap());
         assert_eq!(snap.output(2).unwrap().unwrap().0.height, 2);
         drop(snap);
+        drop(state);
 
         let tip = (chain.tip().unwrap(), chain.state().root());
         let refused = |bytes: &[u8], want: Error, remembered: bool| {
@@ -644,9 +648,11 @@ pub(crate) mod tests {
         // The blocks left were part of the chain once, and are kept.
         assert!(a.iter().all(|x| status(&ours, x) == Some(Status::Valid)));
         assert!(ours.body(&header_of(&a[1]).hash()).unwrap().is_some());
-        let snap = ours.state().snapshot().unwrap();
+        let state = ours.state();
+        let snap = state.snapshot().unwrap();
         assert_eq!(snap.output(3).unwrap().unwrap().0.commitment, d(23));
         drop(snap);
+        drop(state);
 
         // And back, when the first branch has grown: built by a node
         // that never left it.
@@ -719,10 +725,12 @@ pub(crate) mod tests {
 
         // Block 1 commits to a name: an output at 1, after its own.
         extend(&chain, &with(vec![commit(&alice, 7)], vec![]));
-        let snap = chain.state().snapshot().unwrap();
+        let state = chain.state();
+        let snap = state.snapshot().unwrap();
         assert_eq!(snap.commits().position_of(snap.pages(), &commit_of(&alice, 7)).unwrap(), Some(1));
         assert_eq!(snap.output(1).unwrap().unwrap().0.commitment, commit_leaf(&commit_of(&alice, 7), 1));
         drop(snap);
+        drop(state);
         let reveal = |r: &NameRecord, at: u64| BlockNameOp::Reveal { record: *r, commit: at };
         // Too soon: a block after, where two must pass.
         refused(&with(vec![reveal(&alice, 1)], vec![]), Error::CommitAge(1));
@@ -738,11 +746,13 @@ pub(crate) mod tests {
         extend(&chain, &with(vec![commit(&bob, 8)], vec![]));
         // In the window: the name is registered, the commit spent.
         extend(&chain, &with(vec![reveal(&alice, 1)], vec![]));
-        let snap = chain.state().snapshot().unwrap();
+        let state = chain.state();
+        let snap = state.snapshot().unwrap();
         assert_eq!(snap.name(alice.key()).unwrap(), Some(alice));
         assert!(!snap.is_unspent(1).unwrap());
         assert_eq!(snap.commits().count, 1);
         drop(snap);
+        drop(state);
         // Revealed again, by a commit spent or by another: refused.
         refused(&with(vec![reveal(&alice, 1)], vec![]), Error::NoSuchOutput(1));
         refused(&with(vec![reveal(&alice, 3)], vec![]), Error::NameTaken);
@@ -765,10 +775,12 @@ pub(crate) mod tests {
         assert_eq!(chain.tip().unwrap().height, 2 + MAX_REVEAL);
         refused(&with(vec![reveal(&bob, 3)], vec![]), Error::CommitAge(2));
         extend(&chain, &with(vec![], vec![3]));
-        let snap = chain.state().snapshot().unwrap();
+        let state = chain.state();
+        let snap = state.snapshot().unwrap();
         assert!(!snap.is_unspent(3).unwrap());
         assert_eq!((snap.commits().count, snap.name(bob.key()).unwrap()), (0, None));
         drop(snap);
+        drop(state);
         // The reveal at the window's end was a good block of its own
         // branch: kept beside the chain.
         assert_eq!(apply(&chain, &at_the_end), Ok(Applied::Side));

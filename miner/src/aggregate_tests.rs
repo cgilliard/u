@@ -1419,11 +1419,13 @@ fn the_chain_connects_only_proven_blocks() {
     let build = |amount: u64, prev: Option<(u32, &Statement, &[u8])>| {
         let tip = chain.tip().unwrap();
         let height = tip.height + 1;
-        let snap = chain.state().snapshot().unwrap();
+        let state = chain.state();
+        let snap = state.snapshot().unwrap();
         let (prev_root, first) = (snap.root(), snap.outputs().next);
         let txs = vec![reward(&miner, amount)];
         let segments = SegmentWitness::collect_by_rows(&snap, &txs, SMALL.segment_rows(), height).unwrap();
         drop(snap);
+        drop(state);
         let names = empty_names(&segments, height);
         let mut body = Body {
             inputs: vec![],

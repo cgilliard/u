@@ -1010,26 +1010,28 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             Object::Block(id) => self.chain.body(&id).ok().flatten(),
             // The state as of a block of the chain that can still be
             // gone back to, in its pieces (`super::snapshot`).
-            Object::Manifest(block) => Some(Manifest::of(&self.past(&block)?).encode()),
-            Object::Roots { block, index } => snapshot::encode_roots(&self.past(&block)?, index),
-            Object::Part { block, index } => {
-                let past = self.past(&block)?;
+            Object::Manifest(block) => self.past(&block, |past| Some(Manifest::of(past).encode())),
+            Object::Roots { block, index } => self.past(&block, |past| snapshot::encode_roots(past, index)),
+            Object::Part { block, index } => self.past(&block, |past| {
                 let outputs = past.part(index).ok().filter(|o| !o.is_empty())?;
                 Some(snapshot::encode_part(&outputs, &past.commits(index).ok()?))
-            }
-            Object::Names { block, index } => {
-                let records = self.past(&block)?.names_part(index).ok().filter(|r| !r.is_empty())?;
+            }),
+            Object::Names { block, index } => self.past(&block, |past| {
+                let records = past.names_part(index).ok().filter(|r| !r.is_empty())?;
                 Some(snapshot::encode_names(&records))
-            }
+            }),
             // Nothing else is served yet.
             _ => None,
         }
     }
 
-    /// The state as of the block `block`, if that is a block of the
-    /// chain here recent enough to go back to.
-    fn past(&self, block: &Digest) -> Option<crate::store::state::Past<'_, B>> {
-        self.chain.state().past(self.on_chain(block)?.height).ok()
+    /// What `make` makes of the state as of the block `block`, if that
+    /// is a block of the chain here recent enough to go back to, and
+    /// the state here is whole.
+    fn past<T>(&self, block: &Digest, make: impl FnOnce(&crate::store::state::Past<'_, B>) -> Option<T>) -> Option<T> {
+        let height = self.on_chain(block)?.height;
+        let state = self.chain.whole().ok()?;
+        make(&state.past(height).ok()?)
     }
 
     /// Fetches `object`, of `most` bytes at the most, from `from`: what

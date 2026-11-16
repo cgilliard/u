@@ -31,14 +31,18 @@ use crate::error::Error;
 use crate::hash::Digest;
 use crate::pow::{Dataset, SeedText};
 use crate::store::backend::Backend;
-use crate::store::state::State;
+use crate::store::blocks::Blocks;
+use crate::store::pagefile::{Extent, PageFile, ReadPages, Txn};
+use crate::store::receive::Receiving;
+use crate::store::state::{Snapshot, State};
 use crate::u256::U256;
 use headers::{Known, Status};
 use params::ChainParams;
+use std::sync::{RwLockReadGuard, RwLockWriteGuard};
 
 /// A network's chain, in a store.
 pub struct Chain<B: Backend + 'static, V> {
-    state: State<B>,
+    store: RwLock<Store<B>>,
     /// Blocks that can be undone, and whose bodies are kept.
     keep: usize,
     params: ChainParams,
@@ -89,7 +93,7 @@ impl<B: Backend + 'static, V> Chain<B, V> {
             })?,
         }
         Ok(Chain {
-            state,
+            store: RwLock::new(Store::Whole(state)),
             keep,
             params,
             seed,
@@ -116,14 +120,143 @@ impl<B: Backend + 'static, V> Chain<B, V> {
         self.keep
     }
 
-    /// The store beneath.
-    pub fn state(&self) -> &State<B> {
-        &self.state
+    /// What the chain is kept in, to read.
+    pub(crate) fn store(&self) -> RwLockReadGuard<'_, Store<B>> {
+        self.store.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The same, to put another in its place.
+    pub(crate) fn store_mut(&self) -> RwLockWriteGuard<'_, Store<B>> {
+        self.store.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The state: [`Error::Receiving`] while it is being received from
+    /// others, when there is none to read.
+    pub fn whole(&self) -> Result<StateRef<'_, B>, Error> {
+        let store = self.store();
+        match &*store {
+            Store::Whole(_) => Ok(StateRef(store)),
+            _ => Err(Error::Receiving),
+        }
+    }
+
+    /// The state, of a chain known to have one.
+    ///
+    /// # Panics
+    ///
+    /// While the state is being received from others.
+    pub fn state(&self) -> StateRef<'_, B> {
+        self.whole().expect("a chain with its state")
+    }
+
+    /// Whether the state is being received from others: the chain has
+    /// headers, and no blocks join it, until it is whole.
+    pub fn receiving(&self) -> bool {
+        matches!(&*self.store(), Store::Receiving(_))
+    }
+
+    /// Changes the blocks known of, whichever the store is.
+    pub(crate) fn write_blocks<T>(
+        &self,
+        change: impl FnOnce(&Txn<'_, B>, &mut Blocks) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        match &mut *self.store_mut() {
+            Store::Whole(state) => state.write_blocks(change),
+            Store::Receiving(receiving) => receiving.write_blocks(change),
+            Store::Gone => Err(Error::Receiving),
+        }
     }
 
     /// Gives the chain a table of the proof of work to check headers
     /// against. It is used for the heights it is the table of.
     pub fn set_dataset(&self, dataset: Arc<Dataset<'static>>) {
         *self.dataset.write().unwrap() = Some(dataset);
+    }
+}
+
+/// What a chain is kept in: a state, with the blocks known of beside
+/// it, or the same blocks with a state still being received from other
+/// nodes ([`crate::store::receive`]).
+///
+/// The headers are the same business either way: which are known,
+/// which has the most work, what is still to fetch. So everything of
+/// the chain that is about headers reads and writes through this, and
+/// goes on while a state is received; what is about the state (a block
+/// joining, an output looked up) needs it whole.
+pub(crate) enum Store<B: Backend + 'static> {
+    Whole(State<B>),
+    Receiving(Receiving<B>),
+    /// Between the two, for the moment one is made of the other; and
+    /// for good if that failed, when the store must be opened again.
+    Gone,
+}
+
+impl<B: Backend + 'static> Store<B> {
+    /// The blocks known of, to read: of one moment, whatever is written
+    /// meanwhile.
+    pub(crate) fn view(&self) -> Result<View<'_, B>, Error> {
+        match self {
+            Store::Whole(state) => Ok(View::Whole(state.snapshot()?)),
+            Store::Receiving(receiving) => {
+                let (blocks, file) = receiving.blocks();
+                // A chain with no state has no last block but its first.
+                let first = blocks.at(file, 0)?.ok_or(Error::Receiving)?;
+                Ok(View::Receiving { blocks, file, first })
+            }
+            Store::Gone => Err(Error::Receiving),
+        }
+    }
+}
+
+/// The blocks known of, as they were at one moment.
+pub(crate) enum View<'a, B: Backend + 'static> {
+    Whole(Snapshot<'a, B>),
+    Receiving { blocks: &'a Blocks, file: &'a PageFile<B>, first: Digest },
+}
+
+impl<B: Backend + 'static> View<'_, B> {
+    /// What reads the pages the blocks are kept in.
+    pub(crate) fn pages(&self) -> &Self {
+        self
+    }
+
+    pub(crate) fn blocks(&self) -> &Blocks {
+        match self {
+            View::Whole(snap) => snap.blocks(),
+            View::Receiving { blocks, .. } => blocks,
+        }
+    }
+
+    /// The chain's last block: its height and id. While a state is
+    /// received, the first block.
+    pub(crate) fn tip(&self) -> (u32, Digest) {
+        match self {
+            View::Whole(snap) => snap.tip(),
+            View::Receiving { first, .. } => (0, *first),
+        }
+    }
+}
+
+impl<B: Backend + 'static> ReadPages for View<'_, B> {
+    fn read_page<'b>(&self, e: Extent, buf: &'b mut [u8]) -> std::io::Result<&'b [u8]> {
+        match self {
+            View::Whole(snap) => snap.pages().read_page(e, buf),
+            View::Receiving { file, .. } => file.read_page(e, buf),
+        }
+    }
+}
+
+/// A chain's state, held to be read: while it is, the state is not
+/// given up for another.
+pub struct StateRef<'a, B: Backend + 'static>(RwLockReadGuard<'a, Store<B>>);
+
+impl<B: Backend + 'static> std::ops::Deref for StateRef<'_, B> {
+    type Target = State<B>;
+
+    fn deref(&self) -> &State<B> {
+        match &*self.0 {
+            Store::Whole(state) => state,
+            _ => unreachable!("made of a whole state"),
+        }
     }
 }

@@ -62,7 +62,8 @@ impl<B: Backend + 'static, V> Chain<B, V> {
     /// The node's own leaves: all zero until set. Their root goes in the
     /// headers it mines.
     pub fn aux_leaves(&self) -> Result<Leaves, Error> {
-        let snap = self.state.snapshot()?;
+        let store = self.store();
+        let snap = store.view()?;
         match snap.blocks().note(snap.pages())? {
             Some(bytes) => leaves_of(&bytes),
             None => Ok([[0u8; 32]; AUX_LEAVES]),
@@ -72,7 +73,7 @@ impl<B: Backend + 'static, V> Chain<B, V> {
     /// Sets the node's own leaf `index` (0 to 15). Returns the new root.
     pub fn set_aux_leaf(&self, index: usize, value: [u8; 32]) -> Result<[u8; 32], Error> {
         assert!(index < AUX_LEAVES, "a leaf's index is below sixteen");
-        self.state.write_blocks(|txn, blocks| {
+        self.write_blocks(|txn, blocks| {
             let mut leaves = match blocks.note(txn)? {
                 Some(bytes) => leaves_of(&bytes)?,
                 None => [[0u8; 32]; AUX_LEAVES],
@@ -91,7 +92,8 @@ impl<B: Backend + 'static, V> Chain<B, V> {
     /// The leaves of the block of id `id`, if they are kept: checked
     /// against its header when they were.
     pub fn aux_leaves_of(&self, id: &Digest) -> Result<Option<Leaves>, Error> {
-        let snap = self.state.snapshot()?;
+        let store = self.store();
+        let snap = store.view()?;
         let (pages, blocks) = (snap.pages(), snap.blocks());
         let Some(known) = self.known_in(pages, blocks, id)? else { return Ok(None) };
         blocks.aux(pages, known.header.height, id)?.map(|bytes| leaves_of(&bytes)).transpose()
@@ -102,7 +104,7 @@ impl<B: Backend + 'static, V> Chain<B, V> {
     /// auxiliary bytes, or the header is not known. A header whose bytes
     /// are zero has no leaves to keep.
     pub fn put_aux_leaves(&self, id: &Digest, leaves: &Leaves) -> Result<(), Error> {
-        self.state.write_blocks(|txn, blocks| {
+        self.write_blocks(|txn, blocks| {
             let Some(known) = self.known_in(txn, blocks, id)? else { return Err(Error::AuxMismatch) };
             if known.header.aux == [0u8; 32] || aux_merkle_root(leaves) != known.header.aux {
                 return Err(Error::AuxMismatch);
@@ -114,12 +116,14 @@ impl<B: Backend + 'static, V> Chain<B, V> {
     /// The votes of the last `window` blocks of the chain: each block's
     /// leaf 0 where its leaves are kept, and which blocks' are missing.
     pub fn consensus_votes(&self, window: u32) -> Result<Votes, Error> {
-        self.consensus_votes_at(self.state.tip().0, window)
+        let tip = self.store().view()?.tip().0;
+        self.consensus_votes_at(tip, window)
     }
 
     /// The votes of the `window` blocks of the chain ending at `end`.
     pub fn consensus_votes_at(&self, end: u32, window: u32) -> Result<Votes, Error> {
-        let snap = self.state.snapshot()?;
+        let store = self.store();
+        let snap = store.view()?;
         let (pages, blocks) = (snap.pages(), snap.blocks());
         let first = (end + 1).saturating_sub(window);
         let mut all = Vec::with_capacity((end + 1 - first) as usize);
@@ -144,20 +148,22 @@ impl<B: Backend + 'static, V> Chain<B, V> {
             return Err(Error::TooLarge(bytes.len()));
         }
         let hash = sha256(bytes);
-        self.state.write_blocks(|txn, blocks| blocks.put_file(txn, &hash, bytes))?;
+        self.write_blocks(|txn, blocks| blocks.put_file(txn, &hash, bytes))?;
         Ok(hash)
     }
 
     /// A consensus file held, by its SHA-256.
     pub fn consensus_file(&self, hash: &Hash) -> Result<Option<Vec<u8>>, Error> {
-        let snap = self.state.snapshot()?;
+        let store = self.store();
+        let snap = store.view()?;
         Ok(snap.blocks().file(snap.pages(), hash)?)
     }
 
     /// A consensus file held, by its transfer id
     /// ([`crate::consensus::file_id`]): what a peer asks for.
     pub fn consensus_file_by_id(&self, id: &Digest) -> Result<Option<Vec<u8>>, Error> {
-        let snap = self.state.snapshot()?;
+        let store = self.store();
+        let snap = store.view()?;
         let (pages, blocks) = (snap.pages(), snap.blocks());
         match blocks.files(pages)?.into_iter().find(|hash| file_id(hash) == *id) {
             Some(hash) => Ok(blocks.file(pages, &hash)?),
@@ -167,7 +173,8 @@ impl<B: Backend + 'static, V> Chain<B, V> {
 
     /// The hashes of the consensus files held.
     pub fn consensus_files(&self) -> Result<Vec<Hash>, Error> {
-        let snap = self.state.snapshot()?;
+        let store = self.store();
+        let snap = store.view()?;
         Ok(snap.blocks().files(snap.pages())?)
     }
 
@@ -175,7 +182,7 @@ impl<B: Backend + 'static, V> Chain<B, V> {
     /// force, the one before it while a change lasts, and those the
     /// window's votes name. Returns how many went.
     pub fn keep_consensus_files(&self, keep: &[Hash]) -> Result<usize, Error> {
-        self.state.write_blocks(|txn, blocks| {
+        self.write_blocks(|txn, blocks| {
             let mut gone = 0;
             for hash in blocks.files(txn)? {
                 if !keep.contains(&hash) {

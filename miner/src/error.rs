@@ -176,6 +176,10 @@ pub enum Error {
     /// A commit is revealed outside its window, or swept before it is
     /// past: the height it was made at.
     CommitAge(u32),
+    /// The state is being received from other nodes: there is none to
+    /// read or to join a block to yet.
+    Receiving,
+
     // -- The network
     /// A setting a node cannot run with: which, and why.
     Setting(&'static str),
@@ -260,6 +264,7 @@ impl fmt::Display for Error {
             Error::NameOwner => f.write_str("the name's owner did not sign the update"),
             Error::NotACommit(p) => write!(f, "position {p} holds no commit"),
             Error::CommitAge(made) => write!(f, "a commit made at height {made} is not of an age for this"),
+            Error::Receiving => f.write_str("the state is being received, and is not whole yet"),
             Error::Setting(what) => write!(f, "a setting cannot be run with: {what}"),
             Error::Io(kind) => write!(f, "the store failed: {kind}"),
         }

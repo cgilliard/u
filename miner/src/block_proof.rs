@@ -386,7 +386,7 @@ mod tests {
     /// Proves the block of `txs` after the chain's last.
     fn proven(chain: &Proven, txs: &[Transaction], max_rows: usize) -> Body {
         let height = chain.tip().unwrap().height + 1;
-        prove_body(chain.state(), &STARK, params().min_reveal, height, txs, &[], max_rows).unwrap()
+        prove_body(&chain.state(), &STARK, params().min_reveal, height, txs, &[], max_rows).unwrap()
     }
 
     fn apply(chain: &Proven, block: &[u8]) -> Result<Applied, Error> {
@@ -458,10 +458,12 @@ mod tests {
         assert_eq!((chain.tip().unwrap(), chain.state().root()), before);
         assert_eq!(apply(&chain, &sealed(&chain, &body2)), Ok(Applied::Extended));
         // Outputs 1 and 2 are the payment's, 3 the miner's, 4 the commit.
-        let snap = chain.state().snapshot().unwrap();
+        let state = chain.state();
+        let snap = state.snapshot().unwrap();
         assert_eq!(snap.commits().position_of(snap.pages(), &commit).unwrap(), Some(4));
         assert!(!snap.is_unspent(0).unwrap() && snap.is_unspent(4).unwrap());
         drop(snap);
+        drop(state);
 
         // Block 3: coins alone. The commit waits two blocks.
         let b3 = sealed(&chain, &proven(&chain, &[reward(&miner, PAY)], 1 << 13));
@@ -481,10 +483,12 @@ mod tests {
         let (segments, _) = decode(&body4.proof).unwrap();
         assert!(segments.len() >= 2, "{} segments", segments.len());
         assert_eq!(apply(&chain, &sealed(&chain, &body4)), Ok(Applied::Extended));
-        let snap = chain.state().snapshot().unwrap();
+        let state = chain.state();
+        let snap = state.snapshot().unwrap();
         assert_eq!(snap.name(alice.key()).unwrap(), Some(alice));
         assert!(!snap.is_unspent(4).unwrap());
         drop(snap);
+        drop(state);
 
         // Block 5: the name's owner hands it on.
         let handed = NameRecord::new(b"alice", pubkey_hash(&heir.public_key()), d(13), d(14)).unwrap();
@@ -502,7 +506,7 @@ mod tests {
             .sign_with(&mut key(1))
             .unwrap();
         again.set_positions(&[0]);
-        let refused = prove_body(chain.state(), &STARK, 2, 6, &[again], &[], 1 << 13);
+        let refused = prove_body(&chain.state(), &STARK, 2, 6, &[again], &[], 1 << 13);
         assert_eq!(refused.err(), Some(Error::NoSuchOutput(0)));
     }
 
