@@ -1,0 +1,1205 @@
+//! How a node is told what to do: its options, the help that lists
+//! them, the check of what was given, and the lines a node says of its
+//! configuration when it starts.
+//!
+//! `tabminer [options]` is all there is: no command comes first. Every
+//! option is in one list ([`OPTIONS`]), from which the help is written,
+//! the command line is read, and the startup lines are laid out, so
+//! that the three cannot disagree.
+//!
+//! * An option that is not one is refused by name:
+//!   `Error: unknown configuration option: '--prot'`, and the help
+//!   follows.
+//! * `--help`, anywhere on the line, is the help and nothing else.
+//! * Everything given is checked ([`Configuration::read`]) before
+//!   anything is opened, bound or written: a port out of range, a
+//!   number that is not one, two limits that cannot both hold.
+//!
+//! # Where the logs go
+//!
+//! For each of the three logs, the first of these that was given: its
+//! own option, which is the file's whole name (`--main-log`); the
+//! directory for logs (`--log-dir`), with the log's usual name in it;
+//! the data directory (`--data-dir`), the same. Whatever was given, the
+//! names kept are whole paths from the root.
+
+use std::net::SocketAddrV4;
+use std::path::{Path, PathBuf};
+
+use crate::logger::fmt::{column, commas};
+use crate::logger::stats::Every;
+use crate::logger::{Logger, Rotation};
+use crate::net::config::Config as Net;
+use crate::transport::SECOND;
+
+/// What an option takes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Takes {
+    /// Nothing: it is given or it is not.
+    Nothing,
+    /// A value, called this in the help.
+    Value(&'static str),
+    /// A value, and the option may be given more than once.
+    Values(&'static str),
+}
+
+struct Opt {
+    name: &'static str,
+    takes: Takes,
+    /// What the help says of it. A line break is a line break there.
+    help: &'static str,
+}
+
+/// The options, in the sections and the order of the help.
+const OPTIONS: &[(&str, &[Opt])] = &[
+    (
+        "General",
+        &[
+            Opt { name: "help", takes: Takes::Nothing, help: "print this and exit" },
+            Opt { name: "network", takes: Takes::Value("NAME"), help: "mainnet (default), dev or dev-recursive" },
+            Opt {
+                name: "data-dir",
+                takes: Takes::Value("DIR"),
+                help: "where the chain, the peers file and the logs are kept\n(default ~/.tabernacle/tabminer)",
+            },
+            Opt {
+                name: "threads",
+                takes: Takes::Value("N"),
+                help: "threads for hashing and checking proofs\n(default 0: every core)",
+            },
+        ],
+    ),
+    ("Mining", &[Opt { name: "no-mine", takes: Takes::Nothing, help: "follow the chain without mining" }]),
+    (
+        "Network",
+        &[
+            Opt {
+                name: "listen",
+                takes: Takes::Value("ADDR:PORT"),
+                help: "the address datagrams are taken at (default 0.0.0.0:3737)",
+            },
+            Opt {
+                name: "peer",
+                takes: Takes::Values("ADDR:PORT"),
+                help: "a peer to keep whatever it does; may be repeated",
+            },
+            Opt {
+                name: "seed",
+                takes: Takes::Values("HOST:PORT"),
+                help: "a seed to look up besides the built-in ones; may be repeated",
+            },
+            Opt { name: "no-seeds", takes: Takes::Nothing, help: "do not use the built-in seeds" },
+        ],
+    ),
+    (
+        "Peers",
+        &[
+            Opt { name: "max-peers", takes: Takes::Value("N"), help: "peers kept (default 64)" },
+            Opt {
+                name: "target-peers",
+                takes: Takes::Value("N"),
+                help: "live peers below which more are looked for (default 8)",
+            },
+            Opt {
+                name: "max-peers-per-host",
+                takes: Takes::Value("N"),
+                help: "peers of one host, over all its ports (default 4)",
+            },
+            Opt {
+                name: "max-peers-per-network",
+                takes: Takes::Value("N"),
+                help: "peers of one /16 network (default 8)",
+            },
+            Opt { name: "ping-seconds", takes: Takes::Value("TIME"), help: "between pings of a peer (default 30)" },
+            Opt {
+                name: "peer-live-seconds",
+                takes: Takes::Value("TIME"),
+                help: "a peer silent this long is not counted live (default 65)",
+            },
+            Opt {
+                name: "peer-drop-seconds",
+                takes: Takes::Value("TIME"),
+                help: "a peer silent this long is dropped (default 180)",
+            },
+            Opt {
+                name: "ban-strikes",
+                takes: Takes::Value("N"),
+                help: "wrong answers before a host is refused (default 5)",
+            },
+            Opt { name: "ban-seconds", takes: Takes::Value("TIME"), help: "how long it is refused (default 3600)" },
+        ],
+    ),
+    (
+        "Sync",
+        &[
+            Opt {
+                name: "sync-point",
+                takes: Takes::Value("N"),
+                help: "take the state whole as of the block N under the best\nheader when blocks cannot be had (default 144; 0: never)",
+            },
+            Opt {
+                name: "max-undo-blocks",
+                takes: Takes::Value("N"),
+                help: "blocks that can be undone, and whose bodies and states\nare served (default 1008)",
+            },
+            Opt {
+                name: "header-fetches",
+                takes: Takes::Value("N"),
+                help: "runs of headers fetched at once (default 16)",
+            },
+            Opt { name: "block-fetches", takes: Takes::Value("N"), help: "blocks fetched at once (default 24)" },
+            Opt {
+                name: "block-fetches-per-peer",
+                takes: Takes::Value("N"),
+                help: "of those, from one peer (default 8)",
+            },
+            Opt {
+                name: "part-fetches",
+                takes: Takes::Value("N"),
+                help: "parts of a state fetched at once (default 32)",
+            },
+            Opt {
+                name: "header-wait-seconds",
+                takes: Takes::Value("TIME"),
+                help: "how long a peer claiming more work may take to send a\nheader we lack (default 15)",
+            },
+            Opt {
+                name: "pass-over-seconds",
+                takes: Takes::Value("TIME"),
+                help: "how long a peer that failed us is passed over (default 600)",
+            },
+        ],
+    ),
+    (
+        "Serving",
+        &[
+            Opt {
+                name: "serve-chunks-per-second",
+                takes: Takes::Value("N"),
+                help: "chunks sent a second, in all (default 8192)",
+            },
+            Opt {
+                name: "serve-queue",
+                takes: Takes::Value("N"),
+                help: "requests for chunks that may wait (default 64)",
+            },
+            Opt {
+                name: "serve-queue-per-peer",
+                takes: Takes::Value("N"),
+                help: "of those, from one address (default 8)",
+            },
+        ],
+    ),
+    (
+        "Logging",
+        &[
+            Opt {
+                name: "log-dir",
+                takes: Takes::Value("DIR"),
+                help: "where the logs are kept (default: the data directory)",
+            },
+            Opt {
+                name: "main-log",
+                takes: Takes::Value("FILE"),
+                help: "the main log (default tabernacle.log in the log directory)",
+            },
+            Opt {
+                name: "request-log",
+                takes: Takes::Value("FILE"),
+                help: "the request log (default request.log there)",
+            },
+            Opt { name: "stat-log", takes: Takes::Value("FILE"), help: "the stats log (default stat.log there)" },
+            Opt {
+                name: "log-rotate-seconds",
+                takes: Takes::Value("TIME"),
+                help: "a log's file is put aside after this long\n(default 3600, which is 60m or 1h)",
+            },
+            Opt {
+                name: "log-rotate-bytes",
+                takes: Takes::Value("SIZE"),
+                help: "or when it holds this much\n(default 1048576, which is 1024k or 1m)",
+            },
+            Opt {
+                name: "request-log-queue",
+                takes: Takes::Value("N"),
+                help: "lines that may wait to be written to the request log\n(default 10000)",
+            },
+            Opt {
+                name: "stat-interval-seconds",
+                takes: Takes::Value("TIME"),
+                help: "between lines of the stats log (default 10)",
+            },
+            Opt { name: "stat-summary-seconds", takes: Takes::Value("TIME"), help: "between its wholes (default 60)" },
+        ],
+    ),
+];
+
+/// The help: what the options are, by section.
+pub fn help() -> String {
+    let mut out = String::from(
+        "tabminer: a node of the Tabernacle network. It mines unless told not to.\n\nusage: tabminer [options]\n",
+    );
+    // The widest option, with what it takes, sets where the telling
+    // begins.
+    let shown = |o: &Opt| match o.takes {
+        Takes::Nothing => format!("--{}", o.name),
+        Takes::Value(v) | Takes::Values(v) => format!("--{} {v}", o.name),
+    };
+    let wide = OPTIONS.iter().flat_map(|(_, opts)| opts.iter()).map(|o| shown(o).len()).max().unwrap_or(0) + 2;
+    for (section, opts) in OPTIONS {
+        out += &format!("\n{section}\n");
+        for o in *opts {
+            for (k, line) in o.help.lines().enumerate() {
+                let first = if k == 0 { shown(o) } else { String::new() };
+                out += &format!("  {}{line}\n", column(&first, wide, ' '));
+            }
+        }
+    }
+    out += "\nA TIME is so many seconds, or a number and s, m, h or d: 90, 90s, 60m, 1h, 7d.\n";
+    out += "A SIZE is so many bytes, or a number and k, m or g, each 1024 of the one before:\n";
+    out += "1048576, 1024k, 1m.\n";
+    out += "\nOptions can be kept in a file and given as @FILE: one to a line, as they are\n";
+    out += "written here, with # before anything that is not one. What is on the command\n";
+    out += "line is taken before what is in a file.\n";
+    out
+}
+
+/// Why a node does not start on what it was given.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// `--help` was given: the help is what was asked for.
+    Help,
+    /// Something given is wrong: what, as it is said after `Error: `.
+    Wrong(String),
+}
+
+impl Refused {
+    /// What the node says, and the code it ends with. Asked for, the
+    /// help is all there is and nothing is wrong (0); something wrong
+    /// is said first, then the help, and that is a failure (-1).
+    pub fn said(&self) -> (String, i32) {
+        match self {
+            Refused::Help => (help(), 0),
+            Refused::Wrong(what) => (format!("Error: {what}\n\n{}", help()), -1),
+        }
+    }
+}
+
+/// A number and what it is counted in, as `60m` or `1024k`: the number
+/// times what its last letter stands for among `units`, or the number
+/// alone. None if it is not that, or too large to count.
+fn with_unit(value: &str, units: &[(char, u64)]) -> Option<u64> {
+    let last = value.chars().last()?.to_ascii_lowercase();
+    let (digits, times) = match units.iter().find(|(letter, _)| *letter == last) {
+        Some((_, times)) => (&value[..value.len() - 1], *times),
+        None => (value, 1),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok()?.checked_mul(times)
+}
+
+/// A network a node can be of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Network {
+    Mainnet,
+    Dev,
+    DevRecursive,
+}
+
+impl Network {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Network::Mainnet => "mainnet",
+            Network::Dev => "dev",
+            Network::DevRecursive => "dev-recursive",
+        }
+    }
+
+    /// The data directory's name under `~/.tabernacle`.
+    fn directory(&self) -> &'static str {
+        match self {
+            Network::Mainnet => "tabminer",
+            Network::Dev => "tabminer-dev",
+            Network::DevRecursive => "tabminer-dev-recursive",
+        }
+    }
+}
+
+/// How a node is configured: everything it was told, and the default
+/// of everything it was not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Configuration {
+    pub network: Network,
+    pub data_dir: PathBuf,
+    /// Threads for hashing and checking proofs; zero for every core.
+    pub threads: usize,
+    pub mine: bool,
+    pub listen: SocketAddrV4,
+    /// Peers given by hand.
+    pub peers: Vec<SocketAddrV4>,
+    /// Seeds given, besides the built-in ones: names to look up.
+    pub seeds: Vec<String>,
+    /// Whether the built-in seeds are used.
+    pub built_in_seeds: bool,
+    /// Blocks that can be undone.
+    pub keep: usize,
+    /// The node's own settings among its peers.
+    pub net: Net,
+    pub main_log: PathBuf,
+    pub request_log: PathBuf,
+    pub stat_log: PathBuf,
+    pub rotation: Rotation,
+    pub request_log_queue: usize,
+    pub stats: Every,
+    /// The files options were read from, in the order given.
+    pub files: Vec<PathBuf>,
+}
+
+/// What was given, option by option, before it is made sense of: from
+/// files, and from the command line, which is taken before them.
+#[derive(Default)]
+struct Given {
+    /// An option's name, its value, and where it was given: the place
+    /// of its file among the files, or past them all for the command
+    /// line.
+    values: Vec<(&'static str, String, usize)>,
+    flags: Vec<&'static str>,
+}
+
+/// The options of `words` (a command line, or one line of a file),
+/// added to `given` as from `source`. `place` is said before what is
+/// wrong: nothing for the command line, the file and line for a file.
+fn take(given: &mut Given, words: &[&str], source: usize, place: &str) -> Result<(), Refused> {
+    let wrong = |what: String| Refused::Wrong(format!("{place}{what}"));
+    let mut at = 0;
+    while at < words.len() {
+        let word = words[at];
+        let known = word
+            .strip_prefix("--")
+            .and_then(|name| OPTIONS.iter().flat_map(|(_, opts)| opts.iter()).find(|o| o.name == name));
+        let Some(opt) = known else {
+            return Err(wrong(format!("unknown configuration option: '{word}'")));
+        };
+        match opt.takes {
+            Takes::Nothing => {
+                // (Given in a file and on the command line is given.)
+                if !given.flags.contains(&opt.name) {
+                    given.flags.push(opt.name);
+                }
+            }
+            Takes::Value(_) | Takes::Values(_) => {
+                let Some(value) = words.get(at + 1).filter(|v| !v.starts_with("--")) else {
+                    return Err(wrong(format!("--{} needs a value", opt.name)));
+                };
+                // Twice in one place is a mistake; in two places, the
+                // nearer is taken.
+                let twice = given.values.iter().any(|(n, _, from)| *n == opt.name && *from == source);
+                if matches!(opt.takes, Takes::Value(_)) && twice {
+                    return Err(wrong(format!("--{} was given twice", opt.name)));
+                }
+                given.values.push((opt.name, value.to_string(), source));
+                at += 1;
+            }
+        }
+        at += 1;
+    }
+    Ok(())
+}
+
+impl Given {
+    fn flag(&self, name: &str) -> bool {
+        self.flags.contains(&name)
+    }
+
+    /// Every value of an option that may be given more than once: the
+    /// files' and the command line's together.
+    fn all<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.values.iter().filter(move |(n, _, _)| *n == name).map(|(_, v, _)| v.as_str())
+    }
+
+    /// The value of an option: where it was given in more than one
+    /// place, the nearest (the command line, then the last file).
+    fn one(&self, name: &str) -> Option<&str> {
+        self.values.iter().filter(|(n, _, _)| *n == name).max_by_key(|(_, _, from)| *from).map(|(_, v, _)| v.as_str())
+    }
+
+    /// A time in seconds, if the option was given: so many seconds, or
+    /// a number and `s`, `m`, `h` or `d`. No less than `least`.
+    fn time(&self, name: &str, least: u64) -> Result<Option<u64>, Refused> {
+        let units = [('s', 1), ('m', 60), ('h', 3600), ('d', 86_400)];
+        self.counted(name, least, &units, "a time (as 90, 90s, 60m or 1h)")
+    }
+
+    /// A size in bytes, if the option was given: so many bytes, or a
+    /// number and `k`, `m` or `g`.
+    fn size(&self, name: &str, least: u64) -> Result<Option<u64>, Refused> {
+        let units = [('k', 1 << 10), ('m', 1 << 20), ('g', 1 << 30)];
+        self.counted(name, least, &units, "a size (as 1048576, 1024k or 1m)")
+    }
+
+    fn counted(&self, name: &str, least: u64, units: &[(char, u64)], what: &str) -> Result<Option<u64>, Refused> {
+        let Some(value) = self.one(name) else {
+            return Ok(None);
+        };
+        let n = with_unit(value, units).ok_or_else(|| Refused::Wrong(format!("--{name}: '{value}' is not {what}")))?;
+        if n < least {
+            return Err(Refused::Wrong(format!("--{name}: {value} is under the least it may be ({least})")));
+        }
+        Ok(Some(n))
+    }
+
+    /// A whole number, if the option was given: no less than `least`.
+    fn number(&self, name: &str, least: u64) -> Result<Option<u64>, Refused> {
+        let Some(value) = self.one(name) else {
+            return Ok(None);
+        };
+        let n: u64 = value.parse().map_err(|_| Refused::Wrong(format!("--{name}: '{value}' is not a number")))?;
+        if n < least {
+            return Err(Refused::Wrong(format!("--{name}: {value} is under the least it may be ({least})")));
+        }
+        Ok(Some(n))
+    }
+}
+
+impl Configuration {
+    /// The configuration `args` asks for (the command line, without the
+    /// program's own name), or why there is none. `home` is the user's
+    /// own directory, if there is one, and `here` the directory the
+    /// node was started in: paths not from the root are from there.
+    ///
+    /// A word `@FILE` is a file of options, read with `load`: one
+    /// option to a line, written as on the command line, with `#`
+    /// before anything that is not one. What the command line says is
+    /// taken before what a file says, and a later file before an
+    /// earlier; an option that may be given many times has the values
+    /// of all of them.
+    ///
+    /// Beyond reading those files, nothing is opened or made: this
+    /// reads and checks only.
+    pub fn read(
+        args: &[String],
+        home: Option<&Path>,
+        here: &Path,
+        load: &dyn Fn(&Path) -> std::io::Result<String>,
+    ) -> Result<Configuration, Refused> {
+        // `--help` anywhere is the help, whatever else is there.
+        if args.iter().any(|a| a == "--help") {
+            return Err(Refused::Help);
+        }
+        let wrong = |what: String| Refused::Wrong(what);
+        // A path as it was given, from the root: one that is not is
+        // from where the node was started.
+        let whole = |given: &str| {
+            let p = Path::new(given);
+            if p.is_absolute() { p.to_path_buf() } else { here.join(p) }
+        };
+        let mut given = Given::default();
+        let mut files = Vec::new();
+        for file in args.iter().filter_map(|a| a.strip_prefix('@')) {
+            if file.is_empty() {
+                return Err(wrong("@ needs the name of a file after it".into()));
+            }
+            let path = whole(file);
+            let text = load(&path).map_err(|e| wrong(format!("{} cannot be read: {e}", path.display())))?;
+            for (number, line) in text.lines().enumerate() {
+                // What comes after a # is for whoever reads the file.
+                let line = line.split('#').next().unwrap_or("").trim();
+                if line.is_empty() {
+                    continue;
+                }
+                // An option, and the rest of the line its value: so
+                // that a path may have spaces in it.
+                let words: Vec<&str> = line.splitn(2, char::is_whitespace).map(str::trim).collect();
+                let place = format!("{} line {}: ", path.display(), number + 1);
+                match words[0] {
+                    "--help" => return Err(wrong(format!("{place}--help is for the command line"))),
+                    word if word.starts_with('@') => {
+                        return Err(wrong(format!("{place}a file of options cannot name another")));
+                    }
+                    _ => take(&mut given, &words, files.len(), &place)?,
+                }
+            }
+            files.push(path);
+        }
+        let line: Vec<&str> = args.iter().filter(|a| !a.starts_with('@')).map(String::as_str).collect();
+        take(&mut given, &line, files.len(), "")?;
+
+        let network = match given.one("network") {
+            None | Some("mainnet") => Network::Mainnet,
+            Some("dev") => Network::Dev,
+            Some("dev-recursive") => Network::DevRecursive,
+            Some(other) => {
+                return Err(wrong(format!("--network: '{other}' is not mainnet, dev or dev-recursive")));
+            }
+        };
+        let path = |name: &str| -> Result<Option<PathBuf>, Refused> {
+            match given.one(name) {
+                Some("") => Err(wrong(format!("--{name}: no path was given"))),
+                Some(p) => Ok(Some(whole(p))),
+                None => Ok(None),
+            }
+        };
+        let data_dir = match path("data-dir")? {
+            Some(dir) => dir,
+            None => match home {
+                Some(home) => home.join(".tabernacle").join(network.directory()),
+                None => return Err(wrong("there is no home directory to keep data in: give --data-dir".into())),
+            },
+        };
+        let log_dir = path("log-dir")?.unwrap_or_else(|| data_dir.clone());
+        let log = |name: &str, usual: &str| -> Result<PathBuf, Refused> {
+            Ok(path(name)?.unwrap_or_else(|| log_dir.join(usual)))
+        };
+        let (main_log, request_log, stat_log) =
+            (log("main-log", "tabernacle.log")?, log("request-log", "request.log")?, log("stat-log", "stat.log")?);
+        if main_log == request_log || main_log == stat_log || request_log == stat_log {
+            return Err(wrong(format!("two logs cannot be one file: {}", main_log.display())));
+        }
+
+        let address = |name: &str, value: &str| -> Result<SocketAddrV4, Refused> {
+            match value.parse::<SocketAddrV4>() {
+                Ok(a) if a.port() != 0 => Ok(a),
+                _ => Err(wrong(format!("--{name}: '{value}' is not an address and port (as 203.0.113.7:3737)"))),
+            }
+        };
+        let listen = match given.one("listen") {
+            Some(value) => address("listen", value)?,
+            None => "0.0.0.0:3737".parse().expect("an address"),
+        };
+        let peers = given.all("peer").map(|v| address("peer", v)).collect::<Result<Vec<_>, _>>()?;
+        let mut seeds = Vec::new();
+        for seed in given.all("seed") {
+            // A name or an address, and a port that is one.
+            let port = seed.rsplit_once(':').filter(|(host, _)| !host.is_empty()).map(|(_, port)| port.parse::<u16>());
+            match port {
+                Some(Ok(port)) if port != 0 => seeds.push(seed.to_string()),
+                _ => return Err(wrong(format!("--seed: '{seed}' is not a host and port (as seed.example.org:3737)"))),
+            }
+        }
+
+        let mut net = Net::default();
+        let seconds = |name: &str, least: u64| given.time(name, least).map(|n| n.map(|n| n.saturating_mul(SECOND)));
+        let count = |name: &str, least: u64| given.number(name, least).map(|n| n.map(|n| n as usize));
+        let (p, s) = (&mut net.peers, &mut net.sync);
+        p.max = count("max-peers", 1)?.unwrap_or(p.max);
+        p.target = count("target-peers", 1)?.unwrap_or(p.target);
+        p.per_host = count("max-peers-per-host", 1)?.unwrap_or(p.per_host);
+        p.per_network = count("max-peers-per-network", 1)?.unwrap_or(p.per_network);
+        p.ping = seconds("ping-seconds", 1)?.unwrap_or(p.ping);
+        p.live_silence = seconds("peer-live-seconds", 1)?.unwrap_or(p.live_silence);
+        p.drop_silence = seconds("peer-drop-seconds", 1)?.unwrap_or(p.drop_silence);
+        p.strikes = given.number("ban-strikes", 1)?.map_or(p.strikes, |n| n.min(u32::MAX as u64) as u32);
+        p.ban = seconds("ban-seconds", 1)?.unwrap_or(p.ban);
+        s.sync_point = given.number("sync-point", 0)?.map_or(s.sync_point, |n| n.min(u32::MAX as u64) as u32);
+        s.header_fetches = count("header-fetches", 1)?.unwrap_or(s.header_fetches);
+        s.blocks = count("block-fetches", 1)?.unwrap_or(s.blocks);
+        s.blocks_per_peer = count("block-fetches-per-peer", 1)?.unwrap_or(s.blocks_per_peer);
+        s.parts = count("part-fetches", 1)?.unwrap_or(s.parts);
+        s.header_wait = seconds("header-wait-seconds", 1)?.unwrap_or(s.header_wait);
+        s.pass_over = seconds("pass-over-seconds", 1)?.unwrap_or(s.pass_over);
+        net.serve.rate =
+            given.number("serve-chunks-per-second", 1)?.map_or(net.serve.rate, |n| n.min(u32::MAX as u64) as u32);
+        net.serve.waiting = count("serve-queue", 1)?.unwrap_or(net.serve.waiting);
+        net.serve.waiting_each = count("serve-queue-per-peer", 1)?.unwrap_or(net.serve.waiting_each);
+        // What cannot both hold, said by the options' own names.
+        let (p, s) = (&net.peers, &net.sync);
+        let clash = |what: String| Err(wrong(what));
+        if p.target > p.max {
+            return clash(format!("--target-peers ({}) is over --max-peers ({})", p.target, p.max));
+        }
+        if p.per_network < p.per_host {
+            return clash(format!(
+                "--max-peers-per-network ({}) is under --max-peers-per-host ({})",
+                p.per_network, p.per_host
+            ));
+        }
+        if p.live_silence < 2 * p.ping {
+            return clash(format!(
+                "--peer-live-seconds ({}) is under two of --ping-seconds ({})",
+                p.live_silence / SECOND,
+                p.ping / SECOND
+            ));
+        }
+        if p.drop_silence < p.live_silence {
+            return clash(format!(
+                "--peer-drop-seconds ({}) is under --peer-live-seconds ({})",
+                p.drop_silence / SECOND,
+                p.live_silence / SECOND
+            ));
+        }
+        if s.blocks_per_peer > s.blocks {
+            return clash(format!(
+                "--block-fetches-per-peer ({}) is over --block-fetches ({})",
+                s.blocks_per_peer, s.blocks
+            ));
+        }
+        if net.serve.waiting_each > net.serve.waiting {
+            return clash(format!(
+                "--serve-queue-per-peer ({}) is over --serve-queue ({})",
+                net.serve.waiting_each, net.serve.waiting
+            ));
+        }
+        // And whatever else the node itself would not run with.
+        if let Err(e) = net.check() {
+            return Err(wrong(e.to_string()));
+        }
+
+        let keep = count("max-undo-blocks", 1)?.unwrap_or(1008);
+        if s.sync_point as usize >= keep {
+            return clash(format!("--sync-point ({}) is not under --max-undo-blocks ({keep})", s.sync_point));
+        }
+        let rotation = Rotation {
+            max_age: given.time("log-rotate-seconds", 0)?.unwrap_or(Rotation::default().max_age),
+            max_size: given.size("log-rotate-bytes", 0)?.unwrap_or(Rotation::default().max_size),
+        };
+        let stats = Every {
+            interval: given
+                .time("stat-interval-seconds", 1)?
+                .map_or(Every::default().interval, |n| n.saturating_mul(1000)),
+            summary: given
+                .time("stat-summary-seconds", 1)?
+                .map_or(Every::default().summary, |n| n.saturating_mul(1000)),
+        };
+        if stats.summary < stats.interval {
+            return clash(format!(
+                "--stat-summary-seconds ({}) is under --stat-interval-seconds ({})",
+                stats.summary / 1000,
+                stats.interval / 1000
+            ));
+        }
+        Ok(Configuration {
+            network,
+            data_dir,
+            threads: count("threads", 0)?.unwrap_or(0),
+            mine: !given.flag("no-mine"),
+            listen,
+            peers,
+            seeds,
+            built_in_seeds: !given.flag("no-seeds"),
+            keep,
+            net,
+            main_log,
+            request_log,
+            stat_log,
+            rotation,
+            request_log_queue: count("request-log-queue", 1)?.unwrap_or(10_000),
+            stats,
+            files,
+        })
+    }
+
+    /// What a node says of its configuration when it starts: each thing
+    /// by its name, and what it is. Paths are whole, and numbers are
+    /// written as in every log.
+    pub fn lines(&self) -> Vec<(String, String)> {
+        let (p, s) = (&self.net.peers, &self.net.sync);
+        let secs = |micros: u64| format!("{} seconds", commas(micros / SECOND));
+        let yes = |b: bool| if b { "yes" } else { "no" }.to_string();
+        let limit = |n: u64, unit: &str| if n == 0 { "no limit".to_string() } else { format!("{} {unit}", commas(n)) };
+        let mut lines: Vec<(&str, String)> = vec![("UDP Server Listening on", self.listen.to_string())];
+        lines.extend(self.files.iter().map(|file| ("Configuration File", file.display().to_string())));
+        lines.extend([
+            ("Network", self.network.name().to_string()),
+            ("Mining", yes(self.mine)),
+            ("Threads", if self.threads == 0 { "every core".to_string() } else { commas(self.threads as u64) }),
+            ("Data Directory", self.data_dir.display().to_string()),
+            ("Main Log", self.main_log.display().to_string()),
+            ("Request Log", self.request_log.display().to_string()),
+            ("Stat Log", self.stat_log.display().to_string()),
+            ("Log Rotation Time", limit(self.rotation.max_age, "seconds")),
+            ("Log Rotation Size", limit(self.rotation.max_size, "bytes")),
+            ("Request Log Queue", format!("{} lines", commas(self.request_log_queue as u64))),
+            ("Stat Interval", format!("{} seconds", commas(self.stats.interval / 1000))),
+            ("Stat Summary", format!("{} seconds", commas(self.stats.summary / 1000))),
+            ("Built-in Seeds", yes(self.built_in_seeds)),
+        ]);
+        lines.extend(self.seeds.iter().map(|seed| ("Seed", seed.clone())));
+        lines.extend(self.peers.iter().map(|peer| ("Peer", peer.to_string())));
+        lines.extend([
+            ("Max Peers", commas(p.max as u64)),
+            ("Target Peers", commas(p.target as u64)),
+            ("Max Peers per Host", commas(p.per_host as u64)),
+            ("Max Peers per Network", commas(p.per_network as u64)),
+            ("Ping Interval", secs(p.ping)),
+            ("Peer Live Timeout", secs(p.live_silence)),
+            ("Peer Drop Timeout", secs(p.drop_silence)),
+            ("Ban Strikes", commas(p.strikes as u64)),
+            ("Ban Time", secs(p.ban)),
+            (
+                "Sync Point",
+                if s.sync_point == 0 { "never".to_string() } else { format!("{} blocks", commas(s.sync_point as u64)) },
+            ),
+            ("Max Undo Blocks", commas(self.keep as u64)),
+            ("Header Fetches", commas(s.header_fetches as u64)),
+            ("Block Fetches", commas(s.blocks as u64)),
+            ("Block Fetches per Peer", commas(s.blocks_per_peer as u64)),
+            ("Part Fetches", commas(s.parts as u64)),
+            ("Header Wait", secs(s.header_wait)),
+            ("Pass Over Time", secs(s.pass_over)),
+            ("Serve Rate", format!("{} chunks per second", commas(self.net.serve.rate as u64))),
+            ("Serve Queue", commas(self.net.serve.waiting as u64)),
+            ("Serve Queue per Peer", commas(self.net.serve.waiting_each as u64)),
+        ]);
+        lines.into_iter().map(|(name, value)| (name.to_string(), value)).collect()
+    }
+
+    /// Says, in the main log and on the terminal alike, when the node
+    /// started and how it is configured:
+    ///
+    /// ```text
+    /// [2026-10-17 19:30:44:000] Server started 10-17-2026 19:30:44 UTC
+    /// -----------------------------------------------------------------
+    /// [2026-10-17 19:30:44:000] UDP Server Listening on: '0.0.0.0:3737'
+    /// [2026-10-17 19:30:44:000] Main Log:                '/srv/tab/tabernacle.log'
+    /// -----------------------------------------------------------------
+    /// ```
+    pub fn announce(&self, main: &Logger) {
+        let lines = self.lines();
+        let wide = lines.iter().map(|(name, _)| name.chars().count()).max().unwrap_or(0) + 2;
+        main.log_all(&format!("Server started {}", crate::logger::Moment::of(main.now()).started()));
+        main.log_all_no_header(&RULE);
+        for (name, value) in &lines {
+            main.log_all(&format!("{}'{value}'", column(&format!("{name}:"), wide, ' ')));
+        }
+        main.log_all_no_header(&RULE);
+    }
+
+    /// Says that the node is up: after everything of starting is done.
+    pub fn ready(main: &Logger) {
+        main.log_all("Server is ready!");
+    }
+}
+
+/// The rule drawn above and below the configuration.
+static RULE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| "-".repeat(105));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The files there are, for the tests.
+    fn load(path: &Path) -> std::io::Result<String> {
+        match path.to_str().unwrap() {
+            "/work/here/my_config" => Ok("# a seed\n\n--max-peers 2000   # many\n--no-mine\n--peer 203.0.113.7:3737\n\
+                 --data-dir /srv/my tab\n--log-rotate-seconds 2h\n"
+                .into()),
+            "/etc/tab/second" => Ok("--max-peers 300\n--target-peers 20\n--peer 198.51.100.20:3738\n".into()),
+            "/bad/unknown" => Ok("--max-peers 5\n--prot 3737\n".into()),
+            "/bad/twice" => Ok("--max-peers 5\n--max-peers 6\n".into()),
+            "/bad/help" => Ok("--help\n".into()),
+            "/bad/nested" => Ok("@/etc/tab/second\n".into()),
+            "/bad/value" => Ok("--max-peers\n".into()),
+            _ => Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no such file")),
+        }
+    }
+
+    fn read(args: &[&str]) -> Result<Configuration, Refused> {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        Configuration::read(&args, Some(Path::new("/home/chris")), Path::new("/work/here"), &load)
+    }
+
+    fn wrong(args: &[&str]) -> String {
+        match read(args) {
+            Err(Refused::Wrong(what)) => what,
+            other => panic!("{args:?}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nothing_given_is_every_default() {
+        let c = read(&[]).unwrap();
+        assert_eq!((c.network, c.mine, c.threads, c.keep), (Network::Mainnet, true, 0, 1008));
+        assert_eq!(c.listen.to_string(), "0.0.0.0:3737");
+        assert_eq!(c.data_dir, Path::new("/home/chris/.tabernacle/tabminer"));
+        assert_eq!(c.main_log, Path::new("/home/chris/.tabernacle/tabminer/tabernacle.log"));
+        assert_eq!(c.request_log, Path::new("/home/chris/.tabernacle/tabminer/request.log"));
+        assert_eq!(c.stat_log, Path::new("/home/chris/.tabernacle/tabminer/stat.log"));
+        assert_eq!((c.net.clone(), c.rotation, c.stats), (Net::default(), Rotation::default(), Every::default()));
+        assert_eq!((c.request_log_queue, c.built_in_seeds, c.peers.len(), c.seeds.len()), (10_000, true, 0, 0));
+        // Each network has a directory of its own.
+        assert_eq!(read(&["--network", "dev"]).unwrap().data_dir, Path::new("/home/chris/.tabernacle/tabminer-dev"));
+        let recursive = read(&["--network", "dev-recursive"]).unwrap();
+        assert_eq!(recursive.data_dir, Path::new("/home/chris/.tabernacle/tabminer-dev-recursive"));
+    }
+
+    #[test]
+    fn what_is_given_is_what_is_had() {
+        let c = read(&[
+            "--no-mine",
+            "--network",
+            "dev",
+            "--data-dir",
+            "/srv/tab",
+            "--threads",
+            "4",
+            "--listen",
+            "10.0.0.5:4000",
+            "--peer",
+            "203.0.113.7:3737",
+            "--peer",
+            "198.51.100.20:3738",
+            "--seed",
+            "seed.example.org:3737",
+            "--no-seeds",
+            "--max-peers",
+            "2000",
+            "--target-peers",
+            "50",
+            "--max-peers-per-host",
+            "2",
+            "--max-peers-per-network",
+            "16",
+            "--ping-seconds",
+            "20",
+            "--peer-live-seconds",
+            "45",
+            "--peer-drop-seconds",
+            "120",
+            "--ban-strikes",
+            "3",
+            "--ban-seconds",
+            "60",
+            "--sync-point",
+            "100",
+            "--max-undo-blocks",
+            "500",
+            "--header-fetches",
+            "4",
+            "--block-fetches",
+            "10",
+            "--block-fetches-per-peer",
+            "5",
+            "--part-fetches",
+            "64",
+            "--header-wait-seconds",
+            "30",
+            "--pass-over-seconds",
+            "90",
+            "--serve-chunks-per-second",
+            "100000",
+            "--serve-queue",
+            "5000",
+            "--serve-queue-per-peer",
+            "16",
+            "--log-rotate-seconds",
+            "600",
+            "--log-rotate-bytes",
+            "5000000",
+            "--request-log-queue",
+            "250",
+            "--stat-interval-seconds",
+            "5",
+            "--stat-summary-seconds",
+            "30",
+        ])
+        .unwrap();
+        assert_eq!((c.network, c.mine, c.threads, c.keep), (Network::Dev, false, 4, 500));
+        assert_eq!((c.data_dir.as_path(), c.listen.to_string().as_str()), (Path::new("/srv/tab"), "10.0.0.5:4000"));
+        assert_eq!(
+            c.peers.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+            ["203.0.113.7:3737", "198.51.100.20:3738"]
+        );
+        assert_eq!((c.seeds.clone(), c.built_in_seeds), (vec!["seed.example.org:3737".to_string()], false));
+        let (p, s) = (&c.net.peers, &c.net.sync);
+        assert_eq!((p.max, p.target, p.per_host, p.per_network, p.strikes), (2000, 50, 2, 16, 3));
+        assert_eq!(
+            (p.ping, p.live_silence, p.drop_silence, p.ban),
+            (20 * SECOND, 45 * SECOND, 120 * SECOND, 60 * SECOND)
+        );
+        assert_eq!((s.sync_point, s.header_fetches, s.blocks, s.blocks_per_peer, s.parts), (100, 4, 10, 5, 64));
+        assert_eq!((s.header_wait, s.pass_over), (30 * SECOND, 90 * SECOND));
+        assert_eq!((c.net.serve.rate, c.net.serve.waiting, c.net.serve.waiting_each), (100_000, 5000, 16));
+        assert_eq!(c.rotation, Rotation { max_age: 600, max_size: 5_000_000 });
+        assert_eq!((c.request_log_queue, c.stats), (250, Every { interval: 5000, summary: 30_000 }));
+        // What was not given is still its default.
+        assert_eq!(p.host_stale, Net::default().peers.host_stale);
+    }
+
+    /// A log is where its own option says; else in the directory for
+    /// logs; else in the data directory. And every path kept is whole.
+    #[test]
+    fn a_log_goes_where_the_nearest_option_says() {
+        let logs = |args: &[&str]| {
+            let c = read(args).unwrap();
+            [c.main_log, c.request_log, c.stat_log].map(|p| p.display().to_string())
+        };
+        assert_eq!(
+            logs(&["--data-dir", "/srv/tab"]),
+            ["/srv/tab/tabernacle.log", "/srv/tab/request.log", "/srv/tab/stat.log"]
+        );
+        assert_eq!(
+            logs(&["--data-dir", "/srv/tab", "--log-dir", "/var/log/tab"]),
+            ["/var/log/tab/tabernacle.log", "/var/log/tab/request.log", "/var/log/tab/stat.log"]
+        );
+        assert_eq!(
+            logs(&["--log-dir", "/var/log/tab", "--stat-log", "/mnt/fast/s.log"]),
+            ["/var/log/tab/tabernacle.log", "/var/log/tab/request.log", "/mnt/fast/s.log"]
+        );
+        assert_eq!(
+            logs(&["--main-log", "/a/m.log", "--request-log", "/b/r.log", "--stat-log", "/c/s.log", "--log-dir", "/x"]),
+            ["/a/m.log", "/b/r.log", "/c/s.log"]
+        );
+        // Not from the root: from where the node was started.
+        assert_eq!(
+            logs(&["--data-dir", "data", "--log-dir", "logs", "--main-log", "m.log"]),
+            ["/work/here/m.log", "/work/here/logs/request.log", "/work/here/logs/stat.log"]
+        );
+        assert_eq!(read(&["--data-dir", "data"]).unwrap().data_dir, Path::new("/work/here/data"));
+        // Two logs in one file would write over one another.
+        assert!(
+            wrong(&["--main-log", "/a/x.log", "--stat-log", "/a/x.log"]).starts_with("two logs cannot be one file")
+        );
+        // Nowhere to keep anything.
+        let none = Configuration::read(&[], None, Path::new("/"), &load);
+        assert!(matches!(none, Err(Refused::Wrong(w)) if w.contains("--data-dir")));
+    }
+
+    #[test]
+    fn help_anywhere_is_help_and_an_unknown_option_is_named() {
+        assert_eq!(read(&["--help"]), Err(Refused::Help));
+        assert_eq!(read(&["--max-peers", "5", "--help", "--no-such"]), Err(Refused::Help));
+        assert_eq!(read(&["--no-such", "--help"]), Err(Refused::Help));
+        assert_eq!(wrong(&["--prot", "3737"]), "unknown configuration option: '--prot'");
+        assert_eq!(wrong(&["--no-mine", "mine"]), "unknown configuration option: 'mine'");
+        assert_eq!(wrong(&["-h"]), "unknown configuration option: '-h'");
+        assert_eq!(wrong(&["--max-peers=5"]), "unknown configuration option: '--max-peers=5'");
+    }
+
+    #[test]
+    fn what_is_wrong_is_said_by_the_options_name() {
+        // No value, or the next option where one should be.
+        assert_eq!(wrong(&["--max-peers"]), "--max-peers needs a value");
+        assert_eq!(wrong(&["--data-dir", "--no-mine"]), "--data-dir needs a value");
+        // Not a number; under the least.
+        assert_eq!(wrong(&["--max-peers", "many"]), "--max-peers: 'many' is not a number");
+        assert_eq!(wrong(&["--max-peers", "-5"]), "--max-peers: '-5' is not a number");
+        assert_eq!(wrong(&["--max-peers", "0"]), "--max-peers: 0 is under the least it may be (1)");
+        assert_eq!(wrong(&["--ping-seconds", "1.5"]), "--ping-seconds: '1.5' is not a time (as 90, 90s, 60m or 1h)");
+        assert_eq!(
+            wrong(&["--log-rotate-bytes", "1mb"]),
+            "--log-rotate-bytes: '1mb' is not a size (as 1048576, 1024k or 1m)"
+        );
+        // A port out of range, no port, a name where an address is
+        // wanted, port nothing.
+        for bad in ["0.0.0.0:70000", "0.0.0.0", "localhost:3737", "0.0.0.0:0", "1.2.3:4", "[::1]:3737"] {
+            assert_eq!(
+                wrong(&["--listen", bad]),
+                format!("--listen: '{bad}' is not an address and port (as 203.0.113.7:3737)")
+            );
+        }
+        assert!(wrong(&["--peer", "1.2.3.4:99999"]).starts_with("--peer: '1.2.3.4:99999' is not an address"));
+        assert!(
+            wrong(&["--seed", "seed.example.org"]).starts_with("--seed: 'seed.example.org' is not a host and port")
+        );
+        assert!(wrong(&["--seed", ":3737"]).starts_with("--seed"));
+        assert!(wrong(&["--seed", "a.example:70000"]).starts_with("--seed"));
+        // Given twice, where once is all there may be.
+        assert_eq!(wrong(&["--max-peers", "5", "--max-peers", "6"]), "--max-peers was given twice");
+        assert!(read(&["--peer", "1.2.3.4:5", "--peer", "1.2.3.4:6"]).is_ok());
+        assert_eq!(wrong(&["--network", "testnet"]), "--network: 'testnet' is not mainnet, dev or dev-recursive");
+        // Limits that cannot both hold.
+        assert_eq!(wrong(&["--target-peers", "100"]), "--target-peers (100) is over --max-peers (64)");
+        assert_eq!(
+            wrong(&["--max-peers-per-host", "9"]),
+            "--max-peers-per-network (8) is under --max-peers-per-host (9)"
+        );
+        assert_eq!(wrong(&["--ping-seconds", "40"]), "--peer-live-seconds (65) is under two of --ping-seconds (40)");
+        assert_eq!(wrong(&["--peer-drop-seconds", "30"]), "--peer-drop-seconds (30) is under --peer-live-seconds (65)");
+        assert_eq!(wrong(&["--block-fetches", "4"]), "--block-fetches-per-peer (8) is over --block-fetches (4)");
+        assert_eq!(wrong(&["--serve-queue", "4"]), "--serve-queue-per-peer (8) is over --serve-queue (4)");
+        assert_eq!(wrong(&["--sync-point", "2000"]), "--sync-point (2000) is not under --max-undo-blocks (1008)");
+        assert_eq!(
+            wrong(&["--stat-summary-seconds", "5"]),
+            "--stat-summary-seconds (5) is under --stat-interval-seconds (10)"
+        );
+    }
+
+    /// A time may be said in minutes, hours or days, and a size in
+    /// kilobytes, megabytes or gigabytes of 1024.
+    #[test]
+    fn times_and_sizes_take_units() {
+        let rotation = |seconds: &str, bytes: &str| {
+            let c = read(&["--log-rotate-seconds", seconds, "--log-rotate-bytes", bytes]).unwrap();
+            (c.rotation.max_age, c.rotation.max_size)
+        };
+        assert_eq!(rotation("3600", "1048576"), (3600, 1 << 20));
+        assert_eq!(rotation("60m", "1024k"), (3600, 1 << 20));
+        assert_eq!(rotation("1h", "1m"), (3600, 1 << 20));
+        assert_eq!(rotation("90s", "2g"), (90, 2 << 30));
+        assert_eq!(rotation("7d", "1K"), (7 * 86_400, 1024));
+        assert_eq!(rotation("1H", "5M"), (3600, 5 << 20));
+        // Nothing is no limit, said either way.
+        assert_eq!(rotation("0", "0k"), (0, 0));
+        // Every option that is a time takes them.
+        let c = read(&[
+            "--ping-seconds",
+            "1m",
+            "--peer-live-seconds",
+            "3m",
+            "--peer-drop-seconds",
+            "1h",
+            "--ban-seconds",
+            "1d",
+        ])
+        .unwrap();
+        let p = &c.net.peers;
+        assert_eq!(
+            (p.ping, p.live_silence, p.drop_silence, p.ban),
+            (60 * SECOND, 180 * SECOND, 3600 * SECOND, 86_400 * SECOND)
+        );
+        let c = read(&["--stat-interval-seconds", "30s", "--stat-summary-seconds", "5m"]).unwrap();
+        assert_eq!(c.stats, Every { interval: 30_000, summary: 300_000 });
+        // What is neither: no number, a unit of the other kind, two
+        // units, a fraction, more than can be counted.
+        for bad in ["h", "1x", "1hh", "1.5h", "-1h", "1 h", "99999999999999999999", "9999999999999999999d", "1k"] {
+            assert!(wrong(&["--log-rotate-seconds", bad]).contains("is not a time"), "{bad}");
+        }
+        assert!(wrong(&["--log-rotate-bytes", "1h"]).contains("is not a size"));
+        assert!(wrong(&["--log-rotate-bytes", "99999999999g"]).contains("is not a size"));
+        // A count is a count: no units.
+        assert_eq!(wrong(&["--max-peers", "1k"]), "--max-peers: '1k' is not a number");
+    }
+
+    /// Asked for, the help is the help and nothing is wrong; something
+    /// wrong is said first, then the help, and the node ends in failure.
+    #[test]
+    fn help_asked_for_is_no_failure_and_help_for_an_error_is() {
+        let (said, code) = read(&["--help"]).unwrap_err().said();
+        assert_eq!((said, code), (help(), 0));
+        let (said, code) = read(&["--prot", "1"]).unwrap_err().said();
+        assert_eq!(code, -1);
+        assert_eq!(said, format!("Error: unknown configuration option: '--prot'\n\n{}", help()));
+        let (said, code) = read(&["--max-peers", "0"]).unwrap_err().said();
+        assert!(code == -1 && said.starts_with("Error: --max-peers: 0 is under the least it may be (1)\n\ntabminer: "));
+    }
+
+    /// Options kept in a file are the configuration, and what the
+    /// command line says is taken before them.
+    #[test]
+    fn a_file_of_options_is_given_with_an_at() {
+        let c = read(&["@my_config"]).unwrap();
+        assert_eq!((c.net.peers.max, c.mine, c.rotation.max_age), (2000, false, 7200));
+        // (The rest of a line is the value: a path may have spaces.)
+        assert_eq!(c.data_dir, Path::new("/srv/my tab"));
+        assert_eq!(c.peers.len(), 1);
+        assert_eq!(c.files, [Path::new("/work/here/my_config")]);
+        // The command line over the file, wherever on it the file is.
+        for args in [["@my_config", "--max-peers", "70"], ["--max-peers", "70", "@my_config"]] {
+            let c = read(&args).unwrap();
+            assert_eq!((c.net.peers.max, c.mine, c.data_dir.as_path()), (70, false, Path::new("/srv/my tab")));
+        }
+        // An option that may be given many times has them all.
+        let c = read(&["@my_config", "--peer", "10.9.8.7:1"]).unwrap();
+        assert_eq!(c.peers.iter().map(|p| p.to_string()).collect::<Vec<_>>(), ["203.0.113.7:3737", "10.9.8.7:1"]);
+        // Two files: the later over the earlier, and the command line
+        // over both.
+        let c = read(&["@my_config", "@/etc/tab/second"]).unwrap();
+        assert_eq!((c.net.peers.max, c.net.peers.target, c.peers.len()), (300, 20, 2));
+        assert_eq!(c.files.len(), 2);
+        let c = read(&["@/etc/tab/second", "@my_config", "--target-peers", "9"]).unwrap();
+        assert_eq!((c.net.peers.max, c.net.peers.target), (2000, 9));
+        // What is wrong in a file is said with the file and the line.
+        assert_eq!(wrong(&["@/bad/unknown"]), "/bad/unknown line 2: unknown configuration option: '--prot'");
+        assert_eq!(wrong(&["@/bad/twice"]), "/bad/twice line 2: --max-peers was given twice");
+        assert_eq!(wrong(&["@/bad/value"]), "/bad/value line 1: --max-peers needs a value");
+        assert_eq!(wrong(&["@/bad/help"]), "/bad/help line 1: --help is for the command line");
+        assert_eq!(wrong(&["@/bad/nested"]), "/bad/nested line 1: a file of options cannot name another");
+        assert_eq!(wrong(&["@/no/such"]), "/no/such cannot be read: no such file");
+        assert_eq!(wrong(&["@"]), "@ needs the name of a file after it");
+        // And twice on the command line is still a mistake.
+        assert_eq!(wrong(&["@my_config", "--max-peers", "5", "--max-peers", "6"]), "--max-peers was given twice");
+        // The help, asked for, is the help whatever files are named.
+        assert_eq!(read(&["@/no/such", "--help"]), Err(Refused::Help));
+    }
+
+    /// The help names every option there is, and every option the help
+    /// names is one: with a value where it takes one, each is taken.
+    #[test]
+    fn the_help_and_the_options_are_one_list() {
+        let help = help();
+        assert!(help.starts_with("tabminer: a node of the Tabernacle network."));
+        for section in ["General", "Mining", "Network", "Peers", "Sync", "Serving", "Logging"] {
+            assert!(help.contains(&format!("\n{section}\n")), "{section}");
+        }
+        let mut named = 0;
+        for line in help.lines().filter(|l| l.starts_with("  --")) {
+            let mut words = line.split_whitespace();
+            let (option, takes) = (words.next().unwrap(), words.next().unwrap());
+            let value = match takes {
+                "NAME" => Some("dev"),
+                "DIR" | "FILE" => Some("/somewhere/of/its/own"),
+                "N" | "TIME" | "SIZE" => Some("70"),
+                "ADDR:PORT" => Some("10.1.2.3:4000"),
+                "HOST:PORT" => Some("seed.example.org:4000"),
+                _ => None,
+            };
+            named += 1;
+            if option == "--help" {
+                continue;
+            }
+            let mut args = vec![option];
+            args.extend(value);
+            // (Alone it may clash with a default; what matters is that
+            // it is known and its value read.)
+            match read(&args) {
+                Ok(_) => {}
+                Err(Refused::Wrong(what)) => {
+                    assert!(what.contains(" is over ") || what.contains(" under "), "{option}: {what}")
+                }
+                Err(Refused::Help) => panic!("{option}"),
+            }
+        }
+        assert_eq!(named, OPTIONS.iter().map(|(_, opts)| opts.len()).sum::<usize>());
+        // In columns: what every option is begins at one place.
+        let begins: Vec<usize> = help
+            .lines()
+            .filter(|l| l.starts_with("  --"))
+            .map(|l| {
+                let after = l.trim_start().find("  ").unwrap() + 2;
+                after + l[after..].find(|c: char| c != ' ').unwrap()
+            })
+            .collect();
+        assert!(begins.windows(2).all(|w| w[0] == w[1]), "{begins:?}");
+        assert!(help.lines().all(|l| l.len() <= 100 && !l.ends_with(' ')), "{help}");
+    }
+
+    /// What a node says when it starts: when, and how it is configured,
+    /// each thing by name with what it is in quotes, in columns.
+    #[test]
+    fn the_configuration_is_said_at_the_start() {
+        let dir = std::env::temp_dir().join(format!("tabminer-configuration-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data = dir.display().to_string();
+        let c = read(&["--data-dir", &data, "--peer", "203.0.113.7:3737", "--max-peers", "2000", "--no-mine"]).unwrap();
+        let main = Logger::open(&c.main_log, c.rotation).unwrap();
+        c.announce(&main);
+        Configuration::ready(&main);
+        let text = std::fs::read_to_string(&c.main_log).unwrap();
+        let lines: Vec<&str> = text.lines().skip(1).collect();
+        // The time it started, a rule, the configuration, a rule, ready.
+        assert!(lines[0][26..].starts_with("Server started ") && lines[0].ends_with(" UTC"), "{}", lines[0]);
+        assert_eq!((lines[1], lines[lines.len() - 2]), ("-".repeat(105).as_str(), "-".repeat(105).as_str()));
+        assert!(lines[lines.len() - 1].ends_with("] Server is ready!"));
+        let said: Vec<&str> = lines[2..lines.len() - 2].iter().map(|l| &l[26..]).collect();
+        assert_eq!(said[0], "UDP Server Listening on: '0.0.0.0:3737'");
+        assert!(said.contains(&format!("Main Log:                '{data}/tabernacle.log'").as_str()), "{said:#?}");
+        assert!(said.contains(&format!("Request Log:             '{data}/request.log'").as_str()));
+        assert!(said.contains(&"Mining:                  'no'"));
+        assert!(said.contains(&"Max Peers:               '2,000'"));
+        assert!(said.contains(&"Peer:                    '203.0.113.7:3737'"));
+        assert!(said.contains(&"Log Rotation Time:       '3,600 seconds'"));
+        assert!(said.contains(&"Log Rotation Size:       '1,048,576 bytes'"));
+        // Every one has the time before it, its name, and what it is in
+        // quotes beginning at one place.
+        for (line, said) in lines[2..lines.len() - 2].iter().zip(&said) {
+            assert!(line.starts_with('[') && &line[24..26] == "] ", "{line}");
+            assert_eq!(said.find('\''), Some(25), "{said}");
+            assert!(said.ends_with('\'') && said[..25].trim_end().ends_with(':'), "{said}");
+        }
+        assert_eq!(said.len(), c.lines().len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

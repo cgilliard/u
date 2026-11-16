@@ -149,6 +149,15 @@ impl Moment {
         )
     }
 
+    /// The moment as the startup message says it:
+    /// `02-03-2026 00:00:02 UTC` (month, day, year).
+    pub fn started(&self) -> String {
+        format!(
+            "{:02}-{:02}-{:04} {:02}:{:02}:{:02} UTC",
+            self.month, self.day, self.year, self.hour, self.minute, self.second
+        )
+    }
+
     /// What goes into the name of a file put aside at this moment:
     /// `_R_02_03_2026_10_00` (month, day, year, hour, minute).
     pub fn rotated(&self) -> String {
@@ -292,6 +301,14 @@ impl Logger {
         // (The terminal may be gone; the log is what matters.)
         let _ = io::stderr().write_all(text.as_bytes());
         self.write(now, &text);
+    }
+
+    /// Writes `line` as it is, to the log and to the terminal alike:
+    /// for the rules drawn across the startup messages.
+    pub fn log_all_no_header(&self, line: &str) {
+        let text = format!("{line}\n");
+        let _ = io::stderr().write_all(text.as_bytes());
+        self.write((self.clock)(), &text);
     }
 
     /// Puts the file aside if it has been written to for longer than it
@@ -486,6 +503,7 @@ mod tests {
         // Month, day, year, hour, minute, second.
         assert_eq!(Moment::of(1_770_114_604_000).begun(), "_02_03_2026_10_30_04");
         assert_eq!(Moment::of(T).begun(), "_10_17_2026_19_49_31");
+        assert_eq!(Moment::of(1_770_076_802_000).started(), "02-03-2026 00:00:02 UTC");
     }
 
     #[test]

@@ -6,6 +6,7 @@ pub mod chain;
 pub mod chain_verifier;
 pub mod challenger;
 pub mod codec;
+pub mod configuration;
 pub mod consensus;
 pub mod difficulty;
 pub mod error;

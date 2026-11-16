@@ -13,7 +13,10 @@ with the reason for changing it.
 
 ## 1. Configuration
 
-### 1.1 One program, no commands (decided)
+**Decided, and built** (`src/configuration.rs`), but for the binary that
+calls it.
+
+### 1.1 One program, no commands
 
 `tabminer` is the miner, and running it runs it:
 
@@ -27,12 +30,15 @@ not mine is `tabminer --no-mine`.
 The tool that makes a genesis block is a program of its own, built by
 its own Cargo package, so that the miner never has to tell the two
 apart. (Today it is a second binary of this package, `tools/genesis.rs`:
-to be moved.)
+still to be moved.)
 
-### 1.2 Options (decided)
+### 1.2 Options
 
-Every option is `--name` or `--name value`. All configuration is by
-options.
+Every option is `--name` or `--name value`. They are one list in the
+code, from which the help is written, the command line is read and the
+startup lines are laid out, so the three cannot disagree. `tabminer
+--help` is the list; it is in sections: General, Mining, Network,
+Peers, Sync, Serving, Logging.
 
 - **An option that is not one**: the node prints
 
@@ -40,136 +46,92 @@ options.
   Error: unknown configuration option: '--<option>'
   ```
 
-  then the help, and exits.
+  then the help, and exits with **-1**. So does anything else wrong
+  with what was given (1.4).
 - **`--help` anywhere** on the command line: the help is printed and the
-  node exits with code -1. Nothing else on the line is looked at.
-- **Every option is checked before anything is done** (1.4).
+  node exits with **0**. Nothing else on the line is looked at.
 
-### 1.3 The help, in sections (proposed)
+### 1.3 Times, sizes, and a file of options
 
-```
-tabminer: a node of the Tabernacle network. It mines unless told not to.
+- **A time** is so many seconds, or a number and `s`, `m`, `h` or `d`:
+  `--log-rotate-seconds 3600`, `60m` and `1h` are one setting.
+- **A size** is so many bytes, or a number and `k`, `m` or `g`, each
+  1,024 of the one before: `--log-rotate-bytes 1048576`, `1024k` and
+  `1m` are one setting.
+- A count is a count, and takes no unit.
 
-usage: tabminer [options]
-
-General
-  --help                    print this and exit
-  --network NAME            mainnet (default), dev or dev-recursive
-  --data-dir DIR            where the chain, the peers file and the logs are
-                            kept (default ~/.tabernacle/tabminer)
-  --threads N               threads for hashing and checking proofs
-                            (default: every core)
-
-Mining
-  --no-mine                 follow the chain without mining
-
-Network
-  --listen ADDR:PORT        the address datagrams are taken at
-                            (default 0.0.0.0:3737)
-  --peer ADDR:PORT          a peer to keep whatever it does; may be repeated
-  --seed HOST:PORT          a seed to look up besides the built-in ones;
-                            may be repeated
-  --no-seeds                do not use the built-in seeds
-
-Peers
-  --max-peers N             peers kept (default 64)
-  --target-peers N          live peers below which more are looked for
-                            (default 8)
-  --max-peers-per-host N    peers of one host, over all its ports (default 4)
-  --max-peers-per-network N peers of one /16 network (default 8)
-  --ping-seconds N          between pings of a peer (default 30)
-  --peer-live-seconds N     a peer silent this long is not counted live
-                            (default 65)
-  --peer-drop-seconds N     a peer silent this long is dropped (default 180)
-  --ban-strikes N           wrong answers before a host is refused (default 5)
-  --ban-seconds N           how long it is refused (default 3600)
-
-Sync
-  --sync-point N            take the state whole as of the block N under the
-                            best header when blocks cannot be had
-                            (default 144; 0: never)
-  --max-undo-blocks N       blocks that can be undone, and whose bodies and
-                            states are served (default 1008)
-  --header-fetches N        runs of headers fetched at once (default 16)
-  --block-fetches N         blocks fetched at once (default 24)
-  --block-fetches-per-peer N  of those, from one peer (default 8)
-  --part-fetches N          parts of a state fetched at once (default 32)
-  --header-wait-seconds N   how long a peer claiming more work may take to
-                            send a header we lack (default 15)
-  --pass-over-seconds N     how long a peer that failed us is passed over
-                            (default 600)
-
-Serving
-  --serve-chunks-per-second N   chunks sent a second, in all (default 8192)
-  --serve-queue N           requests for chunks that may wait (default 64)
-  --serve-queue-per-peer N  of those, from one address (default 8)
-
-Logging
-  --log-dir DIR             where the logs are kept (default: --data-dir)
-  --main-log FILE           the main log (default main.log in the log directory)
-  --request-log FILE        the request log (default request.log there)
-  --stat-log FILE           the stats log (default stat.log there)
-  --log-rotate-seconds N    a log's file is put aside after this long
-                            (default 3600)
-  --log-rotate-bytes N      or when it holds this much (default 1048576)
-  --request-log-queue N     lines that may wait to be written to the request
-                            log (default 10000)
-  --stat-interval-seconds N between lines of the stats log (default 10)
-  --stat-summary-seconds N  between its wholes (default 60)
-```
-
-Everything a node can be told is in the help, with its default: there
-are no settings that can only be found in the source. The few numbers
-left out are the ones that are not a node's to choose (`docs/WIRE.md`,
-2.9).
-
-### 1.4 What is checked (decided that it is; the list is proposed)
-
-One routine goes through every option before anything is opened, bound
-or written, and reports the first thing wrong as
+**A file of options** is given as `@FILE`:
 
 ```
-Error: <what is wrong>
+tabminer @my_config --max-peers 70
 ```
 
-followed by the help, and exits.
+```
+# my_config
+--no-mine
+--max-peers 2000            # a comment
+--data-dir /srv/my tab      # the rest of the line is the value
+--peer 203.0.113.7:3737
+```
+
+- One option to a line, written as on the command line. `#` begins a
+  comment.
+- **What the command line says is taken before what the file says**,
+  wherever on the line the `@FILE` is. With several files, a later one
+  before an earlier.
+- An option that may be given many times (`--peer`, `--seed`) has the
+  values of all of them.
+- What is wrong in a file is said with the file and the line:
+  `/work/my_config line 2: unknown configuration option: '--prot'`.
+- A file cannot name another file, and `--help` is for the command
+  line.
+
+### 1.4 What is checked
+
+One routine goes through everything given before anything is opened,
+bound or written, and reports the first thing wrong as `Error: <what is
+wrong>`, followed by the help.
 
 | Wrong | Said as |
 |---|---|
 | An option that is not one | `unknown configuration option: '--prot'` |
 | An option that needs a value and has none | `--max-peers needs a value` |
 | A value that is not what the option takes | `--max-peers: 'many' is not a number` |
-| A port out of range, or an address that is not one | `--listen: '0.0.0.0:70000' is not an address and port` |
-| An option given twice that may be given once | `--data-dir was given twice` |
-| A value the node cannot run with | `--target-peers (100) is over --max-peers (64)` |
-| A directory that cannot be used | `--log-dir: /var/log/tab cannot be written to: permission denied` |
+| | `--ping-seconds: '1.5' is not a time (as 90, 90s, 60m or 1h)` |
+| A port out of range, or an address that is not one | `--listen: '0.0.0.0:70000' is not an address and port (as 203.0.113.7:3737)` |
+| An option given twice in one place that may be given once | `--max-peers was given twice` |
+| Limits that cannot both hold | `--target-peers (100) is over --max-peers (64)` |
+| | `--sync-point (2000) is not under --max-undo-blocks (1008)` |
+| Two logs in one file | `two logs cannot be one file: /a/x.log` |
 
-The values a node cannot run with are the ones `net::config` already
-refuses (a live silence under two pings, a serving queue under one
-peer's share, and so on), said in terms of the options.
+Whether a directory can be written to is found when the node opens it,
+and said then (3.2).
 
-### 1.5 Where the logs go (decided)
+### 1.5 Where the logs go
 
 For each of the three logs, the first of these that was given:
 
 1. **Its own option**, the file's full name: `--main-log`,
    `--request-log`, `--stat-log`.
-2. **`--log-dir`**: the log, under its default name, in that directory.
-3. **`--data-dir`**: the log, under its default name, in the data
-   directory. This is what happens if nothing is said.
+2. **`--log-dir`**: the log, under its usual name, in that directory.
+3. **`--data-dir`**: the same, in the data directory. This is what
+   happens if nothing is said.
+
+The usual names are `tabernacle.log`, `request.log` and `stat.log`.
 
 ```
-tabminer                                   ~/.tabernacle/tabminer/main.log
-tabminer --data-dir /srv/tab               /srv/tab/main.log
+tabminer                                   ~/.tabernacle/tabminer/tabernacle.log
+tabminer --data-dir /srv/tab               /srv/tab/tabernacle.log
 tabminer --data-dir /srv/tab --log-dir /var/log/tab
-                                           /var/log/tab/main.log
+                                           /var/log/tab/tabernacle.log
 tabminer --log-dir /var/log/tab --stat-log /mnt/fast/stat.log
-                                           /var/log/tab/main.log
+                                           /var/log/tab/tabernacle.log
                                            /var/log/tab/request.log
                                            /mnt/fast/stat.log
 ```
 
-A file put aside is put beside the file it was (section 2.3).
+Every path the node keeps and prints is a whole path from the root: one
+given otherwise is taken from the directory the node was started in.
 
 ---
 
@@ -303,37 +265,34 @@ does the log.
 
 ## 3. Starting and stopping
 
-### 3.1 Starting (decided in outline; the lines are proposed)
+### 3.1 Starting (decided, and built but for the binary)
 
-When the configuration has no errors, the node says so in the main log
-and on the terminal alike (`log_all`): first when it started, then how
-it is configured, so that a log shows exactly how that run was set up.
-
-```
-[2026-10-17 19:30:44:000] tabminer 0.1.0 started
-[2026-10-17 19:30:44:000] configuration:
-[2026-10-17 19:30:44:000]   network                mainnet
-[2026-10-17 19:30:44:000]   data-dir               /home/chris/.tabernacle/tabminer
-[2026-10-17 19:30:44:000]   mine                   yes
-[2026-10-17 19:30:44:000]   listen                 0.0.0.0:3737
-[2026-10-17 19:30:44:000]   max-peers              2000          (default 64)
-[2026-10-17 19:30:44:000]   ...
-[2026-10-17 19:30:44:000]   main-log               /var/log/tab/main.log
-[2026-10-17 19:30:44:000]   request-log            /var/log/tab/request.log
-[2026-10-17 19:30:44:000]   stat-log               /mnt/fast/stat.log
-```
-
-Every option is listed with the value in force, and those that are not
-the default say what the default is.
-
-Then each step of starting, as it is done:
+When the configuration has no errors, the node says when it started and
+how it is configured, in the main log and on the terminal alike
+(`log_all`): so that a log shows exactly how that run was set up.
 
 ```
-[2026-10-17 19:30:44:412] store opened: block 88213 (3fa9c1e2), 142,113,907 outputs unspent
-[2026-10-17 19:30:46:530] proof of work table of epoch 3 loaded
-[2026-10-17 19:30:46:531] listening on 0.0.0.0:3737
-[2026-10-17 19:30:46:531] ready
+[2026-10-17 19:30:44:000] Server started 10-17-2026 19:30:44 UTC
+---------------------------------------------------------------------------------------------------------
+[2026-10-17 19:30:44:000] UDP Server Listening on: '0.0.0.0:3737'
+[2026-10-17 19:30:44:000] Configuration File:      '/work/my_config'
+[2026-10-17 19:30:44:000] Network:                 'mainnet'
+[2026-10-17 19:30:44:000] Mining:                  'yes'
+[2026-10-17 19:30:44:000] Data Directory:          '/home/chris/.tabernacle/tabminer'
+[2026-10-17 19:30:44:000] Main Log:                '/home/chris/.tabernacle/tabminer/tabernacle.log'
+[2026-10-17 19:30:44:000] Request Log:             '/home/chris/.tabernacle/tabminer/request.log'
+[2026-10-17 19:30:44:000] Stat Log:                '/home/chris/.tabernacle/tabminer/stat.log'
+[2026-10-17 19:30:44:000] Log Rotation Time:       '3,600 seconds'
+[2026-10-17 19:30:44:000] Log Rotation Size:       '1,048,576 bytes'
+[2026-10-17 19:30:44:000] Max Peers:               '2,000'
+...
+---------------------------------------------------------------------------------------------------------
+[2026-10-17 19:30:44:000] Server is ready!
 ```
+
+Every setting is listed, by name, with what it is in quotes, the quotes
+in one column. Paths are whole; numbers are written as in every log.
+"Server is ready!" comes after the store is open and the port bound.
 
 ### 3.2 When it cannot start (proposed)
 
@@ -373,15 +332,8 @@ platform, as the random source already is.
 
 ## 4. Still to settle
 
-1. **What comes after "the time the server started"** in the startup
-   messages: the message that asked for it ended there.
-2. **A settings file** as well as options, or options only? (Written
-   here as options only.)
-3. **Times in whole seconds and sizes in bytes**, with the unit in the
-   option's name, as above: or values with units (`1h`, `1MiB`)?
-4. **The default names** of the three logs: `main.log`, `request.log`,
-   `stat.log`?
-5. **`--help` exits with -1**, as asked. An unknown option and a bad
-   value: -1 as well?
-6. **What a request log line holds**, and **which columns the stats log
+1. **What a request log line holds**, and **which columns the stats log
    has**.
+2. **What the main log says between the configuration and "Server is
+   ready!"**, and for critical events after.
+3. **The genesis tool** as a package of its own.
