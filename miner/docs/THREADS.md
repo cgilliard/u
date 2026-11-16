@@ -208,8 +208,17 @@ one **list of what is to be downloaded**, which the workers share:
    the list again for another. A fetch that fails goes back on the
    list the same way.
 
-The list is behind a lock held for the length of a take or a put back:
+The list is behind a read/write lock. A worker looks at it under the
+read lock, which workers share; only taking an item, putting one back
+or adding to it takes the write lock, for the length of that change:
 microseconds, with nothing waited for inside it.
+
+What the list holds is what the node wants and what is being fetched,
+no more. Which peer has which block is not on it: each worker knows
+that of its own peers, and that is all it needs to take from the list.
+Nor is it what keeps junk out: a worker takes chunks only for a fetch
+it began itself, of a peer it asked, so what nobody asked for is never
+kept, whoever sends it.
 
 Blocks must join the chain in order though they arrive in any, from
 any worker: the applier holds a body until the block before it is in,
