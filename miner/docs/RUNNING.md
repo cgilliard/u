@@ -3,148 +3,173 @@
 How a node is told what to do, what it says while it runs, and what it
 says when it starts and stops.
 
-**This is a proposal.** Nothing in it is built: the binary is empty.
-It is here to be changed before any of it is written. Where the
+The logs (section 2) are decided and built. The rest is being settled:
+what is marked **decided** is, and what is marked **proposed** is here
+to be changed before it is written. The binary is still empty. Where the
 reference node (`tmp/miner`) does something different, that is noted,
 with the reason for changing it.
 
 ---
 
-## 1. Settings
+## 1. Configuration
 
-### 1.1 One name for each setting
+### 1.1 One program, no commands (decided)
 
-Every setting has one name, and that name is used everywhere: on the
-command line, in the settings file, in the documentation, and in the
-message that refuses a bad value.
-
-The names are the ones the code already uses (`net::config::Config`),
-with a dot between group and setting:
+`tabminer` is the miner, and running it runs it:
 
 ```
-peers.max            sync.sync_point        serve.rate
+tabminer [options]
 ```
 
-The reference has a flag for some settings (`--max-undo-blocks`), a
-constant in the source for most, and no file. Changing "64 peers"
-there means rebuilding.
+There is no `mine`, `node` or `genesis` word after it. A node that does
+not mine is `tabminer --no-mine`.
 
-### 1.2 Where settings come from
+The tool that makes a genesis block is a program of its own, built by
+its own Cargo package, so that the miner never has to tell the two
+apart. (Today it is a second binary of this package, `tools/genesis.rs`:
+to be moved.)
 
-Three places, each overriding the one before:
+### 1.2 Options (decided)
 
-1. **The defaults**, built in.
-2. **The settings file**: `tabminer.conf` in the data directory, if
-   there is one.
-3. **The command line.**
+Every option is `--name` or `--name value`. All configuration is by
+options.
 
-No environment variables. They are a fourth place to look when a node
-does something unexpected, and they are invisible in a process list.
-(The reference reads `TABMINER_THREADS` from the environment; here it
-is the setting `threads`.)
+- **An option that is not one**: the node prints
 
-### 1.3 The settings file
+  ```
+  Error: unknown configuration option: '--<option>'
+  ```
 
-Lines of `name = value`. `#` begins a comment. Nothing else: no
-sections, no quoting, no includes.
+  then the help, and exits.
+- **`--help` anywhere** on the command line: the help is printed and the
+  node exits with code -1. Nothing else on the line is looked at.
+- **Every option is checked before anything is done** (1.4).
 
-```
-# tabminer.conf
-listen        = 0.0.0.0:3737
-peers.max     = 2000          # this node is a seed
-serve.waiting = 5000
-sync.sync_point = 144
-peer          = 203.0.113.7:3737
-peer          = 198.51.100.20:3737
-```
-
-A setting that takes several values (`peer`, `seed`) is given once per
-value. Any other setting given twice in one place is an error.
-
-### 1.4 The command line
-
-The same names, with two dashes:
+### 1.3 The help, in sections (proposed)
 
 ```
-tabminer node --peers.max 2000 --peer 203.0.113.7:3737
+tabminer: a node of the Tabernacle network. It mines unless told not to.
+
+usage: tabminer [options]
+
+General
+  --help                    print this and exit
+  --network NAME            mainnet (default), dev or dev-recursive
+  --data-dir DIR            where the chain, the peers file and the logs are
+                            kept (default ~/.tabernacle/tabminer)
+  --threads N               threads for hashing and checking proofs
+                            (default: every core)
+
+Mining
+  --no-mine                 follow the chain without mining
+
+Network
+  --listen ADDR:PORT        the address datagrams are taken at
+                            (default 0.0.0.0:3737)
+  --peer ADDR:PORT          a peer to keep whatever it does; may be repeated
+  --seed HOST:PORT          a seed to look up besides the built-in ones;
+                            may be repeated
+  --no-seeds                do not use the built-in seeds
+
+Peers
+  --max-peers N             peers kept (default 64)
+  --target-peers N          live peers below which more are looked for
+                            (default 8)
+  --max-peers-per-host N    peers of one host, over all its ports (default 4)
+  --max-peers-per-network N peers of one /16 network (default 8)
+  --ping-seconds N          between pings of a peer (default 30)
+  --peer-live-seconds N     a peer silent this long is not counted live
+                            (default 65)
+  --peer-drop-seconds N     a peer silent this long is dropped (default 180)
+  --ban-strikes N           wrong answers before a host is refused (default 5)
+  --ban-seconds N           how long it is refused (default 3600)
+
+Sync
+  --sync-point N            take the state whole as of the block N under the
+                            best header when blocks cannot be had
+                            (default 144; 0: never)
+  --max-undo-blocks N       blocks that can be undone, and whose bodies and
+                            states are served (default 1008)
+  --header-fetches N        runs of headers fetched at once (default 16)
+  --block-fetches N         blocks fetched at once (default 24)
+  --block-fetches-per-peer N  of those, from one peer (default 8)
+  --part-fetches N          parts of a state fetched at once (default 32)
+  --header-wait-seconds N   how long a peer claiming more work may take to
+                            send a header we lack (default 15)
+  --pass-over-seconds N     how long a peer that failed us is passed over
+                            (default 600)
+
+Serving
+  --serve-chunks-per-second N   chunks sent a second, in all (default 8192)
+  --serve-queue N           requests for chunks that may wait (default 64)
+  --serve-queue-per-peer N  of those, from one address (default 8)
+
+Logging
+  --log-dir DIR             where the logs are kept (default: --data-dir)
+  --main-log FILE           the main log (default main.log in the log directory)
+  --request-log FILE        the request log (default request.log there)
+  --stat-log FILE           the stats log (default stat.log there)
+  --log-rotate-seconds N    a log's file is put aside after this long
+                            (default 3600)
+  --log-rotate-bytes N      or when it holds this much (default 1048576)
+  --request-log-queue N     lines that may wait to be written to the request
+                            log (default 10000)
+  --stat-interval-seconds N between lines of the stats log (default 10)
+  --stat-summary-seconds N  between its wholes (default 60)
 ```
 
-A few settings only make sense on the command line, because they say
-where the file is: `--data`, `--network`, `--config`.
+Everything a node can be told is in the help, with its default: there
+are no settings that can only be found in the source. The few numbers
+left out are the ones that are not a node's to choose (`docs/WIRE.md`,
+2.9).
 
-### 1.5 Values
+### 1.4 What is checked (decided that it is; the list is proposed)
 
-| Kind | Written | Examples |
-|---|---|---|
-| Count | digits, `_` allowed | `64`, `8_192` |
-| Time | a number and a unit: `ms`, `s`, `m`, `h`, `d` | `30s`, `10m`, `1h` |
-| Size | a number and a unit: `B`, `KB`, `MB`, `GB` | `32MB` |
-| Address | `host:port`; a seed may be a name, a peer and `listen` must be numbers | `0.0.0.0:3737` |
-| Yes or no | `yes`, `no` | `mine = no` |
-
-A time without a unit is refused, not guessed at: `sync.header_wait =
-15` could be seconds or milliseconds, and the two are very different
-nodes.
-
-### 1.6 A bad setting stops the node before it starts
-
-- A name that is no setting is an error, with the nearest name that is
-  one: `peers.maxx: no such setting (peers.max?)`.
-- A value that cannot be read is an error naming the setting, the value
-  and the place: `tabminer.conf line 4: peers.ping = 30: a time needs a
-  unit (30s?)`.
-- A value the node cannot run with is an error from the existing check
-  (`Config::check`): `peers.target is not between one and peers.max`.
-
-Nothing is opened, bound or written before all settings are read and
-checked.
-
-### 1.7 Seeing what a node will run with
+One routine goes through every option before anything is opened, bound
+or written, and reports the first thing wrong as
 
 ```
-tabminer config [the same options as node]
+Error: <what is wrong>
 ```
 
-prints every setting, its value, and where the value came from:
+followed by the help, and exits.
+
+| Wrong | Said as |
+|---|---|
+| An option that is not one | `unknown configuration option: '--prot'` |
+| An option that needs a value and has none | `--max-peers needs a value` |
+| A value that is not what the option takes | `--max-peers: 'many' is not a number` |
+| A port out of range, or an address that is not one | `--listen: '0.0.0.0:70000' is not an address and port` |
+| An option given twice that may be given once | `--data-dir was given twice` |
+| A value the node cannot run with | `--target-peers (100) is over --max-peers (64)` |
+| A directory that cannot be used | `--log-dir: /var/log/tab cannot be written to: permission denied` |
+
+The values a node cannot run with are the ones `net::config` already
+refuses (a live silence under two pings, a serving queue under one
+peer's share, and so on), said in terms of the options.
+
+### 1.5 Where the logs go (decided)
+
+For each of the three logs, the first of these that was given:
+
+1. **Its own option**, the file's full name: `--main-log`,
+   `--request-log`, `--stat-log`.
+2. **`--log-dir`**: the log, under its default name, in that directory.
+3. **`--data-dir`**: the log, under its default name, in the data
+   directory. This is what happens if nothing is said.
 
 ```
-peers.max          2000     tabminer.conf line 3
-peers.target       8        default
-serve.rate         8192     default
-sync.sync_point    0        command line
-...
+tabminer                                   ~/.tabernacle/tabminer/main.log
+tabminer --data-dir /srv/tab               /srv/tab/main.log
+tabminer --data-dir /srv/tab --log-dir /var/log/tab
+                                           /var/log/tab/main.log
+tabminer --log-dir /var/log/tab --stat-log /mnt/fast/stat.log
+                                           /var/log/tab/main.log
+                                           /var/log/tab/request.log
+                                           /mnt/fast/stat.log
 ```
 
-`tabminer config --changed` prints only those that are not the
-default. The same list, of changed settings only, is in the startup
-messages (section 3).
-
-### 1.8 The settings there are
-
-Everything in `docs/WIRE.md` section 2.9, under its name, plus:
-
-| Setting | Default | What it is |
-|---|---|---|
-| `data` | `~/.tabernacle/tabminer` (`-dev`, `-dev-recursive` for those networks) | Where the store, the peers file, the settings file and the log are |
-| `network` | `mainnet` | Which network |
-| `config` | `tabminer.conf` in `data` | The settings file |
-| `listen` | `0.0.0.0:3737` | The address datagrams are taken at |
-| `seed` | the network's built-in names | Names to look up for first peers; several |
-| `seeds` | `yes` | Whether the built-in seeds are used at all |
-| `peer` | none | A peer given by hand, kept whatever it does; several |
-| `keep` | `1008` (a week of blocks) | How many blocks can be undone, and so how far back bodies and states are served |
-| `threads` | all cores | Threads for hashing and checking proofs |
-| `tick` | `1s` | How often the node looks to what passes with time |
-| `log.level` | `info` | Section 2 |
-| `log.file` | `tabminer.log` in `data` | Section 2 |
-| `log.terminal` | `yes` if started from a terminal | Section 2 |
-| `log.keep` | `5` files of `20MB` | Section 2 |
-
-Mining, the wallet and the mempool will add theirs when they exist.
-
-**Not settings**, because every node of a network must agree on them:
-anything in `ChainParams`, the sizes on the wire, the sizes of the
-parts of a state.
+A file put aside is put beside the file it was (section 2.3).
 
 ---
 
@@ -278,68 +303,67 @@ does the log.
 
 ## 3. Starting and stopping
 
-### 3.1 What a start looks like
+### 3.1 Starting (decided in outline; the lines are proposed)
 
-Each step says what it is doing before it does it, and how long it
-took if that was more than a moment: a node that hangs on start then
-shows where.
-
-```
-tabminer 0.1.0, mainnet
-data: /home/chris/.tabernacle/tabminer
-settings: tabminer.conf (3), command line (1); 4 not the default:
-  peers.max = 2000            tabminer.conf line 3
-  serve.waiting = 5000        tabminer.conf line 4
-  peer = 203.0.113.7:3737     tabminer.conf line 6
-  log.level = debug           command line
-store: opened in 0.4 s; block 88213 (3fa9c1e2), 142,113,907 outputs unspent
-proof of work: table of epoch 3 loaded in 2.1 s
-listening on 0.0.0.0:3737
-peers: 37 remembered, 2 seeds, 1 given
-ready
-```
-
-If the store was being received when the node last stopped:
+When the configuration has no errors, the node says so in the main log
+and on the terminal alike (`log_all`): first when it started, then how
+it is configured, so that a log shows exactly how that run was set up.
 
 ```
-store: opened in 0.4 s; a state was being taken as of block 879,856, 1,204 of its parts received; going on
+[2026-10-17 19:30:44:000] tabminer 0.1.0 started
+[2026-10-17 19:30:44:000] configuration:
+[2026-10-17 19:30:44:000]   network                mainnet
+[2026-10-17 19:30:44:000]   data-dir               /home/chris/.tabernacle/tabminer
+[2026-10-17 19:30:44:000]   mine                   yes
+[2026-10-17 19:30:44:000]   listen                 0.0.0.0:3737
+[2026-10-17 19:30:44:000]   max-peers              2000          (default 64)
+[2026-10-17 19:30:44:000]   ...
+[2026-10-17 19:30:44:000]   main-log               /var/log/tab/main.log
+[2026-10-17 19:30:44:000]   request-log            /var/log/tab/request.log
+[2026-10-17 19:30:44:000]   stat-log               /mnt/fast/stat.log
 ```
 
-### 3.2 When it cannot start
+Every option is listed with the value in force, and those that are not
+the default say what the default is.
 
-One line saying what is wrong and, where there is something to do,
-what:
+Then each step of starting, as it is done:
 
 ```
-error: cannot listen on 0.0.0.0:3737: the address is in use (is another tabminer running? set listen to another port)
-error: the store in /home/chris/.tabernacle/tabminer is of another network (dev); this is mainnet
-error: tabminer.conf line 4: peers.ping = 30: a time needs a unit (30s?)
+[2026-10-17 19:30:44:412] store opened: block 88213 (3fa9c1e2), 142,113,907 outputs unspent
+[2026-10-17 19:30:46:530] proof of work table of epoch 3 loaded
+[2026-10-17 19:30:46:531] listening on 0.0.0.0:3737
+[2026-10-17 19:30:46:531] ready
 ```
 
-and the process ends with a code that says which kind:
+### 3.2 When it cannot start (proposed)
 
-| Code | Meaning |
-|---|---|
-| 0 | Stopped as asked |
-| 1 | Stopped by an error while running |
-| 2 | A bad setting or command line |
-| 3 | The data directory or the store cannot be used |
-| 4 | The network cannot be used (the port) |
+A configuration error is as in 1.4. Anything else that stops a start is
+one line, on the terminal and in the main log if that could be opened,
+saying what is wrong and what can be done:
 
-### 3.3 Stopping
+```
+Error: cannot listen on 0.0.0.0:3737: the address is in use (is another tabminer running?)
+Error: the store in /srv/tab is of another network (dev); this is mainnet
+```
+
+### 3.3 After that (decided)
+
+The main log holds only errors, critical events, each file of another
+log put aside, and stopping.
+
+### 3.4 Stopping (proposed)
 
 On an interrupt (Ctrl-C, or the operating system's signal to end):
 
 ```
-stopping: saying goodbye to 14 peers
-stopping: the block being applied is finished first
-stopped; tip 88214 (a01f33c9)
+[2026-10-17 21:02:10:118] stopping
+[2026-10-17 21:02:10:240] stopped; tip 88214 (a01f33c9)
 ```
 
 The node tells its peers it is going, finishes the work it has given
-the applier, saves the peers it knows, and closes the store. A second
-interrupt ends it at once; the store is safe to be cut off at any
-point, so that loses nothing but the goodbye.
+the applier, saves the peers it knows, writes the last of the stats and
+request logs, and closes the store. A second interrupt ends it at once;
+the store is safe to be cut off at any point.
 
 Taking an interrupt needs a call into the operating system that the
 standard library does not have, so it is written here for each
@@ -347,38 +371,17 @@ platform, as the random source already is.
 
 ---
 
-## 4. Commands
+## 4. Still to settle
 
-To begin with:
-
-| Command | Does |
-|---|---|
-| `tabminer node` | Runs a node |
-| `tabminer config` | Prints the settings a node would run with |
-| `tabminer help [command]` | Says what there is |
-| `tabminer version` | The version, and the networks this build has |
-
-`tabminer` with no command prints the help, and does not start
-anything. (The reference starts mining.)
-
-Mining, the wallet and a way to ask a running node how it is are for
-later.
-
----
-
-## 5. Questions
-
-1. **A settings file at all?** Or the command line only, as the
-   reference has it?
-2. **The dotted names** on the command line (`--peers.max`), the same
-   as in the file: or shorter flags for the common ones?
-3. **The log line**: a sentence, as above, or `name=value` pairs for
-   programs to read, or both (a sentence, then the pairs)?
-4. **Terminal and file both by default**, or one?
-5. **A status line a minute** at `info`: wanted, too often, or not
-   often enough?
-6. **`keep`** defaults to 1,008 blocks, a week, as the reference's
-   `--max-undo-blocks` does. Every node holds that many bodies: at two
-   megabytes a block, about two gigabytes. Right?
-7. **Starting from a terminal with no command**: help, as proposed, or
-   run a node?
+1. **What comes after "the time the server started"** in the startup
+   messages: the message that asked for it ended there.
+2. **A settings file** as well as options, or options only? (Written
+   here as options only.)
+3. **Times in whole seconds and sizes in bytes**, with the unit in the
+   option's name, as above: or values with units (`1h`, `1MiB`)?
+4. **The default names** of the three logs: `main.log`, `request.log`,
+   `stat.log`?
+5. **`--help` exits with -1**, as asked. An unknown option and a bad
+   value: -1 as well?
+6. **What a request log line holds**, and **which columns the stats log
+   has**.
