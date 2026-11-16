@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::block::BlockRef;
-use crate::chain::apply::tests::{grow, next_block};
+use crate::chain::apply::tests::{grow, grow_wide, next_block};
 use crate::chain::headers::tests::{NOW, easy, seed, table};
 use crate::chain::params::ChainParams;
 use crate::chain::verify::AcceptAllProofs;
@@ -873,7 +873,10 @@ fn a_block_that_breaks_a_rule_is_refused_once() {
 fn bodies_are_asked_only_of_those_that_hold_them() {
     let chains = vec![chain_of(easy()), chain_of(easy())];
     grow(&chains[0], KEEP + 6, 1);
-    let mut w = World::with(chains, &small_runs());
+    // (Set never to take a state whole, which it otherwise would.)
+    let mut cfg = small_runs();
+    cfg.sync.sync_point = 0;
+    let mut w = World::with(chains, &cfg);
     w.nodes[1].add_peer(at(0), false, 0);
     w.run(20 * SECOND);
     let said = w.nodes[1].peers().get(&at(0)).unwrap().status.unwrap();
@@ -994,4 +997,224 @@ fn a_state_is_served_as_far_back_as_can_be_undone() {
         node.object(&Object::Part { block: id(node, height), index: 0 }).unwrap();
     }
     assert!(node.served.len() == 62 && node.served.iter().map(|s| s.1.len()).sum::<usize>() <= SERVED_BYTES);
+}
+
+// -- The state, taken whole
+
+/// Settings under which a state is taken as of a block ten under the
+/// best header.
+fn joining() -> Config {
+    let mut cfg = small_runs();
+    cfg.sync.sync_point = 10;
+    cfg
+}
+
+/// A chain longer than its bodies reach back, with a state of several
+/// parts: `blocks` blocks of 300 outputs.
+fn long_chain(blocks: usize) -> (Arc<TestChain>, Vec<Vec<u8>>) {
+    let chain = chain_of(easy());
+    let made = grow_wide(&chain, blocks, 300, 1);
+    (chain, made)
+}
+
+/// A node that starts with nothing, among nodes whose bodies no longer
+/// reach back to the first block, takes the state as of a block ten
+/// under the best header and the blocks from there: it ends where they
+/// are, with their state.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "builds long chains; run with --release")]
+fn a_new_node_takes_the_state_and_goes_on_from_it() {
+    for loss in [0, 150] {
+        let (ahead, blocks) = long_chain(KEEP + 16);
+        let also = chain_of(easy());
+        give(&also, &blocks);
+        let mut w = World::with(vec![ahead, also, chain_of(easy())], &joining());
+        w.loss = loss;
+        w.nodes[2].add_peer(at(0), false, 0);
+        w.nodes[2].add_peer(at(1), false, 0);
+        w.run(90 * SECOND);
+        assert_eq!(tip(&w, 2), tip(&w, 0), "loss {loss}");
+        assert_eq!(w.nodes[2].chain().state().root(), w.nodes[0].chain().state().root());
+        let c = w.nodes[2].counts();
+        // Eighty headers; the state once, as of block seventy; and the
+        // ten blocks after it.
+        assert_eq!((c.headers, c.states, c.states_moved, c.blocks, c.blocks_refused), (80, 1, 0, 10, 0), "loss {loss}");
+        assert!(w.nodes[2].join.is_none() && !w.nodes[2].chain().receiving());
+        // The state was of three parts (twenty-one thousand outputs),
+        // and both peers served pieces of it.
+        let served: Vec<u32> = (0..2).map(|i| w.nodes[2].peers().get(&at(i)).unwrap().delivered).collect();
+        assert!(served.iter().all(|n| *n >= 2), "loss {loss}: {served:?}");
+        // It serves what it took: the block it took the state as of,
+        // and the state as of its tip.
+        let seventy = w.nodes[0].chain().header_at(70).unwrap().unwrap().hash();
+        assert!(w.nodes[2].make(&Object::Block(seventy)).is_some());
+        assert!(w.nodes[2].make(&Object::Manifest(tip(&w, 2).hash())).is_some());
+    }
+}
+
+/// A node with an old state, further behind than anyone's bodies reach,
+/// gives it up for the state taken whole.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "builds long chains; run with --release")]
+fn a_node_long_away_takes_the_state() {
+    let (ahead, blocks) = long_chain(KEEP + 16);
+    let away = chain_of(easy());
+    give(&away, &blocks[..5]);
+    let mut w = World::with(vec![ahead, away], &joining());
+    w.nodes[1].add_peer(at(0), false, 0);
+    w.run(60 * SECOND);
+    assert_eq!(tip(&w, 1), tip(&w, 0));
+    assert_eq!(w.nodes[1].chain().state().root(), w.nodes[0].chain().state().root());
+    let c = w.nodes[1].counts();
+    assert_eq!((c.headers, c.states, c.blocks), (75, 1, 10));
+}
+
+/// A node only a little behind takes blocks, not the state; and one set
+/// never to take a state waits for blocks nobody holds.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "builds long chains; run with --release")]
+fn the_state_is_taken_only_when_blocks_cannot_be_had() {
+    let (ahead, blocks) = long_chain(KEEP + 16);
+    let near = chain_of(easy());
+    give(&near, &blocks[..KEEP + 6]);
+    let mut never = joining();
+    never.sync.sync_point = 0;
+    let mut w = World::with(vec![ahead, near, chain_of(easy())], &joining());
+    w.nodes[2].cfg = never;
+    w.nodes[1].add_peer(at(0), false, 0);
+    w.nodes[2].add_peer(at(0), false, 0);
+    w.run(30 * SECOND);
+    assert_eq!(tip(&w, 1), tip(&w, 0));
+    assert_eq!((w.nodes[1].counts().states, w.nodes[1].counts().blocks), (0, 10));
+    assert_eq!((tip(&w, 2).height, w.best(2).height, w.nodes[2].counts().states), (0, KEEP as u32 + 16, 0));
+}
+
+/// A peer that serves pieces of the state that are not the state is
+/// struck for each, and the pieces come from another.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "builds long chains; run with --release")]
+fn wrong_pieces_of_a_state_are_refused() {
+    let (ahead, blocks) = long_chain(KEEP + 16);
+    let liar = chain_of(easy());
+    give(&liar, &blocks);
+    let mut w = World::with(vec![ahead, liar, chain_of(easy())], &joining());
+    w.nodes[2].add_peer(at(0), false, 0);
+    w.nodes[2].add_peer(at(1), false, 0);
+    // Headers first, from either; then one of the two begins to spoil
+    // everything it serves.
+    w.nodes[2].cfg.sync.sync_point = 0;
+    w.run(8 * SECOND);
+    assert_eq!(w.best(2).height, KEEP as u32 + 16);
+    w.nodes[1].spoil = true;
+    w.nodes[2].cfg.sync.sync_point = 10;
+    w.run(90 * SECOND);
+    assert_eq!(tip(&w, 2), tip(&w, 0));
+    assert_eq!(w.nodes[2].chain().state().root(), w.nodes[0].chain().state().root());
+    assert_eq!(w.nodes[2].counts().states, 1);
+    // The liar is out, or passed over; the honest one is neither.
+    let now = w.now;
+    assert!(!w.nodes[2].peers().may_ask(&at(1), now) && w.nodes[2].peers().may_ask(&at(0), now));
+}
+
+/// The peers go on past the block a state is being taken as of, until
+/// none can go back to it: the state is taken as of a later block, and
+/// the node ends where they are.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "builds long chains; run with --release")]
+fn a_state_is_gone_on_with_as_of_a_later_block() {
+    let (ahead, _) = long_chain(KEEP + 16);
+    let mut w = World::with(vec![ahead, chain_of(easy())], &joining());
+    w.nodes[1].add_peer(at(0), false, 0);
+    // Until it has begun to receive, and then nothing of the state
+    // reaches it for a while.
+    for _ in 0..400 {
+        w.run(50 * MILLI);
+        if w.nodes[1].chain().receiving() {
+            break;
+        }
+    }
+    assert_eq!(w.nodes[1].chain().receiving_as_of().map(|t| t.0), Some(70));
+    w.mute = vec![0];
+    // The other makes blocks meanwhile, until it can no longer go back
+    // to block seventy.
+    grow(w.nodes[0].chain(), 60, 2);
+    assert!(w.nodes[0].make(&Object::Manifest(w.nodes[0].chain().header_at(70).unwrap().unwrap().hash())).is_none());
+    w.mute.clear();
+    w.run(120 * SECOND);
+    assert_eq!(tip(&w, 1), tip(&w, 0));
+    assert_eq!(w.nodes[1].chain().state().root(), w.nodes[0].chain().state().root());
+    let c = w.nodes[1].counts();
+    assert_eq!((c.states, c.states_moved), (1, 1));
+    // The headers of the blocks made meanwhile were taken while the
+    // state was being received.
+    assert_eq!(c.headers, 140);
+}
+
+/// Each piece of a state is held to the piece above it as it arrives:
+/// one that is not what it should be is not kept, and its sender is
+/// not asked again while another can be.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "builds long chains; run with --release")]
+fn each_piece_of_a_state_is_checked_as_it_arrives() {
+    let (ahead, _) = long_chain(KEEP + 16);
+    let mut w = World::with(vec![ahead, chain_of(easy())], &joining());
+    w.nodes[1].add_peer(at(0), false, 0);
+    // Headers, and the block to take the state as of chosen; nothing of
+    // the state fetched yet.
+    w.nodes[1].cfg.sync.parts = 0;
+    w.run(10 * SECOND);
+    let now = w.now;
+    let (id, target) = {
+        let join = w.nodes[1].join.as_ref().unwrap();
+        (join.id, join.target)
+    };
+    assert_eq!(target.height, 70);
+    let (liar, honest) = (at(7), at(0));
+    let made = |w: &mut World, object: Object| w.nodes[0].make(&object).unwrap();
+    let unserved = |w: &World| w.nodes[1].join.as_ref().unwrap().unserved.clone();
+    // A manifest of another block's state, well formed: not this one's.
+    let other = w.nodes[0].chain().header_at(71).unwrap().unwrap().hash();
+    let wrong = made(&mut w, Object::Manifest(other));
+    w.nodes[1].piece_arrived(now, Object::Manifest(id), liar, &wrong);
+    assert!(w.nodes[1].join.as_ref().unwrap().manifest.is_none());
+    assert_eq!(unserved(&w), [liar]);
+    // The block with another's body.
+    let body = w.nodes[0].chain().body(&other).unwrap().unwrap();
+    w.nodes[1].piece_arrived(now, Object::Block(id), liar, &body);
+    assert!(w.nodes[1].join.as_ref().unwrap().block.is_none());
+    // The true ones: the block's proof is checked, and the roots are
+    // what is wanted next.
+    let (manifest, body) = (made(&mut w, Object::Manifest(id)), w.nodes[0].chain().body(&id).unwrap().unwrap());
+    w.nodes[1].piece_arrived(now, Object::Manifest(id), honest, &manifest);
+    w.nodes[1].piece_arrived(now, Object::Block(id), honest, &body);
+    assert!(w.nodes[1].join.as_ref().unwrap().checked && !w.nodes[1].chain().receiving());
+    // Roots of another block's range: not this manifest's.
+    let wrong = made(&mut w, Object::Roots { block: other, index: 0 });
+    w.nodes[1].piece_arrived(now, Object::Roots { block: id, index: 0 }, liar, &wrong);
+    assert!(w.nodes[1].join.as_ref().unwrap().roots.is_empty());
+    assert_eq!(unserved(&w).len(), 3);
+    let roots = made(&mut w, Object::Roots { block: id, index: 0 });
+    w.nodes[1].piece_arrived(now, Object::Roots { block: id, index: 0 }, honest, &roots);
+    assert!(w.nodes[1].chain().receiving());
+    let (missing, _) = w.nodes[1].chain().missing_parts().unwrap();
+    assert_eq!(missing, [0, 1, 2]);
+    // A part of another block's state; a part with a byte changed; a
+    // part that is no part at all.
+    let wrong = made(&mut w, Object::Part { block: other, index: 2 });
+    w.nodes[1].piece_arrived(now, Object::Part { block: id, index: 2 }, liar, &wrong);
+    let mut part = made(&mut w, Object::Part { block: id, index: 1 });
+    part[100] ^= 1;
+    w.nodes[1].piece_arrived(now, Object::Part { block: id, index: 1 }, liar, &part);
+    w.nodes[1].piece_arrived(now, Object::Part { block: id, index: 0 }, liar, b"nothing");
+    assert_eq!(w.nodes[1].chain().missing_parts().unwrap().0, [0, 1, 2]);
+    assert_eq!(unserved(&w).len(), 6);
+    assert!(unserved(&w).iter().all(|a| *a == liar));
+    // The true parts: the state is whole, at the block.
+    for index in [0u64, 1, 2] {
+        let part = made(&mut w, Object::Part { block: id, index });
+        w.nodes[1].piece_arrived(now, Object::Part { block: id, index }, honest, &part);
+    }
+    assert!(w.nodes[1].join.is_none() && !w.nodes[1].chain().receiving());
+    assert_eq!((tip(&w, 1), w.nodes[1].chain().state().root()), (target, target.state_root));
+    assert_eq!(w.nodes[1].counts().states, 1);
 }

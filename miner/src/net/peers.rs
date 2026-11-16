@@ -601,11 +601,22 @@ impl Peers {
     }
 
     /// The live peers, not passed over, that can hand over the state as
-    /// of `height` in parts.
+    /// of `height` in parts, and the block of that height with it.
     pub fn servers_of_state(&self, height: u32, now: Micros) -> impl Iterator<Item = &Peer> {
         self.live(now).filter(move |p| {
-            !self.passed_over(p, now) && p.status.is_some_and(|s| s.window <= height && height <= s.height)
+            !self.passed_over(p, now)
+                && p.status.is_some_and(|s| s.window <= height && s.oldest <= height && height <= s.height)
         })
+    }
+
+    /// The lowest height any live peer can hand the state over as of.
+    pub fn state_reach(&self, now: Micros) -> Option<u32> {
+        self.live(now)
+            .filter(|p| !self.passed_over(p, now))
+            .filter_map(|p| p.status)
+            .map(|s| s.window.max(s.oldest))
+            .filter(|reach| *reach <= self.live(now).filter_map(|p| p.status).map(|s| s.height).max().unwrap_or(0))
+            .min()
     }
 
     /// Whether `addr` may be asked for something: live, and not passed
@@ -1052,6 +1063,10 @@ mod tests {
         assert_eq!(at(40), [holds]);
         assert_eq!(t.servers_of_state(17, now).map(|p| p.addr).collect::<Vec<_>>(), [behind]);
         assert_eq!(t.servers_of_state(95, now).count(), 2);
+        // One that can go back to a block's state, and no longer holds
+        // the block, is not asked for the two.
+        assert_eq!(t.servers_of_state(16, now).count(), 1);
+        assert_eq!(t.state_reach(now), Some(15));
         // One that failed us is passed over for ten minutes.
         t.failed(&holds, now);
         assert_eq!(t.best_source(ours, 10, now).unwrap().addr, most);

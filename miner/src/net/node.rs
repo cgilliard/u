@@ -55,10 +55,18 @@
 //! A peer that serves a body that is not its header's, or a block that
 //! breaks a rule, takes a strike.
 //!
-//! # What is here so far
+//! # The state, taken whole
 //!
-//! Finding and keeping peers, headers and blocks. Taking the state
-//! whole from others comes on top of this.
+//! A node keeps bodies only for the blocks it can undo. One that is
+//! further behind than its peers' bodies reach cannot be given the
+//! blocks it lacks, and takes the state instead, as of a block a little
+//! under the best header: that block and the top of its state, the
+//! block's proof, then the state's parts, several at once from every
+//! peer that can serve them, each checked against the header's root
+//! before it is kept ([`crate::chain::receive`], [`super::snapshot`]).
+//! Headers go on being taken throughout. If the peers can no longer go
+//! back to the block, a later one is taken in its place, and the parts
+//! that are the same are kept.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{SocketAddr, SocketAddrV4};
@@ -110,6 +118,10 @@ pub struct Counts {
     pub blocks_refused: u64,
     /// Announcements of a block sent.
     pub announced: u64,
+    /// States taken whole from other nodes, and times the block one was
+    /// being taken as of was given up for another.
+    pub states: u64,
+    pub states_moved: u64,
 }
 
 /// Objects made to be served are kept while they are being asked for:
@@ -161,6 +173,35 @@ fn apply<B: Backend + 'static, V: ProofVerifier + Sync>(chain: &Chain<B, V>, job
 enum Applier {
     Here(VecDeque<Outcome>),
     Thread(std::sync::mpsc::Sender<Job>, std::sync::mpsc::Receiver<Outcome>),
+}
+
+/// A state being taken whole from other nodes, in place of the blocks
+/// nobody holds any more ([`crate::chain::receive`]).
+struct Join {
+    /// The block it is the state after.
+    target: Header,
+    id: Digest,
+    /// That block, whole, once fetched.
+    block: Option<Vec<u8>>,
+    /// The top of the state in parts, checked against the block's
+    /// header, and who served it.
+    manifest: Option<(Manifest, SocketAddrV4)>,
+    /// The block's proof has been checked, with what the manifest says
+    /// of where its outputs end.
+    checked: bool,
+    /// The roots of the parts of each range fetched so far.
+    roots: BTreeMap<u32, Vec<(u64, Digest)>>,
+    /// The chain has begun to receive the state.
+    begun: bool,
+    /// Peers that did not serve something of it: asked again only if
+    /// no other can be.
+    unserved: Vec<SocketAddrV4>,
+    /// Which peer is asked next.
+    turn: usize,
+    /// Manifests that the block's proof refused.
+    refused: u32,
+    /// Since when no peer has been able to serve it.
+    orphaned: Option<Micros>,
 }
 
 /// The chain being caught up with: a tip some peer has, and its headers
@@ -228,6 +269,8 @@ pub struct Node<B: Backend + 'static, V> {
     /// What came of the fetches asked for from outside
     /// ([`Node::fetch_object`]).
     inbox: Vec<(Object, SocketAddrV4, Option<Vec<u8>>)>,
+    /// The state being taken whole from others, if one is.
+    join: Option<Join>,
     counts: Counts,
     /// Tests: a chain's work claimed that is not there; objects served
     /// with a byte wrong.
@@ -275,6 +318,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             held: Vec::new(),
             announced: VecDeque::new(),
             inbox: Vec::new(),
+            join: None,
             counts: Counts::default(),
             #[cfg(test)]
             boast: None,
@@ -445,6 +489,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         }
         self.sync_headers(now, out);
         self.sync_blocks(now);
+        self.sync_state(now);
     }
 
     /// Takes a datagram that arrived from `from`. Call [`Node::tick`]
@@ -823,6 +868,10 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
     /// first to be applied once it is here. Blocks join the chain in
     /// order, so a body that arrives before the one below it waits.
     fn sync_blocks(&mut self, now: Micros) {
+        // While the state is being taken, no block can join.
+        if self.chain.receiving() {
+            return;
+        }
         let mut need = vec![self.chain.params().genesis().header; self.cfg.sync.lookahead];
         let n = self.chain.missing_bodies(&mut need).unwrap_or(0);
         let ids: Vec<Digest> = need[..n].iter().map(Header::hash).collect();
@@ -924,6 +973,276 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             }
             self.sync_blocks(now);
         }
+    }
+
+    // -- The state, taken whole
+
+    /// Whether `object` is a piece of the state being taken.
+    fn of_join(&self, object: &Object) -> bool {
+        let Some(join) = &self.join else {
+            return false;
+        };
+        match object {
+            Object::Block(id) | Object::Manifest(id) => *id == join.id,
+            Object::Roots { block, .. } | Object::Part { block, .. } | Object::Names { block, .. } => *block == join.id,
+            _ => false,
+        }
+    }
+
+    /// Takes the state whole when the blocks cannot be had: the bodies
+    /// the chain needs next are held by nobody, and some peer can still
+    /// go back to a block [`super::config::Sync::sync_point`] under the
+    /// best header. Then, step by step: that block and the top of its
+    /// state; the block's proof; the roots of the state's parts; the
+    /// parts. Each piece from whichever peer's turn it is, several at
+    /// once, each checked before the next is believed.
+    fn sync_state(&mut self, now: Micros) {
+        if self.join.is_none() && !self.begin_join(now) {
+            return;
+        }
+        let Some(join) = self.join.as_mut() else {
+            return;
+        };
+        // Who can serve it: those that can still go back to its block.
+        let mut servers: Vec<SocketAddrV4> =
+            self.peers.servers_of_state(join.target.height, now).map(|p| p.addr).collect();
+        if servers.is_empty() {
+            // Nobody, for long enough: the block is given up for a
+            // later one, and what was taken of its state that is the
+            // same in the later one's is kept.
+            let since = *join.orphaned.get_or_insert(now);
+            if now.saturating_sub(since) >= self.cfg.sync.header_wait {
+                self.join = None;
+                self.fetches.retain(|f| {
+                    !matches!(
+                        f.object,
+                        Object::Manifest(_) | Object::Roots { .. } | Object::Part { .. } | Object::Names { .. }
+                    )
+                });
+                // (Begun anew, the chain goes on with what it has
+                // received: `Chain::begin_receiving`.)
+                if self.begin_join(now) {
+                    self.counts.states_moved += 1;
+                }
+            }
+            return;
+        }
+        join.orphaned = None;
+        // Those that have not failed us in this first, while there are.
+        if servers.iter().any(|a| !join.unserved.contains(a)) {
+            servers.retain(|a| !join.unserved.contains(a));
+        }
+        // What is wanted now, in order of need.
+        let id = join.id;
+        let mut wanted: Vec<(Object, u32)> = Vec::new();
+        if join.block.is_none() {
+            wanted.push((Object::Block(id), (self.chain.params().max_block_size - HEADER_SIZE) as u32));
+        }
+        match &join.manifest {
+            None => wanted.push((Object::Manifest(id), snapshot::MAX_MANIFEST as u32)),
+            Some((manifest, _)) if join.checked && !join.begun => {
+                for (range, _) in &manifest.ranges {
+                    if !join.roots.contains_key(range) {
+                        wanted.push((Object::Roots { block: id, index: *range }, snapshot::MAX_ROOTS as u32));
+                    }
+                }
+            }
+            Some(_) => {}
+        }
+        if join.begun
+            && let Ok((parts, names)) = self.chain.missing_parts()
+        {
+            wanted.extend(parts.iter().map(|i| (Object::Part { block: id, index: *i }, snapshot::MAX_PART as u32)));
+            wanted.extend(names.iter().map(|i| (Object::Names { block: id, index: *i }, snapshot::MAX_NAMES as u32)));
+        }
+        for (object, most) in wanted {
+            let under_way = self.fetches.iter().filter(|f| f.object != object).filter(|f| {
+                matches!(
+                    f.object,
+                    Object::Manifest(_) | Object::Roots { .. } | Object::Part { .. } | Object::Names { .. }
+                )
+            });
+            if under_way.count() >= self.cfg.sync.parts {
+                break;
+            }
+            if self.fetches.iter().any(|f| f.object == object) {
+                continue;
+            }
+            join.turn = join.turn.wrapping_add(1);
+            let from = servers[join.turn % servers.len()];
+            let path = self.peers.get(&from).map(|p| p.path).unwrap_or_default();
+            let transfer = Self::number(&self.secret, &mut self.numbers);
+            self.fetches.push(Fetching { object, from, fetch: Fetch::new(transfer, None, most, path, now) });
+        }
+    }
+
+    /// Chooses the block to take the state as of, if it is to be taken
+    /// at all. True if one was chosen.
+    fn begin_join(&mut self, now: Micros) -> bool {
+        let point = self.cfg.sync.sync_point;
+        if point == 0 || self.aim.is_some() || !self.applying.is_empty() {
+            return false;
+        }
+        let Ok(best) = self.chain.best_header().map(|k| k.header) else {
+            return false;
+        };
+        // Already receiving (and the block it was as of given up): on,
+        // as of another. Else only where blocks cannot be had: the
+        // first body wanted is held by nobody that is there to ask.
+        if !self.chain.receiving() {
+            let mut first = [best];
+            if self.chain.missing_bodies(&mut first).unwrap_or(0) == 0
+                || self.peers.live(now).next().is_none()
+                || self.peers.holders(first[0].height, now).next().is_some()
+                || self.fetches.iter().any(|f| matches!(f.object, Object::Block(_)))
+                || !self.held.is_empty()
+            {
+                return false;
+            }
+        }
+        // As far under the best header as is asked, if anyone can go
+        // back so far; else as far back as anyone can.
+        let Some(reach) = self.peers.state_reach(now) else {
+            return false;
+        };
+        let height = best.height.saturating_sub(point).max(reach).max(1);
+        if height > best.height {
+            return false;
+        }
+        let Ok(Some(target)) = self.chain.ancestor(&best, height) else {
+            return false;
+        };
+        // The work of that header and of those after it in full: no
+        // proof to come vouches for it.
+        if !matches!(self.chain.confirm_work(&best, height), Ok(Ok(_))) {
+            return false;
+        }
+        self.join = Some(Join {
+            id: target.hash(),
+            target,
+            block: None,
+            manifest: None,
+            checked: false,
+            roots: BTreeMap::new(),
+            begun: false,
+            unserved: Vec::new(),
+            turn: 0,
+            refused: 0,
+            orphaned: None,
+        });
+        true
+    }
+
+    /// A piece of the state being taken has arrived whole from `from`.
+    fn piece_arrived(&mut self, now: Micros, object: Object, from: SocketAddrV4, bytes: &[u8]) {
+        let Some(join) = self.join.as_mut() else {
+            return;
+        };
+        // What a piece is checked against, and what is done with one
+        // that is not what it should be: its sender is struck, and it
+        // is asked of another.
+        let good = match object {
+            Object::Block(_) => {
+                let mut block = join.target.to_bytes().to_vec();
+                block.extend_from_slice(bytes);
+                let good = BlockRef::from_bytes(&block).is_ok_and(|b| b.body_commitment_matches());
+                if good {
+                    join.block = Some(block);
+                }
+                good
+            }
+            Object::Manifest(_) => match Manifest::decode(bytes) {
+                Ok(manifest) if manifest.check(&join.target.state_root) => {
+                    join.manifest = Some((manifest, from));
+                    true
+                }
+                _ => false,
+            },
+            Object::Roots { index, .. } => {
+                let want =
+                    join.manifest.as_ref().and_then(|(m, _)| m.ranges.iter().find(|r| r.0 == index)).map(|r| r.1);
+                match want.map(|root| snapshot::decode_roots(bytes, index, &root)) {
+                    Some(Ok(parts)) => {
+                        join.roots.insert(index, parts);
+                        true
+                    }
+                    Some(Err(_)) => false,
+                    None => true,
+                }
+            }
+            Object::Part { index, .. } => snapshot::decode_part(bytes, index)
+                .and_then(|(outputs, commits)| self.chain.put_part(index, &outputs, &commits))
+                .map_or_else(|e| e != Error::PartRoot && !matches!(e, Error::Malformed(_)), |()| true),
+            Object::Names { index, .. } => snapshot::decode_names(bytes)
+                .and_then(|records| self.chain.put_names(index, &records))
+                .map_or_else(|e| e != Error::PartRoot && !matches!(e, Error::Malformed(_)), |()| true),
+            _ => true,
+        };
+        if !good {
+            self.peers.strike(&from, now);
+            join.unserved.push(from);
+        }
+        self.advance_join(now);
+    }
+
+    /// The steps of taking a state that follow from what is in hand.
+    fn advance_join(&mut self, now: Micros) {
+        let Some(join) = self.join.as_mut() else {
+            return;
+        };
+        // The block and the top of its state: the block's proof, held to
+        // where the manifest says its outputs end.
+        if !join.checked
+            && let (Some(block), Some((manifest, served))) = (&join.block, &join.manifest)
+        {
+            let checked = BlockRef::from_bytes(block).and_then(|b| self.chain.check_state_block(&b, manifest.next));
+            match checked {
+                Ok(()) => join.checked = true,
+                // The block is its header's, so it is the manifest's
+                // word that failed: one peer's, unless one after another
+                // fails the same way.
+                Err(_) => {
+                    let served = *served;
+                    join.manifest = None;
+                    join.refused += 1;
+                    join.unserved.push(served);
+                    self.peers.strike(&served, now);
+                    if join.refused >= self.cfg.sync.snapshot_attempts {
+                        self.join = None;
+                        return;
+                    }
+                }
+            }
+        }
+        let Some(join) = self.join.as_mut() else {
+            return;
+        };
+        // Every range's roots: the state can begin to be received.
+        if join.checked
+            && !join.begun
+            && let Some((manifest, _)) = &join.manifest
+            && manifest.ranges.iter().all(|(range, _)| join.roots.contains_key(range))
+        {
+            let parts: Vec<(u64, Digest)> = join.roots.values().flatten().copied().collect();
+            match self.chain.begin_receiving(&join.target, manifest.next, &parts, &manifest.name_parts) {
+                Ok(()) => join.begun = true,
+                Err(_) => {
+                    self.join = None;
+                    return;
+                }
+            }
+        }
+        // Every part: the chain is whole, at the block.
+        if join.begun
+            && self.chain.missing_parts().is_ok_and(|(parts, names)| parts.is_empty() && names.is_empty())
+            && let Some(block) = &join.block
+            && self.chain.finish_receiving(&block[HEADER_SIZE..]).is_ok()
+        {
+            self.join = None;
+            self.counts.states += 1;
+            return self.sync_blocks(now);
+        }
+        self.sync_state(now);
     }
 
     // -- Objects
@@ -1149,6 +1468,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
 
     /// An object fetched whole from `from`.
     fn arrived(&mut self, now: Micros, object: Object, from: SocketAddrV4, bytes: &[u8]) {
+        if self.of_join(&object) {
+            return self.piece_arrived(now, object, from, bytes);
+        }
         match object {
             Object::Headers { from: first, .. } => self.headers_arrived(now, from, first, bytes),
             Object::Block(id) => self.body_arrived(now, from, id, bytes),
@@ -1162,6 +1484,17 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
     /// Of anything else: whoever asked for it is told, and decides.
     fn fetch_failed(&mut self, now: Micros, object: Object, from: SocketAddrV4) {
         self.counts.fetches_failed += 1;
+        // Of the state being taken: asked of another, and this peer
+        // not again while another can be.
+        if self.of_join(&object) {
+            if let Some(join) = self.join.as_mut() {
+                join.unserved.push(from);
+            }
+            // (Asked again when time is next looked to, not at once: if
+            // nobody has it, asking as fast as they can say so helps
+            // nobody.)
+            return;
+        }
         if matches!(object, Object::Headers { .. } | Object::Block(_)) {
             self.peers.failed(&from, now);
         }

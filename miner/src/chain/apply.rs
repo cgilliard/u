@@ -527,6 +527,24 @@ pub(crate) mod tests {
         block_with(chain, &body, if sound { None } else { Some(d(tag)) })
     }
 
+    /// Extends `chain` by `n` blocks of `outputs` outputs each, so that
+    /// a state of several parts is made in few blocks.
+    pub(crate) fn grow_wide<V: ProofVerifier + Sync>(
+        chain: &Chain<MemBackend, V>,
+        n: usize,
+        outputs: u32,
+        tag: u32,
+    ) -> Vec<Vec<u8>> {
+        (0..n as u32)
+            .map(|i| {
+                let outs: Vec<BlockOutput> = (0..outputs)
+                    .map(|k| out(tag * 1_000_000 + i * 10_000 + k, if k == 0 { PAY - (outputs as u64 - 1) } else { 1 }))
+                    .collect();
+                extend(chain, &body(&[], &outs))
+            })
+            .collect()
+    }
+
     /// Extends `chain` by `n` blocks, each making one output: `tag`
     /// tells one run of blocks from another on the same parent. The
     /// blocks, whole.
