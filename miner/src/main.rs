@@ -31,7 +31,14 @@ fn main() {
     let here = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
     let read = |path: &Path| std::fs::read_to_string(path);
     let configuration = match Configuration::read(&args, home.as_deref(), &here, &read) {
-        Ok(configuration) => configuration,
+        // A thread to a core, unless told how many: and from here on
+        // it is that many, so that the log says the number.
+        Ok(mut configuration) => {
+            if configuration.threads == 0 {
+                configuration.threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+            }
+            configuration
+        }
         Err(refused) => {
             // The help asked for is what was asked for; the help after
             // something wrong is a failure.
@@ -63,15 +70,9 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     if c.network != Network::Mainnet && !cfg!(feature = "dev") {
         return Err(format!("this build has no {} network: it is built with --features dev", c.network.name()));
     }
-    if c.threads > 0 {
-        tabminer::parallel::set_threads(c.threads);
-    }
-    // A worker to a core, unless told how many.
+    tabminer::parallel::set_threads(c.threads);
     let mut net = c.net.clone();
-    net.workers = match c.threads {
-        0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
-        n => n,
-    };
+    net.workers = c.threads;
 
     // Somewhere to keep things, and the logs: the main one first, so
     // that whatever else goes wrong is said there.

@@ -79,6 +79,9 @@ fn a_node_starts_says_it_is_ready_and_halts_when_told() {
     assert_eq!(&said[2][26..], format!("UDP Server Listening on: '{listen}'"));
     assert!(said.contains(&format!("{}Main Log:                '{data}/tabernacle.log'", &said[2][..26])));
     assert!(said.iter().any(|l| l.ends_with("Max Peers:               '2,000'")));
+    // How many threads, as a number: one a core, nothing being said.
+    let cores = std::thread::available_parallelism().unwrap().get();
+    assert!(said.iter().any(|l| l.ends_with(&format!("Threads:                 '{cores}'"))), "{said:#?}");
 
     // It is ready: a datagram that is no message is taken, and has its
     // line in the request log.
