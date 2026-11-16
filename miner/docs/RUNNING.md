@@ -373,7 +373,7 @@ library's `signal`, the same on every platform the node is built for
 
 1. **Mining.** It is not in this node yet, so `tabminer` without
    `--no-mine` says so and does not start.
-2. **Requests on more than one thread** (being discussed).
+2. **Requests on more than one thread**: `THREADS.md`.
 3. **The peers file and the built-in seeds.** `--peer` and `--seed` are
    what a node begins from today.
 4. **The genesis tool** itself, in its package.
