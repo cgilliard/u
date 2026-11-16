@@ -19,6 +19,7 @@ pub mod hash_machine;
 pub mod hash_table;
 #[cfg(test)]
 pub mod inflate;
+pub mod logger;
 pub mod merkle;
 pub mod name;
 pub mod name_air;
