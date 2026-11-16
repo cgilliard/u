@@ -215,7 +215,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Chain<B, V> {
 
     /// Rule 4. The commitment first: the other failures condemn the
     /// header, and hold only of the body it commits to.
-    fn check_body(&self, header: &Header, body: &BodyRef<'_>) -> Result<(), Error> {
+    pub(super) fn check_body(&self, header: &Header, body: &BodyRef<'_>) -> Result<(), Error> {
         if header.body_commitment != body.commitment() {
             return Err(Error::BadBodyCommitment);
         }

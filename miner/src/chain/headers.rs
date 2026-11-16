@@ -600,7 +600,7 @@ impl<B: Backend + 'static, V> Chain<B, V> {
     /// the chain up to it, by height. What the plan has of the same
     /// branch already stands, so a header that extends the best costs
     /// one entry.
-    fn plan(&self, txn: &Txn<'_, B>, blocks: &mut Blocks, best: &Header) -> Result<(), Error> {
+    pub(super) fn plan(&self, txn: &Txn<'_, B>, blocks: &mut Blocks, best: &Header) -> Result<(), Error> {
         blocks.drop_planned(txn, best.height.saturating_add(1), u32::MAX)?;
         let mut h = *best;
         // Down to where the plan already has the branch, or the chain.

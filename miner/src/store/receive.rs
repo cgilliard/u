@@ -209,6 +209,51 @@ impl<B: Backend + 'static> Receiving<B> {
         Ok(this)
     }
 
+    /// Whether `parts` and `name_parts` are the roots of the parts of
+    /// the state `target` names: what [`Receiving::open`] and
+    /// [`Receiving::replace`] check first.
+    pub fn check_roots(target: &Target, parts: &[(u64, Digest)], name_parts: &[(u32, Part)]) -> Result<(), Error> {
+        Self::check(target, parts, name_parts, PART_LEVEL, NAME_PART_LEVEL)
+    }
+
+    /// Goes on for another block: the state as of `target`, whose parts'
+    /// roots are these, in place of the one being received. The parts
+    /// whose roots are the same are kept, and only those that changed
+    /// are wanted again ([`Receiving::missing`]). [`Error::PartRoot`],
+    /// with nothing changed, if the roots are not the target's.
+    pub fn retarget(
+        self,
+        target: Target,
+        parts: &[(u64, Digest)],
+        name_parts: &[(u32, Part)],
+    ) -> Result<Receiving<B>, (Receiving<B>, Error)> {
+        if let Err(e) = Self::check(&target, parts, name_parts, self.level, self.name_level) {
+            return Err((self, e));
+        }
+        let (level, name_level) = (self.level, self.name_level);
+        let Receiving { file, outputs, names, blocks, commits, .. } = self;
+        // (Past the check, a failure is the file's, and there is no
+        // going back to what was.)
+        Receiving::begin(file.clone(), target, parts, name_parts, level, name_level, outputs, names, blocks, commits)
+            .map_err(|e| {
+                let lost = Receiving {
+                    file,
+                    target,
+                    outputs,
+                    names,
+                    blocks,
+                    commits,
+                    level,
+                    name_level,
+                    want: BTreeMap::new(),
+                    have: BTreeMap::new(),
+                    want_names: BTreeMap::new(),
+                    have_names: BTreeMap::new(),
+                };
+                (lost, e)
+            })
+    }
+
     /// What was handed over, against the root: first that it is a list
     /// of parts at all, since the hashing takes that for granted.
     fn check(
