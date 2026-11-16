@@ -71,8 +71,10 @@
 //!   drops lines, and says so in the main log.
 //! * The **stats** log: how the node is doing, every few seconds for
 //!   those seconds and every minute for the whole time since it
-//!   started, laid out to be read ([`stats`]). Also a thread of its
-//!   own.
+//!   started, in columns ([`stats`]). Also a thread of its own.
+//!
+//! Numbers and times are written the same way in all of them
+//! ([`fmt`]).
 //!
 //! # A log must not bring the node down
 //!
@@ -87,6 +89,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod fmt;
 pub mod queued;
 pub mod stats;
 

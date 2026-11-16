@@ -7,13 +7,16 @@
 //!
 //! The queue holds so many lines and no more. When it is full a line is
 //! dropped, not waited for: a node that is being asked more than its
-//! disk can note down should go on answering. Lines dropped are counted
-//! ([`Queued::dropped`]) and said in the main log, once a second at the
-//! most while it goes on:
+//! disk can note down should go on answering. That it happened is said
+//! in the main log there and then, by whoever's line was dropped, and
+//! not again for [`TOLD_EVERY`] while it goes on:
 //!
 //! ```text
-//! [2026-10-17 19:49:31:471] request.log: queue full (10000 lines), 3912 lines dropped so far
+//! [2026-10-17 19:49:31:471] dropped request log queued items
 //! ```
+//!
+//! As a rule the queue empties as fast as the disk takes its lines, and
+//! the log goes on from there with nothing more said.
 //!
 //! The thread also puts the file aside when it is due though nothing is
 //! being said ([`super::Logger::rotate_if_due`]).
@@ -38,34 +41,50 @@ enum Said {
     Hold(SyncSender<()>, Receiver<()>),
 }
 
-/// How often the thread looks to the file's age and to lines dropped,
-/// when nothing is said.
+/// How often the thread looks to the file's age, when nothing is said.
 const LOOK: Duration = Duration::from_secs(1);
+/// How long after the main log was told of lines dropped before it is
+/// told again, in milliseconds.
+pub const TOLD_EVERY: u64 = 5_000;
 
 /// A log written from a queue.
 pub struct Queued {
     said: Option<SyncSender<Said>>,
     logger: Arc<Logger>,
     capacity: usize,
-    dropped: Arc<AtomicU64>,
+    dropped: AtomicU64,
+    /// The main log, what is said in it of lines dropped, and when it
+    /// was last said (and one, so that nothing is never).
+    main: Arc<Logger>,
+    saying: String,
+    told_at: AtomicU64,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Queued {
     /// Starts the thread that writes `logger`, from a queue of
-    /// `capacity` lines. Lines dropped are said in `main`.
+    /// `capacity` lines. That lines were dropped is said in `main`.
     pub fn start(logger: Logger, capacity: usize, main: Arc<Logger>) -> io::Result<Queued> {
         let capacity = capacity.max(1);
         let (said, queue) = sync_channel::<Said>(capacity);
-        let (logger, dropped) = (Arc::new(logger), Arc::new(AtomicU64::new(0)));
+        let logger = Arc::new(logger);
         let name = logger.path().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        // "request.log" is the request log.
+        let stem = logger.path().file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let thread = {
-            let (logger, dropped) = (Arc::clone(&logger), Arc::clone(&dropped));
-            std::thread::Builder::new()
-                .name(format!("log {name}"))
-                .spawn(move || write_from(queue, &logger, &dropped, &main, &name, capacity))?
+            let logger = Arc::clone(&logger);
+            std::thread::Builder::new().name(format!("log {name}")).spawn(move || write_from(queue, &logger))?
         };
-        Ok(Queued { said: Some(said), logger, capacity, dropped, thread: Some(thread) })
+        Ok(Queued {
+            said: Some(said),
+            logger,
+            capacity,
+            dropped: AtomicU64::new(0),
+            main,
+            saying: format!("dropped {stem} log queued items"),
+            told_at: AtomicU64::new(0),
+            thread: Some(thread),
+        })
     }
 
     /// Says `line`, with the time now before it.
@@ -83,14 +102,22 @@ impl Queued {
         let Some(said) = &self.said else { return };
         match said.try_send(Said::Line(now, text)) {
             Ok(()) => {}
-            // Full, or the thread is gone: the line is lost, and counted.
+            // Full, or the thread is gone: the line is lost. Said in
+            // the main log, by whoever is first to find it so in a
+            // while.
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
+                let told = self.told_at.load(Ordering::Relaxed);
+                if (told == 0 || now.saturating_sub(told - 1) >= TOLD_EVERY)
+                    && self.told_at.compare_exchange(told, now + 1, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+                {
+                    self.main.log(&self.saying);
+                }
             }
         }
     }
 
-    /// Lines dropped because the queue was full.
+    /// Lines dropped because the queue was full: for the stats.
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
@@ -126,11 +153,9 @@ impl Drop for Queued {
     }
 }
 
-fn write_from(queue: Receiver<Said>, logger: &Logger, dropped: &AtomicU64, main: &Logger, name: &str, capacity: usize) {
-    let (mut told, mut told_at) = (0u64, 0u64);
+fn write_from(queue: Receiver<Said>, logger: &Logger) {
     loop {
-        let said = queue.recv_timeout(LOOK);
-        match said {
+        match queue.recv_timeout(LOOK) {
             Ok(Said::Line(now, text)) => logger.write_at(now, &text),
             Ok(Said::Flush(done)) => {
                 let _ = done.send(());
@@ -141,19 +166,8 @@ fn write_from(queue: Receiver<Said>, logger: &Logger, dropped: &AtomicU64, main:
                 let _ = go.recv();
             }
             Err(RecvTimeoutError::Timeout) => logger.rotate_if_due(),
-            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Disconnected) => return,
         }
-        // Lines dropped since it was last said: said again, a second
-        // after at the soonest.
-        let (lost, now) = (dropped.load(Ordering::Relaxed), logger.now());
-        if lost > told && (told == 0 || now.saturating_sub(told_at) >= 1000) {
-            main.log(&format!("{name}: queue full ({capacity} lines), {lost} lines dropped so far"));
-            (told, told_at) = (lost, now);
-        }
-    }
-    let lost = dropped.load(Ordering::Relaxed);
-    if lost > told {
-        main.log(&format!("{name}: queue full ({capacity} lines), {lost} lines dropped in all"));
     }
 }
 
@@ -235,15 +249,15 @@ mod tests {
         log.flush();
         // The first eight are there; the rest were never written.
         assert_eq!(lines(&dir.join("request.log")), (0..8).map(|n| format!("line {n}")).collect::<Vec<_>>());
-        // Said once, not nine hundred times; and again with the count
-        // when the log is closed, if more were lost since.
+        // Said once, not nine hundred times, and at the time.
         let said = lines(&dir.join("main.log"));
         assert_eq!(said.len(), 1, "{said:?}");
-        assert!(said[0].ends_with("request.log: queue full (8 lines), 992 lines dropped so far"), "{}", said[0]);
-        // After it, lines are taken again.
+        assert!(said[0].starts_with('[') && said[0].ends_with("] dropped request log queued items"), "{}", said[0]);
+        // After it, lines are taken again, with nothing more said.
         log.log_no_header("after");
         log.flush();
         assert_eq!(lines(&dir.join("request.log")).last().unwrap(), "after");
+        assert_eq!(lines(&dir.join("main.log")).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -209,29 +209,44 @@ A file that holds nothing but that line is not put aside.
 Whoever answers a request does not wait for the disk: the line goes on
 a queue with the time it was said, and the log's own thread writes it.
 The queue's size is a setting. When it is full, lines are dropped, not
-waited for, and the main log says so, once a second at the most while
-it goes on:
+waited for, and the main log says so there and then, and not again for
+five seconds while it goes on:
 
 ```
-[2026-10-17 19:49:31:471] request.log: queue full (10000 lines), 3912 lines dropped so far
+[2026-10-17 19:49:31:471] dropped request log queued items
 ```
+
+How many were dropped is not said. As a rule the queue empties as fast
+as the disk takes its lines, and the log goes on.
 
 ### 2.5 The stats log
 
+In columns, a line at a time (`docs/stat_sample.log`):
+
 ```
-[2026-10-17 19:49:35:000] last 5.0 s
-    requests                 1,204           240.8 /s
-    bytes sent         105,735,600            21.1 MB/s
-    peers live                  14
-[2026-10-17 19:50:00:000] since start, 2 h 14 m 05 s
-    requests            41,022,117         5,099.1 /s
-    bytes sent       9,812,004,551             1.2 MB/s
-    peers live                  14
+Uptime: 300:00:00         Requests_______BytesSent_________PeersLive
+[2026-10-17 19:30:44:000] 3,000          1,000,003         14
+Interval (5 seconds)      43             1,030             13
+Interval (5 seconds)      43             1,030             15
+Uptime: 300:01:00         Requests_______BytesSent_________PeersLive
+[2026-10-17 19:31:44:000] 3,333          1,300,000         15
+Interval (5 seconds)      43             1,030             13
 ```
 
-How often each kind of block is written is a setting (five seconds and
-a minute unless set otherwise). The whole is written once more when the
-node stops.
+- Every minute (a setting): the columns' names, with how long the node
+  has been up, and under them the whole since it started, with the
+  time.
+- Every five seconds (a setting): what happened in those seconds.
+- A counted number shows the whole in the one and the interval's share
+  in the other; a level (peers live) shows what it is at that moment in
+  both.
+- A column is as wide as its name and its numbers need. A number too
+  wide for its column moves the rest of that line over.
+
+The whole is written once when the node starts and once more when it
+stops. Numbers and times are written by the same few functions in every
+log (`logger::fmt`): commas between thousands, bytes in the unit that
+fits, uptime as hours, minutes and seconds.
 
 ### 2.6 Nothing here stops the node
 

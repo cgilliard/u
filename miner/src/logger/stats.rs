@@ -4,25 +4,31 @@
 //! requests, so many bytes sent, so many peers live. Whoever does a
 //! thing adds to its number ([`Stats::add`]), which costs one atomic
 //! add and nothing else. A thread of its own ([`StatsLog`]) reads them
-//! and writes two kinds of block to the stats log:
-//!
-//! * every few seconds (five, unless set otherwise), what happened in
-//!   those seconds;
-//! * every minute (unless set otherwise), the whole since the node
-//!   started.
+//! and writes the stats log, a line at a time, in columns:
 //!
 //! ```text
-//! [2026-10-17 19:49:35:000] last 5.0 s
-//!     requests                    1,204          240.8 /s
-//!     bytes sent            105,735,600           21.1 MB/s
-//!     peers live                     14
-//! [2026-10-17 19:50:00:000] since start, 2 h 14 m 05 s
-//!     requests               41,022,117          5,099.4 /s
-//!     bytes sent          9,812,004,551              1.2 MB/s
-//!     peers live                     14
+//! Uptime: 300:00:00         Requests_______BytesSent_________PeersLive
+//! [2026-10-17 19:30:44:000] 3,000          1,000,003         14
+//! Interval (5 seconds)      43             1,030             13
+//! Interval (5 seconds)      43             1,030             15
+//! Uptime: 300:01:00         Requests_______BytesSent_________PeersLive
+//! [2026-10-17 19:31:44:000] 3,333          1,300,000         15
+//! Interval (5 seconds)      43             1,030             13
 //! ```
 //!
-//! A block is written in one piece, so nothing comes between its lines.
+//! * Every minute (unless set otherwise): the columns' names, with how
+//!   long the node has been up, and under them the whole since it
+//!   started, with the time.
+//! * Every five seconds (unless set otherwise): what happened in those
+//!   seconds.
+//!
+//! A number that is counted (requests, bytes) shows in a line of the
+//! whole how many there have been, and in an interval's line how many
+//! there were in it. A number that is a level (peers live) shows in
+//! both what it is at that moment.
+//!
+//! The names and the whole are written in one piece, so that nothing
+//! comes between them.
 
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,31 +36,43 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use super::fmt::{column, commas, seconds, uptime};
 use super::{Logger, Moment};
 
-/// What kind of number a stat is: how it is shown.
+/// What kind of number a stat is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
-    /// Things counted: shown with how many a second.
+    /// Things counted.
     Count,
-    /// Bytes counted: shown with bytes a second, in the unit that fits.
+    /// Bytes counted: a wider column, for they are many.
     Bytes,
-    /// How much of something there is now (peers, fetches under way):
-    /// shown as it stands, with no rate.
+    /// How much of something there is now (peers, fetches under way).
     Level,
 }
 
+/// How wide the first column is: the time before a line, and a space.
+const FIRST: usize = 26;
+
 /// The numbers a node keeps of itself.
 pub struct Stats {
-    names: Vec<(String, Kind)>,
+    /// Each one's name, kind, and the width of its column.
+    names: Vec<(String, Kind, usize)>,
     values: Vec<AtomicU64>,
 }
 
 impl Stats {
-    /// Stats of these names and kinds, in the order they are shown.
+    /// Stats of these names and kinds, in the order of their columns.
+    /// A name is one word (`BytesSent`), since columns are told apart
+    /// by the space between them.
     pub fn new(names: &[(&str, Kind)]) -> Stats {
+        let width = |name: &str, kind: Kind| {
+            // Room for a number in the billions (bytes: in the
+            // trillions), and for the name and two more.
+            let least = if kind == Kind::Bytes { 18 } else { 15 };
+            least.max(name.chars().count() + 2)
+        };
         Stats {
-            names: names.iter().map(|(n, k)| (n.to_string(), *k)).collect(),
+            names: names.iter().map(|(n, k)| (n.to_string(), *k, width(n, *k))).collect(),
             values: names.iter().map(|_| AtomicU64::new(0)).collect(),
         }
     }
@@ -74,69 +92,41 @@ impl Stats {
         self.values.iter().map(|v| v.load(Ordering::Relaxed)).collect()
     }
 
-    /// A block: `title` on a line with the time before it, then a line
-    /// a stat. A counted stat shows how much it grew from `before` to
-    /// `now` and that over `seconds`; a level shows what it is in
-    /// `now`.
-    pub fn block(&self, moment: &Moment, title: &str, seconds: f64, before: &[u64], now: &[u64]) -> String {
-        let wide = self.names.iter().map(|(n, _)| n.chars().count()).max().unwrap_or(0);
-        let mut out = format!("{} {title}\n", moment.header());
-        for (i, (name, kind)) in self.names.iter().enumerate() {
-            let pad = " ".repeat(wide - name.chars().count());
-            match kind {
-                Kind::Level => out += &format!("    {name}{pad}  {:>18}\n", grouped(now[i])),
-                Kind::Count | Kind::Bytes => {
-                    let grew = now[i].saturating_sub(before[i]);
-                    let rate = if seconds > 0.0 { grew as f64 / seconds } else { 0.0 };
-                    let (rate, unit) = match kind {
-                        Kind::Bytes => bytes_a_second(rate),
-                        _ => (rate, "/s"),
-                    };
-                    out += &format!("    {name}{pad}  {:>18}  {:>14} {unit}\n", grouped(grew), decimal(rate));
-                }
+    /// A line: `first` in the first column, then `cell` of each stat in
+    /// its own, filled out with `fill`; the last is not filled out, so
+    /// that no line ends in spaces.
+    fn line(&self, first: &str, fill: char, cell: impl Fn(usize) -> String) -> String {
+        let mut out = column(first, FIRST, ' ');
+        for (i, (_, _, width)) in self.names.iter().enumerate() {
+            match i + 1 == self.names.len() {
+                true => out += &cell(i),
+                false => out += &column(&cell(i), *width, fill),
             }
         }
+        out.push('\n');
         out
     }
-}
 
-/// A whole number with a comma between each three digits.
-pub fn grouped(n: u64) -> String {
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
+    /// The columns' names, after how long the node has been up:
+    /// `Uptime: 300:00:00         Requests_______BytesSent_________PeersLive`.
+    pub fn names(&self, up_seconds: u64) -> String {
+        self.line(&format!("Uptime: {}", uptime(up_seconds)), '_', |i| self.names[i].0.clone())
     }
-    out
-}
 
-/// A number to one place of decimals, its whole part grouped.
-fn decimal(x: f64) -> String {
-    let tenths = (x * 10.0).round() as u64;
-    format!("{}.{}", grouped(tenths / 10), tenths % 10)
-}
-
-/// A rate of bytes in the unit that fits it.
-fn bytes_a_second(rate: f64) -> (f64, &'static str) {
-    match rate {
-        r if r >= 1e9 => (r / 1e9, "GB/s"),
-        r if r >= 1e6 => (r / 1e6, "MB/s"),
-        r if r >= 1e3 => (r / 1e3, "KB/s"),
-        r => (r, "B/s"),
+    /// The whole since the start, after the time:
+    /// `[2026-10-17 19:30:44:000] 3,000          1,000,003         14`.
+    pub fn whole(&self, moment: &Moment, now: &[u64]) -> String {
+        self.line(&moment.header(), ' ', |i| commas(now[i]))
     }
-}
 
-/// A length of time as it is said: `2 h 14 m 05 s`, `3 d 00 h 00 m 12 s`.
-pub fn lasting(seconds: u64) -> String {
-    let (d, h, m, s) = (seconds / 86_400, seconds % 86_400 / 3600, seconds % 3600 / 60, seconds % 60);
-    match (d, h, m) {
-        (0, 0, 0) => format!("{s} s"),
-        (0, 0, _) => format!("{m} m {s:02} s"),
-        (0, _, _) => format!("{h} h {m:02} m {s:02} s"),
-        _ => format!("{d} d {h:02} h {m:02} m {s:02} s"),
+    /// What happened in an interval of `millis`, from the stats as they
+    /// were `before` it to as they are `now`:
+    /// `Interval (5 seconds)      43             1,030             13`.
+    pub fn interval(&self, millis: u64, before: &[u64], now: &[u64]) -> String {
+        self.line(&format!("Interval ({})", seconds(millis)), ' ', |i| match self.names[i].1 {
+            Kind::Level => commas(now[i]),
+            Kind::Count | Kind::Bytes => commas(now[i].saturating_sub(before[i])),
+        })
     }
 }
 
@@ -146,7 +136,8 @@ pub struct Every {
     /// How often what happened since the last time is written, in
     /// milliseconds.
     pub interval: u64,
-    /// How often the whole since the start is, in milliseconds.
+    /// How often the names and the whole since the start are, in
+    /// milliseconds.
     pub summary: u64,
 }
 
@@ -164,7 +155,8 @@ pub struct StatsLog {
 }
 
 impl StatsLog {
-    /// Starts writing `stats` to `logger`, as often as `every` says.
+    /// Starts writing `stats` to `logger`, as often as `every` says:
+    /// the names and the whole at once, and then as time passes.
     pub fn start(logger: Logger, stats: Arc<Stats>, every: Every) -> io::Result<StatsLog> {
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let thread = {
@@ -190,13 +182,12 @@ impl Drop for StatsLog {
 fn write(logger: &Logger, stats: &Stats, every: Every, stop: &(Mutex<bool>, Condvar)) {
     let (interval, summary) = (every.interval.max(1), every.summary.max(1));
     let started = logger.now();
-    let zero = vec![0; stats.values.len()];
-    let (mut last, mut last_at, mut summed_at) = (stats.read(), started, started);
-    let since_start = |now: u64, values: &[u64]| {
-        let seconds = now.saturating_sub(started) as f64 / 1000.0;
-        let title = format!("since start, {}", lasting(now.saturating_sub(started) / 1000));
-        logger.write_at(now, &stats.block(&Moment::of(now), &title, seconds, &zero, values));
+    let whole = |now: u64, values: &[u64]| {
+        let up = now.saturating_sub(started) / 1000;
+        logger.write_at(now, &(stats.names(up) + &stats.whole(&Moment::of(now), values)));
     };
+    let (mut last, mut last_at, mut summed_at) = (stats.read(), started, started);
+    whole(started, &last);
     loop {
         // Until the next time, or until told to stop.
         let stopped = stop.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -205,17 +196,17 @@ fn write(logger: &Logger, stats: &Stats, every: Every, stop: &(Mutex<bool>, Cond
             stop.1.wait_timeout_while(stopped, wait, |stopped| !*stopped).unwrap_or_else(|e| e.into_inner());
         let (now, values) = (logger.now(), stats.read());
         if *stopped {
-            return since_start(now, &values);
+            return whole(now, &values);
         }
         drop(stopped);
         if now.saturating_sub(last_at) < interval {
             continue;
         }
-        let seconds = now.saturating_sub(last_at) as f64 / 1000.0;
-        let title = format!("last {seconds:.1} s");
-        logger.write_at(now, &stats.block(&Moment::of(now), &title, seconds, &last, &values));
+        // (Its length as set, not as it fell to the millisecond: the
+        // line says which interval it is, and they are all the one.)
+        logger.write_at(now, &stats.interval(interval, &last, &values));
         if now.saturating_sub(summed_at) >= summary {
-            since_start(now, &values);
+            whole(now, &values);
             summed_at = now;
         }
         logger.rotate_if_due();
@@ -228,74 +219,71 @@ mod tests {
     use super::*;
     use crate::logger::Rotation;
 
-    /// 2026-10-17 19:49:35.000 UTC.
-    const T: u64 = 1_792_266_575_000;
+    /// 2026-10-17 19:30:44.000 UTC.
+    const T: u64 = 1_792_265_444_000;
 
     fn stats() -> Stats {
-        Stats::new(&[
-            ("requests", Kind::Count),
-            ("bytes sent", Kind::Bytes),
-            ("peers live", Kind::Level),
-            ("blocks", Kind::Count),
-        ])
+        Stats::new(&[("Requests", Kind::Count), ("BytesSent", Kind::Bytes), ("PeersLive", Kind::Level)])
     }
 
+    /// The lines of `docs/stat_sample.log`.
     #[test]
-    fn a_block_is_laid_out_to_be_read() {
+    fn the_lines_are_in_columns() {
         let s = stats();
-        let before = [1000, 5_000_000, 12, 7];
-        let now = [2204, 110_735_600, 14, 7];
+        let lines = [
+            s.names(300 * 3600),
+            s.whole(&Moment::of(T), &[3000, 1_000_003, 14]),
+            s.interval(5000, &[3000, 1_000_003, 14], &[3043, 1_001_033, 13]),
+            s.interval(5000, &[3043, 1_001_033, 13], &[3086, 1_002_063, 15]),
+            s.names(300 * 3600 + 60),
+            s.whole(&Moment::of(T + 60_000), &[3333, 1_300_000, 15]),
+        ];
         assert_eq!(
-            s.block(&Moment::of(T), "last 5.0 s", 5.0, &before, &now),
-            "[2026-10-17 19:49:35:000] last 5.0 s\n\
-             \x20   requests                 1,204           240.8 /s\n\
-             \x20   bytes sent         105,735,600            21.1 MB/s\n\
-             \x20   peers live                  14\n\
-             \x20   blocks                       0             0.0 /s\n"
+            lines.concat(),
+            "Uptime: 300:00:00         Requests_______BytesSent_________PeersLive\n\
+             [2026-10-17 19:30:44:000] 3,000          1,000,003         14\n\
+             Interval (5 seconds)      43             1,030             13\n\
+             Interval (5 seconds)      43             1,030             15\n\
+             Uptime: 300:01:00         Requests_______BytesSent_________PeersLive\n\
+             [2026-10-17 19:31:44:000] 3,333          1,300,000         15\n"
         );
-        // The whole since the start: from nothing.
-        let whole = s.block(
-            &Moment::of(T + 25_000),
-            "since start, 2 h 14 m 05 s",
-            8045.0,
-            &[0; 4],
-            &[41_022_117, 9_812_004_551, 14, 13],
-        );
-        assert_eq!(
-            whole,
-            "[2026-10-17 19:50:00:000] since start, 2 h 14 m 05 s\n\
-             \x20   requests            41,022,117         5,099.1 /s\n\
-             \x20   bytes sent       9,812,004,551             1.2 MB/s\n\
-             \x20   peers live                  14\n\
-             \x20   blocks                      13             0.0 /s\n"
-        );
-        // The numbers of a column end under one another, whatever
-        // their size.
-        let ends =
-            |l: &str, n: usize| l.split_whitespace().take(n + 1).map(|w| l.find(w).unwrap() + w.len()).last().unwrap();
-        let lines: Vec<&str> = whole.lines().skip(1).collect();
-        assert!(
-            lines
-                .iter()
-                .all(|l| ends(l, 1 + (l.starts_with("    bytes") || l.starts_with("    peers")) as usize) == 34)
-        );
+        // Each column begins at the same place in every line, and no
+        // line ends in spaces.
+        for line in lines.iter().map(|l| l.trim_end_matches('\n')) {
+            assert!(!line.ends_with(' '));
+            for at in [26, 41, 59] {
+                assert!(
+                    line.is_char_boundary(at) && &line[at - 1..at] != "," && !line[at..].starts_with([' ', '_']),
+                    "{line}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn numbers_and_times_are_written_as_they_are_said() {
-        assert_eq!([grouped(0), grouped(999), grouped(1000), grouped(1_234_567)], ["0", "999", "1,000", "1,234,567"]);
-        assert_eq!(grouped(u64::MAX), "18,446,744,073,709,551,615");
-        assert_eq!([decimal(0.0), decimal(0.04), decimal(0.05), decimal(17_622.56)], ["0.0", "0.0", "0.1", "17,622.6"]);
-        assert_eq!(bytes_a_second(999.0), (999.0, "B/s"));
-        assert_eq!(bytes_a_second(1500.0), (1.5, "KB/s"));
-        assert_eq!(bytes_a_second(21_147_120.0).1, "MB/s");
-        assert_eq!(bytes_a_second(3e9), (3.0, "GB/s"));
-        assert_eq!([lasting(0), lasting(59), lasting(60), lasting(3599)], ["0 s", "59 s", "1 m 00 s", "59 m 59 s"]);
-        assert_eq!([lasting(8045), lasting(259_212)], ["2 h 14 m 05 s", "3 d 00 h 00 m 12 s"]);
+    fn a_column_is_as_wide_as_its_name_and_its_numbers_need() {
+        let s = Stats::new(&[
+            ("N", Kind::Count),
+            ("AVeryLongNameForAColumn", Kind::Level),
+            ("B", Kind::Bytes),
+            ("Last", Kind::Count),
+        ]);
+        assert_eq!(
+            s.names(7),
+            "Uptime: 0:00:07           N______________AVeryLongNameForAColumn__B_________________Last\n"
+        );
+        // A number too wide for its column moves the rest of its line
+        // over, and is not run into.
+        let line = s.interval(250, &[0; 4], &[u64::MAX, 5, 12_345_678_901_234, 1]);
+        assert_eq!(
+            line,
+            "Interval (0.25 seconds)   18,446,744,073,709,551,615 5                        12,345,678,901,234 1\n"
+        );
     }
 
-    /// The thread writes what happened in each interval, the whole
-    /// every so often, and the whole once more when it is stopped.
+    /// The thread writes the names and the whole at once, what happened
+    /// in each interval, the names and the whole again every so often,
+    /// and once more when it is stopped.
     #[test]
     fn the_stats_are_written_as_often_as_set() {
         let dir = std::env::temp_dir().join(format!("tabminer-stats-{}", std::process::id()));
@@ -312,24 +300,24 @@ mod tests {
         }
         drop(log);
         let text = std::fs::read_to_string(dir.join("stats.log")).unwrap();
-        let (intervals, wholes) = (text.matches("] last ").count(), text.matches("] since start, ").count());
-        // (How many, on a machine that may be busy, is not to be
-        // counted on: some of each, and no more than there was time for.)
-        assert!((2..=10).contains(&intervals), "{intervals}\n{text}");
-        assert!((1..=4).contains(&wholes), "{wholes}\n{text}");
-        // The last word is the whole, and it is the whole: three
-        // hundred requests.
-        let last = &text[text.rfind("] since start, ").unwrap()..];
-        let requests: Vec<&str> = last.lines().nth(1).unwrap().split_whitespace().collect();
-        assert_eq!((requests[0], requests[1]), ("requests", "300"));
-        assert!(last.lines().nth(3).unwrap().ends_with(" 9"));
-        // The intervals add up to it.
-        let counted: u64 = text
-            .split("] last ")
-            .skip(1)
-            .map(|block| block.lines().nth(1).unwrap().split_whitespace().nth(1).unwrap().parse::<u64>().unwrap())
-            .sum();
-        assert!(counted <= 300 && counted >= 30, "{counted}");
+        let lines: Vec<&str> = text.lines().skip(1).collect();
+        // It begins with the names and the whole, which is little yet.
+        assert!(lines[0].starts_with("Uptime: 0:00:00 "));
+        assert!(lines[0].ends_with("Requests_______BytesSent_________PeersLive"));
+        assert!(lines[1].starts_with('[') && lines[1].split_whitespace().count() == 5, "{}", lines[1]);
+        // (How many of each, on a machine that may be busy, is not to
+        // be counted on: some, and no more than there was time for.)
+        let intervals: Vec<&&str> = lines.iter().filter(|l| l.starts_with("Interval (0.04 seconds) ")).collect();
+        let wholes = lines.iter().filter(|l| l.starts_with("Uptime: ")).count();
+        assert!((2..=10).contains(&intervals.len()), "{text}");
+        assert!((2..=5).contains(&wholes), "{text}");
+        assert_eq!(lines.len(), intervals.len() + 2 * wholes);
+        // The last word is the whole, and it is the whole.
+        let last: Vec<&str> = lines[lines.len() - 1].split_whitespace().skip(2).collect();
+        assert_eq!(last, ["300", "40,000", "9"]);
+        // The intervals add up to no more than it.
+        let counted: u64 = intervals.iter().map(|l| l.split_whitespace().nth(3).unwrap().parse::<u64>().unwrap()).sum();
+        assert!((30..=300).contains(&counted), "{counted}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
