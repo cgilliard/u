@@ -24,8 +24,11 @@ handled on every core.
   by that worker.
 - Options: `--threads` and `--request-queue-size`.
 
-Section 4 (what the workers share) is **proposed**. Nothing here is
-built yet: section 1 is how the node runs today.
+- What is about all peers at once is shared without a thread of its
+  own: counts in atomics, and one list of what is to be downloaded,
+  behind a lock held only to take from it or put back (section 4).
+
+Nothing here is built yet: section 1 is how the node runs today.
 
 ---
 
@@ -153,7 +156,7 @@ stats, both of which are already made for many threads.
 
 ---
 
-## 4. What the workers share (proposed)
+## 4. What the workers share
 
 Most of what a node does is about one peer, and needs nothing shared.
 Three things are about all of them:
@@ -174,26 +177,43 @@ went over. No lock.
 
 ### 4.2 What to fetch, and from whom
 
-This is the one piece of real coordination. Syncing means choosing,
-among all peers, who has the most work, and spreading fetches over
-those who can serve them: 24 blocks at once, 8 of them from any one
-peer; 32 parts of a state at once.
+A fetch belongs to the worker that owns the peer it is from. It has to:
+the chunks come back to our port and are handed out by the peer's
+address, so they arrive at that worker and nowhere else, and the fetch
+(which chunks are in, what to ask again, how the line is doing) must
+be where they arrive. Any thread may *send* on the port (a datagram is
+sent whole or not at all, and two sends never mix), but only the
+owning worker would know what to do with the answer.
 
-Without a thread to own it, it is a **board** the workers share:
+So there are two cases.
 
-- what the node is after: the best chain it has heard of, and the
-  blocks, runs of headers or parts of a state still to fetch;
-- which of those are being fetched now, and how many in all.
+**A block is announced.** The worker that hears of it fetches it from
+the peer that announced it: its own peer. Nothing is shared.
 
-A worker, when it looks to its own peers, takes from the board what one
-of them can serve ("block X: mine, from peer P"), and puts back what
-failed. A worker that hears of more work from one of its peers writes
-that on the board. The board is behind a lock held for the length of
-that lookup: microseconds, and nothing is waited for inside it.
+**The node is behind**, and wants many things at once from many peers:
+24 blocks at a time, 8 of them from any one peer; 32 parts of a state.
+The peers that can serve them are on every worker. For this there is
+one **list of what is to be downloaded**, which the workers share:
 
-What arrives goes to the applier, and what the applier makes of it
-(a block joined the chain, a header was bad) comes back to the board
-and to the worker whose peer sent it.
+1. The worker that finds the node is behind (a peer of its own shows
+   more work) writes on the list what is needed.
+2. Every worker, when it looks to its peers, takes from the list what
+   one of them can serve, marks it as being fetched, and asks that peer
+   itself.
+3. The chunks arrive at that worker. When the object is whole, the
+   worker hands it to the applier, which is the thread that writes the
+   store.
+4. What the applier makes of it comes back: kept, and the item is off
+   the list; bad, and the worker strikes its peer and the item is on
+   the list again for another. A fetch that fails goes back on the
+   list the same way.
+
+The list is behind a lock held for the length of a take or a put back:
+microseconds, with nothing waited for inside it.
+
+Blocks must join the chain in order though they arrive in any, from
+any worker: the applier holds a body until the block before it is in,
+as the node does today.
 
 ### 4.3 The rest
 
@@ -238,10 +258,29 @@ worker. Between peers there is no order, and nothing depends on one.
 
 ## 8. Building it
 
-In steps, each of which leaves the tests passing:
+### 8.1 Where what the node keeps today goes
+
+| Today, in the node | Goes to |
+|---|---|
+| The peers table; who is banned; peers of a host | Each worker, for its hosts |
+| Peers in all, peers of a network | Atomic counts |
+| Tokens (what an address is given to show it is there) | Each worker, from the one secret |
+| What is being served: queues by address | Each worker |
+| How fast chunks are served, how many may wait, in all | Atomic budgets |
+| Objects lately made to be served | Each worker |
+| Fetches under way | Each worker, for its peers |
+| Who announced which block | Each worker |
+| Where the header sync is aiming, what blocks are wanted, the state being taken | The list |
+| Bodies fetched and waiting for the blocks before them | The applier |
+| Work given to the applier and not yet heard of | The list |
+| Counts of what has happened | Each worker; added up for the stats |
+
+### 8.2 Steps
+
+Each leaves the tests passing:
 
 1. **Split the node in place**, still on one thread: what is about one
-   peer (a worker) and the board. The simulation runs one worker. This
+   peer (a worker) and the list. The simulation runs one worker. This
    is most of the work, and where the sync tests earn their keep.
 2. **Several workers on one thread** in the simulation, datagrams
    handed out by the hash: finds whatever still assumed one table.
