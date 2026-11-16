@@ -1,3 +1,4 @@
 miner/target/*
 tmp/*
 **/*.swp
+genesis/target/*

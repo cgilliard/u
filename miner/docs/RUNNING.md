@@ -3,18 +3,15 @@
 How a node is told what to do, what it says while it runs, and what it
 says when it starts and stops.
 
-The logs (section 2) are decided and built. The rest is being settled:
-what is marked **decided** is, and what is marked **proposed** is here
-to be changed before it is written. The binary is still empty. Where the
-reference node (`tmp/miner`) does something different, that is noted,
-with the reason for changing it.
+Everything here is decided and built, except what section 4 lists.
+Where the reference node (`tmp/miner`) does something different, that
+is noted, with the reason for changing it.
 
 ---
 
 ## 1. Configuration
 
-**Decided, and built** (`src/configuration.rs`), but for the binary that
-calls it.
+**Decided, and built** (`src/configuration.rs`).
 
 ### 1.1 One program, no commands
 
@@ -29,8 +26,8 @@ not mine is `tabminer --no-mine`.
 
 The tool that makes a genesis block is a program of its own, built by
 its own Cargo package, so that the miner never has to tell the two
-apart. (Today it is a second binary of this package, `tools/genesis.rs`:
-still to be moved.)
+apart: `genesis/`, beside `miner/`. (It builds, and says it is not
+written yet.)
 
 ### 1.2 Options
 
@@ -137,8 +134,8 @@ given otherwise is taken from the directory the node was started in.
 
 ## 2. The logs
 
-**Decided, and built** (`src/logger`), but for what goes in the request
-and stats logs and the settings' names, which come with the node.
+**Decided, and built** (`src/logger`; what the node puts in them,
+`src/net/node.rs` and `src/net/socket.rs`).
 
 ### 2.1 Three logs
 
@@ -206,24 +203,59 @@ five seconds while it goes on:
 How many were dropped is not said. As a rule the queue empties as fast
 as the disk takes its lines, and the log goes on.
 
-### 2.5 The stats log
+### 2.5 A request's line
 
-In columns, a line at a time. (The columns here are an example: which
-there are, and how wide, follows from what the node counts.)
+Every datagram the node takes has a line: who sent it, how long taking
+it took in microseconds, what it was (with its size), and what was done
+about it.
 
 ```
-Uptime: 300:00:00         Requests_______BytesSent_________PeersLive
-[2026-10-17 19:30:44:000] 3,000          1,000,003         14
-10s ending 19:30:54:      3              100               13
-10s ending 19:31:04:      4              105               15
-10s ending 19:31:14:      5              200               12
-10s ending 19:31:24:      10             1,000             12
-10s ending 19:31:34:      1              900               15
-10s ending 19:31:44:      0              30                15
-Uptime: 300:01:00         Requests_______BytesSent_________PeersLive
-[2026-10-17 19:31:44:000] 3,023          1,002,338         15
-10s ending 19:31:54:      43             1,030             13
+[2026-11-16 05:27:56:237] 127.0.0.1:37412       780 micros      ping height 0 (133 bytes) -> pong (2 datagrams, 266 bytes)
+[2026-11-16 05:27:57:239] 127.0.0.1:37412       56 micros       get-peers (13 bytes) -> peers (6 bytes)
+[2026-11-16 05:27:58:239] 127.0.0.1:37412       7 micros        peers of 0 (6 bytes) -> taken
+[2026-11-16 05:27:59:102] 203.0.113.7:3737      1,250 micros    get block, 1,712 chunks (96 bytes) -> queued
+[2026-11-16 05:27:59:400] 203.0.113.7:3737      9 micros        block height 7 of 1,999,000 bytes (250 bytes) -> taken
+[2026-11-16 05:27:59:731] 198.51.100.20:3738    4 micros        get-peers (13 bytes) -> unheard
 ```
+
+- **The request** is the message's name (`ping`, `pong`, `get-peers`,
+  `peers`, `find-fork`, `fork`, `block`, `get`, `gone`, `goodbye`), with
+  what of it is worth a word: the sender's height, how many addresses,
+  the kind of object asked for and how many chunks of it.
+- **What was done** is the answer's name where one was sent, with what
+  was sent; `queued` for chunks asked for, which go out as the node's
+  pace allows; `taken` for what needs no answer; and `unheard`,
+  `stranger` or `malformed` for what was not listened to (no token,
+  another chain, no message at all).
+- **The time** is from the datagram being handed to the node until the
+  node is done with it.
+- **Chunks of what the node itself is fetching have no line.** They are
+  not requests, a block is some 1,700 of them, and each is like the
+  last. They are counted in the stats.
+
+### 2.6 The stats log
+
+In columns, a line at a time:
+
+```
+Uptime: 0:00:00           Requests_______AvgLatency(us)__BytesIn___________BytesSent_________Peers__________PeersLive______Height_________Blocks_________Fetching
+[2026-11-16 05:27:56:235] 0              -               0                 0                 0              0              0              0              0
+10s ending 05:28:06:      2              392.5           266               266               0              0              0              0              0
+10s ending 05:28:16:      2              29.5            19                19                1              1              0              0              0
+...
+Uptime: 0:01:00           Requests_______AvgLatency(us)__BytesIn___________BytesSent_________Peers__________PeersLive______Height_________Blocks_________Fetching
+[2026-11-16 05:28:56:235] 6              159.3           304               304               1              1              0              0              0
+```
+
+| Column | Is |
+|---|---|
+| Requests | Datagrams taken, chunks too (counted) |
+| AvgLatency(us) | What taking one took, in microseconds, on average: of the interval in an interval's line, of the whole run in a whole's. `-` where there were none |
+| BytesIn, BytesSent | What came and went (counted) |
+| Peers, PeersLive | Peers known, and those heard from lately (levels) |
+| Height | The chain's height (level) |
+| Blocks | Blocks that joined the chain here (counted) |
+| Fetching | Objects being fetched (level) |
 
 - **Every ten seconds** (a setting): what happened in those seconds,
   after how long they were and the time they ended at.
@@ -231,16 +263,13 @@ Uptime: 300:01:00         Requests_______BytesSent_________PeersLive
   node has been up, and under them the whole since it started, with
   the time. So six interval lines come between two wholes.
 - **Counted numbers add up.** A whole is the whole before it and the
-  intervals between: above, 3,000 and the six intervals' 23 are 3,023.
-  The last interval's line and the whole after it are written at the
-  same moment from one reading of the numbers, so this is exact.
-- **Levels do not.** Peers live is, in every line, what it was at that
-  moment.
+  intervals between. The last interval's line and the whole after it
+  are written at the same moment from one reading of the numbers, so
+  this is exact.
+- **Levels and averages do not.** A level is, in every line, what it
+  was at that moment; an average is of its own line's span.
 - Intervals are counted from when the node started, not each from the
   one before, so they do not drift.
-- When the node stops, what happened since the last interval's line is
-  written as a last, shorter interval, and then the whole: the last
-  whole adds up as every other.
 - A column is as wide as its name and its numbers need. A number too
   wide for its column moves the rest of that line over.
 
@@ -248,24 +277,17 @@ Numbers and times are written by the same few functions in every log
 (`logger::fmt`): commas between thousands, bytes in the unit that fits,
 uptime as hours, minutes and seconds.
 
-### 2.6 Nothing here stops the node
+### 2.7 Nothing here stops the node
 
 A line that cannot be written is counted, and the first failure is said
 once on the terminal. If the log's directory goes and comes back, so
 does the log.
 
-### 2.7 Still to settle
-
-- Which requests are logged, and what a request's line holds.
-- Which numbers the stats log shows.
-- The settings for each log (file name, rotation age and size, queue
-  size, the two stats intervals).
-
 ---
 
 ## 3. Starting and stopping
 
-### 3.1 Starting (decided, and built but for the binary)
+### 3.1 Starting
 
 When the configuration has no errors, the node says when it started and
 how it is configured, in the main log and on the terminal alike
@@ -292,48 +314,66 @@ how it is configured, in the main log and on the terminal alike
 
 Every setting is listed, by name, with what it is in quotes, the quotes
 in one column. Paths are whole; numbers are written as in every log.
-"Server is ready!" comes after the store is open and the port bound.
+**"Server is ready!" is the mark that the node is running**, for whoever
+reads the log and for programs that do. So:
 
-### 3.2 When it cannot start (proposed)
+- It is the very next line after the configuration. Nothing is said
+  between them.
+- It is said only when the node can do what it is for: the logs are
+  open, the store is open, the port is bound, the threads are started.
+  All of that is done before the first line above is written, so a
+  node that cannot start never says how it is configured either.
+- No request is taken before it is said. (A datagram that comes
+  between the port being bound and the line waits in the system's
+  queue for those few moments.)
+
+### 3.2 When it cannot start
 
 A configuration error is as in 1.4. Anything else that stops a start is
 one line, on the terminal and in the main log if that could be opened,
-saying what is wrong and what can be done:
+and the node exits with -1:
 
 ```
-Error: cannot listen on 0.0.0.0:3737: the address is in use (is another tabminer running?)
-Error: the store in /srv/tab is of another network (dev); this is mainnet
+[2026-11-16 05:28:03:264] Error: cannot listen on 127.0.0.1:3737: Address already in use (os error 98)
 ```
 
-### 3.3 After that (decided)
+### 3.3 After that
 
 The main log holds only errors, critical events, each file of another
 log put aside, and stopping.
 
-### 3.4 Stopping (proposed)
+### 3.4 Stopping
 
 On an interrupt (Ctrl-C, or the operating system's signal to end):
 
 ```
-[2026-10-17 21:02:10:118] stopping
-[2026-10-17 21:02:10:240] stopped; tip 88214 (a01f33c9)
+[2026-11-16 05:28:01:753] Received shut down signal, halting!
 ```
 
-The node tells its peers it is going, finishes the work it has given
-the applier, saves the peers it knows, writes the last of the stats and
-request logs, and closes the store. A second interrupt ends it at once;
-the store is safe to be cut off at any point.
+and the node ends, with 0. That is all, on purpose: the worst a node
+can do on being told to stop is not to, or to hang.
 
-Taking an interrupt needs a call into the operating system that the
-standard library does not have, so it is written here for each
-platform, as the random source already is.
+- What takes the signal only sets a flag. A thread that does nothing
+  else sees it within a fiftieth of a second, writes the line to the
+  main log and the terminal (`log_all`, on its own thread, waiting for
+  no other), and ends the program.
+- Nothing is put in order first. The store is whole wherever it is cut
+  off; lines still queued for the request log, and the stats since the
+  last interval, are lost.
+- A second interrupt ends the program at once, from where the signal is
+  taken, whatever the first is waiting on.
+
+Taking a signal needs a call the standard library does not have: the C
+library's `signal`, the same on every platform the node is built for
+(`src/interrupt.rs`).
 
 ---
 
-## 4. Still to settle
+## 4. Still to do
 
-1. **What a request log line holds**, and **which columns the stats log
-   has**.
-2. **What the main log says between the configuration and "Server is
-   ready!"**, and for critical events after.
-3. **The genesis tool** as a package of its own.
+1. **Mining.** It is not in this node yet, so `tabminer` without
+   `--no-mine` says so and does not start.
+2. **Requests on more than one thread** (being discussed).
+3. **The peers file and the built-in seeds.** `--peer` and `--seed` are
+   what a node begins from today.
+4. **The genesis tool** itself, in its package.

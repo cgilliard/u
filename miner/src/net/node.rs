@@ -302,6 +302,88 @@ struct Aim {
     source: SocketAddrV4,
 }
 
+/// What a datagram was, and what was done about it: for whoever keeps
+/// a record of what a node is asked ([`Node::handle`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Heard {
+    /// Who sent it, if its address is of a kind we speak to.
+    pub from: Option<SocketAddrV4>,
+    /// The message, by its name: `ping`, `get`, `block`; or
+    /// `malformed`, for a datagram that was none.
+    pub request: &'static str,
+    /// What of it is worth a word.
+    pub about: About,
+    /// What was done: the answer's name where one was sent (`pong`,
+    /// `peers`, `fork`); `queued` for chunks asked for, which are sent
+    /// as the node's pace allows; `taken` for what needs no answer;
+    /// `unheard`, `stranger` or `malformed` for what was not listened
+    /// to.
+    pub answer: &'static str,
+    /// Datagrams sent in answering, and their bytes.
+    pub sent: u32,
+    pub sent_bytes: u32,
+}
+
+/// What is said of a request besides its name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum About {
+    Nothing,
+    /// The height of the sender's chain, or of the block spoken of.
+    Height(u32),
+    /// How many addresses.
+    Peers(usize),
+    /// A block announced: its height, and its body's length.
+    Block {
+        height: u32,
+        bytes: u32,
+    },
+    /// Chunks asked for, and of what kind of object.
+    Chunks {
+        of: &'static str,
+        chunks: u32,
+    },
+}
+
+/// A chunk of something this node is fetching: by far the most of what
+/// arrives while it is, and each much like the last.
+pub const CHUNK: &str = "chunk";
+
+impl Heard {
+    /// The line of the request log: who asked, how long answering took
+    /// in microseconds, what was asked (in a datagram of `bytes`), and
+    /// what was done.
+    ///
+    /// ```text
+    /// 203.0.113.7:3737      41 micros       ping height 88,214 (133 bytes) -> pong (133 bytes)
+    /// ```
+    pub fn line(&self, bytes: usize, micros: u64) -> String {
+        use crate::logger::fmt::{column, commas};
+        let from = self.from.map_or_else(|| "-".to_string(), |a| a.to_string());
+        let about = match self.about {
+            About::Nothing => String::new(),
+            About::Height(height) => format!(" height {}", commas(height as u64)),
+            About::Peers(n) => format!(" of {}", commas(n as u64)),
+            About::Block { height, bytes } => {
+                format!(" height {} of {} bytes", commas(height as u64), commas(bytes as u64))
+            }
+            About::Chunks { of, chunks } => format!(" {of}, {} chunks", commas(chunks as u64)),
+        };
+        let sent = match self.sent {
+            0 => String::new(),
+            1 => format!(" ({} bytes)", commas(self.sent_bytes as u64)),
+            n => format!(" ({} datagrams, {} bytes)", commas(n as u64), commas(self.sent_bytes as u64)),
+        };
+        format!(
+            "{}{}{}{about} ({} bytes) -> {}{sent}",
+            column(&from, 22, ' '),
+            column(&format!("{} micros", commas(micros)), 16, ' '),
+            self.request,
+            commas(bytes as u64),
+            self.answer
+        )
+    }
+}
+
 pub struct Node<B: Backend + 'static, V> {
     cfg: Config,
     /// The network's four bytes.
@@ -592,21 +674,65 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         self.sync_state(now);
     }
 
-    /// Takes a datagram that arrived from `from`. Call [`Node::tick`]
-    /// after it.
-    pub fn handle(&mut self, now: Micros, from: SocketAddr, bytes: &[u8], out: Out<'_>) {
+    /// Takes a datagram that arrived from `from`, and says what it was
+    /// and what was done about it. Call [`Node::tick`] after it.
+    pub fn handle(&mut self, now: Micros, from: SocketAddr, bytes: &[u8], out: Out<'_>) -> Heard {
+        let unheard =
+            |from, request| Heard { from, request, about: About::Nothing, answer: "malformed", sent: 0, sent_bytes: 0 };
         // Addresses of the older kind only (`docs/WIRE.md`, 1.1).
         let from = match from {
             SocketAddr::V4(a) => a,
             SocketAddr::V6(a) => match a.ip().to_ipv4_mapped() {
                 Some(ip) => SocketAddrV4::new(ip, a.port()),
-                None => return,
+                None => return unheard(None, "ipv6"),
             },
         };
         let Ok(message) = Message::decode(self.network, bytes) else {
             self.counts.malformed += 1;
-            return;
+            return unheard(Some(from), "malformed");
         };
+        let (request, about, answers) = match &message {
+            Message::Ping(theirs) => ("ping", About::Height(theirs.height), "pong"),
+            Message::Pong(theirs) => ("pong", About::Height(theirs.height), "answered"),
+            Message::GetPeers { .. } => ("get-peers", About::Nothing, "peers"),
+            Message::Peers(addrs) => ("peers", About::Peers(addrs.as_slice().len()), "answered"),
+            Message::Goodbye { .. } => ("goodbye", About::Nothing, "answered"),
+            Message::FindFork { .. } => ("find-fork", About::Nothing, "fork"),
+            Message::Fork { height, .. } => ("fork", About::Height(*height), "answered"),
+            Message::Block { header, len } => {
+                ("block", About::Block { height: header.height, bytes: *len }, "answered")
+            }
+            Message::Get(get) => {
+                let of = Object::decode(get.name).map_or("nothing", |o| o.kind());
+                ("get", About::Chunks { of, chunks: get.ranges.chunks() }, "answered")
+            }
+            Message::Chunk(_) => (CHUNK, About::Nothing, "answered"),
+            Message::Gone(_) => ("gone", About::Nothing, "answered"),
+            Message::Tx { .. } => ("tx", About::Nothing, "answered"),
+            Message::GetLeaves { .. } => ("get-leaves", About::Nothing, "answered"),
+            Message::Leaves { .. } => ("leaves", About::Nothing, "answered"),
+        };
+        // What was done is read off what it left behind: what was sent,
+        // and what was counted as not listened to.
+        let before = self.counts;
+        let (mut sent, mut sent_bytes) = (0u32, 0u32);
+        self.act(now, from, message, &mut |to, bytes: &[u8]| {
+            sent += 1;
+            sent_bytes += bytes.len() as u32;
+            out(to, bytes)
+        });
+        let answer = match () {
+            () if self.counts.malformed > before.malformed => "malformed",
+            () if self.counts.unheard > before.unheard => "unheard",
+            () if self.counts.strangers > before.strangers => "stranger",
+            () if sent > 0 => answers,
+            () if request == "get" => "queued",
+            () => "taken",
+        };
+        Heard { from: Some(from), request, about, answer, sent, sent_bytes }
+    }
+
+    fn act(&mut self, now: Micros, from: SocketAddrV4, message: Message<'_>, out: Out<'_>) {
         match message {
             Message::Ping(theirs) => self.on_ping(now, from, theirs, out),
             Message::Pong(theirs) => self.on_pong(now, from, theirs),

@@ -682,6 +682,144 @@ fn over_real_sockets() {
     assert_eq!((counts[1].blocks, counts[1].blocks_refused), (45, 0));
 }
 
+/// The request log's line: who, how long, what was asked and what was
+/// done, the first two in columns.
+#[test]
+fn a_request_is_one_line() {
+    use crate::net::node::{About, Heard};
+    let from = Some(at(0));
+    let heard = |request, about, answer, sent, sent_bytes| Heard { from, request, about, answer, sent, sent_bytes };
+    let a = heard("ping", About::Height(88_214), "pong", 1, 133).line(133, 41);
+    let b = heard("get", About::Chunks { of: "block", chunks: 1712 }, "queued", 0, 0).line(96, 1_250);
+    let c = heard("block", About::Block { height: 7, bytes: 1_999_000 }, "answered", 2, 300).line(250, 9);
+    let d = Heard { from: None, ..heard("ipv6", About::Nothing, "malformed", 0, 0) }.line(40, 0);
+    let who = at(0).to_string();
+    assert_eq!(a, format!("{who:<22}41 micros       ping height 88,214 (133 bytes) -> pong (133 bytes)"));
+    assert_eq!(b, format!("{who:<22}1,250 micros    get block, 1,712 chunks (96 bytes) -> queued"));
+    assert_eq!(
+        c,
+        format!(
+            "{who:<22}9 micros        block height 7 of 1,999,000 bytes (250 bytes) -> answered (2 datagrams, 300 bytes)"
+        )
+    );
+    assert_eq!(d, format!("{:<22}0 micros        ipv6 (40 bytes) -> malformed", "-"));
+}
+
+/// What a node says of a datagram: what it was, and what it did.
+#[test]
+fn a_node_says_what_it_heard_and_did() {
+    let mut w = World::with(vec![chain_of(easy()), chain_of(easy())], &small_runs());
+    w.nodes[1].add_peer(at(0), false, 0);
+    // The first thing a node sends a peer is a ping.
+    let mut sent = Vec::new();
+    w.nodes[1].tick(0, NOW, &mut |to, bytes: &[u8]| sent.push((to, bytes.to_vec())));
+    let (to, ping) = sent.first().cloned().expect("a ping");
+    assert_eq!(to, at(0));
+    let mut answers = Vec::new();
+    let heard =
+        w.nodes[0].handle(1, SocketAddr::V4(at(1)), &ping, &mut |to, bytes: &[u8]| answers.push((to, bytes.len())));
+    // (The pong, and a ping of its own to one it did not know.)
+    assert_eq!((heard.from, heard.request, heard.answer, heard.sent), (Some(at(1)), "ping", "pong", 2));
+    assert_eq!(heard.about, crate::net::node::About::Height(0));
+    assert!(answers.iter().all(|(to, _)| *to == at(1)));
+    assert_eq!(answers.iter().map(|(_, n)| n).sum::<usize>(), heard.sent_bytes as usize);
+    // What is no message, and a request without its token.
+    let heard = w.nodes[0].handle(2, SocketAddr::V4(at(1)), b"nothing of ours", &mut |_, _| panic!("no answer"));
+    assert_eq!((heard.request, heard.answer, heard.sent), ("malformed", "malformed", 0));
+    let mut buf = [0u8; crate::net::MAX_DATAGRAM];
+    let n = Message::GetPeers { token: 12345 }.encode(NET, &mut buf);
+    let heard = w.nodes[0].handle(3, SocketAddr::V4(at(1)), &buf[..n], &mut |_, _| panic!("no answer"));
+    assert_eq!((heard.request, heard.answer), ("get-peers", "unheard"));
+}
+
+/// Over real sockets, with the logs: each request has its line in the
+/// request log, and the stats count them, how long they took and what
+/// went each way.
+#[test]
+fn over_real_sockets_requests_are_logged_and_counted() {
+    use crate::logger::queued::Queued;
+    use crate::logger::stats::Stats;
+    use crate::logger::{Logger, Rotation};
+    use crate::net::socket::{self, Watch};
+    use std::net::UdpSocket;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    let dir = std::env::temp_dir().join(format!("tabminer-watched-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let main = Arc::new(Logger::open(dir.join("tabernacle.log"), Rotation::default()).unwrap());
+    let mut cfg = small_runs();
+    cfg.tick = 50 * MILLI;
+    let chains = vec![chain_of(easy()), chain_of(easy())];
+    grow(&chains[0], 12, 1);
+    let tip = chains[0].tip().unwrap();
+    let sockets: Vec<UdpSocket> = (0..2).map(|_| UdpSocket::bind("127.0.0.1:0").unwrap()).collect();
+    let SocketAddr::V4(first) = sockets[0].local_addr().unwrap() else { unreachable!() };
+    let SocketAddr::V4(second) = sockets[1].local_addr().unwrap() else { unreachable!() };
+    let stop = Arc::new(AtomicBool::new(false));
+    let behind = Arc::clone(&chains[1]);
+    let threads: Vec<_> = sockets
+        .into_iter()
+        .zip(chains)
+        .enumerate()
+        .map(|(i, (socket, chain))| {
+            let (cfg, stop, main, dir) = (cfg.clone(), Arc::clone(&stop), Arc::clone(&main), dir.clone());
+            std::thread::spawn(move || {
+                let log = Logger::open(dir.join(format!("request{i}.log")), Rotation::default()).unwrap();
+                let requests = Queued::start(log, 100_000, main).unwrap();
+                let stats = Stats::new(socket::STATS);
+                let mut node = Node::new(cfg, NET, chain, [i as u8 + 1; 32], 0).threaded();
+                if i == 1 {
+                    node.add_peer(first, true, 0);
+                }
+                let watch = Watch { requests: Some(&requests), stats: Some(&stats) };
+                socket::run_watched(&mut node, &socket, &stop, Instant::now(), &|| NOW, &watch).unwrap();
+                requests.flush();
+                stats.read()
+            })
+        })
+        .collect();
+    let start = Instant::now();
+    while behind.tip().unwrap() != tip {
+        assert!(start.elapsed() < Duration::from_secs(60), "at {}", behind.tip().unwrap().height);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // (Long enough for how the nodes stand to be told once more.)
+    std::thread::sleep(Duration::from_millis(1300));
+    stop.store(true, Ordering::Relaxed);
+    let stats: Vec<Vec<u64>> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    let logs: Vec<String> =
+        (0..2).map(|i| std::fs::read_to_string(dir.join(format!("request{i}.log"))).unwrap()).collect();
+    // The one ahead was pinged and asked for headers and blocks, and
+    // every line says who asked, how long it took and what was done.
+    let served: Vec<&str> = logs[0].lines().skip(1).collect();
+    let asked = |what: &str| served.iter().filter(|l| l.contains(what)).count();
+    assert!(asked(" ping height 0 (") >= 1 && asked(") -> pong (") >= 1, "{}", logs[0]);
+    assert!(asked(" get headers, ") >= 1 && asked(" get block, ") >= 12, "{}", logs[0]);
+    assert!(asked(") -> queued") >= 13, "{}", logs[0]);
+    for line in &served {
+        assert!(line[26..].starts_with(&format!("{:<22}", second.to_string())), "{line}");
+        assert!(
+            line[48..].split_once(" micros").is_some_and(|(n, _)| n.replace(',', "").parse::<u64>().is_ok()),
+            "{line}"
+        );
+    }
+    // The one behind got its answers, and a line for none of the chunks.
+    assert!(logs[1].contains(" pong height 12 (") && !logs[1].contains(" chunk "), "{}", logs[1]);
+    // Every datagram is counted, chunks too, with the time it took.
+    use socket::{BLOCKS, BYTES_IN, BYTES_SENT, FETCHING, HEIGHT, LATENCY, PEERS, PEERS_LIVE, REQUESTS};
+    assert_eq!(stats[0][REQUESTS] as usize, served.len());
+    assert!(stats[1][REQUESTS] as usize > logs[1].lines().count());
+    for s in &stats {
+        assert!(s[LATENCY] > 0 && s[BYTES_IN] > 0 && s[BYTES_SENT] > 0, "{s:?}");
+        assert_eq!((s[PEERS], s[PEERS_LIVE], s[HEIGHT], s[FETCHING]), (1, 1, 12, 0), "{s:?}");
+    }
+    // What one sent is what the other took in.
+    assert_eq!((stats[0][BYTES_SENT], stats[1][BYTES_SENT]), (stats[1][BYTES_IN], stats[0][BYTES_IN]));
+    assert_eq!((stats[0][BLOCKS], stats[1][BLOCKS]), (0, 12));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // -- Blocks
 
 fn tip(w: &World, i: usize) -> Header {

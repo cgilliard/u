@@ -64,6 +64,22 @@ const TX: u8 = 9;
 const ROOTS: u8 = 10;
 
 impl Object {
+    /// What kind of object it is, in a word: for the logs.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Object::Block(_) => "block",
+            Object::Lite(_) => "lite",
+            Object::Headers { .. } => "headers",
+            Object::Manifest(_) => "manifest",
+            Object::Roots { .. } => "roots",
+            Object::Part { .. } => "part",
+            Object::Names { .. } => "names",
+            Object::Proof { .. } => "proof",
+            Object::File(_) => "file",
+            Object::Tx(_) => "tx",
+        }
+    }
+
     /// Writes the name to the front of `out` and returns its length.
     pub fn encode(&self, out: &mut [u8; MAX_NAME]) -> usize {
         let mut at = 0;

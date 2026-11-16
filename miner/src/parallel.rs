@@ -7,9 +7,16 @@
 
 use std::sync::OnceLock;
 
+static THREADS: OnceLock<usize> = OnceLock::new();
+
+/// Sets the number of worker threads, if it has not been asked for
+/// yet: for a node told how many to use. Whether it was set.
+pub fn set_threads(n: usize) -> bool {
+    n > 0 && THREADS.set(n).is_ok()
+}
+
 /// Number of worker threads.
 pub fn threads() -> usize {
-    static THREADS: OnceLock<usize> = OnceLock::new();
     *THREADS.get_or_init(|| {
         std::env::var("TABMINER_THREADS")
             .ok()

@@ -52,7 +52,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use super::fmt::{column, commas, short_seconds, uptime};
+use super::fmt::{column, commas, decimal, short_seconds, uptime};
 use super::{Logger, Moment};
 
 /// What kind of number a stat is.
@@ -64,6 +64,20 @@ pub enum Kind {
     Bytes,
     /// How much of something there is now (peers, fetches under way).
     Level,
+    /// An average: the stat itself is a sum that is added to (the
+    /// microseconds requests took), and what is shown is that sum over
+    /// the count at the place given (the requests), to one decimal:
+    /// for an interval, of that interval; for the whole, of the whole.
+    /// `-` where there was nothing to take an average of.
+    Average(usize),
+}
+
+/// A sum over how many it is the sum of, as it is shown.
+fn average(sum: u64, count: u64) -> String {
+    match count {
+        0 => "-".to_string(),
+        _ => decimal(sum as f64 / count as f64, 1),
+    }
 }
 
 /// How wide the first column is: the time before a line, and a space.
@@ -132,7 +146,10 @@ impl Stats {
     /// The whole since the start, after the time:
     /// `[2026-10-17 19:30:44:000] 3,000          1,000,003         14`.
     pub fn whole(&self, moment: &Moment, now: &[u64]) -> String {
-        self.line(&moment.header(), ' ', |i| commas(now[i]))
+        self.line(&moment.header(), ' ', |i| match self.names[i].1 {
+            Kind::Average(over) => average(now[i], now[over]),
+            _ => commas(now[i]),
+        })
     }
 
     /// What happened in the interval of `millis` that ended at
@@ -145,6 +162,7 @@ impl Stats {
         self.line(&first, ' ', |i| match self.names[i].1 {
             Kind::Level => commas(now[i]),
             Kind::Count | Kind::Bytes => commas(now[i].saturating_sub(before[i])),
+            Kind::Average(over) => average(now[i].saturating_sub(before[i]), now[over].saturating_sub(before[over])),
         })
     }
 }
@@ -256,6 +274,32 @@ mod tests {
 
     fn stats() -> Stats {
         Stats::new(&[("Requests", Kind::Count), ("BytesSent", Kind::Bytes), ("PeersLive", Kind::Level)])
+    }
+
+    /// An average is of its own span: an interval's of the interval,
+    /// the whole's of the whole; and of nothing, it is not a number.
+    #[test]
+    fn an_average_is_the_sum_over_the_count_of_its_own_span() {
+        let s =
+            Stats::new(&[("Requests", Kind::Count), ("AvgLatency(us)", Kind::Average(0)), ("PeersLive", Kind::Level)]);
+        // 3,000 requests took 120,000 microseconds; then 4 took 1,000.
+        let (before, now) = ([3000, 120_000, 14], [3004, 121_000, 13]);
+        assert_eq!(
+            [
+                s.names(7),
+                s.whole(&Moment::of(T), &before),
+                s.interval(10_000, &Moment::of(T + 10_000), &before, &now),
+                s.interval(10_000, &Moment::of(T + 20_000), &now, &now),
+                s.whole(&Moment::of(T + 20_000), &now),
+            ]
+            .concat(),
+            "Uptime: 0:00:07           Requests_______AvgLatency(us)__PeersLive\n\
+             [2026-10-17 19:30:44:000] 3,000          40.0            14\n\
+             10s ending 19:30:54:      4              250.0           13\n\
+             10s ending 19:31:04:      0              -               13\n\
+             [2026-10-17 19:31:04:000] 3,004          40.3            13\n"
+        );
+        assert_eq!(s.whole(&Moment::of(T), &[0, 0, 0]), "[2026-10-17 19:30:44:000] 0              -               0\n");
     }
 
     /// The lines of the sample (`docs`), with these columns' widths.

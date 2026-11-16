@@ -2,11 +2,6 @@
 name = "tabminer"
 version = "0.1.0"
 edition = "2024"
-default-run = "tabminer"
-
-[[bin]]
-name = "genesis"
-path = "tools/genesis.rs"
 
 [features]
 # The dev networks (`--network dev`, `dev-recursive`): their built-in

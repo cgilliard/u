@@ -275,8 +275,9 @@ fetched**, so every object's name pins down its content exactly.
 magic (4) | type (1) | body
 ```
 
-- `magic` names the network (main, dev, dev-recursive), so nodes of
-  different networks drop each other's datagrams before parsing.
+- `magic` names the network (`TABM` main, `TABD` dev, `TABR`
+  dev-recursive), so nodes of different networks drop each other's
+  datagrams before parsing.
 - The transport's chunk is 1,220 bytes at most and leaves 12 of the
   1,232; this uses 5.
 - Rules 1 to 3 of 1.2 are kept as they are.

@@ -317,6 +317,16 @@ impl Network {
         }
     }
 
+    /// The four bytes every datagram of the network begins with
+    /// (`docs/WIRE.md`, 2.2).
+    pub fn magic(&self) -> [u8; 4] {
+        match self {
+            Network::Mainnet => *b"TABM",
+            Network::Dev => *b"TABD",
+            Network::DevRecursive => *b"TABR",
+        }
+    }
+
     /// The data directory's name under `~/.tabernacle`.
     fn directory(&self) -> &'static str {
         match self {
@@ -766,11 +776,17 @@ impl Configuration {
         main.log_all_no_header(&RULE);
     }
 
-    /// Says that the node is up: after everything of starting is done.
+    /// Says that the node is up, straight after its configuration. This
+    /// line is the mark that a node is running, for whoever reads the
+    /// log, or a program that does: it is to be said only when the
+    /// port is bound and requests can be taken, and by nothing else.
     pub fn ready(main: &Logger) {
-        main.log_all("Server is ready!");
+        main.log_all(READY);
     }
 }
+
+/// What a node says when it can take requests.
+pub const READY: &str = "Server is ready!";
 
 /// The rule drawn above and below the configuration.
 static RULE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| "-".repeat(105));

@@ -1,0 +1,14 @@
+[package]
+name = "genesis"
+version = "0.1.0"
+edition = "2024"
+
+# The tool that makes a network's genesis block: a program of its own,
+# built by itself (`cargo build --release` here), so that the miner is
+# only ever the miner. It uses the miner's own code and nothing else.
+[dependencies]
+tabminer = { path = "../miner" }
+
+[profile.release]
+codegen-units = 1
+lto = true
