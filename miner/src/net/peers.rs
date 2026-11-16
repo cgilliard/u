@@ -272,7 +272,7 @@ impl Peers {
     }
 
     /// Takes a peer out of the table.
-    fn remove(&mut self, addr: &SocketAddrV4) {
+    pub fn remove(&mut self, addr: &SocketAddrV4) {
         if let Some(p) = self.peers.remove(addr) {
             self.unproven -= (!p.proven && !p.seed) as usize;
         }
@@ -354,10 +354,11 @@ impl Peers {
 
     /// Whether to ping `addr` at once, outside its turn, with `number`:
     /// it pinged us and has not proven itself. True if it is a peer
-    /// with no ping awaiting an answer; it is then marked pinged.
+    /// not proven, with no ping awaiting an answer; it is then marked
+    /// pinged.
     pub fn ping_now(&mut self, addr: &SocketAddrV4, number: u64, now: Micros) -> bool {
         match self.get_mut(addr) {
-            Some(p) if p.pending.is_none() => {
+            Some(p) if p.pending.is_none() && !p.proven => {
                 p.last_ping = Some(now);
                 p.first_ping.get_or_insert(now);
                 p.pending = Some(number);

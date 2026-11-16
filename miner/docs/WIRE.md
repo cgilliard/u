@@ -432,6 +432,7 @@ The defaults are the reference's unless noted.
 | Peers per host (all ports) | 4 |
 | Peers per /16 network | 8 |
 | Pings to unproven addresses per tick | 8 |
+| While short of live peers, how often one is asked for more | 1 s |
 | Ping interval | 30 s |
 | First re-ping of a peer not yet answering | 2 s, doubling |
 | Silence before a peer is not counted live | 65 s |

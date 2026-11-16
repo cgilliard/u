@@ -56,6 +56,9 @@ pub struct Peers {
     /// A host's peer silent this long gives its place to a new port of
     /// that host: a node there that restarted behind a translator.
     pub host_stale: Micros,
+    /// While live peers are fewer than `target`: how often one of them
+    /// is asked whom else it knows.
+    pub discover: Micros,
     /// Bad answers before a peer is dropped and its host refused.
     pub strikes: u32,
     /// A peer's strikes are forgotten this long after the last.
@@ -132,6 +135,7 @@ impl Default for Peers {
             live_silence: 65 * SECOND,
             drop_silence: 180 * SECOND,
             host_stale: 60 * SECOND,
+            discover: SECOND,
             strikes: 5,
             strike_decay: 10 * MINUTE,
             ban: 60 * MINUTE,
@@ -206,6 +210,7 @@ impl Config {
         // Two pings unanswered at the least before a peer is thought gone.
         need(p.live_silence >= 2 * p.ping, "peers.live_silence is under two pings")?;
         need(p.drop_silence >= p.live_silence, "peers.drop_silence is under peers.live_silence")?;
+        need(p.discover >= 100 * MILLI, "peers.discover is under a tenth of a second")?;
         need(p.strikes >= 1, "peers.strikes is zero")?;
         need(s.headers >= 1 && s.headers <= super::object::MAX_HEADERS, "sync.headers is not between 1 and 512")?;
         need(s.header_fetches >= 1, "sync.header_fetches is zero")?;
@@ -236,7 +241,7 @@ mod tests {
         assert_eq!((p.max, p.target, p.per_host, p.per_network, p.unproven_pings), (64, 8, 4, 8, 8));
         assert_eq!((p.ping, p.first_ping_retry), (30 * SECOND, 2 * SECOND));
         assert_eq!((p.live_silence, p.drop_silence, p.host_stale), (65 * SECOND, 180 * SECOND, 60 * SECOND));
-        assert_eq!((p.strikes, p.strike_decay, p.ban), (5, 600 * SECOND, 3600 * SECOND));
+        assert_eq!((p.strikes, p.strike_decay, p.ban, p.discover), (5, 600 * SECOND, 3600 * SECOND, SECOND));
         assert_eq!((s.headers, s.header_fetches, s.header_wait, s.pass_over), (512, 16, 15 * SECOND, 600 * SECOND));
         assert_eq!((s.blocks, s.blocks_per_peer, s.lookahead, s.header_spacing), (24, 8, 32, 2 * SECOND));
         assert_eq!((s.sync_point, s.parts, s.snapshot_attempts), (144, 32, 4));
