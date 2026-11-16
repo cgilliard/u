@@ -261,9 +261,9 @@ fn make_blocks(
 /// that the next run begins with it. (Blocks are made meanwhile: what
 /// they read of the table is filled as they read it.)
 fn fill_table(table: &Arc<RwLock<LazyDataset<'static>>>, kept: &Path, main: &Arc<Logger>) {
-    let (table, kept, told) = (Arc::clone(table), kept.to_path_buf(), Arc::clone(main));
-    let fill = move || {
-        let main = told;
+    // Said here, before the thread is begun: so that it is always said
+    // before what the caller goes on to say.
+    {
         let table = table.read().unwrap_or_else(|e| e.into_inner());
         if table.is_complete() {
             return;
@@ -271,6 +271,11 @@ fn fill_table(table: &Arc<RwLock<LazyDataset<'static>>>, kept: &Path, main: &Arc
         let whole = tabminer::pow::table_bytes(table.log_items());
         let there = whole / table.pairs() as u64 * table.filled() as u64;
         main.log(&format!("Making the table of the proof of work: {} of {} are there", bytes(there), bytes(whole)));
+    }
+    let (table, kept, told) = (Arc::clone(table), kept.to_path_buf(), Arc::clone(main));
+    let fill = move || {
+        let main = told;
+        let table = table.read().unwrap_or_else(|e| e.into_inner());
         let began = Instant::now();
         table.fill();
         main.log(&format!(
