@@ -453,12 +453,24 @@ pub(crate) struct Shared {
     waker: RwLock<Option<Waker>>,
     /// Whose turn it is to hear of work done on the chain.
     turn: AtomicUsize,
+    /// Called with each block of a peer's that becomes the chain's
+    /// last, and who served it: for whoever keeps a record.
+    received: RwLock<Option<Received>>,
+    /// Called with each block refused, who served it (nobody, if it
+    /// was made here), and why.
+    refused: RwLock<Option<Refused>>,
     /// Told whenever the chain has a new last block (`blocks` counts
     /// them): for whoever waits for that.
     moved: (Mutex<()>, std::sync::Condvar),
     #[cfg(test)]
     by_port: AtomicBool,
 }
+
+/// Told of a block that joined the chain, and the peer it came from.
+pub type Received = Box<dyn Fn(&Header, SocketAddrV4) + Send + Sync>;
+
+/// Told of a block that was refused, who served it, and why.
+pub type Refused = Box<dyn Fn(&Header, Option<SocketAddrV4>, &Error) + Send + Sync>;
 
 /// Wakes the worker of this number.
 pub(crate) type Waker = Box<dyn Fn(usize) + Send + Sync>;
@@ -1565,12 +1577,20 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 // (Whoever waits for the chain to move is told.)
                 drop(self.shared.moved.0.lock().unwrap_or_else(|e| e.into_inner()));
                 self.shared.moved.1.notify_all();
+                if let (Some(from), Some(told)) =
+                    (from, &*self.shared.received.read().unwrap_or_else(|e| e.into_inner()))
+                {
+                    told(&header, from);
+                }
                 self.announce(now, header, len, from, out);
                 self.shared.post_others(self.me, Notice::Announce { header, len, except: from });
             }
             Ok(Applied::Known | Applied::Side) => {}
             Err(e) => {
                 self.counts.blocks_refused += 1;
+                if let Some(told) = &*self.shared.refused.read().unwrap_or_else(|e| e.into_inner()) {
+                    told(&header, from, &e);
+                }
                 // A body that is not the header's, or a block that
                 // breaks a rule: whoever served it answers for it.
                 if let Some(from) = from
@@ -2197,6 +2217,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             waker: RwLock::new(None),
             turn: AtomicUsize::new(0),
             moved: (Mutex::new(()), std::sync::Condvar::new()),
+            received: RwLock::new(None),
+            refused: RwLock::new(None),
             #[cfg(test)]
             by_port: AtomicBool::new(false),
         });
@@ -2448,6 +2470,12 @@ pub struct Handle<B: Backend + 'static, V> {
     chain: Arc<Chain<B, V>>,
 }
 
+impl<B: Backend + 'static, V> Clone for Handle<B, V> {
+    fn clone(&self) -> Self {
+        Handle { shared: Arc::clone(&self.shared), list: Arc::clone(&self.list), chain: Arc::clone(&self.chain) }
+    }
+}
+
 /// What a [`Handle`] reads.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Standing {
@@ -2506,6 +2534,19 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
 
     pub fn chain(&self) -> &Arc<Chain<B, V>> {
         &self.chain
+    }
+
+    /// Has `told` called with each block of a peer's that becomes the
+    /// chain's last, and who served it. (On the thread of the worker
+    /// that hears of it: it is to be quick.)
+    pub fn on_received(&self, told: Received) {
+        *self.shared.received.write().unwrap_or_else(|e| e.into_inner()) = Some(told);
+    }
+
+    /// Has `told` called with each block that is refused, who served it
+    /// (nobody, if it was made here), and why.
+    pub fn on_refused(&self, told: Refused) {
+        *self.shared.refused.write().unwrap_or_else(|e| e.into_inner()) = Some(told);
     }
 }
 

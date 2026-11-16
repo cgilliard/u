@@ -53,6 +53,35 @@ pub const STATS: &[(&str, Kind)] = &[
     ("Fetching", Kind::Level),
     ("Mined", Kind::Count),
 ];
+/// The node's stats. The log shows these of them, each in a column
+/// this wide; the rest are counted all the same.
+///
+/// ```text
+/// Uptime: 0:00:00           Requests___AvgLatency(us)_Peers_PeersLive_Height_Blocks_Mined
+/// ```
+pub fn stats() -> Stats {
+    Stats::new(STATS).showing(&[
+        (REQUESTS, 11),
+        (LATENCY, 15),
+        (PEERS, 6),
+        (PEERS_LIVE, 10),
+        (HEIGHT, 7),
+        (BLOCKS, 7),
+        (MINED, 6),
+    ])
+}
+
+/// Sets what of `stats` is how the node stands to what `hold` says it
+/// is now.
+pub fn set_levels<B: Backend + 'static, V>(stats: &Stats, hold: &Handle<B, V>) {
+    let now = hold.read();
+    stats.set(PEERS, now.peers as u64);
+    stats.set(PEERS_LIVE, now.live as u64);
+    stats.set(HEIGHT, now.height as u64);
+    stats.set(BLOCKS, now.blocks);
+    stats.set(FETCHING, now.fetching as u64);
+}
+
 /// Datagrams taken, of whatever kind.
 pub const REQUESTS: usize = 0;
 /// The microseconds taking them took: shown as the average of one.
@@ -107,13 +136,9 @@ impl Watch<'_> {
 
     /// How the node stands.
     fn levels<B: Backend + 'static, V>(&self, gauge: &Handle<B, V>) {
-        let Some(stats) = self.stats else { return };
-        let now = gauge.read();
-        stats.set(PEERS, now.peers as u64);
-        stats.set(PEERS_LIVE, now.live as u64);
-        stats.set(HEIGHT, now.height as u64);
-        stats.set(BLOCKS, now.blocks);
-        stats.set(FETCHING, now.fetching as u64);
+        if let Some(stats) = self.stats {
+            set_levels(stats, gauge);
+        }
     }
 }
 

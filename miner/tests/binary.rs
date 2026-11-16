@@ -170,7 +170,7 @@ fn two_nodes_make_blocks_and_take_each_others() {
         let stats = std::fs::read_to_string(dirs[i].join("stat.log")).ok()?;
         let whole = stats.lines().rev().find(|l| l.starts_with('['))?;
         let n: Vec<u64> = whole[26..].split_whitespace().map(|n| n.replace(',', "").parse().unwrap_or(0)).collect();
-        Some((n[n.len() - 4], n[n.len() - 3], n[n.len() - 1]))
+        Some((n[n.len() - 3], n[n.len() - 2], n[n.len() - 1]))
     };
     // Until each has made blocks, and holds more than it made.
     let began = Instant::now();
@@ -191,7 +191,13 @@ fn two_nodes_make_blocks_and_take_each_others() {
     for dir in &dirs {
         let requests = std::fs::read_to_string(dir.join("request.log")).unwrap();
         assert!(requests.contains(" block height ") && requests.contains(" get block, "), "{requests}");
-        assert!(!std::fs::read_to_string(dir.join("tabernacle.log")).unwrap().contains("Error"));
+        // The main log says of each block that it was being made, that
+        // it was won, or that it came from the other.
+        let main = std::fs::read_to_string(dir.join("tabernacle.log")).unwrap();
+        assert!(!main.contains("Error"), "{main}");
+        for said in ["] Mining block 1 on ", "] Won block ", " hashes in ", "] Received block ", ") from 127.0.0.1:"] {
+            assert!(main.contains(said), "{said}: {main}");
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }

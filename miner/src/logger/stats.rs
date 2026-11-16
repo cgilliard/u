@@ -88,6 +88,12 @@ pub struct Stats {
     /// Each one's name, kind, and the width of its column.
     names: Vec<(String, Kind, usize)>,
     values: Vec<AtomicU64>,
+    /// Which of them the log shows, in what order, and how wide each
+    /// column is: all of them as they come, unless set.
+    shown: Vec<(usize, usize)>,
+    /// Called before the stats are read to be written down: so that
+    /// what is a level is what it is at that moment.
+    refresh: Option<Box<dyn Fn(&Stats) + Send + Sync>>,
 }
 
 impl Stats {
@@ -101,10 +107,36 @@ impl Stats {
             let least = if kind == Kind::Bytes { 18 } else { 15 };
             least.max(name.chars().count() + 2)
         };
+        let names: Vec<(String, Kind, usize)> = names.iter().map(|(n, k)| (n.to_string(), *k, width(n, *k))).collect();
         Stats {
-            names: names.iter().map(|(n, k)| (n.to_string(), *k, width(n, *k))).collect(),
+            shown: names.iter().enumerate().map(|(i, (_, _, width))| (i, *width)).collect(),
             values: names.iter().map(|_| AtomicU64::new(0)).collect(),
+            names,
+            refresh: None,
         }
+    }
+
+    /// The same, but the log shows these only, in this order, each in a
+    /// column this wide (its place in the names given, and the width).
+    /// The rest are kept all the same, to be read.
+    pub fn showing(mut self, columns: &[(usize, usize)]) -> Stats {
+        self.shown = columns.iter().copied().filter(|(i, _)| *i < self.names.len()).collect();
+        self
+    }
+
+    /// Has `refresh` called before the stats are read to be written
+    /// down, to set what is a level to what it is then.
+    pub fn refreshed_by(mut self, refresh: Box<dyn Fn(&Stats) + Send + Sync>) -> Stats {
+        self.refresh = Some(refresh);
+        self
+    }
+
+    /// Every stat as it stands, for the log: the levels set afresh.
+    fn read_fresh(&self) -> Vec<u64> {
+        if let Some(refresh) = &self.refresh {
+            refresh(self);
+        }
+        self.read()
     }
 
     /// Adds `n` to the stat at `index` (its place in the names given).
@@ -127,14 +159,21 @@ impl Stats {
     /// that no line ends in spaces.
     fn line(&self, first: &str, fill: char, cell: impl Fn(usize) -> String) -> String {
         let mut out = column(first, FIRST, ' ');
-        for (i, (_, _, width)) in self.names.iter().enumerate() {
-            match i + 1 == self.names.len() {
-                true => out += &cell(i),
-                false => out += &column(&cell(i), *width, fill),
+        for (k, (i, width)) in self.shown.iter().enumerate() {
+            match k + 1 == self.shown.len() {
+                true => out += &cell(*i),
+                false => out += &column(&cell(*i), *width, fill),
             }
         }
         out.push('\n');
         out
+    }
+
+    /// The rule drawn under a whole, to set it off from the intervals
+    /// that follow: as wide as the names above it.
+    pub fn rule(&self) -> String {
+        let wide = self.names(0).lines().map(|l| l.chars().count()).max().unwrap_or(0);
+        format!("{}\n", "-".repeat(wide))
     }
 
     /// The columns' names, after how long the node has been up:
@@ -225,11 +264,11 @@ fn write(logger: &Logger, stats: &Stats, every: Every, stop: &(Mutex<bool>, Cond
     let started = logger.now();
     let whole = |now: u64, values: &[u64]| {
         let up = now.saturating_sub(started) / 1000;
-        logger.write_at(now, &(stats.names(up) + &stats.whole(&Moment::of(now), values)));
+        logger.write_at(now, &(stats.names(up) + &stats.whole(&Moment::of(now), values) + &stats.rule()));
     };
     // The stats as of the last interval's line, when that was, and how
     // many intervals have been written.
-    let (mut last, mut last_at, mut written) = (stats.read(), started, 0u64);
+    let (mut last, mut last_at, mut written) = (stats.read_fresh(), started, 0u64);
     whole(started, &last);
     loop {
         // Until the next interval is over, counted from the start, or
@@ -241,7 +280,7 @@ fn write(logger: &Logger, stats: &Stats, every: Every, stop: &(Mutex<bool>, Cond
             stop.1.wait_timeout_while(stopped, wait, |stopped| !*stopped).unwrap_or_else(|e| e.into_inner());
         // One reading, for the interval's line and for the whole that
         // may follow it: so that the wholes add up.
-        let (now, values) = (logger.now(), stats.read());
+        let (now, values) = (logger.now(), stats.read_fresh());
         if *stopped {
             // What happened since the last line, as a last interval of
             // whatever length it was; and the whole.
@@ -300,6 +339,34 @@ mod tests {
              [2026-10-17 19:31:04:000] 3,004          40.3            13\n"
         );
         assert_eq!(s.whole(&Moment::of(T), &[0, 0, 0]), "[2026-10-17 19:30:44:000] 0              -               0\n");
+    }
+
+    /// The log shows the columns it is set to, as wide as it is set
+    /// to; the rest are kept, and read, all the same.
+    #[test]
+    fn the_log_shows_the_columns_it_is_set_to() {
+        let all =
+            [("Requests", Kind::Count), ("BytesSent", Kind::Bytes), ("Peers", Kind::Level), ("Mined", Kind::Count)];
+        let s = Stats::new(&all).showing(&[(0, 11), (3, 6), (2, 6)]);
+        let (before, now) = ([3000, 1_000_003, 14, 7], [3003, 1_000_103, 13, 9]);
+        assert_eq!(
+            [
+                s.names(7),
+                s.whole(&Moment::of(T), &before),
+                s.rule(),
+                s.interval(10_000, &Moment::of(T + 10_000), &before, &now)
+            ]
+            .concat(),
+            "Uptime: 0:00:07           Requests___Mined_Peers\n\
+             [2026-10-17 19:30:44:000] 3,000      7     14\n\
+             ------------------------------------------------\n\
+             10s ending 19:30:54:      3          2     13\n"
+        );
+        s.add(1, 5);
+        assert_eq!(s.read()[1], 5);
+        // What is a level is set afresh before it is written down.
+        let s = Stats::new(&all).refreshed_by(Box::new(|s| s.set(2, 99)));
+        assert_eq!((s.read()[2], s.read_fresh()[2]), (0, 99));
     }
 
     /// The lines of the sample (`docs`), with these columns' widths.
@@ -406,9 +473,11 @@ mod tests {
                 // Three intervals to a whole: but before the first,
                 // which has none, and the last, which has what there
                 // was time for and one shorter.
-                let last = at + 2 == lines.len();
+                // And under the whole, a rule as wide as the names.
+                assert_eq!(lines[at + 2], "-".repeat(lines[at].len()), "{text}");
+                let last = at + 3 == lines.len();
                 assert!(wholes == 0 || since_whole == 3 || (last && since_whole <= 3), "{since_whole}\n{text}");
-                (since_whole, wholes, at) = (0, wholes + 1, at + 2);
+                (since_whole, wholes, at) = (0, wholes + 1, at + 3);
             } else {
                 assert_eq!((words[1], words.len()), ("ending", 6), "{}", lines[at]);
                 assert!(words[2].len() == 9 && words[2].ends_with(':'), "{}", lines[at]);

@@ -22,6 +22,7 @@
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::aggregate::{AggregateVerifier, Statement};
 use crate::block::{Block, Body, BodyRef, Header};
@@ -40,8 +41,9 @@ use crate::transaction::UnsignedTransaction;
 /// What came of trying to make a block.
 #[derive(Debug)]
 pub enum Mined {
-    /// The block, whole, and how many hashes finding its nonce took.
-    Block { block: Vec<u8>, height: u32, hashes: u64 },
+    /// The block, whole: with how long proving it took, and how many
+    /// hashes finding its nonce took and how long.
+    Block { block: Vec<u8>, header: Header, proved: Duration, hashes: u64, solved: Duration },
     /// Given up: `cancel` said so.
     Cancelled,
     /// The chain has had its last block: there is none to make.
@@ -109,11 +111,13 @@ pub fn mine<B: Backend + 'static>(
         parent_hash: tip.hash(),
     });
     let jobs = crate::parallel::threads();
+    let began = Instant::now();
     let Some(proof) = chain.verifier().prove_block(height, &statement, &segments, &names, None, jobs, &|_| {}, cancel)
     else {
         return Ok(Mined::Cancelled);
     };
     body.proof = proof;
+    let proved = began.elapsed();
     let header = Header {
         prev_hash: tip.hash(),
         height,
@@ -125,11 +129,13 @@ pub fn mine<B: Backend + 'static>(
         nonce: [0; 32],
     };
     let target = chain.expected_target(&tip)?;
+    let began = Instant::now();
     let Some((nonce, mix, hashes)) = solve(dataset, &header.pow_hash(), &target, start, cancel) else {
         return Ok(Mined::Cancelled);
     };
     let header = Header { nonce, mix, ..header };
-    Ok(Mined::Block { block: Block { header, body }.to_bytes(), height, hashes })
+    let solved = began.elapsed();
+    Ok(Mined::Block { block: Block { header, body }.to_bytes(), header, proved, hashes, solved })
 }
 
 /// A nonce whose hash with `header_hash` meets `target`, with the mix
@@ -204,8 +210,8 @@ mod tests {
         let reward: Digest = core::array::from_fn(|i| Fp::new(1000 + i as u32));
         for height in 1..=3u32 {
             let made = mine(&chain, &dataset, &reward, NOW, height as u64 * 1_000_003, &|| false).unwrap();
-            let Mined::Block { block, height: at, hashes } = made else { panic!("{made:?}") };
-            assert!(at == height && hashes >= 1);
+            let Mined::Block { block, header, hashes, .. } = made else { panic!("{made:?}") };
+            assert!(header.height == height && hashes >= 1);
             let view = BlockRef::from_bytes(&block).unwrap();
             assert_eq!(chain.apply_block(&view, NOW), Ok(Applied::Extended));
             let tip = chain.tip().unwrap();

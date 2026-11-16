@@ -141,7 +141,7 @@ given otherwise is taken from the directory the node was started in.
 
 | Log | Holds | Written by |
 |---|---|---|
-| Main | How the node was started and with what settings; then only errors, critical events and stopping; and each time another log's file was put aside, under what name | Whoever calls it, on their own thread |
+| Main | How the node was started and with what settings; then blocks (being made, won, received), errors, critical events and stopping; and each time another log's file was put aside, under what name | Whoever calls it, on their own thread |
 | Request | Each request the node is asked | A thread of its own, from a queue |
 | Stats | How the node is doing: every few seconds for those seconds, every minute for the whole since it started | A thread of its own |
 
@@ -237,29 +237,33 @@ about it.
 
 ### 2.6 The stats log
 
-In columns, a line at a time:
+In columns, a line at a time. Under each whole a rule is drawn, to set
+it off from the intervals that follow.
 
 ```
-Uptime: 0:00:00           Requests_______AvgLatency(us)__BytesIn___________BytesSent_________Peers__________PeersLive______Height_________Blocks_________Fetching
-[2026-11-16 05:27:56:235] 0              -               0                 0                 0              0              0              0              0
-10s ending 05:28:06:      2              392.5           266               266               0              0              0              0              0
-10s ending 05:28:16:      2              29.5            19                19                1              1              0              0              0
+Uptime: 0:00:00           Requests___AvgLatency(us)_Peers_PeersLive_Height_Blocks_Mined
+[2026-11-16 08:21:55:624] 0          -              0     0         0      0      0
+---------------------------------------------------------------------------------------
+10s ending 08:22:05:      18         12.4           1     1         3      3      3
+10s ending 08:22:15:      156        12.9           1     1         5      2      0
 ...
-Uptime: 0:01:00           Requests_______AvgLatency(us)__BytesIn___________BytesSent_________Peers__________PeersLive______Height_________Blocks_________Fetching
-[2026-11-16 05:28:56:235] 6              159.3           304               304               1              1              0              0              0
+Uptime: 0:01:00           Requests___AvgLatency(us)_Peers_PeersLive_Height_Blocks_Mined
+[2026-11-16 08:22:55:624] 174        12.8           1     1         5      5      3
+---------------------------------------------------------------------------------------
 ```
 
 | Column | Is |
 |---|---|
 | Requests | Datagrams taken, chunks too (counted) |
-| Dropped | Datagrams dropped because the queue of the thread they were for was full (counted): `THREADS.md` |
 | AvgLatency(us) | What taking one took, in microseconds, on average: of the interval in an interval's line, of the whole run in a whole's. `-` where there were none |
-| BytesIn, BytesSent | What came and went (counted) |
 | Peers, PeersLive | Peers known, and those heard from lately (levels) |
 | Height | The chain's height (level) |
 | Blocks | Blocks that joined the chain here (counted) |
-| Fetching | Objects being fetched (level) |
 | Mined | Blocks made here (counted) |
+
+Counted as well, and not shown: datagrams dropped at a full queue (the
+main log says when that happens), bytes in and out, objects being
+fetched.
 
 - **Every ten seconds** (a setting): what happened in those seconds,
   after how long they were and the time they ended at.
@@ -345,8 +349,21 @@ and the node exits with -1:
 
 ### 3.3 After that
 
-The main log holds only errors, critical events, each file of another
-log put aside, and stopping.
+The main log holds what happens to the chain here, errors, critical
+events, each file of another log put aside, and stopping. Of blocks:
+
+```
+[2026-11-16 08:21:57:444] Mining block 4 on 52ce1949
+[2026-11-16 08:22:02:094] Received block 4 (81c45e28) from 127.0.0.1:37412
+[2026-11-16 08:22:02:095] Mining block 5 on 81c45e28
+[2026-11-16 08:22:09:092] Won block 6 (e494f101): proved in 0.05s, 624,125 hashes in 5.57s
+```
+
+- **Mining block N on P**: a block is begun, on the block of id P.
+- **Won block N (id)**: its proof of work was found here, with how long
+  its proof took, and how many hashes and how long its nonce.
+- **Received block N (id) from peer**: a block of a peer's became the
+  chain's last.
 
 ### 3.4 Stopping
 

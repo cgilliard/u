@@ -15,9 +15,10 @@ use std::time::{Duration, Instant};
 use tabminer::aggregate::{AggregateVerifier, AggregatorParams, Genesis};
 use tabminer::chain::Chain;
 use tabminer::chain::params::ChainParams;
-use tabminer::configuration::{Configuration, Network};
+use tabminer::configuration::{Configuration, Network, hex};
 use tabminer::interrupt;
 use tabminer::logger::Logger;
+use tabminer::logger::fmt::{commas, short_seconds};
 use tabminer::logger::queued::Queued;
 use tabminer::logger::stats::{Stats, StatsLog};
 use tabminer::miner::{self, Mined};
@@ -65,6 +66,11 @@ fn main() {
 /// nobody has. They are for trying the network, not for keeping.
 const DEV_REWARD: tabminer::hash::Digest = [tabminer::poseidon2::Fp::ZERO; 8];
 
+/// The first of a block's id, as the logs say it.
+fn short(id: &tabminer::hash::Digest) -> String {
+    hex(&tabminer::poseidon2::digest_to_bytes(id)[..4])
+}
+
 /// Makes blocks, one after another, on whatever the chain's last block
 /// is: begun again whenever that changes, and not while the node is
 /// catching up with a chain ahead of its own.
@@ -87,8 +93,19 @@ fn make_blocks(
         }
         let cancel = || hold.moves() != seen;
         start = start.wrapping_add(1 << 32);
+        if let Ok(tip) = hold.chain().tip() {
+            main.log(&format!("Mining block {} on {}", commas(tip.height as u64 + 1), short(&tip.hash())));
+        }
         match miner::mine(hold.chain(), dataset, reward, socket::unix(), start, &cancel) {
-            Ok(Mined::Block { block, .. }) => {
+            Ok(Mined::Block { block, header, proved, hashes, solved }) => {
+                main.log(&format!(
+                    "Won block {} ({}): proved in {}, {} hashes in {}",
+                    commas(header.height as u64),
+                    short(&header.hash()),
+                    short_seconds(proved.as_millis() as u64),
+                    commas(hashes),
+                    short_seconds(solved.as_millis() as u64)
+                ));
                 stats.add(socket::MINED, 1);
                 hold.mined(block, socket::unix());
                 // Until it has joined the chain (or another has).
@@ -136,7 +153,6 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     let threads = |e: std::io::Error| format!("cannot start a thread: {e}");
     let requests = open(&c.request_log)?.report_rotations_to(Arc::clone(&main));
     let requests = Queued::start(requests, c.request_log_queue, Arc::clone(&main)).map_err(threads)?;
-    let stats = Arc::new(Stats::new(socket::STATS));
     let stat_log = open(&c.stat_log)?.report_rotations_to(Arc::clone(&main));
 
     // The chain.
@@ -182,6 +198,13 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
         }
     }
 
+    // The stats: how the node stands is read afresh for every line.
+    let hold = node.hold();
+    let stats = {
+        let hold = hold.clone();
+        Arc::new(socket::stats().refreshed_by(Box::new(move |stats| socket::set_levels(stats, &hold))))
+    };
+
     // Everything is open: from here the node can do what it is for.
     let _stats_log = StatsLog::start(stat_log, Arc::clone(&stats), c.stats).map_err(threads)?;
     interrupt::halt_when_told(Arc::clone(&main)).map_err(|e| format!("cannot listen for being told to stop: {e}"))?;
@@ -190,7 +213,24 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
 
     // Blocks are made on a thread of their own, for as long as the
     // node runs.
-    let hold = node.hold();
+    {
+        let main = Arc::clone(&main);
+        hold.on_received(Box::new(move |header, from| {
+            main.log(&format!(
+                "Received block {} ({}) from {from}",
+                commas(header.height as u64),
+                short(&header.hash())
+            ));
+        }));
+    }
+    {
+        let main = Arc::clone(&main);
+        hold.on_refused(Box::new(move |header, from, why| {
+            let whose = from.map_or_else(|| "made here".to_string(), |from| format!("from {from}"));
+            let (height, id) = (commas(header.height as u64), short(&header.hash()));
+            main.log(&format!("Refused block {height} ({id}) {whose}: {why}"));
+        }));
+    }
     if let Some((dataset, reward)) = mining {
         let (main, stats) = (Arc::clone(&main), Arc::clone(&stats));
         std::thread::Builder::new()
