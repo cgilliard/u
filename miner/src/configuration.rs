@@ -69,7 +69,17 @@ const OPTIONS: &[(&str, &[Opt])] = &[
             },
         ],
     ),
-    ("Mining", &[Opt { name: "no-mine", takes: Takes::Nothing, help: "follow the chain without mining" }]),
+    (
+        "Mining",
+        &[
+            Opt { name: "no-mine", takes: Takes::Nothing, help: "follow the chain without mining" },
+            Opt {
+                name: "reward-key",
+                takes: Takes::Value("HEX"),
+                help: "the key the rewards of blocks made here are paid to:\nits hash, as 64 hex digits",
+            },
+        ],
+    ),
     (
         "Network",
         &[
@@ -352,6 +362,8 @@ pub struct Configuration {
     /// checking proofs; zero for one a core.
     pub threads: usize,
     pub mine: bool,
+    /// The hash of the key rewards are paid to, if one was given.
+    pub reward: Option<crate::hash::Digest>,
     pub listen: SocketAddrV4,
     /// Peers given by hand.
     pub peers: Vec<SocketAddrV4>,
@@ -663,6 +675,17 @@ impl Configuration {
             return Err(wrong(e.to_string()));
         }
 
+        let reward = match given.one("reward-key") {
+            None => None,
+            Some(hex) => {
+                let not = || wrong(format!("--reward-key: '{hex}' is not the hash of a key (64 hex digits)"));
+                let bytes: Vec<u8> = match hex.len() == 64 && hex.is_ascii() {
+                    true => (0..32).filter_map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()).collect(),
+                    false => Vec::new(),
+                };
+                Some(crate::poseidon2::digest_from_bytes(&bytes).filter(|_| bytes.len() == 32).ok_or_else(not)?)
+            }
+        };
         let keep = count("max-undo-blocks", 1)?.unwrap_or(1008);
         if s.sync_point as usize >= keep {
             return clash(format!("--sync-point ({}) is not under --max-undo-blocks ({keep})", s.sync_point));
@@ -691,6 +714,7 @@ impl Configuration {
             data_dir,
             threads: count("threads", 0)?.unwrap_or(0),
             mine: !given.flag("no-mine"),
+            reward,
             listen,
             peers,
             seeds,
@@ -717,9 +741,9 @@ impl Configuration {
         let limit = |n: u64, unit: &str| if n == 0 { "no limit".to_string() } else { format!("{} {unit}", commas(n)) };
         let mut lines: Vec<(&str, String)> = vec![("UDP Server Listening on", self.listen.to_string())];
         lines.extend(self.files.iter().map(|file| ("Configuration File", file.display().to_string())));
+        lines.extend([("Network", self.network.name().to_string()), ("Mining", yes(self.mine))]);
+        lines.extend(self.reward.iter().map(|key| ("Reward Key", hex(&crate::poseidon2::digest_to_bytes(key)))));
         lines.extend([
-            ("Network", self.network.name().to_string()),
-            ("Mining", yes(self.mine)),
             ("Threads", if self.threads == 0 { "one a core".to_string() } else { commas(self.threads as u64) }),
             ("Request Queue Size", commas(self.net.request_queue as u64)),
             ("Data Directory", self.data_dir.display().to_string()),
@@ -788,9 +812,19 @@ impl Configuration {
     /// line is the mark that a node is running, for whoever reads the
     /// log, or a program that does: it is to be said only when the
     /// port is bound and requests can be taken, and by nothing else.
+    ///
+    /// It is the last thing said on the terminal: from here the main
+    /// log is written to its file alone, and the terminal is left to
+    /// whoever is at it.
     pub fn ready(main: &Logger) {
         main.log_all(READY);
+        main.file_only();
     }
+}
+
+/// Bytes as hex digits.
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// What a node says when it can take requests.
@@ -1043,6 +1077,23 @@ mod tests {
         );
     }
 
+    /// The key rewards are paid to is given by its hash, in hex.
+    #[test]
+    fn the_reward_key_is_a_hash_in_hex() {
+        assert_eq!(read(&[]).unwrap().reward, None);
+        let key: crate::hash::Digest = core::array::from_fn(|i| crate::poseidon2::Fp::new(1000 + i as u32));
+        let text = hex(&crate::poseidon2::digest_to_bytes(&key));
+        let c = read(&["--reward-key", &text]).unwrap();
+        assert_eq!(c.reward, Some(key));
+        assert!(c.lines().contains(&("Reward Key".to_string(), text.clone())));
+        for bad in ["abc", &text[1..], &format!("{}zz", &text[2..]), &"ff".repeat(32), &format!("{text}00")] {
+            assert_eq!(
+                wrong(&["--reward-key", bad]),
+                format!("--reward-key: '{bad}' is not the hash of a key (64 hex digits)")
+            );
+        }
+    }
+
     /// A time may be said in minutes, hours or days, and a size in
     /// kilobytes, megabytes or gigabytes of 1024.
     #[test]
@@ -1158,6 +1209,7 @@ mod tests {
                 "NAME" => Some("dev"),
                 "DIR" | "FILE" => Some("/somewhere/of/its/own"),
                 "N" | "TIME" | "SIZE" => Some("70"),
+                "HEX" => Some("0000000000000000000000000000000000000000000000000000000000000000"),
                 "ADDR:PORT" => Some("10.1.2.3:4000"),
                 "HOST:PORT" => Some("seed.example.org:4000"),
                 _ => None,

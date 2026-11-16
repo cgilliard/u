@@ -23,6 +23,7 @@ pub mod inflate;
 pub mod interrupt;
 pub mod logger;
 pub mod merkle;
+pub mod miner;
 pub mod name;
 pub mod name_air;
 pub mod net;

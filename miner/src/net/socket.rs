@@ -24,7 +24,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::MAX_DATAGRAM;
-use super::node::{CHUNK, Gauge, Heard, Node, Worker, socket_addr};
+use super::node::{CHUNK, Handle, Heard, Node, Worker, socket_addr};
 use crate::chain::Chain;
 use crate::chain::verify::ProofVerifier;
 use crate::logger::Logger;
@@ -51,6 +51,7 @@ pub const STATS: &[(&str, Kind)] = &[
     ("Height", Kind::Level),
     ("Blocks", Kind::Count),
     ("Fetching", Kind::Level),
+    ("Mined", Kind::Count),
 ];
 /// Datagrams taken, of whatever kind.
 pub const REQUESTS: usize = 0;
@@ -68,6 +69,8 @@ pub const HEIGHT: usize = 7;
 pub const BLOCKS: usize = 8;
 /// Objects being fetched.
 pub const FETCHING: usize = 9;
+/// Blocks made here.
+pub const MINED: usize = 10;
 
 /// What the main log says when datagrams are dropped.
 pub const DROPPING: &str = "dropped requests: a worker's queue is full";
@@ -103,7 +106,7 @@ impl Watch<'_> {
     }
 
     /// How the node stands.
-    fn levels<B: Backend + 'static, V>(&self, gauge: &Gauge<B, V>) {
+    fn levels<B: Backend + 'static, V>(&self, gauge: &Handle<B, V>) {
         let Some(stats) = self.stats else { return };
         let now = gauge.read();
         stats.set(PEERS, now.peers as u64);
@@ -176,7 +179,7 @@ where
     Chain<B, V>: Send + Sync,
     Worker<B, V>: Send,
 {
-    let (gauge, queue) = (node.gauge(), node.request_queue());
+    let (gauge, queue) = (node.hold(), node.request_queue());
     let (workers, shared) = node.parts();
     let (senders, queues): (Vec<SyncSender<Item>>, Vec<Receiver<Item>>) =
         workers.iter().map(|_| sync_channel(queue)).unzip();
@@ -260,7 +263,7 @@ fn work<B: Backend + 'static, V: ProofVerifier + Sync>(
     clock: Instant,
     unix: &(dyn Fn() -> u64 + Sync),
     watch: &Watch<'_>,
-    gauge: Option<&Gauge<B, V>>,
+    gauge: Option<&Handle<B, V>>,
 ) {
     let now = || clock.elapsed().as_micros() as Micros;
     // A datagram that cannot be sent is a datagram lost, as any may be.

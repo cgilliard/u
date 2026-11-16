@@ -160,7 +160,9 @@ The time is UTC. Three ways to write:
   writes it.
 - `log_all`: `log`, and the same line to the terminal (standard error).
   The startup messages and the settings are written this way, so that
-  how a run was configured is on the screen and in the file.
+  how a run was configured is on the screen and in the file. Once the
+  node has said "Server is ready!" it writes to the file alone: the
+  terminal is left to whoever is at it.
 
 ### 2.3 Rotation
 
@@ -257,6 +259,7 @@ Uptime: 0:01:00           Requests_______AvgLatency(us)__BytesIn___________Bytes
 | Height | The chain's height (level) |
 | Blocks | Blocks that joined the chain here (counted) |
 | Fetching | Objects being fetched (level) |
+| Mined | Blocks made here (counted) |
 
 - **Every ten seconds** (a setting): what happened in those seconds,
   after how long they were and the time they ended at.
@@ -324,6 +327,8 @@ reads the log and for programs that do. So:
   open, the store is open, the port is bound, the threads are started.
   All of that is done before the first line above is written, so a
   node that cannot start never says how it is configured either.
+- It is the last thing the node says on the terminal. Everything after
+  it goes to the main log's file alone.
 - No request is taken before it is said. (A datagram that comes
   between the port being bound and the line waits in the system's
   queue for those few moments.)
@@ -351,13 +356,13 @@ On an interrupt (Ctrl-C, or the operating system's signal to end):
 [2026-11-16 05:28:01:753] Received shut down signal, halting!
 ```
 
-and the node ends, with 0. That is all, on purpose: the worst a node
+in the main log (not on the terminal, which is quiet once the node is
+ready), and the node ends, with 0. That is all, on purpose: the worst a node
 can do on being told to stop is not to, or to hang.
 
 - What takes the signal only sets a flag. A thread that does nothing
   else sees it within a fiftieth of a second, writes the line to the
-  main log and the terminal (`log_all`, on its own thread, waiting for
-  no other), and ends the program.
+  main log (`log_all`, on its own thread, waiting for no other), and ends the program.
 - Nothing is put in order first. The store is whole wherever it is cut
   off; lines still queued for the request log, and the stats since the
   last interval, are lost.
@@ -370,10 +375,43 @@ library's `signal`, the same on every platform the node is built for
 
 ---
 
-## 4. Still to do
+## 4. Mining
 
-1. **Mining.** It is not in this node yet, so `tabminer` without
-   `--no-mine` says so and does not start.
+A node makes blocks unless it is given `--no-mine`: on a thread of its
+own (`src/miner.rs`), one block after another on the chain's last,
+begun again whenever that changes, and not while the node is catching
+up with a chain ahead of its own. A block made is given to the node,
+which applies it and tells its peers.
+
+**So far, on the dev network only**, and a block carries its reward and
+nothing else:
+
+- `--network dev` (a build with `--features dev`): a block about every
+  second or two, its proof checked directly.
+- `--reward-key HEX`: the hash of the key rewards are paid to. Without
+  it, on the dev network, they are paid to a key nobody has.
+- On mainnet and the recursive dev network a node that is not given
+  `--no-mine` says that mining there is not built yet, and does not
+  start: their blocks' proofs build on the proof of the block before,
+  which the chain does not keep yet.
+
+Two nodes to try it with:
+
+```
+tabminer --network dev --data-dir /tmp/a --listen 127.0.0.1:3737
+tabminer --network dev --data-dir /tmp/b --listen 127.0.0.1:3738 --peer 127.0.0.1:3737
+```
+
+The stats log of each shows its height, the blocks that joined its
+chain, and those it made (`Mined`).
+
+---
+
+## 5. Still to do
+
+1. **Mining on mainnet**: the chain proof on the block before; the
+   table of the proof of work, which is not built in; a wallet for the
+   rewards; transactions in blocks.
 2. **What is left of `THREADS.md`** (its 8.3).
 3. **The peers file and the built-in seeds.** `--peer` and `--seed` are
    what a node begins from today.

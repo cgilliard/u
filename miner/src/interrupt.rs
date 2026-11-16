@@ -71,8 +71,9 @@ pub fn told() -> bool {
 }
 
 /// Listens ([`listen`]), and starts the thread that ends the program
-/// when it is told to stop: [`HALTING`] is said in `main` and on the
-/// terminal, and the program ends with 0. Meanwhile the thread sees to
+/// when it is told to stop: [`HALTING`] is said in `main` (and on the
+/// terminal, if the node has not yet said it is ready), and the
+/// program ends with 0. Meanwhile the thread sees to
 /// it that the main log's file is put aside when it is due, though
 /// nothing is being written to it.
 pub fn halt_when_told(main: Arc<Logger>) -> io::Result<()> {

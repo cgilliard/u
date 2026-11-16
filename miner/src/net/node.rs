@@ -453,6 +453,9 @@ pub(crate) struct Shared {
     waker: RwLock<Option<Waker>>,
     /// Whose turn it is to hear of work done on the chain.
     turn: AtomicUsize,
+    /// Told whenever the chain has a new last block (`blocks` counts
+    /// them): for whoever waits for that.
+    moved: (Mutex<()>, std::sync::Condvar),
     #[cfg(test)]
     by_port: AtomicBool,
 }
@@ -831,19 +834,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     /// Gives work to be done on the chain: what comes of it is heard
     /// in [`Node::applied`].
     fn work(&mut self, l: &mut List, job: Job) {
-        l.outstanding += 1;
-        match &mut l.applier {
-            Applier::Here(done) => match apply(&self.chain, job) {
-                Some(outcome) => {
-                    done.push_back(outcome);
-                    self.shared.ready.fetch_add(1, Ordering::Relaxed);
-                }
-                None => l.outstanding -= 1,
-            },
-            Applier::Thread(jobs, _) => {
-                let _ = jobs.get_mut().unwrap_or_else(|e| e.into_inner()).send(job);
-            }
-        }
+        work(&self.chain, &self.shared, l, job);
     }
 
     /// Whether work given to be done on the chain is still to be heard
@@ -1571,6 +1562,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             Ok(Applied::Extended | Applied::Reorganized { .. }) => {
                 self.counts.blocks += 1;
                 self.shared.blocks.fetch_add(1, Ordering::Relaxed);
+                // (Whoever waits for the chain to move is told.)
+                drop(self.shared.moved.0.lock().unwrap_or_else(|e| e.into_inner()));
+                self.shared.moved.1.notify_all();
                 self.announce(now, header, len, from, out);
                 self.shared.post_others(self.me, Notice::Announce { header, len, except: from });
             }
@@ -2202,6 +2196,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             blocks: AtomicU64::new(0),
             waker: RwLock::new(None),
             turn: AtomicUsize::new(0),
+            moved: (Mutex::new(()), std::sync::Condvar::new()),
             #[cfg(test)]
             by_port: AtomicBool::new(false),
         });
@@ -2307,8 +2302,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
     }
 
     /// How the node stands, to be asked while its workers run.
-    pub fn gauge(&self) -> Gauge<B, V> {
-        Gauge {
+    pub fn hold(&self) -> Handle<B, V> {
+        Handle {
             shared: Arc::clone(&self.shared),
             list: Arc::clone(&self.list),
             chain: Arc::clone(&self.workers[0].chain),
@@ -2444,15 +2439,16 @@ impl<B: Backend + 'static, V> std::ops::DerefMut for Node<B, V> {
     }
 }
 
-/// How a node stands, for whoever watches it: asked of what its
-/// workers share, so that none of them is held up to answer.
-pub struct Gauge<B: Backend + 'static, V> {
+/// A hold on a node while its workers run, for whoever watches it or
+/// makes blocks for it: all by what the workers share, so that none of
+/// them is held up.
+pub struct Handle<B: Backend + 'static, V> {
     shared: Arc<Shared>,
     list: Arc<RwLock<List>>,
     chain: Arc<Chain<B, V>>,
 }
 
-/// What a [`Gauge`] reads.
+/// What a [`Handle`] reads.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Standing {
     /// Peers known, and those of them heard from lately (as each
@@ -2467,7 +2463,53 @@ pub struct Standing {
     pub fetching: usize,
 }
 
-impl<B: Backend + 'static, V> Gauge<B, V> {
+impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
+    /// A block made here: applied, and if it joins the chain, announced
+    /// to every peer. `unix` is the time by the calendar, in seconds.
+    pub fn mined(&self, block: Vec<u8>, unix: u64) {
+        let Ok(header) = BlockRef::from_bytes(&block).map(|b| *b.header()) else {
+            return;
+        };
+        {
+            let l = &mut *write(&self.list);
+            l.applying.push(header.hash());
+            work(&self.chain, &self.shared, l, Job::Block { block, from: None, unix });
+        }
+        // (Where it was applied in place, someone is to hear of it.)
+        self.shared.wake(0);
+    }
+
+    /// Whether the node is catching up with a chain ahead of its own:
+    /// a block made now would be made on what is about to be replaced.
+    pub fn behind(&self) -> bool {
+        {
+            let l = self.list.read().unwrap_or_else(|e| e.into_inner());
+            if l.aim.is_some() || l.join.is_some() || !l.held.is_empty() || !l.fetching.is_empty() {
+                return true;
+            }
+        }
+        let mut first = [self.chain.params().genesis().header];
+        self.chain.receiving() || self.chain.missing_bodies(&mut first).unwrap_or(0) > 0
+    }
+
+    /// How many times the chain has had a new last block here.
+    pub fn moves(&self) -> u64 {
+        self.shared.blocks.load(Ordering::Relaxed)
+    }
+
+    /// Waits until the chain has moved more than `seen` times, or for
+    /// `most`.
+    pub fn wait_moved(&self, seen: u64, most: std::time::Duration) {
+        let guard = self.shared.moved.0.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self.shared.moved.1.wait_timeout_while(guard, most, |_| self.moves() == seen);
+    }
+
+    pub fn chain(&self) -> &Arc<Chain<B, V>> {
+        &self.chain
+    }
+}
+
+impl<B: Backend + 'static, V> Handle<B, V> {
     pub fn read(&self) -> Standing {
         Standing {
             peers: self.shared.totals.peers(),
@@ -2475,6 +2517,24 @@ impl<B: Backend + 'static, V> Gauge<B, V> {
             height: self.chain.tip().map_or(0, |tip| tip.height),
             blocks: self.shared.blocks.load(Ordering::Relaxed),
             fetching: self.list.read().unwrap_or_else(|e| e.into_inner()).fetching.len(),
+        }
+    }
+}
+
+/// Gives work to be done on the chain: done where the list says, and
+/// what comes of it heard by a worker.
+fn work<B: Backend + 'static, V: ProofVerifier + Sync>(chain: &Chain<B, V>, shared: &Shared, l: &mut List, job: Job) {
+    l.outstanding += 1;
+    match &mut l.applier {
+        Applier::Here(done) => match apply(chain, job) {
+            Some(outcome) => {
+                done.push_back(outcome);
+                shared.ready.fetch_add(1, Ordering::Relaxed);
+            }
+            None => l.outstanding -= 1,
+        },
+        Applier::Thread(jobs, _) => {
+            let _ = jobs.get_mut().unwrap_or_else(|e| e.into_inner()).send(job);
         }
     }
 }

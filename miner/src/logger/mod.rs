@@ -86,7 +86,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod fmt;
@@ -201,6 +201,8 @@ pub struct Logger {
     clock: Clock,
     inner: Mutex<Inner>,
     failures: AtomicU64,
+    /// Whether [`Logger::log_all`] still writes to the terminal too.
+    terminal: AtomicBool,
     /// Told of each file put aside: the name it was given.
     on_rotate: Option<Box<dyn Fn(&Path) + Send + Sync>>,
 }
@@ -223,6 +225,7 @@ impl Logger {
             clock,
             inner: Mutex::new(Inner { file: None, size: 0, written: false, since: 0 }),
             failures: AtomicU64::new(0),
+            terminal: AtomicBool::new(true),
             on_rotate: None,
         };
         let now = (logger.clock)();
@@ -295,19 +298,33 @@ impl Logger {
 
     /// Writes `line` with the time before it, to the log and to the
     /// terminal (standard error) alike.
+    ///
+    /// Once [`Logger::file_only`] has been called, to the log alone.
     pub fn log_all(&self, line: &str) {
         let now = (self.clock)();
         let text = format!("{} {line}\n", Moment::of(now).header());
         // (The terminal may be gone; the log is what matters.)
-        let _ = io::stderr().write_all(text.as_bytes());
+        if self.terminal.load(Ordering::Relaxed) {
+            let _ = io::stderr().write_all(text.as_bytes());
+        }
         self.write(now, &text);
+    }
+
+    /// From here on [`Logger::log_all`] and
+    /// [`Logger::log_all_no_header`] write to the log alone: the
+    /// terminal is for whoever is at it. A node says how it started
+    /// there, and nothing after.
+    pub fn file_only(&self) {
+        self.terminal.store(false, Ordering::Relaxed);
     }
 
     /// Writes `line` as it is, to the log and to the terminal alike:
     /// for the rules drawn across the startup messages.
     pub fn log_all_no_header(&self, line: &str) {
         let text = format!("{line}\n");
-        let _ = io::stderr().write_all(text.as_bytes());
+        if self.terminal.load(Ordering::Relaxed) {
+            let _ = io::stderr().write_all(text.as_bytes());
+        }
         self.write((self.clock)(), &text);
     }
 

@@ -1935,6 +1935,11 @@ pub struct AggregateVerifier {
 }
 
 impl AggregateVerifier {
+    /// The parameters proofs are made and checked with.
+    pub fn params(&self) -> &AggregatorParams {
+        &self.params
+    }
+
     pub fn new(params: AggregatorParams, emission: &'static [(u32, u64)], genesis: Genesis) -> AggregateVerifier {
         AggregateVerifier {
             params,
