@@ -17,8 +17,10 @@ handled on every core.
 - There is no coordinator thread.
 - A worker's queue that is full drops the datagram. The main log says
   so and the stats count it.
-- A ban is of a peer (address and port), kept by the worker that owns
-  it.
+- A ban is of a host, every port of it. Other workers may learn of it
+  a moment late.
+- No more than four peers of one host (`--max-peers-per-host`), counted
+  over all workers.
 - Options: `--threads` and `--request-queue-size`.
 
 Section 4 (what the workers share) is **proposed**. Nothing here is
@@ -73,7 +75,14 @@ Reads the port, and for each datagram:
 1. hashes the sender's address and port to a worker;
 2. puts the datagram on that worker's queue.
 
-It decodes nothing and decides nothing. There are no connections to
+A worker's queue is a bounded queue with a lock of its own: the
+receiver puts on at one end without waiting, the worker takes off at
+the other, and waits there when it has nothing to do (until its next
+timer is due). The worker handles each datagram as it takes it off:
+nothing is kept of a datagram afterwards, only what it changed in what
+the worker knows of that peer.
+
+The receiver decodes nothing and decides nothing. There are no connections to
 set up: the first datagram of a peer nobody has heard of goes to its
 worker like any other, and the worker decides whether to keep the peer.
 
@@ -98,8 +107,7 @@ can choose addresses that all fall on one worker.
 A worker owns, for the peers that hash to it:
 
 - the peer's entry: when it was last heard from, whether it has proven
-  its address, its status as it last told it, its strikes, and whether
-  it is banned;
+  its address, its status as it last told it, and its strikes;
 - what it has asked of us: its queue of chunks to be served;
 - what we are fetching from it: the fetches, and the path's measure of
   the line (round trip, window).
@@ -108,7 +116,8 @@ It does everything for those peers:
 
 - handles their datagrams from start to finish, and sends the answers
   on the port itself (sending on one socket from many threads is safe);
-- pings them, drops them when they go silent, strikes and bans them;
+- pings them, drops them when they go silent, strikes them, and bans
+  their host (section 5);
 - asks them whom else they know;
 - fetches from them, and serves them.
 
@@ -155,7 +164,7 @@ to admit a peer, and gives it back if that went over.
 The limits on peers of one host and of one network
 (`--max-peers-per-host`, `--max-peers-per-network`) count across
 workers, since two ports of one host may be on two workers. They keep
-one machine from filling the table, so they are worth keeping: a small
+one machine from filling the table (**decided**: they stay). A small
 table of counts by host and by network, behind a lock taken only when a
 peer is admitted or dropped, which is rare.
 
@@ -197,14 +206,18 @@ and to the worker whose peer sent it.
 
 ## 5. Bans
 
-A peer that sends what no honest peer sends is struck, and after
-`--ban-strikes` is banned for `--ban-seconds`: that peer, by address
-and port, in the worker that owns it. Nothing is told to other workers.
+A peer that sends what no honest peer sends is struck by its worker,
+and after `--ban-strikes` its **host** is banned for `--ban-seconds`:
+every port of it, on every worker. Were a ban of one port only, a bad
+peer would be back on the next port at once.
 
-(Today a ban is of the host, every port of it. A banned peer that
-comes back on another port is a new peer, and has to earn its own
-ban. The limit on peers of one host, 4.1, bounds how many of those
-there can be at once.)
+The bans are one list the workers share, behind a lock, with a number
+beside it that goes up whenever the list changes. Each worker keeps its
+own copy of the list and checks that against every datagram, with no
+lock; it looks at the number (one atomic read) and takes the list
+afresh only when the number has moved. So a ban holds at once on the
+worker that made it, and on the others from their next datagram or
+timer: a moment late, which is fine.
 
 ---
 
