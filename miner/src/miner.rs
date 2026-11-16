@@ -6,10 +6,13 @@
 //! (`net::node::Hand`). Nothing here knows of the network.
 //!
 //! A block made here pays its reward to one key, and carries nothing
-//! else: there is no pool of transactions yet. And only for a network
-//! whose block proofs are checked directly (the dev network): a proof
-//! that builds on the proof of the block before it needs that proof
-//! kept, which the chain does not do yet.
+//! else: there is no pool of transactions yet.
+//!
+//! Where a block's proof builds on the proof of the block before it
+//! (every network but the dev network, whose proofs stand alone), that
+//! proof and what it speaks to are taken from the chain: the proof is
+//! in the block before's body, which is kept, and what it speaks to is
+//! made again from that body and the header before it ([`before`]).
 //!
 //! The steps, each given up if `cancel` says so (the chain has another
 //! last block, or the node is stopping):
@@ -152,8 +155,20 @@ pub fn mine<B: Backend + 'static>(
     let (segments, prev_state_root, first_output_position) = {
         let state = chain.whole()?;
         let snap = state.snapshot()?;
+        // (The state of the block being built on, or it has moved on.)
+        // (The state before the first block is of no block.)
+        let (at, id) = snap.tip();
+        if at != tip.height || (at > 0 && id != tip.hash()) {
+            return Ok(Mined::Cancelled);
+        }
         let segments = SegmentWitness::collect_by_rows(&snap, &[tx], rows, height)?;
         (segments, snap.root(), snap.outputs().next)
+    };
+    // What the proof of the block before speaks to, and that proof:
+    // where this block's proof is to build on it.
+    let before = match chain.verifier().needs_plan() && height > 1 {
+        true => Some(before(chain, &tip, first_output_position)?),
+        false => None,
     };
     let first = &segments[0];
     let names = NameWitness {
@@ -185,7 +200,8 @@ pub fn mine<B: Backend + 'static>(
     });
     let jobs = crate::parallel::threads();
     let began = Instant::now();
-    let Some(proof) = chain.verifier().prove_block(height, &statement, &segments, &names, None, jobs, &|_| {}, cancel)
+    let on = before.as_ref().map(|(statement, body)| (tip.height, statement, proof_of(body), &tip));
+    let Some(proof) = chain.verifier().prove_block(height, &statement, &segments, &names, on, jobs, &|_| {}, cancel)
     else {
         return Ok(Mined::Cancelled);
     };
@@ -209,6 +225,45 @@ pub fn mine<B: Backend + 'static>(
     let header = Header { nonce, mix, ..header };
     let solved = began.elapsed();
     Ok(Mined::Block { block: Block { header, body }.to_bytes(), header, proved, hashes, solved })
+}
+
+/// The proof in a body kept by the chain.
+fn proof_of(body: &[u8]) -> &[u8] {
+    BodyRef::from_bytes(body).map_or(&[], |b| b.proof())
+}
+
+/// What the proof of the chain's last block `tip` speaks to, and that
+/// block's body, in which its proof is: for the proof of the block
+/// after it to build on. `end` is the position the next output takes,
+/// the state being as `tip` left it.
+///
+/// Nothing of this is kept as such, and nothing need be. The body is
+/// kept. The state's root before the block is in the header before it.
+/// Where its outputs begin is where they end, less how many it made:
+/// so that a node that took its state whole, and has no state of
+/// before its last block, can still say.
+fn before<B: Backend + 'static>(
+    chain: &Chain<B, AggregateVerifier>,
+    tip: &Header,
+    end: u64,
+) -> Result<(Statement, Vec<u8>), Error> {
+    let missing = |what: &'static str| -> Error { std::io::Error::new(std::io::ErrorKind::InvalidData, what).into() };
+    let body = chain.body(&tip.hash())?.ok_or_else(|| missing("the last block's body is not kept"))?;
+    let view = BodyRef::from_bytes(&body)?;
+    let parent = chain.header_at(tip.height - 1)?.ok_or_else(|| missing("the header before the last is not kept"))?;
+    let made = (view.outputs().len() + view.commits()) as u64;
+    let first = end.checked_sub(made).ok_or_else(|| missing("the last block made more outputs than there are"))?;
+    let statement = Statement::from_block(&BlockStatement {
+        height: tip.height,
+        prev_state_root: parent.state_root,
+        new_state_root: tip.state_root,
+        first_output_position: first,
+        subsidy: chain.params().subsidy(tip.height),
+        body: view,
+        parent_work: chain.parent_work(&parent),
+        parent_hash: tip.prev_hash,
+    });
+    Ok((statement, body))
 }
 
 /// A nonce whose hash with `header_hash` meets `target`, with the mix
@@ -306,10 +361,16 @@ mod tests {
     const NOW: u64 = 1_780_000_000;
 
     fn dev() -> (Chain<MemBackend, AggregateVerifier>, Dataset<'static>) {
-        let params = ChainParams::DEV;
+        network(ChainParams::DEV, AggregatorParams::DEV)
+    }
+
+    fn network(
+        params: ChainParams,
+        proofs: AggregatorParams,
+    ) -> (Chain<MemBackend, AggregateVerifier>, Dataset<'static>) {
         let seed = SeedText::new(params.pow);
         let genesis = Genesis::of(&params.genesis().header, &seed);
-        let verifier = AggregateVerifier::new(AggregatorParams::DEV, params.emission, genesis);
+        let verifier = AggregateVerifier::new(proofs, params.emission, genesis);
         let chain = Chain::open(MemBackend::new(), 64, params, seed, verifier).unwrap();
         (chain, Dataset::built_in(&seed).expect("the dev network's table is built in"))
     }
@@ -335,6 +396,32 @@ mod tests {
             assert_eq!(outputs.len(), 1);
             assert_eq!((outputs[0].commitment, outputs[0].amount), (paid.commitment, paid.amount));
         }
+    }
+
+    /// On the recursive dev network a block's proof builds on the proof
+    /// of the block before, which is taken from the chain: the first
+    /// block's on none, and each after it on the last.
+    #[test]
+    #[ignore = "proves proofs of proofs, block on block; run with --release"]
+    fn blocks_of_a_recursive_network_build_on_the_proof_before() {
+        let (chain, dataset) = network(ChainParams::DEV_RECURSIVE, AggregatorParams::DEV_RECURSIVE);
+        let reward: Digest = core::array::from_fn(|i| Fp::new(1000 + i as u32));
+        for height in 1..=3u32 {
+            let began = Instant::now();
+            let made = mine(&chain, &dataset, &reward, NOW, height as u64 * 1_000_003, &|| false).unwrap();
+            let Mined::Block { block, header, proved, .. } = made else { panic!("{made:?}") };
+            println!("block {height}: {} bytes, proved in {proved:?}, made in {:?}", block.len(), began.elapsed());
+            let view = BlockRef::from_bytes(&block).unwrap();
+            // The chain checks the proof, the one before in it.
+            assert_eq!(chain.apply_block(&view, NOW), Ok(Applied::Extended));
+            assert_eq!(chain.tip().unwrap(), header);
+        }
+        // What is made again of the last block is what its proof was
+        // made to: the chain's own check of the proof with it holds.
+        let tip = chain.tip().unwrap();
+        let end = chain.whole().unwrap().snapshot().unwrap().outputs().next;
+        let (statement, body) = before(&chain, &tip, end).unwrap();
+        assert_eq!(chain.verifier().verify_chain_proof(tip.height, &statement, proof_of(&body)), Ok(()));
     }
 
     /// Told to give up, it does: while proving, or while looking for

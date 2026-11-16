@@ -242,21 +242,23 @@ In columns, a line at a time. Under each whole a rule is drawn, to set
 it off from the intervals that follow.
 
 ```
-Uptime: 0:00:00           Packets____AvgLatency(us)_Peers_PeersLive_Height_Blocks_Mined
-[2026-11-16 08:21:55:624] 0          -              0     0         0      0      0
----------------------------------------------------------------------------------------
-10s ending 08:22:05:      18         12.4           1     1         3      3      3
-10s ending 08:22:15:      156        12.9           1     1         5      2      0
+Uptime: 0:00:00           Requests___Packets____AvgLatency(us)_Peers_PeersLive_Height_Blocks_Mined
+[2026-11-16 21:25:22:952] 0          0          -              0     0         0      0      0
+--------------------------------------------------------------------------------------------------
+10s ending 21:25:32:      10         10         15.4           1     1         0      0      0
+10s ending 21:25:42:      3          33         434.3          1     1         1      1      0
+10s ending 21:25:52:      1          31         827.0          1     1         2      1      0
 ...
-Uptime: 0:01:00           Packets____AvgLatency(us)_Peers_PeersLive_Height_Blocks_Mined
-[2026-11-16 08:22:55:624] 174        12.8           1     1         5      5      3
----------------------------------------------------------------------------------------
+Uptime: 0:01:00           Requests___Packets____AvgLatency(us)_Peers_PeersLive_Height_Blocks_Mined
+[2026-11-16 21:26:22:952] 22         82         108.6          1     1         4      4      2
+--------------------------------------------------------------------------------------------------
 ```
 
 | Column | Is |
 |---|---|
-| Packets | Datagrams taken, of every kind (counted): the requests of the request log, and the chunks of what the node itself is fetching, of which a block is some seventy and more |
-| AvgLatency(us) | What taking one took, in microseconds, on average: of the interval in an interval's line, of the whole run in a whole's. `-` where there were none |
+| Requests | Requests taken: what the request log has a line for, one for one (counted) |
+| Packets | Datagrams taken, of every kind (counted): the requests, and the chunks of what the node itself is fetching, of which a block is some seventy and more |
+| AvgLatency(us) | What taking a request took, in microseconds, on average: of the interval in an interval's line, of the whole run in a whole's. `-` where there were none |
 | Peers, PeersLive | Peers known, and those heard from lately (levels) |
 | Height | The chain's height (level) |
 | Blocks | Blocks that joined the chain here (counted) |
@@ -424,17 +426,22 @@ begun again whenever that changes, and not while the node is catching
 up with a chain ahead of its own. A block made is given to the node,
 which applies it and tells its peers.
 
-**So far, on the dev network only**, and a block carries its reward and
-nothing else:
+**So far, on the two dev networks** (a build with `--features dev`),
+and a block carries its reward and nothing else:
 
-- `--network dev` (a build with `--features dev`): a block about every
-  second or two, its proof checked directly.
+- `--network dev`: a block about every second, its proof checked
+  directly.
+- `--network dev-recursive`: a block about every ten seconds, its proof
+  made the mainnet way at the smallest parameters: each builds on the
+  proof of the block before, which is taken from the chain (the proof
+  from that block's body, and what it speaks to made again from the
+  body and the header before it). Proving a block takes some seconds.
 - `--reward-key HEX`: the hash of the key rewards are paid to. Without
-  it, on the dev network, they are paid to a key nobody has.
-- On mainnet and the recursive dev network a node that is not given
-  `--no-mine` says that mining there is not built yet, and does not
-  start: their blocks' proofs build on the proof of the block before,
-  which the chain does not keep yet.
+  it, on the dev networks, they are paid to a key nobody has.
+- On mainnet a node that is not given `--no-mine` says that mining
+  there is not built yet, and does not start: mainnet's table of the
+  proof of work is not built into the program, and is not yet made
+  when a node starts.
 
 ### 4.1 When a node does not make blocks
 
@@ -481,9 +488,9 @@ chain, and those it made (`Mined`).
 
 ## 5. Still to do
 
-1. **Mining on mainnet**: the chain proof on the block before; the
-   table of the proof of work, which is not built in; a wallet for the
-   rewards; transactions in blocks.
+1. **Mining on mainnet**: the table of the proof of work, made once
+   and kept in the data directory; a key for the rewards (there is no
+   wallet); transactions in blocks.
 2. **What is left of `THREADS.md`** (its 8.3).
 3. **The peers file and the built-in seeds.** `--peer` and `--seed` are
    what a node begins from today.

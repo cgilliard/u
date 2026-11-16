@@ -224,8 +224,9 @@ fn make_blocks(
 /// could not go on. Told to stop, the program ends where that is
 /// heard ([`interrupt::halt_when_told`]).
 fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::convert::Infallible, String> {
-    // Blocks are made only where their proofs stand alone, for now.
-    if c.mine && c.network != Network::Dev {
+    // Blocks are made only on the dev networks, for now: mainnet's
+    // table of the proof of work is not built in.
+    if c.mine && c.network == Network::Mainnet {
         return Err(format!("mining on the {} network is not built yet: give --no-mine", c.network.name()));
     }
     if c.network != Network::Mainnet && !cfg!(feature = "dev") {

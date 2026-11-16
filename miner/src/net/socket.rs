@@ -52,16 +52,18 @@ pub const STATS: &[(&str, Kind)] = &[
     ("Blocks", Kind::Count),
     ("Fetching", Kind::Level),
     ("Mined", Kind::Count),
+    ("Requests", Kind::Count),
 ];
 /// The node's stats. The log shows these of them, each in a column
 /// this wide; the rest are counted all the same.
 ///
 /// ```text
-/// Uptime: 0:00:00           Packets____AvgLatency(us)_Peers_PeersLive_Height_Blocks_Mined
+/// Uptime: 0:00:00           Requests___Packets____AvgLatency(us)_Peers_PeersLive_Height_Blocks_Mined
 /// ```
 pub fn stats() -> Stats {
     Stats::new(STATS).showing(&[
         (REQUESTS, 11),
+        (PACKETS, 11),
         (LATENCY, 15),
         (PEERS, 6),
         (PEERS_LIVE, 10),
@@ -82,9 +84,11 @@ pub fn set_levels<B: Backend + 'static, V>(stats: &Stats, hold: &Handle<B, V>) {
     stats.set(FETCHING, now.fetching as u64);
 }
 
-/// Datagrams taken, of whatever kind.
-pub const REQUESTS: usize = 0;
-/// The microseconds taking them took: shown as the average of one.
+/// Datagrams taken, of whatever kind: the requests, and the chunks of
+/// what the node itself is fetching (a block is many).
+pub const PACKETS: usize = 0;
+/// The microseconds taking the requests took: shown as the average of
+/// one.
 pub const LATENCY: usize = 1;
 /// Datagrams dropped because the queue of the worker they were for was
 /// full.
@@ -100,6 +104,9 @@ pub const BLOCKS: usize = 8;
 pub const FETCHING: usize = 9;
 /// Blocks made here.
 pub const MINED: usize = 10;
+/// Requests taken: what the request log has a line for, each one line
+/// there and one here. (Not the chunks of what the node is fetching.)
+pub const REQUESTS: usize = 11;
 
 /// What the main log says when datagrams are dropped.
 pub const DROPPING: &str = "dropped requests: a worker's queue is full";
@@ -122,13 +129,19 @@ pub struct Watch<'a> {
 impl Watch<'_> {
     /// A datagram of `bytes` was taken in `micros`.
     fn heard(&self, heard: &Heard, bytes: usize, micros: u64) {
+        // A request has a line in the request log, and is counted as
+        // one; a chunk of something being fetched is a packet only.
+        let request = heard.request != CHUNK;
         if let Some(stats) = self.stats {
-            stats.add(REQUESTS, 1);
-            stats.add(LATENCY, micros);
+            stats.add(PACKETS, 1);
             stats.add(BYTES_IN, bytes as u64);
+            if request {
+                stats.add(REQUESTS, 1);
+                stats.add(LATENCY, micros);
+            }
         }
         if let Some(requests) = self.requests
-            && heard.request != CHUNK
+            && request
         {
             requests.log(&heard.line(bytes, micros));
         }

@@ -842,7 +842,9 @@ fn over_real_sockets_requests_are_logged_and_counted() {
     // Every datagram is counted, chunks too, with the time it took.
     use socket::{BLOCKS, BYTES_IN, BYTES_SENT, FETCHING, HEIGHT, LATENCY, PEERS, PEERS_LIVE, REQUESTS};
     assert_eq!(stats[0][REQUESTS] as usize, served.len());
-    assert!(stats[1][REQUESTS] as usize > logs[1].lines().count());
+    assert_eq!(stats[1][REQUESTS] as usize, logs[1].lines().count());
+    // The chunks of its blocks were packets, and no requests.
+    assert!(stats[1][socket::PACKETS] > stats[1][REQUESTS] && stats[0][socket::PACKETS] == stats[0][REQUESTS]);
     for s in &stats {
         assert!(s[LATENCY] > 0 && s[BYTES_IN] > 0 && s[BYTES_SENT] > 0, "{s:?}");
         assert_eq!((s[PEERS], s[PEERS_LIVE], s[HEIGHT], s[FETCHING]), (1, 1, 12, 0), "{s:?}");

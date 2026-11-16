@@ -146,6 +146,7 @@ jobs:
           - block_air::circuit_tests::the_block_circuit_has_no_unintended_freedom
           - block_air::circuit_tests::the_circuit_agrees_with_the_chain_on_random_blocks
           - chain_verifier::tests::write_fam_verifier
+          - miner::tests::blocks_of_a_recursive_network_build_on_the_proof_before
           - name_air::tests::has_no_unintended_freedom
           - pow::tests::write_dev_dataset
           - pow_air::tests::mainnet_attacks
