@@ -142,7 +142,26 @@ pub const T_RB2: usize = HM_COLS + 49;
 pub const T_ENT0: usize = HM_COLS + 50;
 pub const T_ENT1: usize = HM_COLS + 51;
 pub const T_SP: usize = HM_COLS + 52;
-const NUM_TYPES: usize = 53;
+// ---- outputs, gathered into subtrees and put in the tree together ----
+/// An entry pushed on the outputs' stack: hashed, then compressed with
+/// the stack below it.
+pub const T_SPUSH0: usize = HM_COLS + 53;
+pub const T_SPUSH1: usize = HM_COLS + 54;
+/// A merge: the top entry popped, then the one under it, and the two
+/// compressed into the node over them.
+pub const T_MPOP0: usize = HM_COLS + 55;
+pub const T_MPOP1: usize = HM_COLS + 56;
+pub const T_MPOP2: usize = HM_COLS + 57;
+pub const T_MPOP3: usize = HM_COLS + 58;
+pub const T_MRG: usize = HM_COLS + 59;
+/// The stack emptied into the tree: an entry popped, the empty subtree
+/// of its height made, and the entry put in its place.
+pub const T_FPOP0: usize = HM_COLS + 60;
+pub const T_FPOP1: usize = HM_COLS + 61;
+pub const T_EMP: usize = HM_COLS + 62;
+/// The last row of an output.
+pub const T_OEND: usize = HM_COLS + 63;
+const NUM_TYPES: usize = 64;
 // ---- bits, and the sibling of a tree's step ----
 /// A field element's bits, for what the circuit ranges ([`crate::bits`]).
 pub const BCOLS: bits::Cols = bits::Cols::new(HM_COLS + NUM_TYPES);
@@ -285,7 +304,30 @@ pub const C_SP_LAST: usize = R_SPN + 1;
 pub const C_SP_INV: usize = C_SP_LAST + 1;
 /// The last row of a path.
 pub const C_SP_END: usize = C_SP_INV + 1;
-pub const NUM_COLS: usize = C_SP_END + 1;
+// ---- the outputs' stack ----
+/// The stack's digest: zeros of an empty one.
+pub const R_STK: usize = C_SP_END + 1;
+/// What is being pushed: a node, its level, and the position of the
+/// first leaf under it (two limbs).
+pub const R_PN: usize = R_STK + DIGEST;
+pub const R_PV: usize = R_PN + DIGEST;
+pub const R_PP: usize = R_PV + 1;
+/// What was popped last, and the node and level popped before it.
+pub const R_AN: usize = R_PP + 2;
+pub const R_AV: usize = R_AN + DIGEST;
+pub const R_AP: usize = R_AV + 1;
+pub const R_BN: usize = R_AP + 2;
+pub const R_BV: usize = R_BN + DIGEST;
+/// Levels of empty subtree still to make before an entry's path, and
+/// whether none is.
+pub const R_EV: usize = R_BV + 1;
+pub const C_EV_ZERO: usize = R_EV + 1;
+pub const C_EV_INV: usize = C_EV_ZERO + 1;
+/// One while the stack is being emptied into the tree, and the last
+/// row of an entry's path then.
+pub const R_FL: usize = C_EV_INV + 1;
+pub const C_FEND: usize = R_FL + 1;
+pub const NUM_COLS: usize = C_FEND + 1;
 
 // ---- public values ----
 pub const PUB_ROOT_IN: usize = 0;
@@ -330,8 +372,46 @@ pub const fn input_rows(_height: usize) -> usize {
 }
 /// Rows of an input.
 pub const ROWS_PER_INPUT: usize = ROWS_PER_SIGNATURE + 6 + 1 + 2 * DEPTH + 2;
-/// Rows of one output.
-pub const ROWS_PER_OUTPUT: usize = 9 + 2 * DEPTH;
+/// Rows of one output, before any merge its push sets off: its
+/// commitment, leaf, list and body rows, its entry pushed, and its end.
+pub const ROWS_PER_OUTPUT: usize = 9 + 2 + 1;
+/// Rows of a merge of two entries of the outputs' stack.
+pub const ROWS_PER_MERGE: usize = 7;
+/// Rows an output is counted as when a segment is packed: no run of
+/// outputs has as many merges as outputs.
+pub const ROWS_PER_OUTPUT_PACKED: usize = ROWS_PER_OUTPUT + ROWS_PER_MERGE;
+/// Rows of putting an entry of `level` in the tree: popped, the empty
+/// subtree of its height made, and the path from there up, twice.
+pub const fn flush_rows(level: usize) -> usize {
+    2 + level + 2 * (DEPTH - level)
+}
+/// At most the rows of emptying the stack after `outputs` outputs: a
+/// run of consecutive leaves is at most two subtrees a level.
+pub fn flush_rows_bound(outputs: usize) -> usize {
+    if outputs == 0 {
+        return 0;
+    }
+    let entries = outputs.min(2 * outputs.ilog2() as usize + 2);
+    entries * flush_rows(0)
+}
+
+/// What a leaf pushed at `position` does to the outputs' stack, as
+/// levels and first positions: pushed, and merged with the entry under
+/// it for as long as the two are the halves of one subtree. Returns
+/// the merges.
+pub fn push_leaf(stack: &mut Vec<(u8, u64)>, position: u64) -> usize {
+    stack.push((0, position));
+    let mut merges = 0;
+    while let [.., (av, ap), (bv, _)] = stack[..] {
+        if av != bv || ap & ((1u64 << (av + 1)) - 1) != 0 {
+            break;
+        }
+        stack.truncate(stack.len() - 2);
+        stack.push((av + 1, ap));
+        merges += 1;
+    }
+    merges
+}
 /// Extra rows of an output in a policy input's covered run.
 pub const ROWS_PER_COVERED: usize = 2;
 /// Rows ending a covered run: the rebindable message.
@@ -380,7 +460,7 @@ pub fn item_rows_of(tx: &Transaction) -> (Vec<usize>, bool) {
     for j in 0..tx.outputs.len() {
         let covered = j >= start && j < start + count;
         let last = covered && j + 1 == start + count;
-        rows.push(ROWS_PER_OUTPUT + usize::from(covered) * ROWS_PER_COVERED + usize::from(last) * ROWS_RUN_END);
+        rows.push(ROWS_PER_OUTPUT_PACKED + usize::from(covered) * ROWS_PER_COVERED + usize::from(last) * ROWS_RUN_END);
     }
     rows.extend(std::iter::repeat_n(ROWS_PER_OP, tx.ops.len()));
     (rows, !tx.policy_inputs.is_empty())
@@ -715,22 +795,42 @@ pub struct Part {
 /// parts in order. `items(t)` gives the rows of each of transaction `t`'s
 /// items and whether it must stay whole.
 pub fn pack(num_txs: usize, items: impl Fn(usize) -> (Vec<usize>, bool), max_rows: usize) -> Vec<Vec<Part>> {
+    pack_with(num_txs, items, |_| 0..0, max_rows)
+}
+
+/// [`pack`], knowing which of a transaction's items are outputs
+/// (`outputs(t)`, a range of its items): a segment's outputs are put in
+/// the tree together when it ends, and room is kept for that
+/// ([`flush_rows_bound`]).
+pub fn pack_with(
+    num_txs: usize,
+    items: impl Fn(usize) -> (Vec<usize>, bool),
+    outputs: impl Fn(usize) -> core::ops::Range<usize>,
+    max_rows: usize,
+) -> Vec<Vec<Part>> {
     let cap = max_rows - 1;
     let mut segments = Vec::new();
     let mut cur: Vec<Part> = Vec::new();
-    let mut rows = 0;
+    // Rows taken in the segment, and outputs in it.
+    let (mut rows, mut outs) = (0, 0);
     for tx in 0..num_txs {
         let (item_rows, whole) = items(tx);
         let n = item_rows.len();
+        let is_out = |k: usize| usize::from(outputs(tx).contains(&k));
         if whole {
             let total = 2 + item_rows.iter().sum::<usize>();
-            assert!(total <= cap, "a transaction that must stay whole does not fit a segment of {max_rows} rows");
-            if rows + total > cap {
+            let made = outputs(tx).len();
+            assert!(
+                total + flush_rows_bound(made) <= cap,
+                "a transaction that must stay whole does not fit a segment of {max_rows} rows"
+            );
+            if rows + total + flush_rows_bound(outs + made) > cap {
                 segments.push(std::mem::take(&mut cur));
-                rows = 0;
+                (rows, outs) = (0, 0);
             }
             cur.push(Part { tx, start: 0, end: n });
             rows += total;
+            outs += made;
             continue;
         }
         // Rows item k needs, with the end row after the last item.
@@ -739,16 +839,17 @@ pub fn pack(num_txs: usize, items: impl Fn(usize) -> (Vec<usize>, bool), max_row
         loop {
             // A part needs its start (or resume) row and its first item,
             // or the end row for an empty transaction.
-            let first = if k < n { cost(k) } else { 1 };
-            assert!(first < cap, "an item does not fit a segment of {max_rows} rows");
-            if rows + 1 + first > cap {
+            let (first, made) = if k < n { (cost(k), is_out(k)) } else { (1, 0) };
+            assert!(first + flush_rows_bound(made) < cap, "an item does not fit a segment of {max_rows} rows");
+            if rows + 1 + first + flush_rows_bound(outs + made) > cap {
                 segments.push(std::mem::take(&mut cur));
-                rows = 0;
+                (rows, outs) = (0, 0);
             }
             let start = k;
             rows += 1;
-            while k < n && rows + cost(k) <= cap {
+            while k < n && rows + cost(k) + flush_rows_bound(outs + is_out(k)) <= cap {
                 rows += item_rows[k];
+                outs += is_out(k);
                 k += 1;
             }
             cur.push(Part { tx, start, end: k });
@@ -757,7 +858,7 @@ pub fn pack(num_txs: usize, items: impl Fn(usize) -> (Vec<usize>, bool), max_row
                 break;
             }
             segments.push(std::mem::take(&mut cur));
-            rows = 0;
+            (rows, outs) = (0, 0);
         }
     }
     if !cur.is_empty() {
@@ -840,6 +941,12 @@ impl Air for BlockAir {
         let done = l[T_DONE];
         let resume = l[T_RESUME];
         let (ent0, ent1, sp) = (l[T_ENT0], l[T_ENT1], l[T_SP]);
+        let (spush0, spush1, mrg, emp, oend) = (l[T_SPUSH0], l[T_SPUSH1], l[T_MRG], l[T_EMP], l[T_OEND]);
+        let (mpop0, mpop1, mpop2, mpop3) = (l[T_MPOP0], l[T_MPOP1], l[T_MPOP2], l[T_MPOP3]);
+        let (fpop0, fpop1) = (l[T_FPOP0], l[T_FPOP1]);
+        // The two rows of a pop, whatever it is for.
+        let (pop0, pop1) = (mpop0 + mpop2 + fpop0, mpop1 + mpop3 + fpop1);
+        let (fl, fend) = (l[R_FL], l[C_FEND]);
         let (spn, sp_last, sp_end) = (l[R_SPN], l[C_SP_LAST], l[C_SP_END]);
         let msg: [F; DIGEST] = core::array::from_fn(|i| l[R_MSG + i]);
         let smsg: [F; DIGEST] = core::array::from_fn(|i| l[R_SMSG + i]);
@@ -878,13 +985,17 @@ impl Air for BlockAir {
                 + psig
                 + cvc
                 + cvm
-                + rb0,
+                + rb0
+                + spush0
+                + pop0
+                + mrg
+                + emp,
         );
         b.assert_eq(l[COL_ABSORB], pkh1 + cm1 + body_in1 + ocm1 + olist2 + body_out1 + body_out2 + rb1 + rb2);
         b.assert_zero(l[COL_LOAD]);
         b.assert_zero(l[COL_CHAIN]);
-        b.assert_eq(l[COL_PASS], tx_end + done + resume + pstart + pend);
-        b.assert_eq(l[COL_COMPRESS], ent0 + ent1 + sp);
+        b.assert_eq(l[COL_PASS], tx_end + done + resume + pstart + pend + oend);
+        b.assert_eq(l[COL_COMPRESS], ent0 + ent1 + sp + spush1 + pop1);
         b.when_first_row(one - tx_start - resume);
         b.when_last_row(one - done);
 
@@ -902,7 +1013,8 @@ impl Air for BlockAir {
         let is_out = l[R_IS_OUT];
         b.assert_zero(is_out * is_out - is_out);
         let out_end = l[C_OUT_END];
-        b.assert_eq(out_end, smt_end * is_out);
+        b.assert_eq(out_end, oend);
+        b.assert_eq(fend, smt_end * fl);
         // remaining-item counters and zero tests
         let in_left = l[R_IN_LEFT];
         let out_left = l[R_OUT_LEFT];
@@ -941,13 +1053,13 @@ impl Air for BlockAir {
             disp,
             tx_start + body_in1 + out_end * (one - inrun) + op_list + resume + rb2 + cvm * (one - cvn_zero),
         );
-        b.when_transition(disp * (one - in_zero) * (one - nt(T_PKH0) - nt(T_DONE)));
+        b.when_transition(disp * (one - in_zero) * (one - nt(T_PKH0) - nt(T_DONE) - nt(T_FPOP0)));
         let go_pol = l[C_GO_POL];
         b.assert_eq(go_pol, in_zero * pol_left);
-        b.when_transition(disp * go_pol * (one - nt(T_PSTART) - nt(T_DONE)));
-        b.when_transition(disp * go_out * (one - nt(T_OCM0) - nt(T_DONE)));
-        b.when_transition(disp * go_ops * (one - nt(T_OP_BODY) - nt(T_DONE)));
-        b.when_transition(disp * go_end * (one - nt(T_TX_END) - nt(T_DONE)));
+        b.when_transition(disp * go_pol * (one - nt(T_PSTART) - nt(T_DONE) - nt(T_FPOP0)));
+        b.when_transition(disp * go_out * (one - nt(T_OCM0) - nt(T_DONE) - nt(T_FPOP0)));
+        b.when_transition(disp * go_ops * (one - nt(T_OP_BODY) - nt(T_DONE) - nt(T_FPOP0)));
+        b.when_transition(disp * go_end * (one - nt(T_TX_END) - nt(T_DONE) - nt(T_FPOP0)));
         // operation
         b.when_transition(op_body * (one - nt(T_OP_LIST)));
         // A resume is only ever the first row.
@@ -961,7 +1073,7 @@ impl Air for BlockAir {
         b.when_transition(nt(T_TX_START) * (one - n[R_OPEN]));
         b.when_transition((one - tx_end - nt(T_TX_START)) * (n[R_OPEN] - open));
         b.when_last_row(open - pubv(PUB_CARRY_OUT + CARRY_OPEN));
-        b.when_transition(tx_end * (one - nt(T_TX_START) - nt(T_DONE)));
+        b.when_transition(tx_end * (one - nt(T_TX_START) - nt(T_DONE) - nt(T_FPOP0)));
         b.when_transition(done * (one - nt(T_DONE)));
         // A signature: the key's hash, its entry, and the entry's path
         // through the signed set; then on with the input, or into the
@@ -991,7 +1103,7 @@ impl Air for BlockAir {
         b.when_transition(old_t * (n[C_LEVEL] - level));
         b.when_transition(new_t * (one - is_last) * (one - nt(T_OLD)));
         b.when_transition(new_t * (one - is_last) * (n[C_LEVEL] - level - one));
-        b.when_transition(smt_end * (one - is_out) * (one - nt(T_BODY_IN0)));
+        b.when_transition((smt_end - fend) * (one - nt(T_BODY_IN0)));
         b.when_transition(body_in0 * (one - nt(T_BODY_IN1)));
         // output
         b.when_transition(ocm0 * (one - nt(T_OCM1)));
@@ -1002,8 +1114,7 @@ impl Air for BlockAir {
         b.when_transition(olist2 * (one - nt(T_BODY_OUT0)));
         b.when_transition(body_out0 * (one - nt(T_BODY_OUT1)));
         b.when_transition(body_out1 * (one - nt(T_BODY_OUT2)));
-        b.when_transition(body_out2 * (one - nt(T_OLD)));
-        b.when_transition(body_out2 * n[C_LEVEL]);
+        b.when_transition(body_out2 * (one - nt(T_SPUSH0)));
         // is_out: 1 from ocm0 until the output ends, 0 on inputs and tx start
         b.assert_zero(ocm0 * (one - is_out));
         b.assert_zero(pkh0 * is_out);
@@ -1160,12 +1271,12 @@ impl Air for BlockAir {
                 npos_hi += n[R_PBITS + i] * pow2::<F>(i - 30);
             }
             let shifted = if i + 1 < DEPTH { pbits[i + 1] } else { F::ZERO };
-            b.when_transition(new_t * (one - is_last) * (n[R_PBITS + i] - shifted));
-            b.when_transition((one - new_t - nt(T_ILIST) - body_out2) * (n[R_PBITS + i] - *bit));
+            b.when_transition((new_t * (one - is_last) + emp) * (n[R_PBITS + i] - shifted));
+            b.when_transition((one - new_t - nt(T_ILIST) - fpop1 - emp) * (n[R_PBITS + i] - *bit));
         }
         // output position: decomposed into the path bits entering the insert
-        b.when_transition(body_out2 * (npos_lo - l[R_OPOS_LO]));
-        b.when_transition(body_out2 * (npos_hi - l[R_OPOS_HI]));
+        b.when_transition(fpop1 * (npos_lo - l[R_AP]));
+        b.when_transition(fpop1 * (npos_hi - l[R_AP + 1]));
         let wrap = l[C_WRAP];
         let lo_max = F::from_u32((1u32 << 30) - 1);
         b.assert_zero(wrap * wrap - wrap);
@@ -1187,14 +1298,15 @@ impl Air for BlockAir {
                 (l[R_OLD + i], l[R_NEW + i], l[R_SIB + i], l[R_ROOT + i], l[COL_ACC + i], l[COL_OUTPUT + i]);
             // old: commitment entering ilist, zero entering an output insert, output after old rows
             b.when_transition(nt(T_ILIST) * (n[R_OLD + i] - acc));
-            b.when_transition(body_out2 * n[R_OLD + i]);
+            b.when_transition(fpop1 * n[R_OLD + i]);
+            b.when_transition(emp * (n[R_OLD + i] - out));
             b.when_transition(old_t * (n[R_OLD + i] - out));
-            b.when_transition((one - old_t - nt(T_ILIST) - body_out2 - smt_end) * (n[R_OLD + i] - o));
+            b.when_transition((one - old_t - nt(T_ILIST) - fpop1 - emp - smt_end) * (n[R_OLD + i] - o));
             // new: zero on ilist, the output commitment entering an insert, output after new rows
             b.assert_zero(ilist * nw);
-            b.when_transition(body_out2 * (n[R_NEW + i] - l[R_LEAF + i]));
+            b.when_transition(fpop1 * (n[R_NEW + i] - l[R_AN + i]));
             b.when_transition(new_t * (one - is_last) * (n[R_NEW + i] - out));
-            b.when_transition((one - new_t - body_out2 - nt(T_ILIST)) * (n[R_NEW + i] - nw));
+            b.when_transition((one - new_t - fpop1 - nt(T_ILIST)) * (n[R_NEW + i] - nw));
             // sibling: witness on old rows, copied to the new row
             b.when_transition(old_t * (n[R_SIB + i] - sib));
             // root
@@ -1210,6 +1322,125 @@ impl Air for BlockAir {
             b.assert_zero(old_t * (inp_hi - ((one - dir) * sib + dir * o)));
             b.assert_zero(new_t * (inp_lo - ((one - dir) * nw + dir * sib)));
             b.assert_zero(new_t * (inp_hi - ((one - dir) * sib + dir * nw)));
+        }
+
+        // ---------------- the outputs' stack ----------------
+        //
+        // An output's leaf is not put in the tree where the output is:
+        // it is pushed on a stack, and the stack's top two entries are
+        // merged into the node over them when they are its halves. When
+        // the segment ends the stack is emptied into the tree, an entry
+        // at a time: a whole subtree set down where an empty one was,
+        // by one path, in place of a path for each leaf. The stack is
+        // a digest: an entry's hash compressed with the digest of what
+        // is under it, so what is popped is what was pushed.
+        //
+        // An entry is a node, its level and the position of the first
+        // leaf under it. Two entries of one level are merged as left
+        // and right; that the left one's position is a multiple of the
+        // merged size, so that the two are the halves of one subtree,
+        // is held when the entry is put in the tree: its position's low
+        // bits, a level's worth, must be zero. And they are next to
+        // each other, the stack being of consecutive leaves, unless
+        // some between them were popped into the tree: then the
+        // subtree the merged entry claims is not empty there, and it
+        // cannot be put down.
+        b.mark("output stack");
+        let ev = l[R_EV];
+        let ev_zero = l[C_EV_ZERO];
+        b.assert_zero(ev_zero * ev_zero - ev_zero);
+        b.assert_zero(ev_zero * ev);
+        b.assert_eq(ev * l[C_EV_INV], one - ev_zero);
+        b.assert_zero(fl * fl - fl);
+        b.when_first_row(fl);
+        // Order: a push, then merges while there are any, then the
+        // output's end; a merge's two pops, its compression, and the
+        // push of what it made.
+        b.when_transition(spush0 * (one - nt(T_SPUSH1)));
+        b.when_transition(spush1 * (one - nt(T_MPOP0) - nt(T_OEND)));
+        b.when_transition(mpop0 * (one - nt(T_MPOP1)));
+        b.when_transition(mpop1 * (one - nt(T_MPOP2)));
+        b.when_transition(mpop2 * (one - nt(T_MPOP3)));
+        b.when_transition(mpop3 * (one - nt(T_MRG)));
+        b.when_transition(mrg * (one - nt(T_SPUSH0)));
+        // Emptying: a pop, as many rows of empty subtree as the entry
+        // has levels, then its path; and after a path another entry, or
+        // the padding. Nothing else follows: the stack is emptied last.
+        b.when_transition(fpop0 * (one - nt(T_FPOP1)));
+        b.when_transition((fpop1 + emp) * (one - n[C_EV_ZERO]) * (one - nt(T_EMP)));
+        b.when_transition((fpop1 + emp) * n[C_EV_ZERO] * (one - nt(T_OLD)));
+        b.when_transition(fpop1 * (n[R_EV] - l[R_AV]));
+        b.when_transition(emp * (n[R_EV] - ev + one));
+        b.when_transition((one - fpop1 - emp) * n[R_EV]);
+        b.when_transition(fpop1 * n[C_LEVEL]);
+        b.when_transition(emp * (n[C_LEVEL] - level - one));
+        b.when_transition(nt(T_FPOP0) * (one - n[R_FL]));
+        b.when_transition(fend * (one - nt(T_FPOP0)) * n[R_FL]);
+        b.when_transition((one - nt(T_FPOP0) - fend) * (n[R_FL] - fl));
+        b.when_transition(fend * (one - nt(T_FPOP0) - nt(T_DONE)));
+        // An entry's position is of a subtree of its level: a row of
+        // empty subtree for each level, and at each the position's
+        // lowest bit left is zero.
+        b.assert_zero(emp * pbits[0]);
+        b.assert_zero((spush1 + pop1) * dir);
+        // The halves of a merge are of one level.
+        b.assert_zero(mrg * (l[R_AV] - l[R_BV]));
+        for i in 0..DIGEST {
+            // An entry hashed: its node, then its level and position.
+            let pushed = match i {
+                0 => l[R_PV],
+                1 => l[R_PP],
+                2 => l[R_PP + 1],
+                _ => F::ZERO,
+            };
+            b.assert_zero(spush0 * (l[COL_INPUT + i] - l[R_PN + i]));
+            b.assert_zero(spush0 * (l[COL_INPUT + RATE + i] - pushed));
+            if i >= 3 {
+                b.assert_zero(pop0 * l[COL_INPUT + RATE + i]);
+            }
+            // Compressed with the stack under it: a push makes the new
+            // digest of that, and a pop is held to the digest there is,
+            // and leaves the one it gave for what is under.
+            b.assert_zero(spush1 * (l[COL_DATA + i] - l[R_STK + i]));
+            b.assert_zero(pop1 * (l[COL_ACC + i] - l[R_STK + i]));
+            b.when_first_row(l[R_STK + i]);
+            b.when_last_row(l[R_STK + i]);
+            b.when_transition(spush1 * (n[R_STK + i] - l[COL_ACC + i]));
+            b.when_transition(pop1 * (n[R_STK + i] - l[COL_DATA + i]));
+            b.when_transition((one - spush1 - pop1) * (n[R_STK + i] - l[R_STK + i]));
+            // What was popped, and what was popped before it.
+            b.when_transition(pop0 * (n[R_AN + i] - l[COL_INPUT + i]));
+            b.when_transition((one - pop0) * (n[R_AN + i] - l[R_AN + i]));
+            b.when_transition(pop0 * (n[R_BN + i] - l[R_AN + i]));
+            b.when_transition((one - pop0) * (n[R_BN + i] - l[R_BN + i]));
+            // A merge: the entry under on the left, the top on the right.
+            b.assert_zero(mrg * (l[COL_INPUT + i] - l[R_AN + i]));
+            b.assert_zero(mrg * (l[COL_INPUT + RATE + i] - l[R_BN + i]));
+            // What is pushed: an output's leaf, or a merge's node.
+            b.when_transition(body_out2 * (n[R_PN + i] - l[R_LEAF + i]));
+            b.when_transition(mrg * (n[R_PN + i] - l[COL_ACC + i]));
+            b.when_transition((one - nt(T_SPUSH0)) * (n[R_PN + i] - l[R_PN + i]));
+            // An empty subtree: the one of a level less, twice.
+            b.assert_zero(emp * (l[COL_INPUT + i] - l[R_OLD + i]));
+            b.assert_zero(emp * (l[COL_INPUT + RATE + i] - l[R_OLD + i]));
+        }
+        // The level and position of what was popped, and of what is
+        // pushed: a leaf's are nought and the output's position, a
+        // merge's a level up and its left half's position.
+        for (k, reg) in [R_AV, R_AP, R_AP + 1].into_iter().enumerate() {
+            b.when_transition(pop0 * (n[reg] - l[COL_INPUT + RATE + k]));
+            b.when_transition((one - pop0) * (n[reg] - l[reg]));
+        }
+        b.when_transition(pop0 * (n[R_BV] - l[R_AV]));
+        b.when_transition((one - pop0) * (n[R_BV] - l[R_BV]));
+        b.when_transition(body_out2 * n[R_PV]);
+        b.when_transition(body_out2 * (n[R_PP] - l[R_OPOS_LO]));
+        b.when_transition(body_out2 * (n[R_PP + 1] - l[R_OPOS_HI]));
+        b.when_transition(mrg * (n[R_PV] - l[R_AV] - one));
+        b.when_transition(mrg * (n[R_PP] - l[R_AP]));
+        b.when_transition(mrg * (n[R_PP + 1] - l[R_AP + 1]));
+        for reg in [R_PV, R_PP, R_PP + 1] {
+            b.when_transition((one - nt(T_SPUSH0)) * (n[reg] - l[reg]));
         }
 
         // ---------------- policy input ----------------
@@ -1591,7 +1822,16 @@ pub struct InputWitness {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputWitness {
     pub output: Output,
-    pub siblings: [Digest; DEPTH],
+}
+
+/// An entry of the outputs' stack as it is put in the tree when a
+/// segment ends: a subtree of `level` whose first leaf is at
+/// `position`, and the siblings of its path from its level up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlushEntry {
+    pub level: u8,
+    pub position: u64,
+    pub siblings: Vec<Digest>,
 }
 
 /// A policy input (see [`crate::policy`]) with what the prover reads from
@@ -1679,6 +1919,9 @@ pub struct SegmentWitness {
     pub nsp_in: [Fp; WIDTH],
     pub pos_in: u64,
     pub txs: Vec<TxWitness>,
+    /// The segment's outputs as they are put in the tree when it ends:
+    /// the entries of the stack, the top first.
+    pub flush: Vec<FlushEntry>,
     /// The signatures of the whole block, as its signature segments
     /// take them, and their set: where this segment's are looked up.
     pub signed: Arc<Signed>,
@@ -1717,7 +1960,12 @@ impl SegmentWitness {
         max_rows: usize,
         height: u32,
     ) -> Result<Vec<SegmentWitness>, Error> {
-        let plan = pack(txs.len(), |t| item_rows_of(&txs[t]), max_rows);
+        let made = |t: usize| {
+            let tx: &Transaction = &txs[t];
+            let before = tx.inputs.len() + tx.policy_inputs.len();
+            before..before + tx.outputs.len()
+        };
+        let plan = pack_with(txs.len(), |t| item_rows_of(&txs[t]), made, max_rows);
         Self::collect_parts(snap, txs, plan, height)
     }
 
@@ -1770,6 +2018,10 @@ impl SegmentWitness {
         for parts in segments {
             let root_in = root_now(&tree);
             let pos_in = next;
+            // The segment's outputs wait on a stack, and are put in the
+            // tree when it ends: their leaves, and the stack's entries.
+            let mut leaves: Vec<Digest> = Vec::new();
+            let mut stack: Vec<(u8, u64)> = Vec::new();
             let (isp_in, osp_in, nsp_in) = (isp, osp, nsp);
             let mut out = Vec::with_capacity(parts.len());
             for part in parts {
@@ -1839,12 +2091,12 @@ impl SegmentWitness {
                         });
                     } else if k < n_in + n_out {
                         let o = &tx.outputs[k - n_in];
-                        let siblings = tree.path(next);
-                        tree.set(next, &crate::output::leaf(&o.commitment, &o.slot(), height));
+                        leaves.push(crate::output::leaf(&o.commitment, &o.slot(), height));
+                        push_leaf(&mut stack, next);
                         next += 1;
                         absorb_output(&mut osp, &o.commitment, &o.slot());
                         body_absorb_output(&mut bsp, o);
-                        outputs.push(OutputWitness { output: *o, siblings });
+                        outputs.push(OutputWitness { output: *o });
                     } else {
                         let digest = tx.ops[k - n_in - n_out].digest();
                         absorb_op(&mut nsp, &digest);
@@ -1866,8 +2118,29 @@ impl SegmentWitness {
                     ends: part.end == n_in + n_pol + n_out + n_ops,
                 });
             }
+            // The stack into the tree, the top first: each entry's path
+            // as the tree is when it is put there, after everything the
+            // segment spent and the entries before it.
+            let mut flush = Vec::with_capacity(stack.len());
+            for &(level, position) in stack.iter().rev() {
+                let siblings = tree.path(position)[level as usize..].to_vec();
+                for at in position..position + (1u64 << level) {
+                    tree.set(at, &leaves[(at - pos_in) as usize]);
+                }
+                flush.push(FlushEntry { level, position, siblings });
+            }
             let signed = Arc::default();
-            out_segments.push(SegmentWitness { height, root_in, isp_in, osp_in, nsp_in, pos_in, txs: out, signed });
+            out_segments.push(SegmentWitness {
+                height,
+                root_in,
+                isp_in,
+                osp_in,
+                nsp_in,
+                pos_in,
+                txs: out,
+                flush,
+                signed,
+            });
         }
         let signed = Arc::new(Signed::pack(SegmentWitness::signings(&out_segments)));
         for segment in &mut out_segments {
@@ -1897,9 +2170,14 @@ impl SegmentWitness {
         self.txs.iter().flat_map(|t| t.outputs.iter().map(|o| o.output.block_output())).collect()
     }
 
-    /// Trace rows before padding; a trace needs at least one more.
+    /// Trace rows before padding; a trace needs at least one more. The
+    /// transactions' rows, a merge for each output the stack's entries
+    /// are fewer than, and each entry put in the tree.
     pub fn num_rows(&self) -> usize {
-        self.txs.iter().map(TxWitness::num_rows).sum()
+        let outputs: usize = self.txs.iter().map(|t| t.outputs.len()).sum();
+        let merges = outputs.saturating_sub(self.flush.len());
+        let flush: usize = self.flush.iter().map(|e| flush_rows(e.level as usize)).sum();
+        self.txs.iter().map(TxWitness::num_rows).sum::<usize>() + merges * ROWS_PER_MERGE + flush
     }
 
     /// Every signature these segments rest on, in their order: each
@@ -1994,6 +2272,18 @@ struct Regs {
     sidx: u64,
     kh: Digest,
     spn: u32,
+    // the outputs' stack
+    stk: Digest,
+    pn: Digest,
+    pv: u32,
+    pp: u64,
+    an: Digest,
+    av: u32,
+    ap: u64,
+    bn: Digest,
+    bv: u32,
+    ev: u32,
+    fl: bool,
 }
 
 impl Regs {
@@ -2035,7 +2325,21 @@ impl Regs {
         row[R_OLD..R_OLD + DIGEST].copy_from_slice(&self.old);
         row[R_NEW..R_NEW + DIGEST].copy_from_slice(&self.new);
         row[R_IS_OUT] = Fp::new(self.is_out as u32);
-        row[C_OUT_END] = Fp::new((row[C_SMT_END] == Fp::ONE && self.is_out) as u32);
+        row[C_OUT_END] = row[T_OEND];
+        row[R_STK..R_STK + DIGEST].copy_from_slice(&self.stk);
+        row[R_PN..R_PN + DIGEST].copy_from_slice(&self.pn);
+        row[R_PV] = Fp::new(self.pv);
+        row[R_PP..R_PP + 2].copy_from_slice(&position_limbs(self.pp));
+        row[R_AN..R_AN + DIGEST].copy_from_slice(&self.an);
+        row[R_AV] = Fp::new(self.av);
+        row[R_AP..R_AP + 2].copy_from_slice(&position_limbs(self.ap));
+        row[R_BN..R_BN + DIGEST].copy_from_slice(&self.bn);
+        row[R_BV] = Fp::new(self.bv);
+        row[R_EV] = Fp::new(self.ev);
+        row[C_EV_ZERO] = Fp::new((self.ev == 0) as u32);
+        row[C_EV_INV] = if self.ev == 0 { Fp::ZERO } else { Fp::new(self.ev).inverse().unwrap() };
+        row[R_FL] = Fp::new(self.fl as u32);
+        row[C_FEND] = Fp::new(self.fl as u32) * row[C_SMT_END];
         row[R_MSG..R_MSG + DIGEST].copy_from_slice(&self.msg);
         row[R_BSP..R_BSP + WIDTH].copy_from_slice(&self.bsp);
         row[R_ISP..R_ISP + WIDTH].copy_from_slice(&self.isp);
@@ -2163,6 +2467,18 @@ struct Gen {
     height: u32,
     /// The block's signed set, where signatures are looked up.
     signed: Arc<Signed>,
+    /// The outputs' stack: each entry's node, level and first position,
+    /// and the stack's digest under it.
+    stack: Vec<(Digest, u8, u64, Digest)>,
+}
+
+/// The sixteen elements an entry of the outputs' stack is hashed from.
+fn entry_input(node: &Digest, level: u32, position: u64) -> [Fp; WIDTH] {
+    let mut input = [Fp::ZERO; WIDTH];
+    input[..DIGEST].copy_from_slice(node);
+    input[DIGEST] = Fp::new(level);
+    input[DIGEST + 1..DIGEST + 3].copy_from_slice(&position_limbs(position));
+    input
 }
 
 impl Gen {
@@ -2212,9 +2528,16 @@ impl Gen {
 
     fn smt_update(&mut self, position: u64, siblings: &[Digest; DEPTH]) {
         // Caller has set regs.old / regs.new / regs.pbits / regs.level = 0.
+        self.smt_walk(0, position, siblings)
+    }
+
+    /// The path from `start` up, the old node and the new, with the
+    /// siblings of those levels: a leaf's from the bottom, a subtree's
+    /// from its level. Caller has set regs.old / regs.new / regs.pbits.
+    fn smt_walk(&mut self, start: usize, position: u64, siblings: &[Digest]) {
         let mut old_node = self.regs.old;
         let mut new_node = self.regs.new;
-        for (level, sib) in siblings.iter().enumerate() {
+        for (level, sib) in (start..DEPTH).zip(siblings) {
             let right = (position >> level) & 1 == 1;
             self.regs.level = level as u32;
             self.regs.sib = *sib;
@@ -2678,14 +3001,129 @@ impl Gen {
         self.regs.bsp = out;
         let out = self.absorb(o.slot(), T_BODY_OUT2);
         self.regs.bsp = out;
-        let position = self.regs.opos;
-        self.regs.old = EMPTY;
-        self.regs.new = self.regs.leaf;
-        self.regs.level = 0;
-        self.regs.pbits = core::array::from_fn(|i| Fp::new(((position >> i) & 1) as u32));
-        self.smt_update(position, &w.siblings);
+        // The leaf onto the stack, merged with what is under it while
+        // the two are the halves of a subtree; then the output's end.
+        let (leaf, position) = (self.regs.leaf, self.regs.opos);
+        self.push_rows(leaf, 0, position);
+        while let [.., (_, av, ap, _), (_, bv, _, _)] = self.stack[..] {
+            if av != bv || ap & ((1u64 << (av + 1)) - 1) != 0 {
+                break;
+            }
+            self.pop_rows(T_MPOP0, T_MPOP1);
+            let (left, level, first) = self.pop_rows(T_MPOP2, T_MPOP3);
+            let mut input = [Fp::ZERO; WIDTH];
+            input[..DIGEST].copy_from_slice(&left);
+            input[DIGEST..].copy_from_slice(&self.regs.bn);
+            self.b.start(input);
+            {
+                let row = self.b.last_row_mut();
+                row[T_MRG] = Fp::ONE;
+                self.regs.write(row);
+            }
+            let node = self.b.acc();
+            self.push_rows(node, level as u32 + 1, first);
+        }
+        self.b.pass();
+        {
+            let row = self.b.last_row_mut();
+            row[T_OEND] = Fp::ONE;
+            self.regs.write(row);
+        }
         self.regs.opos += 1;
         self.covered_rows();
+    }
+
+    /// Pushes an entry on the outputs' stack: hashed, and compressed
+    /// with the stack under it.
+    fn push_rows(&mut self, node: Digest, level: u32, position: u64) {
+        self.regs.pn = node;
+        self.regs.pv = level;
+        self.regs.pp = position;
+        self.b.start(entry_input(&node, level, position));
+        {
+            let row = self.b.last_row_mut();
+            row[T_SPUSH0] = Fp::ONE;
+            self.regs.write(row);
+        }
+        let under = self.regs.stk;
+        self.b.compress(under, false);
+        {
+            let row = self.b.last_row_mut();
+            row[T_SPUSH1] = Fp::ONE;
+            self.regs.write(row);
+        }
+        self.regs.stk = self.b.acc();
+        self.stack.push((node, level as u8, position, under));
+    }
+
+    /// Pops the top entry of the outputs' stack, in rows of these two
+    /// types: its hash made again, and compressed with the digest of
+    /// what is under it to the digest there is. Returns the entry.
+    fn pop_rows(&mut self, first: usize, second: usize) -> (Digest, u8, u64) {
+        let Some((node, level, position, under)) = self.stack.pop() else {
+            crate::stark::refuse(false, "the outputs' stack is empty");
+            return (EMPTY, 0, 0);
+        };
+        self.b.start(entry_input(&node, level as u32, position));
+        {
+            let row = self.b.last_row_mut();
+            row[first] = Fp::ONE;
+            self.regs.write(row);
+        }
+        self.regs.bn = self.regs.an;
+        self.regs.bv = self.regs.av;
+        self.regs.an = node;
+        self.regs.av = level as u32;
+        self.regs.ap = position;
+        self.b.compress(under, false);
+        {
+            let row = self.b.last_row_mut();
+            row[second] = Fp::ONE;
+            self.regs.write(row);
+        }
+        debug_assert_eq!(self.b.acc(), self.regs.stk);
+        self.regs.stk = under;
+        (node, level, position)
+    }
+
+    /// Empties the outputs' stack into the tree: each entry popped,
+    /// the empty subtree of its height made, and the entry set down in
+    /// its place by the path from its level up.
+    fn flush(&mut self, entries: &[FlushEntry]) {
+        crate::stark::refuse(entries.len() == self.stack.len(), "the stack's entries are not the witness's");
+        for entry in entries {
+            self.regs.fl = true;
+            let (node, level, position) = self.pop_rows(T_FPOP0, T_FPOP1);
+            crate::stark::refuse(
+                (level, position) == (entry.level, entry.position) && entry.siblings.len() == DEPTH - level as usize,
+                "a stack entry is not the witness's",
+            );
+            self.regs.ev = level as u32;
+            self.regs.old = EMPTY;
+            self.regs.new = node;
+            self.regs.level = 0;
+            self.regs.pbits = core::array::from_fn(|i| Fp::new(((position >> i) & 1) as u32));
+            for _ in 0..level {
+                let mut input = [Fp::ZERO; WIDTH];
+                input[..DIGEST].copy_from_slice(&self.regs.old);
+                input[DIGEST..].copy_from_slice(&self.regs.old);
+                self.b.start(input);
+                {
+                    let row = self.b.last_row_mut();
+                    row[T_EMP] = Fp::ONE;
+                    self.regs.write(row);
+                }
+                self.regs.old = self.b.acc();
+                for i in 0..DEPTH - 1 {
+                    self.regs.pbits[i] = self.regs.pbits[i + 1];
+                }
+                self.regs.pbits[DEPTH - 1] = Fp::ZERO;
+                self.regs.ev -= 1;
+                self.regs.level += 1;
+            }
+            self.smt_walk(level as usize, position, &entry.siblings);
+        }
+        self.regs.fl = false;
     }
 
     /// A name operation: its digest into the body, then into the
@@ -2779,8 +3217,25 @@ impl BlockAir {
             sidx: 0,
             kh: EMPTY,
             spn: 0,
+            stk: EMPTY,
+            pn: EMPTY,
+            pv: 0,
+            pp: 0,
+            an: EMPTY,
+            av: 0,
+            ap: 0,
+            bn: EMPTY,
+            bv: 0,
+            ev: 0,
+            fl: false,
         };
-        let mut g = Gen { b: HashTraceBuilder::new(NUM_COLS), regs, height: w.height, signed: w.signed.clone() };
+        let mut g = Gen {
+            b: HashTraceBuilder::new(NUM_COLS),
+            regs,
+            height: w.height,
+            signed: w.signed.clone(),
+            stack: Vec::new(),
+        };
         let mut carry_in = Carry::CLOSED;
         let mut carry_out = Carry::CLOSED;
         let parts = w.txs.len();
@@ -2892,6 +3347,8 @@ impl BlockAir {
                 };
             }
         }
+        // The segment's outputs into the tree, last of all.
+        g.flush(&w.flush);
         let public = SegmentPublic {
             height: w.height,
             root_in: w.root_in,
@@ -3154,7 +3611,7 @@ mod tests {
     #[test]
     fn layout() {
         assert_eq!(DEPTH, 42);
-        assert_eq!(ROWS_PER_OUTPUT, 9 + 2 * 42);
+        assert_eq!((ROWS_PER_OUTPUT, ROWS_PER_MERGE, flush_rows(0), flush_rows(3)), (12, 7, 86, 83));
         assert_eq!(BlockAir.width(), NUM_COLS);
         assert_eq!(measure_degree(&BlockAir, NUM_PUBLIC), BlockAir.max_constraint_degree());
     }

@@ -312,3 +312,39 @@ As built (`src/aggregate.rs`, "The signature tree"; the tree's shape is
 
 Not done: signature segments are proven one after another, and every
 block proves its own, there being nothing yet that keeps them.
+
+## 9. Outputs put in the tree together
+
+An output was put in the state tree where it stood: a path of the
+tree's forty-two levels, walked twice, 84 of its 93 rows. A block's
+outputs take positions one after another, and share nearly all of
+those paths.
+
+A segment now keeps its outputs on a stack (`src/block_air.rs`, "the
+outputs' stack"). An output's leaf is pushed; the top two entries are
+merged into the node over them when they are the two halves of one
+subtree; and when the segment ends the stack is emptied into the tree,
+each entry a whole subtree set down where an empty one was, by one
+path from its level up. A run of outputs ends as at most two subtrees a
+level.
+
+- An output is 12 rows, and a merge 7; no run has as many merges as
+  outputs. Emptying costs 86 rows an entry at most.
+- The stack is a digest: an entry's hash (its node, its level, the
+  position of its first leaf) compressed with the digest of what is
+  under it. What is popped is what was pushed.
+- A merge asks only that its halves be of one level. That the merged
+  entry begins where a subtree of its size begins is held when it is
+  set down: its position's low bits must be zero. That its halves were
+  next to each other follows from the stack being of consecutive
+  leaves; were some between them set down first, the subtree the
+  merged entry claims would not be empty there, and it could not be.
+- The stack is emptied last, before the padding, and must be empty
+  when the trace ends.
+- A segment's outputs are not in the tree until it ends, so nothing in
+  it can spend one of them. Nothing could before either: a block's
+  witnesses are gathered from the state as the block before left it.
+
+A proof of proofs added its children's sums of amounts limb by limb. A
+segment can now hold many times the outputs, and four such limbs added
+would pass the field: each child's limbs are normalized first.

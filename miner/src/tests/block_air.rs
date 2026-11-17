@@ -173,7 +173,9 @@ fn policy_spends_satisfy_constraints() {
     let (txs, segments) = policy_segments();
     assert_eq!(segments.len(), 4);
     for (k, seg) in segments.iter().enumerate() {
-        assert_eq!(seg.num_rows(), tx_rows(&txs[k]), "rows of transaction {k}");
+        let made = txs[k].outputs.len();
+        let exact = tx_rows(&txs[k]) - made * ROWS_PER_MERGE + stack_rows(seg.pos_in, made);
+        assert_eq!(seg.num_rows(), exact, "rows of transaction {k}");
         let (trace, public) = BlockAir::generate_trace(seg);
         assert_eq!(check_constraints(&BlockAir, &trace, &public.to_values()), Ok(()), "transaction {k}");
         // Tampering with the state number breaks the update's rows.
@@ -216,6 +218,15 @@ fn signatures_hold(signed: &crate::signed::Signed) -> bool {
         });
         made.unwrap_or(false)
     })
+}
+
+/// The rows a segment's stack takes for `outputs` outputs from
+/// `pos_in`: a merge wherever two entries are the halves of a subtree,
+/// and each entry left put in the tree when the segment ends.
+fn stack_rows(pos_in: u64, outputs: usize) -> usize {
+    let mut stack = Vec::new();
+    let merges: usize = (0..outputs as u64).map(|i| push_leaf(&mut stack, pos_in + i)).sum();
+    merges * ROWS_PER_MERGE + stack.iter().map(|(level, _)| flush_rows(*level as usize)).sum::<usize>()
 }
 
 fn cheat(w: &SegmentWitness) -> Cheat {
@@ -841,9 +852,8 @@ fn mutate_segment(w: &mut SegmentWitness, rng: &mut crate::test_util::Rng) -> Op
             format!("tx {t} output {o} key hash")
         }
         15 if no > 0 => {
-            let l = k % DEPTH;
-            tx.outputs[o].siblings[l][d] += delta;
-            format!("tx {t} output {o} sibling {l}")
+            tx.outputs[o].output.amount ^= 1 << (k % 20);
+            format!("tx {t} output {o} amount")
         }
         16 => {
             tx.message[d] += delta;
@@ -1436,7 +1446,7 @@ fn keys_of_other_heights_verify() {
     assert_eq!(tx.inputs[0].signature.height(), 10);
     assert_eq!(tx.inputs[1].signature.height(), 1);
     let segments = utxo.collect(std::slice::from_ref(&tx), 1, 1).unwrap();
-    assert_eq!(segments[0].num_rows(), 2 + input_rows(10) + input_rows(1) + ROWS_PER_OUTPUT);
+    assert_eq!(segments[0].num_rows(), 2 + input_rows(10) + input_rows(1) + ROWS_PER_OUTPUT + flush_rows(0));
     let (trace, public) = BlockAir::generate_trace(&segments[0]);
     assert_eq!(trace.height(), segments[0].num_rows().next_power_of_two());
     assert_eq!(check_constraints(&BlockAir, &trace, &public.to_values()), Ok(()));
@@ -1476,7 +1486,9 @@ fn layout_and_degree() {
     assert_eq!(ROWS_PER_SIGNATURE, 2 + 29);
     assert_eq!((input_rows(4), input_rows(20)), (ROWS_PER_INPUT, ROWS_PER_INPUT));
     assert_eq!(ROWS_PER_INPUT, 31 + 6 + 1 + 84 + 2);
-    assert_eq!(ROWS_PER_OUTPUT, 93);
+    // An output is its own rows and a push on the stack; the tree's
+    // forty-two levels are walked for a subtree of them, not for each.
+    assert_eq!((ROWS_PER_OUTPUT, ROWS_PER_OUTPUT_PACKED, flush_rows(0)), (12, 19, 86));
     assert_eq!(NUM_PUBLIC, 128 + 2 * 28 + 1 + 8);
 }
 
@@ -1485,7 +1497,10 @@ fn segments_satisfy_constraints_and_chain() {
     let (segments, expected_root, positions, outputs) = scenario("ok", 2);
     assert_eq!(segments.len(), 2);
     assert_eq!(segments[0].txs.len(), 2);
-    assert_eq!(segments[0].num_rows(), 2 * 2 + 2 * input_rows(4) + 3 * ROWS_PER_OUTPUT);
+    assert_eq!(
+        segments[0].num_rows(),
+        2 * 2 + 2 * input_rows(4) + 3 * ROWS_PER_OUTPUT + stack_rows(segments[0].pos_in, 3)
+    );
     let mut publics = Vec::new();
     for (k, seg) in segments.iter().enumerate() {
         let (trace, public) = BlockAir::generate_trace(seg);
@@ -1618,7 +1633,7 @@ fn packing_splits_between_items() {
         rows.extend(std::iter::repeat_n(ROWS_PER_OP, n_ops));
         (rows, whole)
     };
-    let max_rows = 512;
+    let max_rows = 256;
     let plan = pack(4, items, max_rows);
     // Parts cover every item once, in order.
     let mut next = [0usize; 4];
@@ -1638,12 +1653,139 @@ fn packing_splits_between_items() {
         assert!(rows < max_rows, "{rows}");
     }
     assert_eq!(next, [1, 6, 3, 8]);
-    // The second transaction's inputs fit beside the first; its outputs
-    // do not, and go on in the next segment, with the third whole. The
-    // last must stay whole, and has a segment to itself.
-    assert_eq!(plan[0], vec![Part { tx: 0, start: 0, end: 1 }, Part { tx: 1, start: 0, end: 3 }]);
-    assert_eq!(plan[1], vec![Part { tx: 1, start: 3, end: 6 }, Part { tx: 2, start: 0, end: 3 }]);
-    assert_eq!(plan[2], vec![Part { tx: 3, start: 0, end: 8 }]);
+    // One of the second transaction's inputs fits beside the first
+    // transaction; the other two fill a segment; its outputs go on in
+    // the next, with the third transaction and the last, each whole.
+    assert_eq!(plan[0], vec![Part { tx: 0, start: 0, end: 1 }, Part { tx: 1, start: 0, end: 1 }]);
+    assert_eq!(plan[1], vec![Part { tx: 1, start: 1, end: 3 }]);
+    assert_eq!(
+        plan[2],
+        vec![Part { tx: 1, start: 3, end: 6 }, Part { tx: 2, start: 0, end: 3 }, Part { tx: 3, start: 0, end: 8 }]
+    );
+}
+
+/// The stack's entries after a run of leaves are the fewest subtrees
+/// that hold exactly those leaves, each where a subtree of its size
+/// begins.
+#[test]
+fn a_run_of_leaves_is_stacked_as_its_subtrees() {
+    for (first, count) in [(0u64, 1usize), (0, 8), (1, 7), (3, 6), (5, 1), (6, 20), (1023, 3), (1 << 30, 5)] {
+        let mut stack = Vec::new();
+        let merges: usize = (0..count as u64).map(|i| push_leaf(&mut stack, first + i)).sum();
+        assert_eq!(merges, count - stack.len(), "{first}+{count}");
+        // In order, covering the run and nothing else, each aligned.
+        let mut at = first;
+        for &(level, position) in &stack {
+            assert_eq!(position, at, "{first}+{count}");
+            assert_eq!(position & ((1 << level) - 1), 0, "{first}+{count}: level {level} at {position}");
+            at += 1 << level;
+        }
+        assert_eq!(at, first + count as u64);
+        // And no two next to each other could be one.
+        for pair in stack.windows(2) {
+            let ((av, ap), (bv, _)) = (pair[0], pair[1]);
+            assert!(av != bv || ap & ((1 << (av + 1)) - 1) != 0, "{first}+{count}: {stack:?}");
+        }
+        assert!(stack.len() * flush_rows(0) <= flush_rows_bound(count), "{first}+{count}: {} entries", stack.len());
+    }
+}
+
+/// A segment's outputs go onto a stack and into the tree together
+/// when it ends: the tree is then what it is with each put in alone,
+/// and nothing of the stack can be moved: not what is pushed, not what
+/// is popped, not the stack under either, not where or at what level an
+/// entry is set down, and not whether the stack was emptied at all.
+#[test]
+fn outputs_are_stacked_and_put_in_the_tree_together() {
+    let utxo = TestSet::new();
+    let dest = key(3).public_key();
+    // Seven outputs from position 1: subtrees of one, two and four.
+    utxo.add_output(&Output::new(&dest, 5).block_output(), 0).unwrap();
+    let tx = UnsignedTransaction::new(vec![], (0..7).map(|i| Output::new(&dest, 10 + i)).collect())
+        .sign(|_, _, _| Err::<Sig, ()>(()))
+        .unwrap();
+    let segments = utxo.collect(std::slice::from_ref(&tx), 1, 1).unwrap();
+    let w = &segments[0];
+    assert_eq!(w.pos_in, 1);
+    let entries: Vec<(u8, u64)> = w.flush.iter().map(|e| (e.level, e.position)).collect();
+    assert_eq!(entries, [(2, 4), (1, 2), (0, 1)]);
+    assert!(w.flush.iter().all(|e| e.siblings.len() == DEPTH - e.level as usize));
+    assert_eq!(
+        w.num_rows(),
+        2 + 7 * ROWS_PER_OUTPUT + 4 * ROWS_PER_MERGE + flush_rows(2) + flush_rows(1) + flush_rows(0)
+    );
+    let (trace, public) = BlockAir::generate_trace(w);
+    let values = public.to_values();
+    assert_eq!(check_constraints(&BlockAir, &trace, &values), Ok(()));
+    assert_eq!((public.pos_out, public.root_out), (8, utxo.root()));
+    // A witness whose entries are not the stack's makes no trace.
+    for change in [0usize, 1, 2] {
+        let mut bad = w.clone();
+        match change {
+            0 => drop(bad.flush.pop()),
+            1 => bad.flush[0].position += 4,
+            _ => bad.flush[1].siblings[3][0] += Fp::ONE,
+        }
+        assert!(std::panic::catch_unwind(|| BlockAir::generate_trace(&bad)).is_err(), "change {change}");
+    }
+    let width = NUM_COLS;
+    let row_of = |ty: usize, which: usize| {
+        (0..trace.height()).filter(|&r| trace.values[r * width + ty] == Fp::ONE).nth(which).expect("such a row")
+    };
+    let breaks = |what: &str, change: &dyn Fn(&mut crate::stark::Trace)| {
+        let mut bad = trace.clone();
+        change(&mut bad);
+        assert!(check_constraints(&BlockAir, &bad, &values).is_err(), "{what}");
+    };
+    // What is pushed: the leaf, its level, its position.
+    breaks("pushed node", &|t| t.values[row_of(T_SPUSH0, 0) * width + R_PN] += Fp::ONE);
+    breaks("pushed node, as hashed", &|t| t.values[row_of(T_SPUSH0, 2) * width + COL_INPUT] += Fp::ONE);
+    breaks("pushed level", &|t| t.values[row_of(T_SPUSH0, 0) * width + R_PV] += Fp::ONE);
+    breaks("pushed position", &|t| t.values[row_of(T_SPUSH0, 1) * width + R_PP] += Fp::ONE);
+    breaks("the stack under a push", &|t| t.values[row_of(T_SPUSH1, 1) * width + COL_DATA] += Fp::ONE);
+    breaks("the stack kept", &|t| t.values[row_of(T_OEND, 2) * width + R_STK] += Fp::ONE);
+    // What is popped: for a merge, and for the tree.
+    for (name, ty) in [("merge", T_MPOP0), ("merge's second", T_MPOP2), ("tree", T_FPOP0)] {
+        breaks(&format!("{name}: popped node"), &|t| t.values[row_of(ty, 0) * width + COL_INPUT] += Fp::ONE);
+        breaks(&format!("{name}: popped level"), &|t| t.values[row_of(ty, 0) * width + COL_INPUT + 8] += Fp::ONE);
+        breaks(&format!("{name}: popped position"), &|t| t.values[row_of(ty, 0) * width + COL_INPUT + 9] += Fp::ONE);
+    }
+    for (name, ty) in [("merge", T_MPOP1), ("merge's second", T_MPOP3), ("tree", T_FPOP1)] {
+        breaks(&format!("{name}: the stack under a pop"), &|t| t.values[row_of(ty, 0) * width + COL_DATA] += Fp::ONE);
+        breaks(&format!("{name}: what was popped"), &|t| t.values[row_of(ty, 0) * width + R_AN + 1] += Fp::ONE);
+    }
+    // A merge: its halves, their levels, what it makes.
+    breaks("merge's left", &|t| t.values[row_of(T_MRG, 0) * width + COL_INPUT] += Fp::ONE);
+    breaks("merge's right", &|t| t.values[row_of(T_MRG, 1) * width + COL_INPUT + 8] += Fp::ONE);
+    breaks("merge's levels", &|t| t.values[row_of(T_MRG, 0) * width + R_BV] += Fp::ONE);
+    breaks("merged level", &|t| t.values[(row_of(T_MRG, 0) + 1) * width + R_PV] += Fp::ONE);
+    breaks("merged position", &|t| t.values[(row_of(T_MRG, 0) + 1) * width + R_PP] += Fp::ONE);
+    // Set down in the tree: at its level, at its place, as itself.
+    breaks("levels of empty subtree", &|t| t.values[row_of(T_EMP, 0) * width + R_EV] += Fp::ONE);
+    breaks("an unaligned entry", &|t| t.values[row_of(T_EMP, 0) * width + R_PBITS] = Fp::ONE);
+    breaks("the empty subtree", &|t| t.values[row_of(T_EMP, 1) * width + COL_INPUT] += Fp::ONE);
+    breaks("the node set down", &|t| t.values[(row_of(T_FPOP1, 0) + 1) * width + R_NEW] += Fp::ONE);
+    breaks("what was there", &|t| t.values[(row_of(T_FPOP1, 2) + 1) * width + R_OLD] += Fp::ONE);
+    breaks("the place set down at", &|t| t.values[(row_of(T_FPOP1, 2) + 1) * width + R_PBITS + 1] = Fp::ONE);
+    breaks("the level counted from", &|t| t.values[(row_of(T_FPOP1, 2) + 1) * width + C_LEVEL] = Fp::ONE);
+    breaks("emptying, said not to be", &|t| t.values[(row_of(T_FPOP1, 1) + 1) * width + R_FL] = Fp::ZERO);
+    // An output's end cannot be another kind of row, nor a push skipped.
+    breaks("an output's end", &|t| {
+        let at = row_of(T_OEND, 3) * width;
+        t.values[at + T_OEND] = Fp::ZERO;
+        t.values[at + T_DONE] = Fp::ONE;
+    });
+    // The stack not emptied: the entries left are still on it when the
+    // trace ends.
+    breaks("the stack left full", &|t| {
+        let from = row_of(T_FPOP0, 2);
+        for r in from..t.height() {
+            let at = r * width;
+            let done = t.values[trace.height() * width - width..].to_vec();
+            t.values[at..at + width].copy_from_slice(&done);
+            t.values[at + R_STK..at + R_STK + DIGEST].copy_from_slice(&trace.values[from * width + R_STK..][..DIGEST]);
+        }
+    });
 }
 
 /// A signature is looked up in the block's signed set, and nothing
