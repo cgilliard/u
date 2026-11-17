@@ -1109,12 +1109,19 @@ fn security_configs() {
         for k in [1, 16] {
             let (segments, statement, names) = full_segments(name, &params, k);
             let shape = plan_with(&params, k, &mut cache);
+            // The most memory the process holds at once, from here.
+            let _ = std::fs::write("/proc/self/clear_refs", "5");
             let t = std::time::Instant::now();
             let times = Mutex::new(Vec::new());
             let proof = prove_block_with(&params, &shape, &statement, &segments, &names, 2, &|p| {
                 times.lock().unwrap().push(format!("{p:?}"));
             });
             let elapsed = t.elapsed();
+            let peak = std::fs::read_to_string("/proc/self/status").ok().and_then(|s| {
+                let line = s.lines().find(|l| l.starts_with("VmHWM:"))?.to_string();
+                line.split_whitespace().nth(1)?.parse::<u64>().ok()
+            });
+            println!("  block of {k}: most memory while proving {} MB", peak.map_or(0, |kb| kb / 1024));
             let wrap_line = times.lock().unwrap().iter().rev().find(|l| l.starts_with("Wrap")).cloned();
             let t = std::time::Instant::now();
             let w = shape.wrap.unwrap();
