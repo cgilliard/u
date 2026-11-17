@@ -35,8 +35,14 @@ a laptop.
   shorten.
 - **A header does not commit to its proof.** A miner looks for the
   nonce while the proof is being made, so proving time costs it no
-  hashing. What it costs is the chance of finding the nonce before the
-  proof is ready and being overtaken while it waits.
+  hashing. A pool hashes on a block of its reward alone until the full
+  block's proof is ready, and loses only the fees of the blocks it
+  finds meanwhile; or, once fees are enough of a block's income, on
+  the full block from the start.
+- **The hardware is three servers of 64 cores**, for a proof ready
+  about 2.3 minutes after the parent; one is enough to keep up. No
+  GPUs. With that, about a fifth of blocks come without transactions
+  while the reward is large, and none once it is small.
 - No single proof needs more than about 4 GB of memory at the
   parameters measured here. A cluster is many small provers, not one
   large one.
@@ -213,23 +219,24 @@ its header as soon as it has chosen the block and computed the state
 root, well under a second, and looks for the nonce from then on. The
 block can be sent when both the nonce and the proof are there.
 
-What proving time costs is therefore not hashing but a risk: a nonce
-found before the proof is ready must wait, and another miner's block
-may arrive first. With a proof ready `t` after the parent, that is
-about `(t / 600 s)^2 / 2` of a miner's blocks: one in two hundred at
-one minute, one in fifty at two, one in eight at five.
+So proving never costs hashing. What it costs depends on what a miner
+hashes on while the proof is being made, and there are two ways to go
+about it.
 
-A pool can remove even that for the reward. It hashes on a block of
-its reward alone, whose proof is the last three and ready soonest, and
-changes over to the full block when its proof is ready. It is then
-never worse off than a miner of empty blocks, and has the fees of every
-block found after the change. The blocks found before it carry no
-transactions: about `t / 600 s` of them. That share is what a pool's
-proving hardware buys down, and what a network of such pools pays in
-throughput.
+**Its reward's block first.** A block of the reward alone has the
+shortest proof there is: the last three of section 5. A pool hashes on
+that, and changes over to the full block when the full block's proof is
+ready. It never loses a block to proving, and is never worse off than a
+miner of empty blocks; the blocks it finds before the change carry no
+transactions and earn no fees.
 
-Including a transaction therefore costs a pool close to nothing at the
-margin, so long as the transaction pays a fee at all.
+**The full block from the start.** A pool hashes on the full block at
+once. If it finds the nonce before the proof is ready it must wait, and
+another miner's block may arrive first: then it loses the block, reward
+and fees.
+
+Which is better is a matter of how long the proof takes and how much of
+a block's income is fees: section 10.
 
 ## 8. What one proof costs
 
@@ -284,15 +291,147 @@ burst: some 300 core-minutes a block, 30 cores kept busy.
 
 The last line is the floor of section 5 at these costs: a segment, two
 levels of nodes, the root, the wrap and the chain step in sequence,
-each on six cores. A proof given more cores, or made on a GPU, lowers
-it; how far has not been measured, and is the first thing a pool
-should measure.
+each on six cores.
 
-By section 7, a proof ready two minutes after the parent costs a pool
-that hashes on its reward's block meanwhile about a fifth of its
-blocks' fees and none of their rewards; at one minute, a tenth.
+### The hardware, in full
 
-## 10. Limits and cautions
+Three servers of 64 cores and 128 GB each (a proof takes six cores and
+about 4 GB, so a server makes about ten at once). One of them is
+enough to keep up; three have the proof ready soonest and leave one
+free to fail. Disks and network are of no account: witnesses and proofs
+are megabytes.
+
+No GPU is needed for any of it, and the prover has no GPU code.
+Signatures are proven on the same CPUs, ahead of time.
+
+This is the proving alone. The hashing is elsewhere, on the pool's
+miners, each with the table of the proof of work (1.1 GB in the first
+year) and nothing else of this list. The coordinator is the node
+itself, with its mempool and state, and is light.
+
+### How the cluster's time is spent
+
+Signature proving does not stop for a block. The critical path is wide
+only where it begins:
+
+| Step | Proofs at once | Cores | For about |
+|---|---|---|---|
+| State segments | 27 | 160 | 12 s |
+| Nodes, first level | 7 | 40 | 25 s |
+| Nodes, second level | 2 | 12 | 25 s |
+| Root, then wrap, then chain step | 1 | 6 | 75 s |
+
+| In ten minutes, for full blocks | Core-minutes |
+|---|---|
+| Signatures, made ahead | about 260 |
+| The critical path | about 50 |
+| Three servers have | 1,920 |
+
+The cluster is a sixth busy. Its size is not for the amount of work,
+which one server has room for, but for the twelve seconds in which 27
+segments are proven at once.
+
+### Below the floor
+
+More machines do nothing for six proofs that follow one another. What
+shortens them is making a single proof faster: more of a server's
+cores to one proof, or a prover on a GPU. Neither has been measured,
+and it is the first thing a pool should measure: everything in section
+10 turns on it.
+
+More than half the floor is the last three proofs, which every block
+has, a reward alone included. They are where faster hardware counts
+most.
+
+## 10. What the delay costs, and who pays
+
+Write `t` for how long after the parent a pool's full proof is ready,
+and take the block time as ten minutes. The next block is found within
+`t` of the last with probability `1 - e^(-t / 10 min)`: about `t / 10
+min` while `t` is short.
+
+| Proof ready after | Blocks found before it is |
+|---|---|
+| 2.3 minutes | 20% |
+| 1 minute | 10% |
+| 30 seconds | 5% |
+| 15 seconds | 2.5% |
+
+### The two ways compared
+
+| | Its reward's block first | The full block from the start |
+|---|---|---|
+| Loses | The fees of the blocks found before the proof: `t / 10 min` of its fees | The whole of a block overtaken while it waits: `(t / 10 min)^2 / 2` of its blocks |
+| At 2.3 minutes | 20% of its fees | 2.6% of its blocks |
+| At 1 minute | 10% | 0.5% |
+| At 30 seconds | 5% | 0.1% |
+| The network sees | Blocks without transactions | Blocks with them, and a few more stale ones |
+
+The full block from the start is the better way once fees are enough
+of a block's income:
+
+```text
+fees / (reward + fees)  >  t / 20 minutes
+```
+
+(A pool with a large share of the hashing has a threshold a little
+lower: the block that overtakes it is sometimes its own.)
+
+### Across the emission
+
+The reward is 1,500 coins a block for three and a half years, 500 for
+the next three and a half, and 7 from then on.
+
+| Proof ready after | Fees must be | With 1,500 a block | With 500 | With 7 |
+|---|---|---|---|---|
+| 2.3 minutes | 11% of income | 195 coins a block | 65 | 0.9 |
+| 1 minute | 5% | 79 | 26 | 0.4 |
+| 30 seconds | 2.5% | 38 | 13 | 0.2 |
+
+- **While the reward is large**, fees are a small part of a block's
+  income, and a pool does best to hash on its reward's block first. A
+  share of blocks, `t / 10 min` of them, come without transactions.
+  This is when blocks are least likely to be full, so the room that
+  costs is room nobody was waiting for; a transaction that misses such
+  a block is in the next.
+- **Once the reward is 7**, fees are most of a block's income as soon
+  as the chain is used at all: under one coin a block, a ten-thousandth
+  of a coin a transaction of a full block. Pools mine full blocks from
+  the start, with any hardware, and blocks without transactions are
+  gone.
+
+So the years in which empty blocks are the rational thing to mine are
+the years in which the reward is what secures the chain; and by the
+time fees must secure it, taking transactions is plainly the better
+way.
+
+### What it gives miners reason to do
+
+- **To take transactions.** At the margin a transaction costs a pool
+  close to nothing, either way of mining, so long as it pays a fee at
+  all.
+- **To prove faster.** In the first way, each minute off the delay is
+  a tenth more of a pool's blocks with fees. In the second, the blocks
+  lost to waiting fall with the square of the delay. Either way faster
+  proving is paid for out of fees, and more of it is worth buying the
+  more fees there are.
+- **And it favours those who do.** When fees are nearly all of a
+  block's income, a pool whose proof takes 2.3 minutes gives up 2.6%
+  of its income to blocks overtaken, and one whose proof takes 30
+  seconds a tenth of a percent. That is an edge to better proving
+  hardware of the kind faster block relay gives elsewhere, and of
+  about that size once proofs take well under a minute.
+
+### What the network pays
+
+With pools of commodity servers and the prover as it is, about a fifth
+of blocks carry no transactions while the reward is large: capacity is
+four-fifths of nominal when blocks are full, and unchanged when they
+are not. Nothing is lost in security: a block without transactions is
+as much work as any. The share falls as proving gets faster and as
+fees grow, each of which gives pools reason for the other.
+
+## 11. Limits and cautions
 
 - **Memory is by the proof.** The figures above are the most one proof
   held. A machine proving `k` at once needs `k` times that. The
