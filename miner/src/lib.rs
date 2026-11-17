@@ -55,6 +55,7 @@ pub mod transaction;
 pub mod transport;
 pub mod u256;
 pub mod vm_air;
+pub mod wallet;
 pub mod xmss;
 pub mod xmss_air;
 pub mod xmss_fragment;
