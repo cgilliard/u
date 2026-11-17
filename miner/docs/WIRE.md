@@ -318,9 +318,13 @@ Differences from the reference:
   (`src/mempool.rs`); and then announced to every other peer. One that
   is not the transaction of the id it was announced by, or is badly
   signed, is held against who served it.
+- An announcement that cannot be fetched at once waits its turn (1,024
+  wait at the most, by one worker).
+- A peer new to a node is told of what the node pools, the best paying
+  first, 256 at the most.
 - Not yet: a peer is not told what a pool asks a byte, so it may
-  announce what will be refused; and a peer new to a node is not told
-  of what the node already pools.
+  announce what will be refused. (That is to be a message of the
+  pool's own, not a field of `Status`: 2.6.)
 
 ## 2.4 The objects
 

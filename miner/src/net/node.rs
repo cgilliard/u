@@ -79,7 +79,7 @@ use super::object::{MAX_NAME, Object};
 use super::peers::{Peers, Totals};
 use super::snapshot::{self, Manifest};
 use super::{MAX_DATAGRAM, VERSION};
-use crate::block::{BlockRef, HEADER_SIZE, Header};
+use crate::block::{BlockRef, BodyRef, HEADER_SIZE, Header};
 use crate::chain::Chain;
 use crate::chain::apply::{Applied, condemns};
 use crate::chain::headers::LOCATOR;
@@ -165,6 +165,16 @@ const ANNOUNCED: usize = 256;
 /// what a peer can have a node fetch by announcing is bounded by these.
 const TX_FETCHES: usize = 64;
 const TX_FETCHES_EACH: usize = 8;
+/// Transactions announced that wait their turn to be fetched, by one
+/// worker: when there are so many, the one that has waited longest is
+/// forgotten.
+const TX_WANTED: usize = 1024;
+/// Pooled transactions a peer new to the node is told of, the best
+/// paying first: it missed their announcement.
+const POOL_CATCHUP: usize = 256;
+/// Blocks back from the chain's last whose outputs the pool is told
+/// of, when the chain has gone over to another branch.
+const POOL_LOOKS_BACK: u32 = 64;
 /// How many blocks kept on side branches have who served them
 /// remembered: more than branches run to between two blocks that try one.
 const SIDES: usize = 256;
@@ -805,6 +815,9 @@ pub struct Worker<B: Backend + 'static, V> {
     /// What came of the fetches asked for from outside
     /// ([`Node::fetch_object`]).
     inbox: Vec<(Object, SocketAddrV4, Option<Vec<u8>>)>,
+    /// Transactions announced and not yet fetched: which, by whom, and
+    /// how long each is. The first to wait is the first fetched.
+    tx_wanted: VecDeque<(Digest, SocketAddrV4, u32)>,
     counts: Counts,
     /// Tests: a chain's work claimed that is not there; objects served
     /// with a byte wrong.
@@ -863,6 +876,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             list,
             announced: VecDeque::new(),
             inbox: Vec::new(),
+            tx_wanted: VecDeque::new(),
             counts: Counts::default(),
             #[cfg(test)]
             boast: None,
@@ -1173,7 +1187,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     fn act(&mut self, now: Micros, from: SocketAddrV4, message: Message<'_>, out: Out<'_>) {
         match message {
             Message::Ping(theirs) => self.on_ping(now, from, theirs, out),
-            Message::Pong(theirs) => self.on_pong(now, from, theirs),
+            Message::Pong(theirs) => self.on_pong(now, from, theirs, out),
             Message::GetPeers { token } => {
                 if self.asked_rightly(&from, token) {
                     self.peers.seen(&from, now);
@@ -1261,7 +1275,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         }
     }
 
-    fn on_pong(&mut self, now: Micros, from: SocketAddrV4, theirs: Status) {
+    fn on_pong(&mut self, now: Micros, from: SocketAddrV4, theirs: Status, out: Out<'_>) {
         // Only the answer to a ping of ours counts for anything.
         if !self.peers.pong(&from, theirs, now) {
             self.counts.unheard += 1;
@@ -1278,6 +1292,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         if let Err(place) = self.was_live.binary_search(&from) {
             self.was_live.insert(place, from);
             self.shared.say(Event::PeerConnected { peer: from, height: theirs.height });
+            self.announce_pool_to(from, out);
         }
     }
 
@@ -1628,12 +1643,53 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         if behind || self.shared.pool().contains(&id) {
             return;
         }
-        let fetching = |f: &&Fetching| matches!(f.object, Object::Tx(_));
-        let all = self.fetches.iter().filter(fetching).count();
-        let theirs = self.fetches.iter().filter(fetching).filter(|f| f.from == from).count();
-        let already = self.fetches.iter().any(|f| f.object == Object::Tx(id));
-        if all < TX_FETCHES && theirs < TX_FETCHES_EACH && !already {
+        // It waits its turn, behind what was announced before it.
+        if !self.tx_wanted.iter().any(|(wanted, by, _)| *wanted == id && *by == from) {
+            if self.tx_wanted.len() >= TX_WANTED {
+                self.tx_wanted.pop_front();
+            }
+            self.tx_wanted.push_back((id, from, len));
+        }
+        self.fetch_txs(now);
+    }
+
+    /// Fetches the transactions that wait to be, the longest waiting
+    /// first, as many at once as may be in all and of each peer. One
+    /// that is pooled by now, or being fetched, or whose peer is not
+    /// to be asked, waits no longer.
+    fn fetch_txs(&mut self, now: Micros) {
+        let mut later = VecDeque::new();
+        while let Some((id, from, len)) = self.tx_wanted.pop_front() {
+            let fetching = |f: &&Fetching| matches!(f.object, Object::Tx(_));
+            if self.fetches.iter().filter(fetching).count() >= TX_FETCHES {
+                later.push_back((id, from, len));
+                later.append(&mut self.tx_wanted);
+                break;
+            }
+            if self.fetches.iter().any(|f| f.object == Object::Tx(id)) || self.shared.pool().contains(&id) {
+                continue;
+            }
+            if self.fetches.iter().filter(fetching).filter(|f| f.from == from).count() >= TX_FETCHES_EACH {
+                later.push_back((id, from, len));
+                continue;
+            }
             self.fetch_object(now, Object::Tx(id), from, len);
+        }
+        self.tx_wanted = later;
+    }
+
+    /// A peer new to the node is told of what the node pools, the best
+    /// paying first, [`POOL_CATCHUP`] at the most: it was not there
+    /// when they were announced.
+    fn announce_pool_to(&mut self, to: SocketAddrV4, out: Out<'_>) {
+        let mut best: Vec<(u128, Digest, u32)> = {
+            let pool = self.shared.pool();
+            let rate = |e: &crate::mempool::Entry| ((e.fee as u128) << 32) / e.size().max(1) as u128;
+            pool.entries().map(|e| (rate(e), e.txid, e.size() as u32)).collect()
+        };
+        best.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        for (_, id, len) in best.into_iter().take(POOL_CATCHUP) {
+            self.send(to, &Message::Tx { id, len }, out);
         }
     }
 
@@ -1665,15 +1721,48 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             // of the peer's.
             _ => {}
         }
+        // (There is room for another to be fetched.)
+        self.fetch_txs(now);
     }
 
-    /// The chain has a new last block: the pool is looked over against
-    /// the state as it now is.
-    fn pool_follows(&self) {
+    /// The chain has a new last block, `tip`, and `taken` blocks more
+    /// than it had of the branch it is on: the pool is looked over
+    /// against the state as it now is, and told what those blocks
+    /// made. When each output was made, by its block's time: a
+    /// transaction whose outputs are all there has confirmed. And
+    /// where each is, which the pool holds against the state before it
+    /// believes it: a transaction set aside when the chain went over to
+    /// this branch may spend the same output where it is now.
+    fn pool_follows(&self, tip: &Header, taken: u32) {
         let Ok(state) = self.chain.whole() else { return };
         let Ok(snapshot) = state.snapshot() else { return };
         let height = snapshot.tip().0 + 1;
-        let (moved, created) = (std::collections::HashMap::new(), std::collections::HashMap::new());
+        let mut moved: std::collections::HashMap<Digest, Vec<u64>> = std::collections::HashMap::new();
+        let mut created: std::collections::HashMap<Digest, u64> = std::collections::HashMap::new();
+        // The newest block's outputs are the last before the next
+        // position, and each block's before those of the one after it.
+        // (If the state has moved on since, the positions are not
+        // these: none is said.)
+        let mut end = (snapshot.tip().1 == tip.hash()).then_some(snapshot.outputs().next);
+        let mut header = Some(*tip);
+        for _ in 0..taken.min(POOL_LOOKS_BACK) {
+            let Some(h) = header else { break };
+            let Ok(Some(body)) = self.chain.body(&h.hash()) else { break };
+            let Ok(body) = BodyRef::from_bytes(&body) else { break };
+            let outputs = body.outputs();
+            // (A block's commits of names take the positions after its
+            // outputs.)
+            let made = (outputs.len() + body.commits()) as u64;
+            let first = end.map(|end| end.saturating_sub(made));
+            for (k, o) in outputs.enumerate() {
+                created.insert(o.commitment, h.timestamp);
+                if let Some(first) = first {
+                    moved.entry(o.commitment).or_default().push(first + k as u64);
+                }
+            }
+            end = first;
+            header = h.height.checked_sub(1).and_then(|below| self.chain.header_at(below).ok().flatten());
+        }
         let mut pool = self.shared.pool();
         let _ = pool.revalidate(&snapshot, height, &moved, &created, self.unix);
         pool.expire(self.unix);
@@ -1860,7 +1949,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     _ => (0, 1),
                 };
                 self.shared.say(Event::Block { header, from, undone, taken });
-                self.pool_follows();
+                self.pool_follows(&header, taken);
                 // Caught up, if a chain ahead was being caught up with.
                 let mut first = [header];
                 if l.syncing
@@ -2518,7 +2607,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             }
             (Object::Headers { .. }, None) => {}
             // (Whoever else has it will say so.)
-            (Object::Tx(_), _) => {}
+            (Object::Tx(_), _) => self.fetch_txs(now),
             _ => self.inbox.push((object, from, None)),
         }
     }
