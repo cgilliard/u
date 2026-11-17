@@ -19,6 +19,7 @@ pub mod hash;
 pub mod hash_machine;
 pub mod hash_table;
 #[cfg(test)]
+#[path = "tests/inflate.rs"]
 pub mod inflate;
 pub mod interrupt;
 pub mod logger;
@@ -43,6 +44,7 @@ pub mod sha256;
 pub mod stark;
 pub mod store;
 #[cfg(test)]
+#[path = "tests/util.rs"]
 pub(crate) mod test_util;
 pub mod transaction;
 pub mod transport;

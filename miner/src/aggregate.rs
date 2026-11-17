@@ -2134,7 +2134,7 @@ impl ProofVerifier for AggregateVerifier {
 }
 
 #[cfg(test)]
-#[path = "aggregate_tests.rs"]
+#[path = "tests/aggregate.rs"]
 mod tree_tests;
 
 #[cfg(test)]

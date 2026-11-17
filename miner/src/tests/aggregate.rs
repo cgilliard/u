@@ -1114,6 +1114,17 @@ fn security_configs() {
             let t = std::time::Instant::now();
             let times = Mutex::new(Vec::new());
             let proof = prove_block_with(&params, &shape, &statement, &segments, &names, 2, &|p| {
+                // The most memory held since the stage before this one
+                // was done: which stage it is that takes the most.
+                if std::env::var_os("STAGES").is_some() {
+                    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+                    let peak = status.lines().find(|l| l.starts_with("VmHWM:")).map(str::to_string).unwrap_or_default();
+                    let now = status.lines().find(|l| l.starts_with("VmRSS:")).map(str::to_string).unwrap_or_default();
+                    let mb =
+                        |l: &str| l.split_whitespace().nth(1).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0) / 1024;
+                    println!("    up to {p:?}: most {} MB, held after {} MB", mb(&peak), mb(&now));
+                    let _ = std::fs::write("/proc/self/clear_refs", "5");
+                }
                 times.lock().unwrap().push(format!("{p:?}"));
             });
             let elapsed = t.elapsed();

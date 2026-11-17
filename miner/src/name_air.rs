@@ -1945,5 +1945,5 @@ pub fn expected_states(digests: &[Digest], sweeps: &[u64]) -> ([Fp; WIDTH], [Fp;
 }
 
 #[cfg(test)]
-#[path = "name_air_tests.rs"]
+#[path = "tests/name_air.rs"]
 mod tests;

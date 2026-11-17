@@ -2852,7 +2852,7 @@ impl BlockAir {
 /// Commitment type re-export for callers.
 pub type Leaf = Commitment;
 #[cfg(test)]
-#[path = "block_air_tests.rs"]
+#[path = "tests/block_air.rs"]
 pub(crate) mod circuit_tests;
 
 #[cfg(test)]
