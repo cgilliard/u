@@ -548,9 +548,9 @@ fn an_age_outside_the_window_cannot_wrap_around() {
         let width = trace.width;
         let row = (0..trace.height()).find(|r| trace.values[r * width + ty] == Fp::ONE).expect("the row that compares");
         let cells = &mut trace.values[row * width..(row + 1) * width];
-        let digit = (0..crate::xmss::DIGITS_PER_ELEMENT).find(|k| cells[XCOLS.ksel(*k)] == Fp::ONE).unwrap();
+
         // The difference as the field has it, in bits.
-        xmss_fragment::write_bits(cells, &XCOLS, P - short, digit);
+        crate::bits::write(cells, &BCOLS, P - short);
         let checked = check_constraints(&NameAir::MAINNET, &trace, &public.to_values());
         assert!(checked.is_err(), "height {height}, sweep {sweep}: {short} outside the window, and taken");
     }
@@ -940,15 +940,10 @@ fn an_update_signature_is_looked_up_in_the_signed_set() {
         t.values[at + C_SP_LAST] = Fp::ONE;
         t.values[at + C_SP_END] = Fp::ONE;
     });
-    breaks("a fragment row", &|t| {
+    breaks("a row of another kind", &|t| {
         let at = row_of(T_SP, 4) * width;
         t.values[at + T_SP] = Fp::ZERO;
-        t.values[at + T_MSG_START] = Fp::ONE;
-    });
-    breaks("a key hash row", &|t| {
-        let at = row_of(T_SP, 4) * width;
-        t.values[at + T_SP] = Fp::ZERO;
-        t.values[at + T_PKH1] = Fp::ONE;
+        t.values[at + T_DONE] = Fp::ONE;
     });
 }
 

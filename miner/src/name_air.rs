@@ -62,7 +62,7 @@
 //! register of the other key's bits.
 //!
 //! The update's owner signs the hash of the new record's leaf value; the
-//! signature is verified by [`crate::xmss_fragment`] and the key's hash
+//! signature is looked up in the block's signed set ([`crate::signed`]) and the key's hash
 //! must be the current owner, which must differ from the new one.
 //!
 //! `opd` hashes the operation's digest as the block lists it and `nlist`
@@ -71,6 +71,7 @@
 
 use std::sync::Arc;
 
+use crate::bits;
 use crate::block_air::{DEPTH, absorb_op, absorb_sweep, initial_names_state, initial_sweeps_state};
 use crate::error::Error;
 use crate::field::Field;
@@ -96,7 +97,6 @@ use crate::store::pagefile::Txn;
 use crate::store::sparse::EMPTY;
 use crate::store::state::State;
 use crate::xmss::PublicKey;
-use crate::xmss_fragment::{self, Cols as XCols, Types as XTypes, bits_value};
 
 /// A commit's memo from its slot (the memo, then amount zero's limbs).
 fn memo_of(slot: &Digest) -> crate::output::Memo {
@@ -124,35 +124,26 @@ pub const T_WNEW: usize = HM_COLS + 9;
 pub const T_TERM: usize = HM_COLS + 10;
 pub const T_SPLIT: usize = HM_COLS + 11;
 pub const T_UMSG: usize = HM_COLS + 12;
-pub const T_MSG_START: usize = HM_COLS + 13;
-pub const T_MSG_ABS: usize = HM_COLS + 14;
-pub const T_LOAD: usize = HM_COLS + 15;
-pub const T_STEP: usize = HM_COLS + 16;
-pub const T_LEAF: usize = HM_COLS + 17;
-pub const T_TREE_START: usize = HM_COLS + 18;
-pub const T_TREE_ABS: usize = HM_COLS + 19;
-pub const T_PKH0: usize = HM_COLS + 20;
-pub const T_PKH1: usize = HM_COLS + 21;
-pub const T_COMMIT: usize = HM_COLS + 22;
-pub const T_CLEAF: usize = HM_COLS + 23;
-pub const T_LEAFC: usize = HM_COLS + 24;
-pub const T_WIN: usize = HM_COLS + 25;
-pub const T_WIN2: usize = HM_COLS + 26;
-pub const T_PLOAD: usize = HM_COLS + 27;
-pub const T_OPD: usize = HM_COLS + 28;
-pub const T_NLIST: usize = HM_COLS + 29;
-pub const T_SLIST: usize = HM_COLS + 30;
-pub const T_DONE: usize = HM_COLS + 31;
+pub const T_COMMIT: usize = HM_COLS + 13;
+pub const T_CLEAF: usize = HM_COLS + 14;
+pub const T_LEAFC: usize = HM_COLS + 15;
+pub const T_WIN: usize = HM_COLS + 16;
+pub const T_WIN2: usize = HM_COLS + 17;
+pub const T_PLOAD: usize = HM_COLS + 18;
+pub const T_OPD: usize = HM_COLS + 19;
+pub const T_NLIST: usize = HM_COLS + 20;
+pub const T_SLIST: usize = HM_COLS + 21;
+pub const T_DONE: usize = HM_COLS + 22;
 /// The commit output's second leaf row: `leafc`'s digest compressed with
 /// the commit's height, its creation height ([`crate::output::leaf`]).
-pub const T_LEAFC2: usize = HM_COLS + 32;
+pub const T_LEAFC2: usize = HM_COLS + 23;
 /// The update's signature, looked up in the block's signed set
 /// ([`crate::signed`]): the owner's key hash compressed with the update
 /// message, that with the signing leaf's index, and the entry's path.
-pub const T_ENT0: usize = HM_COLS + 33;
-pub const T_ENT1: usize = HM_COLS + 34;
-pub const T_SP: usize = HM_COLS + 35;
-const NUM_TYPES: usize = 36;
+pub const T_ENT0: usize = HM_COLS + 24;
+pub const T_ENT1: usize = HM_COLS + 25;
+pub const T_SP: usize = HM_COLS + 26;
+const NUM_TYPES: usize = 27;
 
 /// Row types and their lengths (rows per phase); `T_OPD` is 2 or 3.
 const PHASES: [(usize, usize); 9] = [
@@ -168,19 +159,11 @@ const PHASES: [(usize, usize); 9] = [
 ];
 const IDX: usize = 4;
 
-pub const XCOLS: XCols = XCols::new(HM_COLS + NUM_TYPES);
-pub const XTYPES: XTypes = XTypes {
-    msg_start: T_MSG_START,
-    msg_abs: T_MSG_ABS,
-    load: T_LOAD,
-    step: T_STEP,
-    leaf: T_LEAF,
-    tree_start: T_TREE_START,
-    tree_abs: T_TREE_ABS,
-};
-/// The walk's sibling register, shared with the signature fragment.
-pub const R_SIB: usize = XCOLS.sib(0);
-const BASE: usize = XCOLS.base + xmss_fragment::LEN;
+/// A field element's bits, for what the circuit ranges ([`crate::bits`]).
+pub const BCOLS: bits::Cols = bits::Cols::new(HM_COLS + NUM_TYPES);
+/// The sibling at a step of a walk.
+pub const R_SIB: usize = BCOLS.base + bits::LEN;
+const BASE: usize = R_SIB + DIGEST;
 
 // ---- counters and gadgets ----
 /// One-hot row index within a phase.
@@ -335,13 +318,10 @@ impl Air for NameAir {
         let ty = |t: usize| -> F { l[t] };
         let (op, name, key, rec2, rec) = (ty(T_OP), ty(T_NAME), ty(T_KEY), ty(T_REC2), ty(T_REC));
         let (tleaf, tleaf2, tload, wold, wnew) = (ty(T_TLEAF), ty(T_TLEAF2), ty(T_TLOAD), ty(T_WOLD), ty(T_WNEW));
-        let (term, split, umsg, pkh0, pkh1) = (ty(T_TERM), ty(T_SPLIT), ty(T_UMSG), ty(T_PKH0), ty(T_PKH1));
+        let (term, split, umsg) = (ty(T_TERM), ty(T_SPLIT), ty(T_UMSG));
         let (commit_t, cleaf, leafc, win, win2) = (ty(T_COMMIT), ty(T_CLEAF), ty(T_LEAFC), ty(T_WIN), ty(T_WIN2));
         let leafc2 = ty(T_LEAFC2);
         let (pload, opd, nlist, slist, done) = (ty(T_PLOAD), ty(T_OPD), ty(T_NLIST), ty(T_SLIST), ty(T_DONE));
-        let (msg_start, msg_abs, load, step) = (ty(T_MSG_START), ty(T_MSG_ABS), ty(T_LOAD), ty(T_STEP));
-        let (xleaf, tree_start, tree_abs) = (ty(T_LEAF), ty(T_TREE_START), ty(T_TREE_ABS));
-        let active = l[XCOLS.active()];
         let (ent0, ent1, sp) = (ty(T_ENT0), ty(T_ENT1), ty(T_SP));
         let (spn, sp_last, sp_end) = (l[R_SPN], l[C_SP_LAST], l[C_SP_END]);
         let idx: [F; IDX] = core::array::from_fn(|i| l[C_IDX + i]);
@@ -363,38 +343,19 @@ impl Air for NameAir {
         b.assert_eq(wk.iter().fold(F::ZERO, |a, v| a + *v), one);
         let trie = wk[WK_REMPTY] + wk[WK_RSPLIT] + wk[WK_UPDATE];
 
-        // The signature fragment, over the update message register.
-        let msg: [F; DIGEST] = core::array::from_fn(|i| l[R_MSG + i]);
         // No signature is checked here: an update's is looked up in the
-        // block's signed set. The fragment's columns stay for what else
-        // reads them (its bits and its sibling), and its rows never
-        // come; nor the key hash's, the owner being a key hash already.
-        xmss_fragment::eval(b, &XCOLS, &XTYPES, &msg, nt(T_PKH0));
-        b.assert_zero(msg_start + msg_abs + load + step + xleaf + tree_start + tree_abs + pkh0 + pkh1);
+        // block's signed set. What the circuit ranges it ranges by the
+        // bits.
+        bits::eval(b, &BCOLS);
 
         // machine op mapping
         let multi_start = (name + rec2 + rec + commit_t + cleaf + tleaf + tleaf2 + opd) * idx[0];
         let multi_absorb = (name + rec2 + rec + commit_t + opd) * (one - idx[0]) + (cleaf + tleaf + tleaf2) * idx[1];
-        b.assert_eq(
-            l[COL_START],
-            multi_start
-                + leafc
-                + leafc2
-                + umsg
-                + wold
-                + wnew
-                + split
-                + nlist
-                + slist
-                + pkh0
-                + msg_start
-                + xleaf
-                + tree_start,
-        );
-        b.assert_eq(l[COL_ABSORB], multi_absorb + pkh1 + msg_abs + tree_abs);
-        b.assert_eq(l[COL_LOAD], load);
-        b.assert_eq(l[COL_CHAIN], step * active);
-        b.assert_eq(l[COL_PASS], op + key + win + win2 + pload + tload + term + done + step * (one - active));
+        b.assert_eq(l[COL_START], multi_start + leafc + leafc2 + umsg + wold + wnew + split + nlist + slist);
+        b.assert_eq(l[COL_ABSORB], multi_absorb);
+        b.assert_zero(l[COL_LOAD]);
+        b.assert_zero(l[COL_CHAIN]);
+        b.assert_eq(l[COL_PASS], op + key + win + win2 + pload + tload + term + done);
         b.assert_eq(l[COL_COMPRESS], ent0 + ent1 + sp);
         b.when_first_row(one - op - done);
         b.when_first_row(one - idx[0]);
@@ -421,16 +382,7 @@ impl Air for NameAir {
             + done
             + ent0
             + ent1
-            + sp
-            + pkh0
-            + pkh1
-            + msg_start
-            + msg_abs
-            + load
-            + step
-            + xleaf
-            + tree_start
-            + tree_abs;
+            + sp;
         let mut phase_last = singles;
         for (t, len) in PHASES {
             if t == T_OPD {
@@ -671,7 +623,7 @@ impl Air for NameAir {
         b.when_transition(nt(T_NAME) * n[C_LIVE] * (one - l[C_LIVE + RATE - 1]));
         // key: element i of the name hash decomposed canonically; its low
         // 30 bits become key bits 30i.. (most significant first).
-        let bits_v = bits_value(l, &XCOLS);
+        let bits_v = bits::value(l, &BCOLS);
         let mut elem = F::ZERO;
         for i in 0..IDX {
             elem += idx[i] * nameh[i];
@@ -740,7 +692,7 @@ impl Air for NameAir {
         // difference is below 2^29, heights being under 2^30, and so
         // not below zero: the commit's age is in the window (or past
         // it, for a sweep).
-        b.assert_zero((win + win2) * (l[XCOLS.bits(29)] + l[XCOLS.bits(30)]));
+        b.assert_zero((win + win2) * (l[BCOLS.bit(29)] + l[BCOLS.bit(30)]));
         // opd: the operation digest as the block lists it.
         let opd_len = F::from_u32(2 * DIGEST as u32) + is_commit * F::from_u32(DIGEST as u32);
         let tag = is_commit * F::from_u32(names::TAG_COMMIT as u32)
@@ -828,7 +780,7 @@ impl Air for NameAir {
         // walk load, shifted by a level (not the trie's top), else fixed.
         for m in 0..KEY_BITS {
             let slot = m / 30;
-            let bit = l[XCOLS.bits(29 - m % 30)];
+            let bit = l[BCOLS.bit(29 - m % 30)];
             let loaded = idx[slot] * bit + (one - idx[slot]) * kb[m];
             b.when_transition(key * (n[R_KB + m] - loaded));
             let shifted = if m + 1 < KEY_BITS { kb[m + 1] } else { F::ZERO };
@@ -1334,7 +1286,7 @@ impl NamePublic {
 
 #[derive(Clone)]
 struct Regs {
-    xmss: xmss_fragment::Regs,
+    sib: Digest,
     kind: usize,
     wk: usize,
     cnt: [u32; 4],
@@ -1372,7 +1324,7 @@ fn inv_or_zero(x: Fp) -> Fp {
 
 impl Regs {
     fn write(&self, row: &mut [Fp]) {
-        self.xmss.write(row, &XCOLS);
+        row[R_SIB..R_SIB + DIGEST].copy_from_slice(&self.sib);
         self.write_rest(row);
     }
 
@@ -1595,7 +1547,7 @@ impl Gen {
         crate::stark::refuse((0..1 << 29).contains(&value), "commit age out of range");
         self.b.pass();
         let row = self.b.last_row_mut();
-        xmss_fragment::write_bits(row, &XCOLS, value as u32, self.r.xmss.ksel);
+        bits::write(row, &BCOLS, value as u32);
         self.finish(ty, 0);
     }
 
@@ -1634,7 +1586,7 @@ impl Gen {
         for i in 0..4 {
             self.b.pass();
             let row = self.b.last_row_mut();
-            xmss_fragment::write_bits(row, &XCOLS, nameh[i].to_canonical(), self.r.xmss.ksel);
+            bits::write(row, &BCOLS, nameh[i].to_canonical());
             self.finish(T_KEY, i);
             self.r.kb[30 * i..30 * (i + 1)].copy_from_slice(&bits[30 * i..30 * (i + 1)]);
         }
@@ -1694,7 +1646,7 @@ impl Gen {
         self.r.root = new[0];
         for lv in 0..levels.dirs.len() {
             let (right, sib) = (levels.dirs[lv], levels.sibs[lv]);
-            self.r.xmss.sib = sib;
+            self.r.sib = sib;
             self.b.start(ordered(&old[lv + 1], &sib, right));
             self.b.last_row_mut()[COL_DIR] = Fp::new(right as u32);
             self.finish(T_WOLD, 0);
@@ -1853,7 +1805,7 @@ impl Gen {
                     for t in d..=j {
                         let right = bit(key, t);
                         let (child, sib) = if t < j { (chain[t + 1 - d], EMPTY) } else { (new_leaf, self.r.oleaf) };
-                        self.r.xmss.sib = sib;
+                        self.r.sib = sib;
                         self.b.start(ordered(&child, &sib, right));
                         self.b.last_row_mut()[COL_DIR] = Fp::new(right as u32);
                         self.finish(T_SPLIT, 0);
@@ -1961,7 +1913,7 @@ impl NameAir {
 
     fn generate_trace_with(w: &NameWitness, min_rows: usize) -> (Trace, NamePublic) {
         let regs = Regs {
-            xmss: xmss_fragment::Regs::default(),
+            sib: EMPTY,
             kind: KIND_COMMIT,
             wk: WK_COMMIT,
             cnt: [0; 4],

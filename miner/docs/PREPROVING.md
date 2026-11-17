@@ -260,8 +260,8 @@ the rest, and nothing in consensus is in its way.
 2. The signed set, its tree and paths: done, `src/signed.rs`.
 3. The transaction segment looks signatures up: done, `src/block_air.rs`
    (`T_ENT0`, `T_ENT1`, `T_SP`; public value `PUB_SIGNED`). Policy
-   inputs the same. The fragment's columns are still in the circuit,
-   unused but for its bit columns and sibling register: to be taken out.
+   inputs the same. The fragment is out of the circuit: what it ranges
+   it ranges by a gadget of bits (`src/bits.rs`).
 4. `block_proof` (networks of quick blocks) proves and checks signature
    segments: done.
 5. The proof of proofs verifies a block's signature tree: done,

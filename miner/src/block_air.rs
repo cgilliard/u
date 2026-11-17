@@ -31,6 +31,7 @@
 //!
 //! The circuit itself is not here yet.
 
+use crate::bits;
 use crate::block::BlockOutput;
 use std::sync::Arc;
 
@@ -53,7 +54,6 @@ use crate::store::sparse::{EMPTY, STATE_HEIGHT};
 use crate::store::state::Snapshot;
 use crate::transaction::Transaction;
 use crate::xmss::{PUB_SEED_LEN, PublicKey};
-use crate::xmss_fragment::{self, Cols as XCols, Types as XTypes};
 
 /// Levels of the state tree a leaf's path climbs: the outputs' half and
 /// the node above it, whose other child is the names' root.
@@ -70,101 +70,87 @@ const MASK30: u64 = (1 << POS_LOW_BITS) - 1;
 // ---- row types ----
 pub const T_TX_START: usize = HM_COLS;
 pub const T_TX_END: usize = HM_COLS + 1;
-pub const T_MSG_START: usize = HM_COLS + 2;
-pub const T_MSG_ABS: usize = HM_COLS + 3;
-pub const T_LOAD: usize = HM_COLS + 4;
-pub const T_STEP: usize = HM_COLS + 5;
-pub const T_LEAF: usize = HM_COLS + 6;
-pub const T_TREE_START: usize = HM_COLS + 7;
-pub const T_TREE_ABS: usize = HM_COLS + 8;
-pub const T_PKH0: usize = HM_COLS + 9;
-pub const T_PKH1: usize = HM_COLS + 10;
-pub const T_CM0: usize = HM_COLS + 11;
-pub const T_CM1: usize = HM_COLS + 12;
-pub const T_ILIST: usize = HM_COLS + 13;
-pub const T_OLD: usize = HM_COLS + 14;
-pub const T_NEW: usize = HM_COLS + 15;
-pub const T_BODY_IN0: usize = HM_COLS + 16;
-pub const T_BODY_IN1: usize = HM_COLS + 17;
-pub const T_OCM0: usize = HM_COLS + 18;
-pub const T_OCM1: usize = HM_COLS + 19;
-pub const T_OLIST: usize = HM_COLS + 20;
-pub const T_BODY_OUT0: usize = HM_COLS + 21;
-pub const T_BODY_OUT1: usize = HM_COLS + 22;
-pub const T_DONE: usize = HM_COLS + 23;
-pub const T_RESUME: usize = HM_COLS + 24;
-pub const T_OLIST2: usize = HM_COLS + 25;
-pub const T_BODY_OUT2: usize = HM_COLS + 26;
-pub const T_ILEAF: usize = HM_COLS + 27;
-pub const T_OLEAF: usize = HM_COLS + 28;
-pub const T_OP_BODY: usize = HM_COLS + 29;
-pub const T_OP_LIST: usize = HM_COLS + 30;
+pub const T_PKH0: usize = HM_COLS + 2;
+pub const T_PKH1: usize = HM_COLS + 3;
+pub const T_CM0: usize = HM_COLS + 4;
+pub const T_CM1: usize = HM_COLS + 5;
+pub const T_ILIST: usize = HM_COLS + 6;
+pub const T_OLD: usize = HM_COLS + 7;
+pub const T_NEW: usize = HM_COLS + 8;
+pub const T_BODY_IN0: usize = HM_COLS + 9;
+pub const T_BODY_IN1: usize = HM_COLS + 10;
+pub const T_OCM0: usize = HM_COLS + 11;
+pub const T_OCM1: usize = HM_COLS + 12;
+pub const T_OLIST: usize = HM_COLS + 13;
+pub const T_BODY_OUT0: usize = HM_COLS + 14;
+pub const T_BODY_OUT1: usize = HM_COLS + 15;
+pub const T_DONE: usize = HM_COLS + 16;
+pub const T_RESUME: usize = HM_COLS + 17;
+pub const T_OLIST2: usize = HM_COLS + 18;
+pub const T_BODY_OUT2: usize = HM_COLS + 19;
+pub const T_ILEAF: usize = HM_COLS + 20;
+pub const T_OLEAF: usize = HM_COLS + 21;
+pub const T_OP_BODY: usize = HM_COLS + 22;
+pub const T_OP_LIST: usize = HM_COLS + 23;
 /// The second leaf row: the first's digest compressed with the creation
 /// height (see [`crate::transaction::leaf`]).
-pub const T_ILEAF2: usize = HM_COLS + 31;
-pub const T_OLEAF2: usize = HM_COLS + 32;
+pub const T_ILEAF2: usize = HM_COLS + 24;
+pub const T_OLEAF2: usize = HM_COLS + 25;
 // ---- policy input rows (see `docs/ELTOO.md` and `crate::policy`) ----
 /// Pass row loading the policy input's registers.
-pub const T_PSTART: usize = HM_COLS + 33;
+pub const T_PSTART: usize = HM_COLS + 26;
 /// Covered-run sponge start: `[count, 0, …]`.
-pub const T_CVS: usize = HM_COLS + 34;
+pub const T_CVS: usize = HM_COLS + 27;
 /// Leaf sponge start: the header block.
-pub const T_LHDR: usize = HM_COLS + 35;
+pub const T_LHDR: usize = HM_COLS + 28;
 /// Threshold header block `[mode, m, n, 0, …]`.
-pub const T_THR: usize = HM_COLS + 36;
+pub const T_THR: usize = HM_COLS + 29;
 /// Threshold channel block.
-pub const T_CHAN: usize = HM_COLS + 37;
+pub const T_CHAN: usize = HM_COLS + 30;
 /// One listed key hash.
-pub const T_KEY: usize = HM_COLS + 38;
+pub const T_KEY: usize = HM_COLS + 31;
 /// A selected key, absorbed into the keys sponge after its `key` row.
-pub const T_KSEL: usize = HM_COLS + 39;
+pub const T_KSEL: usize = HM_COLS + 32;
 /// The hash lock's preimage hashed (its own permutation).
-pub const T_HL: usize = HM_COLS + 40;
+pub const T_HL: usize = HM_COLS + 33;
 /// The hash lock block, equal to the preimage's hash.
-pub const T_HASH: usize = HM_COLS + 41;
-pub const T_AFTER: usize = HM_COLS + 42;
-pub const T_OLDER: usize = HM_COLS + 43;
-pub const T_STATE: usize = HM_COLS + 44;
+pub const T_HASH: usize = HM_COLS + 34;
+pub const T_AFTER: usize = HM_COLS + 35;
+pub const T_OLDER: usize = HM_COLS + 36;
+pub const T_STATE: usize = HM_COLS + 37;
 /// The covenant block: the covered digest.
-pub const T_OUTS: usize = HM_COLS + 45;
+pub const T_OUTS: usize = HM_COLS + 38;
 /// The policy tree path, one row per level.
-pub const T_PP0: usize = HM_COLS + 46;
-pub const T_PP1: usize = HM_COLS + 47;
-pub const T_PP2: usize = HM_COLS + 48;
-pub const T_PP3: usize = HM_COLS + 49;
+pub const T_PP0: usize = HM_COLS + 39;
+pub const T_PP1: usize = HM_COLS + 40;
+pub const T_PP2: usize = HM_COLS + 41;
+pub const T_PP3: usize = HM_COLS + 42;
 /// A signer's key hash absorbed into the signers sponge.
-pub const T_PSIG: usize = HM_COLS + 50;
+pub const T_PSIG: usize = HM_COLS + 43;
 /// Pass row ending the signatures: signers and selected keys agree.
-pub const T_PEND: usize = HM_COLS + 51;
+pub const T_PEND: usize = HM_COLS + 44;
 /// A covered output's commitment, then memo, into the covered sponge.
-pub const T_CVC: usize = HM_COLS + 52;
-pub const T_CVM: usize = HM_COLS + 53;
+pub const T_CVC: usize = HM_COLS + 45;
+pub const T_CVM: usize = HM_COLS + 46;
 /// The rebindable message over the channel, state and covered digest.
-pub const T_RB0: usize = HM_COLS + 54;
-pub const T_RB1: usize = HM_COLS + 55;
-pub const T_RB2: usize = HM_COLS + 56;
+pub const T_RB0: usize = HM_COLS + 47;
+pub const T_RB1: usize = HM_COLS + 48;
+pub const T_RB2: usize = HM_COLS + 49;
 /// A signature looked up in the block's signed set ([`crate::signed`]):
 /// the key hash compressed with the message, that with the signing
 /// leaf's index, and the path from that entry to the set's root.
-pub const T_ENT0: usize = HM_COLS + 57;
-pub const T_ENT1: usize = HM_COLS + 58;
-pub const T_SP: usize = HM_COLS + 59;
-const NUM_TYPES: usize = 60;
-// ---- xmss fragment ----
-pub const XCOLS: XCols = XCols::new(HM_COLS + NUM_TYPES);
-pub const XTYPES: XTypes = XTypes {
-    msg_start: T_MSG_START,
-    msg_abs: T_MSG_ABS,
-    load: T_LOAD,
-    step: T_STEP,
-    leaf: T_LEAF,
-    tree_start: T_TREE_START,
-    tree_abs: T_TREE_ABS,
-};
-/// The fragment's sibling register, shared with the tree update.
-pub const R_SIB: usize = XCOLS.sib(0);
+pub const T_ENT0: usize = HM_COLS + 50;
+pub const T_ENT1: usize = HM_COLS + 51;
+pub const T_SP: usize = HM_COLS + 52;
+const NUM_TYPES: usize = 53;
+// ---- bits, and the sibling of a tree's step ----
+/// A field element's bits, for what the circuit ranges ([`crate::bits`]).
+pub const BCOLS: bits::Cols = bits::Cols::new(HM_COLS + NUM_TYPES);
+/// The sibling at a step of a tree: a witness on the row that takes it,
+/// copied to the row that takes it again.
+pub const R_SIB: usize = BCOLS.base + bits::LEN;
 // ---- tree update ----
-pub const C_LEVEL: usize = XCOLS.base + xmss_fragment::LEN;
+pub const C_LEVEL: usize = R_SIB + DIGEST;
 pub const C_LEVEL_INV: usize = C_LEVEL + 1;
 pub const C_IS_LAST: usize = C_LEVEL_INV + 1;
 pub const C_SMT_END: usize = C_IS_LAST + 1;
@@ -813,13 +799,6 @@ impl Air for BlockAir {
         b.assert_eq(types.iter().fold(F::ZERO, |a, t| a + *t), one);
         let tx_start = l[T_TX_START];
         let tx_end = l[T_TX_END];
-        let msg_start = l[T_MSG_START];
-        let msg_abs = l[T_MSG_ABS];
-        let load = l[T_LOAD];
-        let step = l[T_STEP];
-        let leaf = l[T_LEAF];
-        let tree_start = l[T_TREE_START];
-        let tree_abs = l[T_TREE_ABS];
         let pkh0 = l[T_PKH0];
         let pkh1 = l[T_PKH1];
         let cm0 = l[T_CM0];
@@ -862,22 +841,16 @@ impl Air for BlockAir {
         let resume = l[T_RESUME];
         let (ent0, ent1, sp) = (l[T_ENT0], l[T_ENT1], l[T_SP]);
         let (spn, sp_last, sp_end) = (l[R_SPN], l[C_SP_LAST], l[C_SP_END]);
-        let active = l[XCOLS.active()];
         let msg: [F; DIGEST] = core::array::from_fn(|i| l[R_MSG + i]);
         let smsg: [F; DIGEST] = core::array::from_fn(|i| l[R_SMSG + i]);
         // No signature is checked here: each is looked up in the block's
-        // signed set. The fragment's columns stay for what else reads
-        // them (its bits and its sibling), and its rows never come.
-        xmss_fragment::eval(b, &XCOLS, &XTYPES, &smsg, n[T_PKH0]);
-        b.assert_zero(msg_start + msg_abs + load + step + leaf + tree_start + tree_abs);
+        // signed set. What the circuit ranges it ranges by the bits.
+        bits::eval(b, &BCOLS);
 
         // machine op mapping
         b.assert_eq(
             l[COL_START],
             tx_start
-                + msg_start
-                + leaf
-                + tree_start
                 + pkh0
                 + cm0
                 + ilist
@@ -907,13 +880,10 @@ impl Air for BlockAir {
                 + cvm
                 + rb0,
         );
-        b.assert_eq(
-            l[COL_ABSORB],
-            msg_abs + tree_abs + pkh1 + cm1 + body_in1 + ocm1 + olist2 + body_out1 + body_out2 + rb1 + rb2,
-        );
-        b.assert_eq(l[COL_LOAD], load);
-        b.assert_eq(l[COL_CHAIN], step * active);
-        b.assert_eq(l[COL_PASS], step * (one - active) + tx_end + done + resume + pstart + pend);
+        b.assert_eq(l[COL_ABSORB], pkh1 + cm1 + body_in1 + ocm1 + olist2 + body_out1 + body_out2 + rb1 + rb2);
+        b.assert_zero(l[COL_LOAD]);
+        b.assert_zero(l[COL_CHAIN]);
+        b.assert_eq(l[COL_PASS], tx_end + done + resume + pstart + pend);
         b.assert_eq(l[COL_COMPRESS], ent0 + ent1 + sp);
         b.when_first_row(one - tx_start - resume);
         b.when_last_row(one - done);
@@ -1463,7 +1433,7 @@ impl Air for BlockAir {
         b.assert_zero(thr * (srem - m_reg));
         b.assert_zero(ileaf2 * pin * (l[COL_INPUT + RATE] - created));
         b.assert_zero(rb2 * hascov * cvn);
-        let bits_v = xmss_fragment::bits_value(l, &XCOLS);
+        let bits_v = bits::value(l, &BCOLS);
         for i in 0..RATE {
             let blk = l[COL_INPUT + i] - l[R_LSP + i];
             // Leaf rows continue the leaf sponge; the header starts it.
@@ -1498,7 +1468,7 @@ impl Air for BlockAir {
                 // zero the difference is below 2^29 and so not below
                 // zero, heights, locks and state numbers all being
                 // under 2^30.
-                b.assert_zero(word * (l[XCOLS.bits(29)] + l[XCOLS.bits(30)]));
+                b.assert_zero(word * (l[BCOLS.bit(29)] + l[BCOLS.bit(30)]));
             } else {
                 b.assert_zero(word * blk);
             }
@@ -1962,7 +1932,7 @@ pub fn tx_rows(tx: &Transaction) -> usize {
 
 #[derive(Clone)]
 struct Regs {
-    xmss: xmss_fragment::Regs,
+    sib: Digest,
     level: u32,
     pbits: [Fp; DEPTH],
     root: Digest,
@@ -2045,12 +2015,7 @@ impl Regs {
     }
 
     fn write(&self, row: &mut [Fp]) {
-        self.xmss.write(row, &XCOLS);
-        self.write_rest(row);
-    }
-
-    /// Everything but the signature fragment's registers.
-    fn write_rest(&self, row: &mut [Fp]) {
+        row[R_SIB..R_SIB + DIGEST].copy_from_slice(&self.sib);
         row[R_SEED..R_SEED + PUB_SEED_LEN].copy_from_slice(&self.seed);
         row[R_KHEIGHT] = Fp::new(self.kheight);
         row[R_SIDX] = Fp::from_u64(self.sidx);
@@ -2252,8 +2217,8 @@ impl Gen {
         for (level, sib) in siblings.iter().enumerate() {
             let right = (position >> level) & 1 == 1;
             self.regs.level = level as u32;
-            self.regs.xmss.sib = *sib;
-            self.b.start(compress_input(&old_node, &self.regs.xmss.sib, right));
+            self.regs.sib = *sib;
+            self.b.start(compress_input(&old_node, &self.regs.sib, right));
             {
                 let row = self.b.last_row_mut();
                 row[T_OLD] = Fp::ONE;
@@ -2262,7 +2227,7 @@ impl Gen {
             }
             old_node = self.b.acc();
             self.regs.old = old_node;
-            self.b.start(compress_input(&new_node, &self.regs.xmss.sib, right));
+            self.b.start(compress_input(&new_node, &self.regs.sib, right));
             {
                 let row = self.b.last_row_mut();
                 row[T_NEW] = Fp::ONE;
@@ -2532,9 +2497,8 @@ impl Gen {
                     crate::stark::refuse((0..1 << 29).contains(&value), "a policy condition's lock has not passed");
                     self.leaf_absorb(blocks[bi], ty);
                     bi += 1;
-                    let ksel = self.regs.xmss.ksel;
                     let row = self.b.last_row_mut();
-                    xmss_fragment::write_bits(row, &XCOLS, value as u32, ksel);
+                    bits::write(row, &BCOLS, value as u32);
                 }
                 (Cond::Outputs(list), CondWitness::None) => {
                     self.regs.cov = crate::policy::covered_digest(list);
@@ -2553,7 +2517,7 @@ impl Gen {
         for (k, ty) in [T_PP0, T_PP1, T_PP2, T_PP3].into_iter().enumerate() {
             let right = (p.index as usize >> k) & 1 == 1;
             let sib = p.siblings[k];
-            self.regs.xmss.sib = sib;
+            self.regs.sib = sib;
             self.b.start(compress_input(&node, &sib, right));
             {
                 let row = self.b.last_row_mut();
@@ -2756,7 +2720,7 @@ impl BlockAir {
     fn generate_trace_with(w: &SegmentWitness, min_rows: usize) -> (Trace, SegmentPublic) {
         assert!(!w.txs.is_empty(), "a segment needs at least one transaction");
         let regs = Regs {
-            xmss: xmss_fragment::Regs::default(),
+            sib: EMPTY,
             level: 0,
             pbits: [Fp::ZERO; DEPTH],
             root: w.root_in,

@@ -290,9 +290,8 @@ fn a_lock_not_passed_cannot_wrap_around() {
         let width = trace.width;
         let row = (0..trace.height()).find(|r| trace.values[r * width + ty] == Fp::ONE).expect("the row that compares");
         let cells = &mut trace.values[row * width..(row + 1) * width];
-        let digit = (0..crate::xmss::DIGITS_PER_ELEMENT).find(|k| cells[XCOLS.ksel(*k)] == Fp::ONE).unwrap();
         // The difference as the field has it, in bits.
-        xmss_fragment::write_bits(cells, &XCOLS, P - short, digit);
+        crate::bits::write(cells, &BCOLS, P - short);
         let checked = check_constraints(&BlockAir, &trace, &public.to_values());
         assert!(checked.is_err(), "{cond:?} at height {height}, state {state}: {short} short, and taken");
     }
@@ -1136,13 +1135,6 @@ fn column_name(c: usize) -> String {
     let named: &[(&str, usize)] = &[
         ("T_TX_START", T_TX_START),
         ("T_TX_END", T_TX_END),
-        ("T_MSG_START", T_MSG_START),
-        ("T_MSG_ABS", T_MSG_ABS),
-        ("T_LOAD", T_LOAD),
-        ("T_STEP", T_STEP),
-        ("T_LEAF", T_LEAF),
-        ("T_TREE_START", T_TREE_START),
-        ("T_TREE_ABS", T_TREE_ABS),
         ("T_PKH0", T_PKH0),
         ("T_PKH1", T_PKH1),
         ("T_CM0", T_CM0),
@@ -1287,27 +1279,9 @@ fn column_name(c: usize) -> String {
         ("hm::COL_DATA", crate::hash_machine::COL_DATA),
         ("hm::COL_ACC", crate::hash_machine::COL_ACC),
         ("perm", 0),
-        ("x::mc", XCOLS.mc()),
-        ("x::active", XCOLS.active()),
-        ("x::rem", XCOLS.rem()),
-        ("x::rem_inv", XCOLS.rem_inv()),
-        ("x::last", XCOLS.last()),
-        ("x::tlast", XCOLS.tlast()),
-        ("x::t3", XCOLS.t3()),
-        ("x::d", XCOLS.d()),
-        ("x::csum", XCOLS.csum()),
-        ("x::ssel", XCOLS.ssel(0)),
-        ("x::ksel", XCOLS.ksel(0)),
-        ("x::esel", XCOLS.esel(0)),
-        ("x::lsel", XCOLS.lsel(0)),
-        ("x::hsel", XCOLS.hsel(0)),
-        ("x::bits", XCOLS.bits(0)),
-        ("x::pub_seed", XCOLS.pub_seed(0)),
-        ("x::idx", XCOLS.idx(0)),
-        ("x::m", XCOLS.m(0)),
-        ("x::sp", XCOLS.sp(0)),
-        ("x::node", XCOLS.node(0)),
-        ("x::sib", XCOLS.sib(0)),
+        ("bits", BCOLS.bit(0)),
+        ("bits::top", BCOLS.top()),
+        ("R_SIB", R_SIB),
     ];
     let (name, at) = named.iter().filter(|(_, v)| *v <= c).max_by_key(|(_, v)| *v).unwrap();
     if *at == c { name.to_string() } else { format!("{name}+{}", c - at) }
@@ -1722,11 +1696,11 @@ fn a_signature_is_looked_up_in_the_signed_set() {
     breaks("key's seed", &|t| t.values[row_of(T_PKH1, 0) * width + R_SEED] += Fp::ONE);
     breaks("key's height", &|t| t.values[row_of(T_PKH1, 0) * width + R_KHEIGHT] += Fp::ONE);
     breaks("key's root", &|t| t.values[row_of(T_PKH0, 0) * width + R_PKROOT] += Fp::ONE);
-    // No row of the signature's old kind is taken.
-    breaks("a fragment row", &|t| {
+    // A row of the path cannot be another kind of row.
+    breaks("a row of another kind", &|t| {
         let at = row_of(T_SP, 1) * width;
         t.values[at + T_SP] = Fp::ZERO;
-        t.values[at + T_MSG_START] = Fp::ONE;
+        t.values[at + T_DONE] = Fp::ONE;
     });
 }
 
