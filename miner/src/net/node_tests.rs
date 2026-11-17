@@ -1792,3 +1792,63 @@ fn over_real_sockets_blocks_come_from_several_peers_of_several_workers() {
     // though four workers were fetching.
     assert_eq!((c.fetched, c.fetches_failed), (50, 0));
 }
+
+/// A transaction given to one node is in every node's pool in a moment,
+/// fetched by each once; and one that spends what a block has spent is
+/// in none.
+#[test]
+fn a_transaction_crosses_the_network() {
+    use crate::chain::apply::tests::extend_with;
+    use crate::chain::params::COIN;
+    use crate::mempool::Reject;
+    use crate::output::Output;
+    use crate::transaction::UnsignedTransaction;
+    let chains: Vec<Arc<TestChain>> = (0..4).map(|_| chain_of(easy())).collect();
+    // An output of a key of ours, made by a block every node has.
+    let mut key = crate::xmss::SecretKey::generate(&[7; 32]);
+    let paid = Output::new(&key.public_key(), 1500 * COIN);
+    let block = extend_with(&chains[0], &[paid.block_output()]);
+    chains[1..].iter().for_each(|c| give(c, std::slice::from_ref(&block)));
+    let position = {
+        let state = chains[0].state();
+        let snapshot = state.snapshot().unwrap();
+        (0..64).find(|p| snapshot.output(*p).unwrap().is_some_and(|(r, _)| r.commitment == paid.commitment)).unwrap()
+    };
+    let mut w = World::with(chains, &Config::default());
+    for i in 1..4 {
+        w.nodes[i].add_peer(at(0), true, 0);
+    }
+    w.run(20 * SECOND);
+    assert!((0..4).all(|i| w.live(i).len() == 3));
+    // Spent, all but a fee, to the same key.
+    let mut tx = UnsignedTransaction::new(
+        vec![(key.public_key(), 1500 * COIN)],
+        vec![Output::new(&key.public_key(), 1499 * COIN)],
+    )
+    .sign(|_, _, m| key.sign(m))
+    .unwrap();
+    tx.set_positions(&[position]);
+    let bytes = tx.to_bytes();
+    let fetched: Vec<u64> = (0..4).map(|i| w.nodes[i].counts().fetched).collect();
+    let id = w.nodes[2].hold().submit(&bytes, NOW).unwrap();
+    assert_eq!(id, tx.txid());
+    w.wake.iter_mut().for_each(|at| *at = w.now);
+    w.run(2 * SECOND);
+    for i in 0..4 {
+        assert!(w.nodes[i].hold().pooled(&id), "node {i}");
+        assert_eq!(w.nodes[i].hold().pool_size(), (1, bytes.len()), "node {i}");
+        // Each fetched it once, but the one it was given to.
+        assert_eq!(w.nodes[i].counts().fetched - fetched[i], (i != 2) as u64, "node {i}");
+    }
+    assert_eq!(w.nodes[0].hold().submit(&bytes, NOW), Err(Reject::Known));
+    // One that is not signed by the output's key is in nobody's pool.
+    let mut other = crate::xmss::SecretKey::generate(&[8; 32]);
+    let forged = UnsignedTransaction::new(
+        vec![(key.public_key(), 1500 * COIN)],
+        vec![Output::new(&other.public_key(), 1498 * COIN)],
+    )
+    .sign(|_, _, m| other.sign(m));
+    let mut forged = forged.unwrap();
+    forged.set_positions(&[position]);
+    assert_eq!(w.nodes[1].hold().submit(&forged.to_bytes(), NOW), Err(Reject::BadSignature));
+}

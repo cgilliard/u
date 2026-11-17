@@ -311,7 +311,16 @@ Differences from the reference:
 - **`GetProof` and `Proof` are gone.** A proof is an object.
 - **`GetChunks`, `Chunk`, `NotHeld`** are the transport's three.
 - **`Inv` is called `Block`** and `TxInv` `Tx`: they announce one.
-- `Tx` waits for the mempool, which is not ported yet.
+- `Tx` is taken only from a peer, and only by a node that is not
+  catching up. The transaction is fetched as an object, unless it is
+  pooled already or as many are being fetched as may be (64 by one
+  worker, 8 of one peer); pooled if the pool takes it
+  (`src/mempool.rs`); and then announced to every other peer. One that
+  is not the transaction of the id it was announced by, or is badly
+  signed, is held against who served it.
+- Not yet: a peer is not told what a pool asks a byte, so it may
+  announce what will be refused; and a peer new to a node is not told
+  of what the node already pools.
 
 ## 2.4 The objects
 
@@ -328,7 +337,7 @@ A `Get` names its object in up to 64 bytes: a kind byte, then fields.
 | 6 Names | block id, index (4) | The name records under one 12-bit key prefix | under 1 MB | Its root in the manifest |
 | 7 Proof | block id, position (8) | The output at that position and its Merkle path | 1.4 KB | The block's state root |
 | 8 File | file id | A consensus file | to be bounded | Its id (a hash) |
-| 9 Tx | transaction id | A transaction | to be bounded | Its id |
+| 9 Tx | transaction id | A transaction | 128 KB | Its id |
 
 Why `Headers` is named with a block id: "headers from height 5,000"
 alone would change under a reorganisation while being fetched. "…on the
@@ -510,7 +519,7 @@ Decided:
 - The manifest is cut in two levels (2.5).
 - 512 headers an object.
 - Limits and times are settings (2.9).
-- Sync first. `Lite` blocks, `Proof` objects and `Tx` come after.
+- Sync first. `Lite` blocks and `Proof` objects come after.
 
 Open:
 

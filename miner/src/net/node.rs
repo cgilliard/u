@@ -86,6 +86,7 @@ use crate::chain::headers::LOCATOR;
 use crate::chain::verify::ProofVerifier;
 use crate::error::Error;
 use crate::hash::Digest;
+use crate::mempool::{DEFAULT_CAPACITY, MAX_TX_SIZE, Mempool, Reject};
 use crate::sha256::Sha256;
 use crate::store::backend::Backend;
 use crate::transport::fetch::{Fetch, Poll, Why};
@@ -160,6 +161,10 @@ struct Fetching {
 
 /// Announcements remembered: who said it had which block.
 const ANNOUNCED: usize = 256;
+/// Transactions being fetched at once by one worker, and of one peer:
+/// what a peer can have a node fetch by announcing is bounded by these.
+const TX_FETCHES: usize = 64;
+const TX_FETCHES_EACH: usize = 8;
 /// How many blocks kept on side branches have who served them
 /// remembered: more than branches run to between two blocks that try one.
 const SIDES: usize = 256;
@@ -475,6 +480,8 @@ enum Notice {
     Work,
     /// The header of a block this peer of yours announced was checked.
     Announced { header: Header, len: u32, from: SocketAddrV4, verdict: Verdict },
+    /// A transaction joined the pool: every peer is told, but `except`.
+    Tx { id: Digest, len: u32, except: Option<SocketAddrV4> },
 }
 
 /// What the workers of a node share besides the list.
@@ -510,6 +517,9 @@ pub(crate) struct Shared {
     /// Told whenever the chain has a new last block (`blocks` counts
     /// them): for whoever waits for that.
     moved: (Mutex<()>, std::sync::Condvar),
+    /// The transactions waiting to be mined. (Taken after the chain's
+    /// state, by whoever takes both.)
+    pool: Mutex<Mempool>,
     #[cfg(test)]
     by_port: AtomicBool,
 }
@@ -574,6 +584,19 @@ impl Shared {
         x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         ((x ^ (x >> 31)) % self.mail.len() as u64) as usize
+    }
+
+    /// The pool, held.
+    fn pool(&self) -> std::sync::MutexGuard<'_, Mempool> {
+        self.pool.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A transaction has joined the pool: every worker is to tell its
+    /// peers, but the one it came from.
+    fn relay(&self, id: Digest, len: u32, except: Option<SocketAddrV4>) {
+        for worker in 0..self.mail.len() {
+            self.post(worker, Notice::Tx { id, len, except });
+        }
     }
 
     fn post(&self, worker: usize, notice: Notice) {
@@ -911,7 +934,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             Notice::SentHeaders(addr) => self.peers.headers_arrived(&addr),
             Notice::NotFrom(id, addr) => self.announced.retain(|(told, from, _)| !(*told == id && *from == addr)),
             // (Seen to where there is somewhere to send: `mail`.)
-            Notice::Announce { .. } | Notice::Work | Notice::Announced { .. } => {}
+            Notice::Announce { .. } | Notice::Work | Notice::Announced { .. } | Notice::Tx { .. } => {}
         }
     }
 
@@ -921,6 +944,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         for notice in notices {
             match notice {
                 Notice::Announce { header, len, except } => self.announce(now, header, len, except, out),
+                Notice::Tx { id, len, except } => self.announce_tx(now, id, len, except, out),
                 Notice::Announced { header, len, from, verdict } => {
                     let list = Arc::clone(&self.list);
                     self.header_checked(&mut write(&list), now, header, len, from, verdict, out);
@@ -1197,7 +1221,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     None => self.counts.unheard += 1,
                 }
             }
-            // Transactions and aux leaves are not here yet.
+            Message::Tx { id, len } => self.on_tx(now, from, id, len),
+            // Aux leaves are not here yet.
             _ => self.counts.unheard += 1,
         }
     }
@@ -1586,6 +1611,74 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         }
     }
 
+    /// A peer says it has a transaction: fetched, unless it is here, or
+    /// the node is catching up (checked against an old state it would
+    /// mostly fail), or as many are being fetched as may be.
+    fn on_tx(&mut self, now: Micros, from: SocketAddrV4, id: Digest, len: u32) {
+        // Unasked: only from a peer.
+        if !self.peers.proven(&from) {
+            self.counts.unheard += 1;
+            return;
+        }
+        self.peers.seen(&from, now);
+        if len == 0 || len as usize > MAX_TX_SIZE {
+            return;
+        }
+        let behind = self.chain.receiving() || self.list.read().unwrap_or_else(|e| e.into_inner()).syncing;
+        if behind || self.shared.pool().contains(&id) {
+            return;
+        }
+        let fetching = |f: &&Fetching| matches!(f.object, Object::Tx(_));
+        let all = self.fetches.iter().filter(fetching).count();
+        let theirs = self.fetches.iter().filter(fetching).filter(|f| f.from == from).count();
+        let already = self.fetches.iter().any(|f| f.object == Object::Tx(id));
+        if all < TX_FETCHES && theirs < TX_FETCHES_EACH && !already {
+            self.fetch_object(now, Object::Tx(id), from, len);
+        }
+    }
+
+    /// The transaction `id`, of `len` bytes, is told to every peer of
+    /// this worker's but `except`.
+    fn announce_tx(&mut self, now: Micros, id: Digest, len: u32, except: Option<SocketAddrV4>, out: Out<'_>) {
+        let all: Vec<SocketAddrV4> = self.peers.live(now).map(|p| p.addr).filter(|a| Some(*a) != except).collect();
+        for addr in all {
+            self.send(addr, &Message::Tx { id, len }, out);
+        }
+    }
+
+    /// A transaction fetched from `from` as the one of id `id`: pooled
+    /// if the pool takes it, and then told to everyone else. One that
+    /// is not what it was asked for as, or that no honest peer would
+    /// have pooled whatever the state, is held against who served it.
+    fn tx_arrived(&mut self, now: Micros, from: SocketAddrV4, id: Digest, bytes: &[u8]) {
+        let named = crate::transaction::TransactionRef::from_bytes(bytes).is_ok_and(|tx| tx.txid() == id);
+        if !named {
+            self.strike(&from, now);
+            return;
+        }
+        match pool_tx(&self.chain, &self.shared, bytes, self.unix) {
+            Some(Ok(id)) => self.shared.relay(id, bytes.len() as u32, Some(from)),
+            Some(Err(Reject::BadSignature | Reject::NoInputs | Reject::NegativeFee)) => {
+                self.strike(&from, now);
+            }
+            // Refused for what this node's pool or state is: no fault
+            // of the peer's.
+            _ => {}
+        }
+    }
+
+    /// The chain has a new last block: the pool is looked over against
+    /// the state as it now is.
+    fn pool_follows(&self) {
+        let Ok(state) = self.chain.whole() else { return };
+        let Ok(snapshot) = state.snapshot() else { return };
+        let height = snapshot.tip().0 + 1;
+        let (moved, created) = (std::collections::HashMap::new(), std::collections::HashMap::new());
+        let mut pool = self.shared.pool();
+        let _ = pool.revalidate(&snapshot, height, &moved, &created, self.unix);
+        pool.expire(self.unix);
+    }
+
     /// The bodies the best header's branch still lacks: fetches those
     /// not yet asked for, as many at once as may be, and gives the
     /// first to be applied once it is here. Blocks join the chain in
@@ -1767,6 +1860,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     _ => (0, 1),
                 };
                 self.shared.say(Event::Block { header, from, undone, taken });
+                self.pool_follows();
                 // Caught up, if a chain ahead was being caught up with.
                 let mut first = [header];
                 if l.syncing
@@ -2222,6 +2316,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 Some(bytes)
             }
             Object::Block(id) => self.chain.body(&id).ok().flatten(),
+            Object::Tx(id) => self.shared.pool().entry(&id).map(|e| e.bytes().to_vec()),
             // The state as of a block of the chain that can still be
             // gone back to, in its pieces (`super::snapshot`).
             Object::Manifest(block) => self.past(&block, |past| Some(Manifest::of(past).encode())),
@@ -2386,6 +2481,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         match object {
             Object::Headers { from: first, .. } => self.headers_arrived(l, now, from, first, bytes),
             Object::Block(id) => self.body_arrived(l, now, from, id, bytes),
+            Object::Tx(id) => self.tx_arrived(now, from, id, bytes),
             // Asked for by whoever drives this node.
             _ => self.inbox.push((object, from, Some(bytes.to_vec()))),
         }
@@ -2421,6 +2517,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 self.sync_blocks(l, now);
             }
             (Object::Headers { .. }, None) => {}
+            // (Whoever else has it will say so.)
+            (Object::Tx(_), _) => {}
             _ => self.inbox.push((object, from, None)),
         }
     }
@@ -2456,6 +2554,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             waker: RwLock::new(None),
             turn: AtomicUsize::new(0),
             moved: (Mutex::new(()), std::sync::Condvar::new()),
+            pool: Mutex::new(Mempool::new(DEFAULT_CAPACITY)),
             told: RwLock::new(None),
             #[cfg(test)]
             by_port: AtomicBool::new(false),
@@ -2812,6 +2911,26 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
         &self.chain
     }
 
+    /// Pools a transaction of this node's own making (a wallet's), as
+    /// of `unix`, and has every peer told of it. Its id; or why the
+    /// pool does not take it.
+    pub fn submit(&self, bytes: &[u8], unix: u64) -> Result<Digest, Reject> {
+        let id = pool_tx(&self.chain, &self.shared, bytes, unix).unwrap_or(Err(Reject::Store(Error::Receiving)))?;
+        self.shared.relay(id, bytes.len() as u32, None);
+        Ok(id)
+    }
+
+    /// Whether the transaction `id` is in the pool.
+    pub fn pooled(&self, id: &Digest) -> bool {
+        self.shared.pool().contains(id)
+    }
+
+    /// The pool: how many transactions it holds, and their bytes.
+    pub fn pool_size(&self) -> (usize, usize) {
+        let pool = self.shared.pool();
+        (pool.len(), pool.bytes())
+    }
+
     /// Has `told` called with each thing that happens to the node that
     /// a log would say. (On the thread of the worker it happens to: it
     /// is to be quick.)
@@ -2851,6 +2970,21 @@ fn work<B: Backend + 'static, V: ProofVerifier + Sync>(chain: &Chain<B, V>, shar
 }
 
 /// The list, to change: whoever held it and failed left it as it was.
+/// Puts the transaction `bytes` are in the pool, against the chain's
+/// state as it is, at `unix`: what the pool says of it. Nothing while
+/// there is no state to hold it against.
+fn pool_tx<B: Backend + 'static, V>(
+    chain: &Chain<B, V>,
+    shared: &Shared,
+    bytes: &[u8],
+    unix: u64,
+) -> Option<Result<Digest, Reject>> {
+    let state = chain.whole().ok()?;
+    let snapshot = state.snapshot().ok()?;
+    let height = snapshot.tip().0 + 1;
+    Some(shared.pool().insert(bytes, &snapshot, height, unix))
+}
+
 fn write(list: &RwLock<List>) -> RwLockWriteGuard<'_, List> {
     list.write().unwrap_or_else(|e| e.into_inner())
 }

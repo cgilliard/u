@@ -585,6 +585,15 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// Extends `chain` by a block that makes `outputs`. The block,
+    /// whole.
+    pub(crate) fn extend_with<V: ProofVerifier + Sync>(
+        chain: &Chain<MemBackend, V>,
+        outputs: &[BlockOutput],
+    ) -> Vec<u8> {
+        extend(chain, &body(&[], outputs))
+    }
+
     /// Extends `chain` by `n` blocks, each making one output: `tag`
     /// tells one run of blocks from another on the same parent. The
     /// blocks, whole.
