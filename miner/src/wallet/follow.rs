@@ -121,9 +121,12 @@ pub fn follow<B: Backend + 'static, V, W: Backend>(
     // A wallet restored from its phrase finds what is its own, once.
     if wallet.scan_pending() {
         done.found = wallet.scan(&snap, now)?;
+        wallet.scan_names(&snap, now)?;
         wallet.clear_scan_pending()?;
     }
     done.changed = wallet.reconcile(&snap, height, chain.keep() as u32, undone_from)?;
+    // Its names, as the chain's records now have them.
+    wallet.sync_names(&snap)?;
     // Rewards of blocks found, once no reorganization reaches them:
     // done with if the block is the chain's, forgotten if it is not.
     let settled = chain.keep() as u32;

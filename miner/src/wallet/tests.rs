@@ -532,3 +532,166 @@ fn base64_is_base64() {
         assert_eq!(base64_decode(bad), None, "{bad}");
     }
 }
+
+/// The chain's names: the records, and the commits not yet revealed
+/// (each one's hash, its output's memo, and where and when it was made).
+#[derive(Default)]
+struct Names {
+    records: std::collections::HashMap<Vec<u8>, crate::name::Record>,
+    commits: Vec<(Digest, Memo, u64, u32)>,
+}
+
+type Digest = crate::hash::Digest;
+
+impl names::Registry for Names {
+    fn record(&self, name: &[u8]) -> io::Result<Option<crate::name::Record>> {
+        Ok(self.records.get(name).copied())
+    }
+
+    fn commit(&self, commit: &Digest) -> io::Result<Option<(u64, u32)>> {
+        Ok(self.commits.iter().find(|c| c.0 == *commit).map(|c| (c.2, c.3)))
+    }
+
+    fn each_record(&self, f: &mut dyn FnMut(&crate::name::Record)) -> io::Result<()> {
+        self.records.values().for_each(f);
+        Ok(())
+    }
+
+    fn each_commit(&self, f: &mut dyn FnMut(&Digest, &Memo)) -> io::Result<()> {
+        self.commits.iter().for_each(|c| f(&c.0, &c.1));
+        Ok(())
+    }
+}
+
+impl Names {
+    /// A block carries `tx`: what its name operations do is done, as
+    /// of `height`.
+    fn take(&mut self, tx: &Transaction, height: u32) {
+        use crate::name::NameOp;
+        for op in &tx.ops {
+            match op {
+                NameOp::Commit { commit, memo } => self.commits.push((*commit, *memo, 100 + height as u64, height)),
+                NameOp::Reveal { record, commit, .. } => {
+                    self.commits.retain(|c| c.2 != *commit);
+                    assert!(self.records.insert(record.name.as_bytes().to_vec(), *record).is_none());
+                }
+                NameOp::Update { record, .. } => {
+                    let current = self.records[record.name.as_bytes()];
+                    assert!(op.verify_owner(&current.owner), "not signed by the owner");
+                    self.records.insert(record.name.as_bytes().to_vec(), *record);
+                }
+            }
+        }
+    }
+}
+
+fn d(n: u32) -> Digest {
+    core::array::from_fn(|i| Fp::new(n + i as u32))
+}
+
+/// A name is registered by a commit and then a reveal, each carried by
+/// a transaction of the wallet's; what it says is changed, under a
+/// fresh key each time; it is given to another wallet; and a wallet
+/// made again from its phrase finds its names, and its commits.
+#[test]
+fn a_name_is_registered_changed_and_given() {
+    use names::NameStage;
+    let mut chain = Outputs::default();
+    let mut names = Names::default();
+    let (mut alice, phrase) = Wallet::open(MemBackend::new()).unwrap();
+    alice.set_min_confirmations(1);
+    let funds: Vec<Output> = (0..6).map(|_| alice.receive(10 * COIN, NOW).unwrap()).collect();
+    chain.make(&funds, &mut [&mut alice]);
+    // Carried by a transaction, mined: the chain's names change, the
+    // chain's outputs change, and the wallet looks at both.
+    fn mined(chain: &mut Outputs, alice: &mut Wallet<MemBackend>, names: &mut Names, signed: &Signed, height: u32) {
+        assert!(signed.tx.verify_signatures() && signed.tx.balance() > 0);
+        names.take(&signed.tx, height);
+        chain.take(&signed.tx, &mut [alice]);
+    }
+
+    // What is no name, and what cannot be carried.
+    assert!(matches!(alice.name_commit(b"Not A Name", d(1), NOW), Err(WalletError::Name(_))));
+    assert!(matches!(alice.carry(vec![], None, &Outputs::default(), NOW), Err(WalletError::Name(_))));
+    let op = alice.name_commit(b"alice", d(1), NOW).unwrap();
+    assert!(matches!(alice.name_commit(b"alice", d(1), NOW), Err(WalletError::Name(_))));
+    assert!(matches!(
+        alice.carry(vec![op.clone()], None, &Outputs::default(), NOW),
+        Err(WalletError::Insufficient { .. })
+    ));
+    // No transaction carried it: it is as if it had not been made.
+    alice.undo_name_op(&op).unwrap();
+    assert!(alice.pending_commits().is_empty());
+
+    // The commit, carried and mined at height 10.
+    let op = alice.name_commit(b"alice", d(1), NOW).unwrap();
+    let signed = alice.carry(vec![op], None, &chain, NOW).unwrap();
+    assert_eq!(signed.tx.ops.len(), 1);
+    mined(&mut chain, &mut alice, &mut names, &signed, 10);
+    assert_eq!(alice.pending_commits().len(), 1);
+    // Not revealed before it has waited; nor a name there is no commit for.
+    assert!(
+        matches!(alice.name_reveal(b"alice", 0, 3, &names, 12, NOW), Err(WalletError::Name(m)) if m.contains("wait 1 more"))
+    );
+    assert!(matches!(alice.name_reveal(b"bob", 0, 3, &names, 20, NOW), Err(WalletError::Name(_))));
+    let op = alice.name_reveal(b"alice", 0, 3, &names, 13, NOW).unwrap();
+    assert_eq!(alice.owned_name(b"alice").unwrap().stage, NameStage::Revealed);
+    assert!(alice.pending_commits().is_empty());
+    // A reveal taken back goes back to its commit; made again, mined.
+    let signed = alice.carry(vec![op], None, &chain, NOW).unwrap();
+    alice.cancel_sent(&signed.tx.txid(), None, &chain, NOW).unwrap();
+    assert!(alice.owned_name(b"alice").is_none() && alice.pending_commits().len() == 1);
+    let op = alice.name_reveal(b"alice", 0, 3, &names, 13, NOW).unwrap();
+    let signed = alice.carry(vec![op], None, &chain, NOW).unwrap();
+    mined(&mut chain, &mut alice, &mut names, &signed, 13);
+    assert_eq!(alice.sync_names(&names).unwrap(), 1);
+    let owned = alice.owned_name(b"alice").unwrap();
+    assert_eq!((owned.stage, owned.value, names.records[&b"alice"[..]].value), (NameStage::Owned, d(1), d(1)));
+    assert_eq!(alice.sync_names(&names).unwrap(), 0);
+
+    // Changed: what it says, and the key it is under.
+    let (op, last) = alice.name_update(b"alice", d(2)).unwrap();
+    assert!(!last && matches!(alice.name_update(b"alice", d(3)), Err(WalletError::Name(_))));
+    let signed = alice.carry(vec![op], None, &chain, NOW).unwrap();
+    mined(&mut chain, &mut alice, &mut names, &signed, 14);
+    assert_eq!(alice.sync_names(&names).unwrap(), 1);
+    let rotated = alice.owned_name(b"alice").unwrap();
+    assert_eq!((rotated.value, rotated.used, rotated.pending), (d(2), 0, None));
+    assert_ne!(rotated.nonce, owned.nonce);
+
+    // A wallet made again from the phrase finds the name, and signs for
+    // it from the other half of its key's leaves.
+    let mut again = Wallet::restore(MemBackend::new(), &phrase.unwrap(), "", "").unwrap();
+    assert_eq!(again.scan_names(&names, NOW).unwrap(), (1, 0));
+    let found = again.owned_name(b"alice").unwrap();
+    assert!(found.recovered && found.nonce == rotated.nonce && found.stage == NameStage::Owned);
+    assert_eq!(again.scan_names(&names, NOW).unwrap(), (0, 0));
+
+    // Given to another wallet: which writes the record, for the owner
+    // to sign over.
+    let mut bob = new();
+    let record = bob.name_offer(b"alice", d(9), NOW).unwrap();
+    assert_eq!(bob.owned_name(b"alice").unwrap().stage, NameStage::Offered);
+    assert!(matches!(bob.name_transfer(record), Err(WalletError::Name(_))));
+    let (op, _) = alice.name_transfer(record).unwrap();
+    let signed = alice.carry(vec![op], None, &chain, NOW).unwrap();
+    mined(&mut chain, &mut alice, &mut names, &signed, 15);
+    assert_eq!((alice.sync_names(&names).unwrap(), bob.sync_names(&names).unwrap()), (1, 1));
+    assert!(alice.owned_name(b"alice").is_none());
+    assert_eq!(bob.owned_name(b"alice").unwrap().stage, NameStage::Owned);
+    assert_eq!(reopened(&bob, "").unwrap().owned_names(), bob.owned_names());
+
+    // A commit found by a scan is of a name not known, until it is
+    // revealed by the wallet that made it.
+    let op = alice.name_commit(b"second", d(4), NOW).unwrap();
+    let signed = alice.carry(vec![op], None, &chain, NOW).unwrap();
+    mined(&mut chain, &mut alice, &mut names, &signed, 20);
+    assert_eq!(again.scan_names(&names, NOW).unwrap(), (0, 1));
+    assert_eq!(again.pending_commits()[0].name, None);
+    assert!(matches!(again.name_reveal(b"wrong", 0, 3, &names, 30, NOW), Err(WalletError::Name(_))));
+    assert!(again.name_reveal(b"second", 0, 3, &names, 30, NOW).is_ok());
+    // And one that never reached the chain is forgotten when pruned.
+    alice.name_commit(b"never", d(5), NOW).unwrap();
+    assert_eq!(alice.prune_commits(&names, &[]).unwrap(), ["never"]);
+    assert_eq!(alice.pending_commits().len(), 1);
+}

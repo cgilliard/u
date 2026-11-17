@@ -49,6 +49,7 @@
 //! the chain's state holds is asked through [`Unspent`].
 
 pub mod follow;
+pub mod names;
 pub mod records;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -79,6 +80,8 @@ const T_ANSWERED: usize = 5;
 const T_LANDED: usize = 6;
 const T_LOST: usize = 7;
 const T_RECENT: usize = 8;
+const T_COMMITS: usize = 9;
+const T_NAMES: usize = 10;
 
 /// Blocks looked at that the wallet remembers, at the most: as far back
 /// as it can find where the chain parted from what it knew.
@@ -495,6 +498,8 @@ pub enum WalletError {
     WrongPassword,
     /// Restoring over an existing wallet.
     Exists,
+    /// A name operation the wallet cannot make.
+    Name(String),
     /// An input has not been seen in a block yet.
     Unconfirmed,
     /// The transaction's inputs are no longer unspent on chain: it (or
@@ -516,6 +521,7 @@ impl core::fmt::Display for WalletError {
             WalletError::OldFormat => f.write_str("the wallet's file is of a format not known here"),
             WalletError::WrongPassword => f.write_str("wrong wallet password"),
             WalletError::Exists => f.write_str("a wallet already exists there"),
+            WalletError::Name(m) => f.write_str(m),
             WalletError::Unconfirmed => f.write_str("an input is not confirmed yet"),
             WalletError::Landed => f.write_str("the inputs are already spent on chain"),
         }
@@ -778,6 +784,10 @@ struct Tables {
     /// the chain has gone over to another branch, the newest of these
     /// that is still of the chain is where the branches part.
     recent: std::collections::VecDeque<(u32, [u8; 32], u64)>,
+    /// Commits of names awaiting their reveal, by commit.
+    commits: BTreeMap<Id, names::PendingCommit>,
+    /// The names the wallet holds or awaits, by name.
+    names: BTreeMap<Vec<u8>, names::OwnedName>,
 }
 
 /// A table of records each named by 32 bytes.
@@ -825,6 +835,8 @@ impl Tables {
             T_ANSWERED => put_entries(self.answered.iter().map(|id| (id, Vec::new()))),
             T_LANDED => put_entries(self.landed.iter().map(|(id, height)| (id, height.to_le_bytes().to_vec()))),
             T_LOST => put_entries(self.lost.iter().map(|(id, height)| (id, height.to_le_bytes().to_vec()))),
+            T_COMMITS => put_entries(self.commits.iter().map(|(id, c)| (id, c.to_bytes()))),
+            T_NAMES => names::put_names(self.names.values()),
             T_RECENT => put_entries(self.recent.iter().map(|(height, id, next)| {
                 let mut b = height.to_le_bytes().to_vec();
                 b.extend_from_slice(&next.to_le_bytes());
@@ -874,6 +886,13 @@ impl Tables {
         }
         for (id, b) in get_entries(&table(T_LOST)?).ok_or(WalletError::Corrupt("lost"))? {
             t.lost.insert(id, height(b).ok_or(WalletError::Corrupt("lost output"))?);
+        }
+        for (id, b) in get_entries(&table(T_COMMITS)?).ok_or(WalletError::Corrupt("commits"))? {
+            let c = commitment(&id).and_then(|c| names::PendingCommit::from_bytes(c, b));
+            t.commits.insert(id, c.ok_or(WalletError::Corrupt("commit"))?);
+        }
+        for name in names::get_names(&table(T_NAMES)?).ok_or(WalletError::Corrupt("names"))? {
+            t.names.insert(name.name.clone(), name);
         }
         for (id, b) in get_entries(&table(T_RECENT)?).ok_or(WalletError::Corrupt("recent"))? {
             if b.len() != 12 {
@@ -1605,7 +1624,7 @@ impl<B: Backend> Wallet<B> {
             tx: signed.tx.clone(),
         };
         t.sent.insert(digest_to_bytes(&next.txid), next);
-        self.commit(t, &[T_OUTPUTS, T_SENT])?;
+        self.commit(t, &[T_OUTPUTS, T_SENT, T_COMMITS, T_NAMES])?;
         Ok(signed)
     }
 
@@ -1636,6 +1655,13 @@ impl<B: Backend> Wallet<B> {
         }
         let mut t = self.t.clone();
         let back = self.receive_in(&mut t, (total - fee as u128) as u64, now)?;
+        // The replacement carries none of the payment's name operations:
+        // their entries go back to where they were before it was signed.
+        // Should the payment land after all, the names are taken up from
+        // what it wrote ([`Wallet::sync_names`]).
+        for op in &sent.tx.ops {
+            self.undo_name_op_in(&mut t, op);
+        }
         self.replace(t, sent, UnsignedTransaction::new(inputs, vec![back]), fee, now)
     }
 
