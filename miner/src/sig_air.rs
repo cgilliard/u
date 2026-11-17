@@ -13,18 +13,21 @@
 //! For each signature it checks, an **entry**:
 //!
 //! ```text
-//! entry = compress(key hash, message)
+//! entry = compress(compress(key hash, message), [leaf index, 0, ..])
 //! ```
 //!
 //! the key hash as an output's commitment takes it
-//! ([`crate::output::pubkey_hash`]), the message whatever was signed.
+//! ([`crate::output::pubkey_hash`]), the message whatever was signed,
+//! and the leaf of the key that signed it: a spend policy can ask that
+//! a signature be by one leaf and no other ([`crate::policy`]), and
+//! whoever asks nothing of the leaf gives the one it was.
 //! The public values are the entries, [`SLOTS`] of them, in the order
 //! checked; a slot with no signature holds zeros, which no entry is.
 //! Whoever verifies the proof makes of them what it needs: a tree, of
 //! which a transaction segment shows a path to one.
 //!
-//! An entry is a compression of two digests and not a hash under a
-//! domain of its own. It is only ever a leaf of a tree of a fixed
+//! An entry is two compressions and not a hash under a domain of its
+//! own. It is only ever a leaf of a tree of a fixed
 //! depth, read at that depth, so it is taken for nothing else.
 //!
 //! # Schedule
@@ -33,7 +36,8 @@
 //! for each signature:
 //!     the fragment's rows            message, chains, the key's tree ([`crate::xmss_fragment`])
 //!     pkh0, pkh1                     the key's hash: its root, its seed and its height
-//!     ent                            compress(key hash, message): the entry
+//!     ent0                           compress(key hash, message)
+//!     ent1                           compress(that, the leaf index): the entry
 //! done ...                           padding
 //! ```
 //!
@@ -52,7 +56,7 @@ use crate::output::pubkey_hash;
 use crate::poseidon2::{DIGEST, Fp, RATE, WIDTH, compress};
 use crate::poseidon2_air::COL_INPUT;
 use crate::stark::{Air, Builder, Trace};
-use crate::xmss::{Digest, PUB_SEED_LEN, PublicKey, Signature};
+use crate::xmss::{Digest, MAX_HEIGHT, PUB_SEED_LEN, PublicKey, Signature};
 use crate::xmss_fragment::{self, Cols, Regs, Types, height_value};
 
 // Row types (one-hot).
@@ -65,9 +69,10 @@ pub const T_TREE_START: usize = HM_COLS + 5;
 pub const T_TREE_ABS: usize = HM_COLS + 6;
 pub const T_PKH0: usize = HM_COLS + 7;
 pub const T_PKH1: usize = HM_COLS + 8;
-pub const T_ENT: usize = HM_COLS + 9;
-pub const T_DONE: usize = HM_COLS + 10;
-const NUM_TYPES: usize = 11;
+pub const T_ENT0: usize = HM_COLS + 9;
+pub const T_ENT1: usize = HM_COLS + 10;
+pub const T_DONE: usize = HM_COLS + 11;
+const NUM_TYPES: usize = 12;
 
 pub const COLS: Cols = Cols::new(HM_COLS + NUM_TYPES);
 pub const TYPES: Types = Types {
@@ -97,18 +102,26 @@ pub const NUM_PUBLIC: usize = SLOTS * DIGEST;
 
 /// Rows of a signature by a key of `height`, with its key hash and entry.
 pub const fn rows(height: usize) -> usize {
-    xmss_fragment::rows(height) + 3
+    xmss_fragment::rows(height) + 4
 }
 
-/// What a signature segment says of a signature by `pk` over `msg`.
-pub fn entry(pk: &PublicKey, msg: &Digest) -> Digest {
-    entry_of(&pubkey_hash(pk), msg)
+/// What a signature segment says of a signature by `pk` over `msg`
+/// with the key's leaf `index`.
+pub fn entry(pk: &PublicKey, msg: &Digest, index: u64) -> Digest {
+    entry_of(&pubkey_hash(pk), msg, index)
 }
 
 /// [`entry`] from the key's hash: what a circuit that has the key hash
 /// and the message computes, to look the entry up.
-pub fn entry_of(key_hash: &Digest, msg: &Digest) -> Digest {
-    compress(key_hash, msg)
+pub fn entry_of(key_hash: &Digest, msg: &Digest, index: u64) -> Digest {
+    compress(&compress(key_hash, msg), &index_block(Fp::from_u64(index)))
+}
+
+/// The leaf index as the digest an entry takes it as.
+fn index_block<F: Field>(index: F) -> [F; DIGEST] {
+    let mut block = [F::ZERO; DIGEST];
+    block[0] = index;
+    block
 }
 
 fn cap_pk<F: Field>() -> [F; RATE] {
@@ -140,7 +153,7 @@ impl Air for SigAir {
         // Row types, and the machine op each is.
         b.mark("sig air row types");
         let types: [F; NUM_TYPES] = core::array::from_fn(|i| l[T_MSG_START + i]);
-        let [msg_start, msg_abs, load, step, leaf, tree_start, tree_abs, pkh0, pkh1, ent, done] = types;
+        let [msg_start, msg_abs, load, step, leaf, tree_start, tree_abs, pkh0, pkh1, ent0, ent, done] = types;
         for t in types {
             b.assert_zero(t * t - t);
         }
@@ -151,7 +164,7 @@ impl Air for SigAir {
         b.assert_eq(l[COL_LOAD], load);
         b.assert_eq(l[COL_CHAIN], step * active);
         b.assert_eq(l[COL_PASS], step * (one - active) + done);
-        b.assert_eq(l[COL_COMPRESS], ent);
+        b.assert_eq(l[COL_COMPRESS], ent0 + ent);
 
         // The order of things: signatures from the first row, each to its
         // key hash and its entry, and padding to the last.
@@ -160,14 +173,16 @@ impl Air for SigAir {
         b.when_last_row(one - done);
         b.when_transition(done * (one - n[T_DONE]));
         b.when_transition(pkh0 * (one - n[T_PKH1]));
-        b.when_transition(pkh1 * (one - n[T_ENT]));
+        b.when_transition(pkh1 * (one - n[T_ENT0]));
+        b.when_transition(ent0 * (one - n[T_ENT1]));
         b.when_transition(ent * (one - n[T_MSG_START] - n[T_DONE]));
         // And nothing is come to but from what leads to it: a key hash
         // from the top of a key's tree, an entry from a key hash, a
         // signature or the padding from an entry.
         b.when_transition(n[T_PKH0] * (one - tree_abs * l[COLS.tlast()]));
         b.when_transition(n[T_PKH1] * (one - pkh0));
-        b.when_transition(n[T_ENT] * (one - pkh1));
+        b.when_transition(n[T_ENT0] * (one - pkh1));
+        b.when_transition(n[T_ENT1] * (one - ent0));
         b.when_transition(n[T_MSG_START] * (one - ent));
         b.when_transition(n[T_DONE] * (one - ent - done));
 
@@ -194,11 +209,15 @@ impl Air for SigAir {
             b.assert_zero(pkh1 * (l[COL_DATA + i] - data));
         }
 
-        // The entry: the key hash with the message, into the next slot.
+        // The entry: the key hash with the message, and that with the
+        // leaf that signed, into the next slot.
         b.mark("sig air entry");
-        b.assert_zero(ent * l[COL_DIR]);
+        b.assert_zero((ent0 + ent) * l[COL_DIR]);
+        let index = (0..MAX_HEIGHT).fold(F::ZERO, |a, i| a + l[COLS.idx(i)] * F::from_u32(1 << i));
+        let index = index_block(index);
         for i in 0..DIGEST {
-            b.assert_zero(ent * (l[COL_DATA + i] - l[R_MSG + i]));
+            b.assert_zero(ent0 * (l[COL_DATA + i] - l[R_MSG + i]));
+            b.assert_zero(ent * (l[COL_DATA + i] - index[i]));
         }
         let filled: [F; SLOTS] = core::array::from_fn(|j| l[R_FILLED + j]);
         // Which slot is next: the first not filled.
@@ -253,14 +272,17 @@ impl SigAir {
             let mut seed = [Fp::ZERO; RATE];
             seed[..PUB_SEED_LEN].copy_from_slice(&pk.pub_seed);
             seed[PUB_SEED_LEN] = Fp::new(pk.height as u32);
-            for (t, step) in [(T_PKH0, 0), (T_PKH1, 1), (T_ENT, 2)] {
+            for (t, step) in [(T_PKH0, 0), (T_PKH1, 1), (T_ENT0, 2), (T_ENT1, 3)] {
                 match step {
                     0 => {}
                     1 => {
                         b.absorb(seed);
                     }
-                    _ => {
+                    2 => {
                         b.compress(*msg, false);
+                    }
+                    _ => {
+                        b.compress(index_block(Fp::from_u64(sig.index)), false);
                     }
                 }
                 let row = b.last_row_mut();
@@ -268,7 +290,7 @@ impl SigAir {
                 regs.write(row, &COLS);
                 rest(row, msg, k);
             }
-            debug_assert_eq!(b.acc(), entry(pk, msg));
+            debug_assert_eq!(b.acc(), entry(pk, msg, sig.index));
             last = *msg;
         }
         assert!(b.len() < height, "the signatures do not fit the rows");
@@ -283,10 +305,10 @@ impl SigAir {
     }
 
     /// The public values of a segment that checks these, in this order.
-    pub fn public_values<'a>(signed: impl IntoIterator<Item = (&'a PublicKey, &'a Digest)>) -> [Fp; NUM_PUBLIC] {
+    pub fn public_values(signed: &[(PublicKey, Digest, Signature)]) -> [Fp; NUM_PUBLIC] {
         let mut v = [Fp::ZERO; NUM_PUBLIC];
-        for (j, (pk, msg)) in signed.into_iter().enumerate() {
-            v[j * DIGEST..(j + 1) * DIGEST].copy_from_slice(&entry(pk, msg));
+        for (j, (pk, msg, sig)) in signed.iter().enumerate() {
+            v[j * DIGEST..(j + 1) * DIGEST].copy_from_slice(&entry(pk, msg, sig.index));
         }
         v
     }
@@ -320,7 +342,7 @@ mod tests {
     }
 
     fn said(s: &[(PublicKey, Digest, Signature)]) -> [Fp; NUM_PUBLIC] {
-        SigAir::public_values(s.iter().map(|(pk, m, _)| (pk, m)))
+        SigAir::public_values(s)
     }
 
     const LOG_N: usize = 13;
@@ -328,8 +350,8 @@ mod tests {
     #[test]
     fn layout() {
         assert_eq!(measure_degree(&SigAir, NUM_PUBLIC), 3);
-        assert_eq!(rows(20), 3 + 67 * 17 + 40 + 3);
-        assert_eq!((NUM_PUBLIC, NUM_COLS), (256, HM_COLS + 11 + xmss_fragment::LEN + 8 + 32));
+        assert_eq!(rows(20), 3 + 67 * 17 + 40 + 4);
+        assert_eq!((NUM_PUBLIC, NUM_COLS), (256, HM_COLS + 12 + xmss_fragment::LEN + 8 + 32));
         // A main network's segment holds this many by the tallest keys,
         // and has a slot for each.
         assert!((1 << 15) / rows(20) <= SLOTS);
@@ -346,8 +368,9 @@ mod tests {
         let public = said(&s);
         assert_eq!(check_constraints(&SigAir, &trace, &public), Ok(()));
         for j in 0..s.len() {
-            assert_eq!(public[j * DIGEST..(j + 1) * DIGEST], entry(&s[j].0, &s[j].1));
-            assert_eq!(entry(&s[j].0, &s[j].1), entry_of(&pubkey_hash(&s[j].0), &s[j].1));
+            let (pk, m, sig) = &s[j];
+            assert_eq!(public[j * DIGEST..(j + 1) * DIGEST], entry(pk, m, sig.index));
+            assert_eq!(entry(pk, m, sig.index), entry_of(&pubkey_hash(pk), m, sig.index));
         }
         assert!(public[s.len() * DIGEST..].iter().all(|x| *x == Fp::ZERO));
         // Any value of an entry changed, or a slot not filled said to be.
@@ -361,9 +384,15 @@ mod tests {
         swapped.swap(0, 1);
         assert!(check_constraints(&SigAir, &trace, &said(&swapped)).is_err());
         assert!(check_constraints(&SigAir, &trace, &said(&s[..3])).is_err());
-        // Another message, or another key, is another entry.
-        assert_ne!(entry(&s[0].0, &s[0].1), entry(&s[0].0, &s[1].1));
-        assert_ne!(entry(&s[0].0, &s[0].1), entry(&s[1].0, &s[0].1));
+        // Another message, another key or another leaf is another entry;
+        // and the trace does not hold for a leaf that did not sign.
+        let (pk, m, sig) = &s[0];
+        assert_ne!(entry(pk, m, sig.index), entry(pk, &s[1].1, sig.index));
+        assert_ne!(entry(pk, m, sig.index), entry(&s[1].0, m, sig.index));
+        assert_ne!(entry(pk, m, sig.index), entry(pk, m, sig.index - 1));
+        let mut bad = public;
+        bad[..DIGEST].copy_from_slice(&entry(pk, m, sig.index - 1));
+        assert!(check_constraints(&SigAir, &trace, &bad).is_err());
     }
 
     /// No signature at all: padding, and every slot zeros.
@@ -400,17 +429,21 @@ mod tests {
         // The message, from some row of the first signature on.
         let mut bad = good.clone();
         let from = row_of(T_LEAF, 3);
-        for r in from..=row_of(T_ENT, 0) {
+        for r in from..=row_of(T_ENT1, 0) {
             bad.values[r * w + R_MSG] += Fp::ONE;
         }
         assert!(check_constraints(&SigAir, &bad, &public).is_err());
         // The message on the entry's row alone.
         let mut bad = good.clone();
-        bad.values[row_of(T_ENT, 1) * w + R_MSG + 2] += Fp::ONE;
+        bad.values[row_of(T_ENT0, 1) * w + R_MSG + 2] += Fp::ONE;
         assert!(check_constraints(&SigAir, &bad, &public).is_err());
         // A slot marked filled before its entry.
         let mut bad = good.clone();
         bad.values[row_of(T_PKH1, 0) * w + R_FILLED] = Fp::ONE;
+        assert!(check_constraints(&SigAir, &bad, &public).is_err());
+        // The leaf the entry takes, where the signature's is another.
+        let mut bad = good.clone();
+        bad.values[row_of(T_ENT1, 0) * w + COL_DATA] += Fp::ONE;
         assert!(check_constraints(&SigAir, &bad, &public).is_err());
         // The seed the key hash takes.
         let mut bad = good.clone();
@@ -418,8 +451,8 @@ mod tests {
         assert!(check_constraints(&SigAir, &bad, &public).is_err());
         // An entry's row made padding: the signature said by nothing.
         let mut bad = good.clone();
-        let r = row_of(T_ENT, 3);
-        bad.values[r * w + T_ENT] = Fp::ZERO;
+        let r = row_of(T_ENT1, 3);
+        bad.values[r * w + T_ENT1] = Fp::ZERO;
         bad.values[r * w + T_DONE] = Fp::ONE;
         assert!(check_constraints(&SigAir, &bad, &public).is_err());
     }

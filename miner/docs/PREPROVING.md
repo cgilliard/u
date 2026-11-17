@@ -77,9 +77,12 @@ height 20. It is `xmss_fragment` under a small schedule of its own, as
 For each signature it checks, it makes an **entry**:
 
 ```text
-entry = compress(key hash, message)
+entry = compress(compress(key hash, message), [leaf index, 0, ..])
 ```
 
+(the leaf of the key that signed is in it because a spend policy can
+ask for one leaf and no other: a rebindable signature's leaf is its
+state number; whoever asks nothing of the leaf gives the one it was)
 and its public values are its entries, 32 of them, in the order checked
 (a slot with no signature says zeros). Whoever verifies the proof makes
 the small Merkle tree over them: a proof of proofs does, and hashing 32
@@ -89,8 +92,7 @@ the message is whatever was signed, a transaction's body hash or a
 policy's rebindable message or a name update's message. All three are
 fixed by the transaction.
 
-An entry is a compression of two digests, not a hash under a domain of
-its own: it is only ever a leaf of a tree of a fixed depth, read at
+An entry is two compressions, not a hash under a domain of its own: it is only ever a leaf of a tree of a fixed depth, read at
 that depth.
 
 Built: `src/sig_air.rs`.
