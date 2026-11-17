@@ -204,6 +204,20 @@ enum Cheat {
     NoTrace(String),
 }
 
+/// Whether every signature segment of a block has a trace that holds:
+/// every signature verifies, by the circuit's own account.
+fn signatures_hold(signed: &crate::signed::Signed) -> bool {
+    use crate::sig_air::SigAir;
+    signed.segments.iter().all(|signings| {
+        let made = std::panic::catch_unwind(|| {
+            let trace = SigAir::generate_trace(signings, crate::sig_air::log_rows(signings));
+            let said: Vec<Fp> = crate::signed::Signed::entries(signings).iter().flatten().copied().collect();
+            check_constraints(&SigAir, &trace, &said).is_ok()
+        });
+        made.unwrap_or(false)
+    })
+}
+
 fn cheat(w: &SegmentWitness) -> Cheat {
     crate::stark::LENIENT.with(|l| l.set(true));
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| BlockAir::generate_trace(w)));
@@ -669,8 +683,10 @@ fn the_circuit_agrees_with_the_chain_on_random_blocks() {
                 inconclusive += 1;
                 continue;
             };
-            // Some segment's trace must fail.
-            if segments.iter().any(|w| cheat(w) != Cheat::Accepted) {
+            // Some segment's trace must fail: a transaction segment's,
+            // or a signature segment's, where the signatures are held
+            // to what they are over.
+            if segments.iter().any(|w| cheat(w) != Cheat::Accepted) || !signatures_hold(&segments[0].signed) {
                 rejected += 1;
             } else {
                 panic!("round {round}: {what} accepted by every segment");
@@ -688,6 +704,8 @@ fn the_circuit_agrees_with_the_chain_on_random_blocks() {
                 public
             })
             .collect();
+        assert!(signatures_hold(&segments[0].signed), "round {round}: signatures");
+        assert!(publics.iter().all(|p| p.signed == segments[0].signed.set.root()), "round {round}: one signed set");
         for p in publics.windows(2) {
             assert_eq!(
                 (p[0].root_out, p[0].isp_out, p[0].osp_out, p[0].pos_out, p[0].carry_out),
@@ -1420,50 +1438,6 @@ fn the_block_circuit_has_no_unintended_freedom() {
     assert!(problems.is_empty(), "{} problems:\n{}", problems.len(), problems.join("\n"));
 }
 
-/// The hash permutation of each load and step row of a spend, replaced
-/// by an honest permutation of another input: every active chain step
-/// notices (a signature chain is linked step to step), and no pass or
-/// load row does, whose permutation the hash machine does not use.
-#[test]
-#[ignore = "slow: one job each in .github/workflows/test.yml"]
-fn a_replaced_permutation_is_caught_where_it_is_used() {
-    let utxo = TestSet::new();
-    let mut k = Key::generate_with_height(&[9; 32], 4);
-    let dest = key(3).public_key();
-    utxo.add_output(&Output::new(&k.public_key(), 70).block_output(), 0).unwrap();
-    let mut tx = UnsignedTransaction::new(vec![(k.public_key(), 70)], vec![Output::new(&dest, 70)])
-        .sign(|_, _, m| k.sign(m))
-        .unwrap();
-    tx.set_positions(&[0]);
-    let segments = utxo.collect(std::slice::from_ref(&tx), 1, 1).unwrap();
-    let (trace, public) = BlockAir::generate_trace(&segments[0]);
-    let public = public.to_values();
-    let perm_cols = crate::poseidon2_air::NUM_COLS;
-    let other = crate::poseidon2_air::Poseidon2Air::generate_trace(&[core::array::from_fn(|i| Fp::new(77 + i as u32))]);
-    let mut by_kind = std::collections::BTreeMap::<String, (usize, usize)>::new();
-    for r in 0..trace.height() {
-        let kind = if trace.row(r)[T_LOAD] == Fp::ONE {
-            "T_LOAD"
-        } else if trace.row(r)[T_STEP] == Fp::ONE {
-            if trace.row(r)[XCOLS.active()] == Fp::ONE { "T_STEP active" } else { "T_STEP pass" }
-        } else {
-            continue;
-        };
-        let mut bad = trace.clone();
-        bad.values[r * bad.width..r * bad.width + perm_cols].copy_from_slice(&other.row(0)[..perm_cols]);
-        let caught = check_constraints(&BlockAir, &bad, &public).is_err();
-        let e = by_kind.entry(kind.to_string()).or_default();
-        e.0 += 1;
-        if !caught {
-            e.1 += 1;
-        }
-    }
-    let active = by_kind["T_STEP active"];
-    assert!(active.0 > 0 && active.1 == 0, "active steps that miss a replaced permutation: {by_kind:?}");
-    let (pass, load) = (by_kind["T_STEP pass"], by_kind["T_LOAD"]);
-    assert_eq!((pass.1, load.1), (pass.0, load.0), "unused permutations seen: {by_kind:?}");
-}
-
 /// Keys of any height up to the maximum verify; the fragment stops at
 /// the key's last level and the rows count accordingly.
 #[test]
@@ -1522,11 +1496,14 @@ fn the_amount_in_the_leaf_is_the_committed_one() {
 #[test]
 fn layout_and_degree() {
     assert_eq!(measure_degree(&BlockAir, NUM_PUBLIC), 3);
-    // Two rows a level of the tree, of which there are forty-two.
-    assert_eq!(input_rows(4), 1150 + 6 + 1 + 84 + 2);
-    assert_eq!(ROWS_PER_INPUT, 1182 + 6 + 1 + 84 + 2);
+    // A signature is looked up, not checked: two rows of its entry and
+    // one a level of the signed set, whatever the key's height. Then
+    // two rows a level of the state tree, of which there are forty-two.
+    assert_eq!(ROWS_PER_SIGNATURE, 2 + 19);
+    assert_eq!((input_rows(4), input_rows(20)), (ROWS_PER_INPUT, ROWS_PER_INPUT));
+    assert_eq!(ROWS_PER_INPUT, 21 + 6 + 1 + 84 + 2);
     assert_eq!(ROWS_PER_OUTPUT, 93);
-    assert_eq!(NUM_PUBLIC, 128 + 2 * 28 + 1);
+    assert_eq!(NUM_PUBLIC, 128 + 2 * 28 + 1 + 8);
 }
 
 #[test]
@@ -1667,7 +1644,7 @@ fn packing_splits_between_items() {
         rows.extend(std::iter::repeat_n(ROWS_PER_OP, n_ops));
         (rows, whole)
     };
-    let max_rows = 2048;
+    let max_rows = 512;
     let plan = pack(4, items, max_rows);
     // Parts cover every item once, in order.
     let mut next = [0usize; 4];
@@ -1687,11 +1664,70 @@ fn packing_splits_between_items() {
         assert!(rows < max_rows, "{rows}");
     }
     assert_eq!(next, [1, 6, 3, 8]);
-    // A segment holds one input: the second transaction's three are
-    // spread over three segments, its outputs joining the last.
-    assert_eq!(plan[0], vec![Part { tx: 0, start: 0, end: 1 }, Part { tx: 1, start: 0, end: 1 }]);
-    assert_eq!(plan[1], vec![Part { tx: 1, start: 1, end: 2 }]);
-    assert_eq!(plan[2][0], Part { tx: 1, start: 2, end: 6 });
+    // The second transaction's inputs fit beside the first; its outputs
+    // do not, and go on in the next segment, with the third whole. The
+    // last must stay whole, and has a segment to itself.
+    assert_eq!(plan[0], vec![Part { tx: 0, start: 0, end: 1 }, Part { tx: 1, start: 0, end: 3 }]);
+    assert_eq!(plan[1], vec![Part { tx: 1, start: 3, end: 6 }, Part { tx: 2, start: 0, end: 3 }]);
+    assert_eq!(plan[2], vec![Part { tx: 3, start: 0, end: 8 }]);
+}
+
+/// A signature is looked up in the block's signed set, and nothing
+/// stands in for it: not another set, not a path that leads elsewhere,
+/// not another message, leaf or key on the way to the entry.
+#[test]
+fn a_signature_is_looked_up_in_the_signed_set() {
+    let (segments, _, _, _) = scenario("signed", 10);
+    let w = &segments[0];
+    assert!(!w.signed.segments.is_empty());
+    let (trace, public) = BlockAir::generate_trace(w);
+    assert_eq!(public.signed, w.signed.set.root());
+    let values = public.to_values();
+    assert_eq!(check_constraints(&BlockAir, &trace, &values), Ok(()));
+    // Against another set's root the trace does not hold.
+    let mut other = public;
+    other.signed[3] += Fp::ONE;
+    assert!(check_constraints(&BlockAir, &trace, &other.to_values()).is_err());
+    // A witness whose set lacks the signatures makes no trace.
+    let mut bare = w.clone();
+    bare.signed = Default::default();
+    assert!(std::panic::catch_unwind(|| BlockAir::generate_trace(&bare)).is_err());
+    let width = NUM_COLS;
+    let row_of = |ty: usize, which: usize| {
+        (0..trace.height()).filter(|&r| trace.values[r * width + ty] == Fp::ONE).nth(which).expect("such a row")
+    };
+    let breaks = |what: &str, change: &dyn Fn(&mut crate::stark::Trace)| {
+        let mut bad = trace.clone();
+        change(&mut bad);
+        assert!(check_constraints(&BlockAir, &bad, &values).is_err(), "{what}");
+    };
+    // The path: a sibling, a direction, a row left out of it.
+    breaks("sibling", &|t| t.values[row_of(T_SP, 5) * width + COL_DATA + 1] += Fp::ONE);
+    breaks("direction", &|t| {
+        let at = row_of(T_SP, 0) * width + COL_DIR;
+        t.values[at] = Fp::ONE - t.values[at];
+    });
+    breaks("levels left", &|t| t.values[row_of(T_SP, 2) * width + R_SPN] -= Fp::ONE);
+    breaks("the path's end", &|t| {
+        let at = row_of(T_SP, 3) * width;
+        t.values[at + C_SP_LAST] = Fp::ONE;
+        t.values[at + C_SP_END] = Fp::ONE;
+    });
+    // The entry: the message, the leaf that signed, the key's hash.
+    breaks("message", &|t| t.values[row_of(T_ENT0, 0) * width + COL_DATA] += Fp::ONE);
+    breaks("message register", &|t| t.values[row_of(T_ENT0, 0) * width + R_SMSG] += Fp::ONE);
+    breaks("leaf", &|t| t.values[row_of(T_ENT1, 0) * width + COL_DATA] += Fp::ONE);
+    breaks("leaf register", &|t| t.values[row_of(T_ENT1, 0) * width + R_SIDX] += Fp::ONE);
+    breaks("key hash kept", &|t| t.values[row_of(T_CM0, 0) * width + R_KH] += Fp::ONE);
+    breaks("key's seed", &|t| t.values[row_of(T_PKH1, 0) * width + R_SEED] += Fp::ONE);
+    breaks("key's height", &|t| t.values[row_of(T_PKH1, 0) * width + R_KHEIGHT] += Fp::ONE);
+    breaks("key's root", &|t| t.values[row_of(T_PKH0, 0) * width + R_PKROOT] += Fp::ONE);
+    // No row of the signature's old kind is taken.
+    breaks("a fragment row", &|t| {
+        let at = row_of(T_SP, 1) * width;
+        t.values[at + T_SP] = Fp::ZERO;
+        t.values[at + T_MSG_START] = Fp::ONE;
+    });
 }
 
 #[test]
@@ -1708,7 +1744,8 @@ fn forged_segments_fail() {
     let o = &mut inflated.txs[0].outputs[0].output;
     o.commitment = crate::output::key_commitment(&o.key_hash, o.amount + 1_000_000);
     assert!(std::panic::catch_unwind(|| BlockAir::generate_trace(&inflated)).is_err());
-    // A wrong message means the signature chains do not reach the key.
+    // A wrong message is one nobody signed: no such entry is in the
+    // block's signed set.
     let mut wrong_msg = w.clone();
     wrong_msg.txs[2].message[0] += Fp::ONE;
     assert!(std::panic::catch_unwind(|| BlockAir::generate_trace(&wrong_msg)).is_err());

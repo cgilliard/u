@@ -14,9 +14,12 @@
 //! no harm, so a segment proven for transactions that have since gone
 //! into another's block still serves for the rest.
 
+use std::collections::HashMap;
+
 use crate::hash::Digest;
 use crate::poseidon2::{DIGEST, Fp, compress};
-use crate::sig_air::SLOTS;
+use crate::sig_air::{self, SLOTS};
+use crate::xmss::{PublicKey, Signature};
 
 /// Levels of the tree inside one segment's entries.
 pub const SEGMENT_LEVELS: usize = SLOTS.trailing_zeros() as usize;
@@ -77,12 +80,20 @@ impl Path {
 
 /// The signed set of a block: its segments' entries, and the tree over
 /// them, kept whole where it is not empty.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignedSet {
     /// `levels[0]` is the leaves that there are, in whole segments;
     /// each level above is half as long, rounded up.
     levels: Vec<Vec<Digest>>,
     empty: [Digest; DEPTH + 1],
+    /// Where each entry is first.
+    places: HashMap<[u32; DIGEST], u32>,
+}
+
+impl Default for SignedSet {
+    fn default() -> SignedSet {
+        SignedSet::new(&[])
+    }
 }
 
 impl SignedSet {
@@ -100,7 +111,13 @@ impl SignedSet {
             let above = below.chunks(2).map(|pair| compress(&pair[0], pair.get(1).unwrap_or(&empty[h]))).collect();
             levels.push(above);
         }
-        SignedSet { levels, empty }
+        let mut places = HashMap::new();
+        for (at, entry) in levels[0].iter().enumerate() {
+            if *entry != NO_ENTRY {
+                places.entry(entry.map(|x| x.to_canonical())).or_insert(at as u32);
+            }
+        }
+        SignedSet { levels, empty, places }
     }
 
     /// The set's root: of nothing, the empty tree's.
@@ -129,7 +146,51 @@ impl SignedSet {
 
     /// The first leaf holding `entry`, if one does.
     pub fn find(&self, entry: &Digest) -> Option<u32> {
-        self.levels[0].iter().position(|e| e == entry).map(|at| at as u32)
+        self.places.get(&entry.map(|x| x.to_canonical())).copied()
+    }
+}
+
+/// A signature to be checked: the key, the message and the signature.
+pub type Signing = (PublicKey, Digest, Signature);
+
+/// Rows of a signature segment as [`Signed::pack`] fills one: a main
+/// network's segment.
+pub const SEGMENT_LOG_ROWS: usize = 15;
+
+/// A block's signatures, as its signature segments take them, and the
+/// set they make.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Signed {
+    /// What each signature segment checks, in order.
+    pub segments: Vec<Vec<Signing>>,
+    pub set: SignedSet,
+}
+
+impl Signed {
+    /// Packs `signings` into segments in their order: as many to a
+    /// segment as it has slots and rows for. Nothing is checked here;
+    /// a signature that does not verify is refused when its segment's
+    /// trace is made.
+    pub fn pack(signings: Vec<Signing>) -> Signed {
+        let rows = (1usize << SEGMENT_LOG_ROWS) - 1;
+        let mut segments: Vec<Vec<Signing>> = Vec::new();
+        let mut used = rows;
+        for signing in signings {
+            let needs = sig_air::rows(signing.0.height());
+            if segments.last().is_none_or(|s| s.len() == SLOTS) || used + needs > rows {
+                segments.push(Vec::new());
+                used = 0;
+            }
+            used += needs;
+            segments.last_mut().expect("there is one").push(signing);
+        }
+        let entries: Vec<[Digest; SLOTS]> = segments.iter().map(|s| Self::entries(s)).collect();
+        Signed { segments, set: SignedSet::new(&entries) }
+    }
+
+    /// What a segment that checks `signings` says: its entries.
+    pub fn entries(signings: &[Signing]) -> [Digest; SLOTS] {
+        core::array::from_fn(|j| signings.get(j).map_or(NO_ENTRY, |(pk, msg, sig)| sig_air::entry(pk, msg, sig.index)))
     }
 }
 

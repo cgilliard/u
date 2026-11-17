@@ -142,7 +142,7 @@ jobs:
           - aggregate::tree_tests::spanning_transaction_roundtrip
           - aggregate::tree_tests::the_chain_connects_only_proven_blocks
           - aggregate::tree_tests::write_fam_chain_proof
-          - block_air::circuit_tests::a_replaced_permutation_is_caught_where_it_is_used
+          - sig_air::tests::a_replaced_permutation_is_caught_where_it_is_used
           - block_air::circuit_tests::the_block_circuit_has_no_unintended_freedom
           - block_air::circuit_tests::the_circuit_agrees_with_the_chain_on_random_blocks
           - chain_verifier::tests::write_fam_verifier

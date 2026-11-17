@@ -243,6 +243,13 @@ impl Air for SigAir {
     }
 }
 
+/// The fewest rows, as a power of two, that hold these signatures and
+/// a row of padding.
+pub fn log_rows(signed: &[(PublicKey, Digest, Signature)]) -> usize {
+    let rows: usize = signed.iter().map(|(pk, _, _)| rows(pk.height())).sum();
+    (rows + 1).next_power_of_two().trailing_zeros().max(1) as usize
+}
+
 impl SigAir {
     /// The trace checking each signature in turn, of `2^log_n` rows.
     /// The generator refuses a signature that does not verify.
@@ -472,6 +479,44 @@ mod tests {
             !(unused && f.cells.iter().all(|(c, _)| *c < crate::poseidon2_air::NUM_COLS))
         });
         assert!(lines.is_empty(), "{} freedoms:\n{}", lines.len(), lines.join("\n"));
+    }
+
+    /// The hash permutation of each load and step row of a signature,
+    /// replaced by an honest permutation of another input: every active
+    /// chain step notices (a signature chain is linked step to step),
+    /// and no pass or load row does, whose permutation the hash machine
+    /// does not use.
+    #[test]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
+    fn a_replaced_permutation_is_caught_where_it_is_used() {
+        let s = vec![signed(9, 4, 5, msg(70))];
+        let trace = SigAir::generate_trace(&s, log_rows(&s));
+        let public = said(&s);
+        let perm_cols = crate::poseidon2_air::NUM_COLS;
+        let other =
+            crate::poseidon2_air::Poseidon2Air::generate_trace(&[core::array::from_fn(|i| Fp::new(77 + i as u32))]);
+        let mut by_kind = std::collections::BTreeMap::<String, (usize, usize)>::new();
+        for r in 0..trace.height() {
+            let kind = if trace.row(r)[T_LOAD] == Fp::ONE {
+                "T_LOAD"
+            } else if trace.row(r)[T_STEP] == Fp::ONE {
+                if trace.row(r)[COLS.active()] == Fp::ONE { "T_STEP active" } else { "T_STEP pass" }
+            } else {
+                continue;
+            };
+            let mut bad = trace.clone();
+            bad.values[r * bad.width..r * bad.width + perm_cols].copy_from_slice(&other.row(0)[..perm_cols]);
+            let caught = check_constraints(&SigAir, &bad, &public).is_err();
+            let e = by_kind.entry(kind.to_string()).or_default();
+            e.0 += 1;
+            if !caught {
+                e.1 += 1;
+            }
+        }
+        let active = by_kind["T_STEP active"];
+        assert!(active.0 > 0 && active.1 == 0, "active steps that miss a replaced permutation: {by_kind:?}");
+        let (pass, load) = (by_kind["T_STEP pass"], by_kind["T_LOAD"]);
+        assert_eq!((pass.1, load.1), (pass.0, load.0), "unused permutations seen: {by_kind:?}");
     }
 
     #[test]

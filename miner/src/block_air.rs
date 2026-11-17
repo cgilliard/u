@@ -32,6 +32,8 @@
 //! The circuit itself is not here yet.
 
 use crate::block::BlockOutput;
+use std::sync::Arc;
+
 use crate::error::Error;
 use crate::field::Field;
 use crate::hash::{DOM_BODY, DOM_COMMITMENT, DOM_INPUTS, DOM_NAME_OPS, DOM_OUTPUTS, DOM_PUBKEY, DOM_SWEEPS, Digest};
@@ -43,6 +45,7 @@ use crate::output::{Commitment, MEMO_LEN, Output, Sig, amount_fps};
 use crate::policy::{Cond, CondWitness, LEAF_CONDS, POLICY_DEPTH, PolicyInput};
 use crate::poseidon2::{DIGEST, Fp, RATE, WIDTH, permute};
 use crate::poseidon2_air::{COL_INPUT, COL_OUTPUT};
+use crate::signed::{Signed, Signing};
 use crate::stark::{Air, Builder, Trace};
 use crate::store::backend::Backend;
 use crate::store::partial::Partial;
@@ -140,7 +143,13 @@ pub const T_CVM: usize = HM_COLS + 53;
 pub const T_RB0: usize = HM_COLS + 54;
 pub const T_RB1: usize = HM_COLS + 55;
 pub const T_RB2: usize = HM_COLS + 56;
-const NUM_TYPES: usize = 57;
+/// A signature looked up in the block's signed set ([`crate::signed`]):
+/// the key hash compressed with the message, that with the signing
+/// leaf's index, and the path from that entry to the set's root.
+pub const T_ENT0: usize = HM_COLS + 57;
+pub const T_ENT1: usize = HM_COLS + 58;
+pub const T_SP: usize = HM_COLS + 59;
+const NUM_TYPES: usize = 60;
 // ---- xmss fragment ----
 pub const XCOLS: XCols = XCols::new(HM_COLS + NUM_TYPES);
 pub const XTYPES: XTypes = XTypes {
@@ -275,7 +284,22 @@ pub const R_CSP: usize = R_SSP + WIDTH;
 pub const C_CEND: usize = R_CSP + WIDTH;
 /// Plain inputs done and a policy input left.
 pub const C_GO_POL: usize = C_CEND + 1;
-pub const NUM_COLS: usize = C_GO_POL + 1;
+// ---- a signature, looked up ----
+/// The key of the signature being looked up: its seed and height (its
+/// root is `R_PKROOT`), and the leaf of it that signed. Free entering
+/// the key hash's first row.
+pub const R_SEED: usize = C_GO_POL + 1;
+pub const R_KHEIGHT: usize = R_SEED + PUB_SEED_LEN;
+pub const R_SIDX: usize = R_KHEIGHT + 1;
+/// The key's hash, from the row after it is made.
+pub const R_KH: usize = R_SIDX + 1;
+/// Levels of the path left after this row's, and whether none is.
+pub const R_SPN: usize = R_KH + DIGEST;
+pub const C_SP_LAST: usize = R_SPN + 1;
+pub const C_SP_INV: usize = C_SP_LAST + 1;
+/// The last row of a path.
+pub const C_SP_END: usize = C_SP_INV + 1;
+pub const NUM_COLS: usize = C_SP_END + 1;
 
 // ---- public values ----
 pub const PUB_ROOT_IN: usize = 0;
@@ -294,7 +318,10 @@ pub const PUB_CARRY_IN: usize = PUB_SUM_OUT + LIMBS;
 pub const PUB_CARRY_OUT: usize = PUB_CARRY_IN + CARRY_LEN;
 /// The block's height: the creation height of every output.
 pub const PUB_HEIGHT: usize = PUB_CARRY_OUT + CARRY_LEN;
-pub const NUM_PUBLIC: usize = PUB_HEIGHT + 1;
+/// The root of the block's signed set: every signature the segment
+/// rests on is shown to be under it.
+pub const PUB_SIGNED: usize = PUB_HEIGHT + 1;
+pub const NUM_PUBLIC: usize = PUB_SIGNED + DIGEST;
 
 /// Layout of a carry: open flag, message, body sponge, items left.
 pub const CARRY_OPEN: usize = 0;
@@ -305,14 +332,18 @@ pub const CARRY_OUT_LEFT: usize = CARRY_IN_LEFT + 1;
 pub const CARRY_OPS_LEFT: usize = CARRY_OUT_LEFT + 1;
 pub const CARRY_LEN: usize = CARRY_OPS_LEFT + 1;
 
-/// Rows of one input (signature plus commitment, tree update and body).
-/// Rows of an input whose key has `height`: its signature, key hash,
-/// commitment, leaf and list rows, the removal, and the body rows.
-pub const fn input_rows(height: usize) -> usize {
-    xmss_fragment::rows(height) + 6 + 1 + 2 * DEPTH + 2
+/// Rows of a signature looked up in the signed set: its entry's two
+/// rows and the path's.
+pub const ROWS_PER_SIGNATURE: usize = 2 + crate::signed::DEPTH;
+/// Rows of an input: its key hash, its signature looked up, its
+/// commitment, leaf and list rows, the removal, and the body rows. The
+/// same whatever the key's height: the signature itself is checked in a
+/// signature segment ([`crate::sig_air`]).
+pub const fn input_rows(_height: usize) -> usize {
+    ROWS_PER_INPUT
 }
-/// Rows of an input by the tallest key.
-pub const ROWS_PER_INPUT: usize = input_rows(crate::xmss::MAX_HEIGHT);
+/// Rows of an input.
+pub const ROWS_PER_INPUT: usize = ROWS_PER_SIGNATURE + 6 + 1 + 2 * DEPTH + 2;
 /// Rows of one output.
 pub const ROWS_PER_OUTPUT: usize = 9 + 2 * DEPTH;
 /// Extra rows of an output in a policy input's covered run.
@@ -341,9 +372,7 @@ pub fn policy_rows(p: &PolicyInput) -> usize {
         .witness
         .iter()
         .filter_map(|w| match w {
-            CondWitness::Signatures(s) => {
-                Some(s.iter().map(|s| xmss_fragment::rows(s.pubkey.height()) + 3).sum::<usize>())
-            }
+            CondWitness::Signatures(s) => Some(s.len() * (ROWS_PER_SIGNATURE + 3)),
             _ => None,
         })
         .sum();
@@ -613,6 +642,8 @@ pub struct SegmentPublic {
     pub carry_in: Carry,
     pub carry_out: Carry,
     pub height: u32,
+    /// The root of the block's signed set.
+    pub signed: Digest,
 }
 
 impl SegmentPublic {
@@ -640,6 +671,7 @@ impl SegmentPublic {
         self.carry_in.write(&mut v[PUB_CARRY_IN..PUB_CARRY_IN + CARRY_LEN]);
         self.carry_out.write(&mut v[PUB_CARRY_OUT..PUB_CARRY_OUT + CARRY_LEN]);
         v[PUB_HEIGHT] = Fp::new(self.height);
+        v[PUB_SIGNED..PUB_SIGNED + DIGEST].copy_from_slice(&self.signed);
         v
     }
 
@@ -668,6 +700,7 @@ impl SegmentPublic {
             carry_in: Carry::from_values(&v[PUB_CARRY_IN..PUB_CARRY_IN + CARRY_LEN])?,
             carry_out: Carry::from_values(&v[PUB_CARRY_OUT..PUB_CARRY_OUT + CARRY_LEN])?,
             height: v[PUB_HEIGHT].to_canonical(),
+            signed: digest(PUB_SIGNED),
         })
     }
 
@@ -827,10 +860,16 @@ impl Air for BlockAir {
         let op_list = l[T_OP_LIST];
         let done = l[T_DONE];
         let resume = l[T_RESUME];
+        let (ent0, ent1, sp) = (l[T_ENT0], l[T_ENT1], l[T_SP]);
+        let (spn, sp_last, sp_end) = (l[R_SPN], l[C_SP_LAST], l[C_SP_END]);
         let active = l[XCOLS.active()];
         let msg: [F; DIGEST] = core::array::from_fn(|i| l[R_MSG + i]);
         let smsg: [F; DIGEST] = core::array::from_fn(|i| l[R_SMSG + i]);
+        // No signature is checked here: each is looked up in the block's
+        // signed set. The fragment's columns stay for what else reads
+        // them (its bits and its sibling), and its rows never come.
         xmss_fragment::eval(b, &XCOLS, &XTYPES, &smsg, n[T_PKH0]);
+        b.assert_zero(msg_start + msg_abs + load + step + leaf + tree_start + tree_abs);
 
         // machine op mapping
         b.assert_eq(
@@ -875,7 +914,7 @@ impl Air for BlockAir {
         b.assert_eq(l[COL_LOAD], load);
         b.assert_eq(l[COL_CHAIN], step * active);
         b.assert_eq(l[COL_PASS], step * (one - active) + tx_end + done + resume + pstart + pend);
-        b.assert_zero(l[COL_COMPRESS]);
+        b.assert_eq(l[COL_COMPRESS], ent0 + ent1 + sp);
         b.when_first_row(one - tx_start - resume);
         b.when_last_row(one - done);
 
@@ -932,7 +971,7 @@ impl Air for BlockAir {
             disp,
             tx_start + body_in1 + out_end * (one - inrun) + op_list + resume + rb2 + cvm * (one - cvn_zero),
         );
-        b.when_transition(disp * (one - in_zero) * (one - nt(T_MSG_START) - nt(T_DONE)));
+        b.when_transition(disp * (one - in_zero) * (one - nt(T_PKH0) - nt(T_DONE)));
         let go_pol = l[C_GO_POL];
         b.assert_eq(go_pol, in_zero * pol_left);
         b.when_transition(disp * go_pol * (one - nt(T_PSTART) - nt(T_DONE)));
@@ -954,10 +993,24 @@ impl Air for BlockAir {
         b.when_last_row(open - pubv(PUB_CARRY_OUT + CARRY_OPEN));
         b.when_transition(tx_end * (one - nt(T_TX_START) - nt(T_DONE)));
         b.when_transition(done * (one - nt(T_DONE)));
-        // input tail (the signature rows are the fragment's)
+        // A signature: the key's hash, its entry, and the entry's path
+        // through the signed set; then on with the input, or into the
+        // signers of a policy.
         b.when_transition(pkh0 * (one - nt(T_PKH1)));
-        b.when_transition(pkh1 * (one - pin) * (one - nt(T_CM0)));
-        b.when_transition(pkh1 * pin * (one - nt(T_PSIG)));
+        b.when_transition(pkh1 * (one - nt(T_ENT0)));
+        b.when_transition(ent0 * (one - nt(T_ENT1)));
+        b.when_transition(ent1 * (one - nt(T_SP)));
+        b.when_transition((sp - sp_end) * (one - nt(T_SP)));
+        b.when_transition(sp_end * (one - pin) * (one - nt(T_CM0)));
+        b.when_transition(sp_end * pin * (one - nt(T_PSIG)));
+        // The path's length: as many rows as the set's tree has levels.
+        b.assert_zero(sp_last * sp_last - sp_last);
+        b.assert_zero(sp_last * spn);
+        b.assert_eq(spn * l[C_SP_INV], one - sp_last);
+        b.assert_eq(sp_end, sp * sp_last);
+        b.when_transition(ent1 * (n[R_SPN] - F::from_u32((crate::signed::DEPTH - 1) as u32)));
+        b.when_transition((sp - sp_end) * (n[R_SPN] - spn + one));
+        b.when_transition((one - ent1 - sp + sp_end) * n[R_SPN]);
         b.when_transition(cm0 * (one - nt(T_CM1)));
         b.when_transition(cm1 * (one - nt(T_ILEAF)));
         b.when_transition(ileaf * (one - nt(T_ILEAF2)));
@@ -983,12 +1036,12 @@ impl Air for BlockAir {
         b.when_transition(body_out2 * n[C_LEVEL]);
         // is_out: 1 from ocm0 until the output ends, 0 on inputs and tx start
         b.assert_zero(ocm0 * (one - is_out));
-        b.assert_zero(msg_start * is_out);
+        b.assert_zero(pkh0 * is_out);
         b.assert_zero(tx_start * is_out);
-        b.when_transition((one - nt(T_OCM0) - nt(T_MSG_START) - nt(T_TX_START)) * (n[R_IS_OUT] - is_out));
+        b.when_transition((one - nt(T_OCM0) - nt(T_PKH0) - nt(T_TX_START)) * (n[R_IS_OUT] - is_out));
         // item counters
-        b.when_transition(nt(T_MSG_START) * (one - n[R_PIN]) * (n[R_IN_LEFT] - in_left + one));
-        b.when_transition((one - nt(T_MSG_START) * (one - n[R_PIN]) - nt(T_TX_START)) * (n[R_IN_LEFT] - in_left));
+        b.when_transition(nt(T_PKH0) * (one - n[R_PIN]) * (n[R_IN_LEFT] - in_left + one));
+        b.when_transition((one - nt(T_PKH0) * (one - n[R_PIN]) - nt(T_TX_START)) * (n[R_IN_LEFT] - in_left));
         b.when_transition(nt(T_OCM0) * (n[R_OUT_LEFT] - out_left + one));
         b.when_transition((one - nt(T_OCM0) - nt(T_TX_START)) * (n[R_OUT_LEFT] - out_left));
         b.when_transition(nt(T_OP_BODY) * (n[R_OPS_LEFT] - ops_left + one));
@@ -1015,14 +1068,19 @@ impl Air for BlockAir {
 
         // ---------------- registers: amount bits ----------------
         b.mark("amount registers");
-        let pub_seed: [F; PUB_SEED_LEN] = core::array::from_fn(|i| l[XCOLS.pub_seed(i)]);
+        let pub_seed: [F; PUB_SEED_LEN] = core::array::from_fn(|i| l[R_SEED + i]);
+        // The key looked up: free where its hash begins, held after.
+        for reg in R_SEED..R_KH {
+            b.when_transition((one - nt(T_PKH0)) * (n[reg] - l[reg]));
+        }
+        b.assert_zero((ent0 + ent1) * l[COL_DIR]);
         let abits: [F; AMOUNT_BITS] = core::array::from_fn(|i| l[R_ABITS + i]);
         let (mut amt_lo, mut amt_mid, mut amt_hi) = (F::ZERO, F::ZERO, F::ZERO);
         let mut l16 = [F::ZERO; LIMBS];
         for (i, bit) in abits.iter().enumerate() {
             b.assert_zero(*bit * *bit - *bit);
             b.when_transition(
-                (one - nt(T_MSG_START) * (one - n[R_PIN]) - nt(T_OCM0) - nt(T_PSTART)) * (n[R_ABITS + i] - *bit),
+                (one - nt(T_PKH0) * (one - n[R_PIN]) - nt(T_OCM0) - nt(T_PSTART)) * (n[R_ABITS + i] - *bit),
             );
             if i < 30 {
                 amt_lo += *bit * pow2::<F>(i);
@@ -1038,8 +1096,7 @@ impl Air for BlockAir {
             b.when_transition((one - nt(T_TX_START)) * (n[R_MSG + i] - msg[i]));
             b.when_transition((one - nt(T_OCM0)) * (n[R_OCM + i] - l[R_OCM + i]));
             b.when_transition(
-                (one - nt(T_OCM0) - nt(T_MSG_START) * (one - n[R_PIN]) - nt(T_PSTART))
-                    * (n[R_MEMO + i] - l[R_MEMO + i]),
+                (one - nt(T_OCM0) - nt(T_PKH0) * (one - n[R_PIN]) - nt(T_PSTART)) * (n[R_MEMO + i] - l[R_MEMO + i]),
             );
             // Leaves: the commitment just hashed and the memo, compressed,
             // then that digest compressed with the creation height: the
@@ -1058,9 +1115,18 @@ impl Air for BlockAir {
             // The operation digest is a witness entering its first row.
             b.when_transition((one - nt(T_OP_BODY)) * (n[R_OPD + i] - l[R_OPD + i]));
             b.assert_zero((olist2 + body_out2) * (l[COL_DATA + i] - l[R_MEMO + i]));
-            // pkroot: set entering pkh0 from the tree root, else copied
-            b.when_transition(nt(T_PKH0) * (n[R_PKROOT + i] - l[COL_ACC + i]));
+            // pkroot: the key's root, free entering pkh0, else copied
             b.when_transition((one - nt(T_PKH0)) * (n[R_PKROOT + i] - l[R_PKROOT + i]));
+            // The key's hash, kept from the row after it is made.
+            b.when_transition(nt(T_ENT0) * (n[R_KH + i] - l[COL_ACC + i]));
+            b.when_transition((one - nt(T_ENT0)) * (n[R_KH + i] - l[R_KH + i]));
+            // The entry: the key hash with the message signed, and that
+            // with the leaf that signed; and its path ends at the root
+            // of the block's signed set.
+            b.assert_zero(ent0 * (l[COL_DATA + i] - smsg[i]));
+            let index_word = if i == 0 { l[R_SIDX] } else { F::ZERO };
+            b.assert_zero(ent1 * (l[COL_DATA + i] - index_word));
+            b.assert_zero(sp_end * (l[COL_ACC + i] - pubv(PUB_SIGNED + i)));
         }
 
         // ---------------- key hash and commitment ----------------
@@ -1068,8 +1134,8 @@ impl Air for BlockAir {
         let cap_pk = cap_const::<F>(DOM_PUBKEY, (DIGEST + PUB_SEED_LEN + 1) as u32);
         let cap_cm = cap_const::<F>(DOM_COMMITMENT, (DIGEST + 3) as u32);
         for i in 0..RATE {
-            b.when_transition(nt(T_PKH0) * (n[COL_INPUT + i] - l[COL_ACC + i]));
-            b.when_transition(nt(T_CM0) * (one - n[R_PIN]) * (n[COL_INPUT + i] - l[COL_ACC + i]));
+            b.assert_zero(pkh0 * (l[COL_INPUT + i] - l[R_PKROOT + i]));
+            b.when_transition(nt(T_CM0) * (one - n[R_PIN]) * (n[COL_INPUT + i] - n[R_KH + i]));
             b.when_transition(nt(T_CM0) * n[R_PIN] * (n[COL_INPUT + i] - n[R_PROOT + i]));
             b.assert_zero(pkh0 * (l[COL_INPUT + RATE + i] - cap_pk[i]));
             b.assert_zero(cm0 * (l[COL_INPUT + RATE + i] - cap_cm[i]));
@@ -1077,10 +1143,10 @@ impl Air for BlockAir {
             // hash a free witness, so the amount summed is the one it hides.
             b.assert_zero(ocm0 * (l[COL_INPUT + RATE + i] - cap_cm[i]));
             b.assert_zero(ocm1 * (l[COL_ACC + i] - l[R_OCM + i]));
-            // The key hash covers the tree height: the fragment's for now.
+            // The key hash covers the tree height.
             let pkh1_data = match i {
                 _ if i < PUB_SEED_LEN => pub_seed[i],
-                PUB_SEED_LEN => xmss_fragment::height_value(l, &XCOLS),
+                PUB_SEED_LEN => l[R_KHEIGHT],
                 _ => F::ZERO,
             };
             b.assert_zero(pkh1 * (l[COL_DATA + i] - pkh1_data));
@@ -1237,12 +1303,11 @@ impl Air for BlockAir {
         // (`rebind` is only ever set within a policy input.)
         for i in 0..DIGEST {
             b.assert_zero((one - pin) * (smsg[i] - msg[i]));
-            b.assert_zero(msg_abs * (one - rebind) * (smsg[i] - msg[i]));
-            b.assert_zero(msg_abs * rebind * (smsg[i] - l[R_RMSG + i]));
+            b.assert_zero(ent0 * (one - rebind) * (smsg[i] - msg[i]));
+            b.assert_zero(ent0 * rebind * (smsg[i] - l[R_RMSG + i]));
         }
         // A rebindable signature's leaf index is the state number.
-        let idx = (0..crate::xmss::MAX_HEIGHT).fold(F::ZERO, |a, i| a + l[XCOLS.idx(i)] * pow2::<F>(i));
-        b.assert_zero(msg_start * rebind * (idx - pstate));
+        b.assert_zero(ent1 * rebind * (l[R_SIDX] - pstate));
         // The covered run: counters loaded at the start, zero for a
         // transaction without a policy input, moving as outputs begin.
         for reg in [R_CVB, R_CVN] {
@@ -1372,11 +1437,11 @@ impl Air for BlockAir {
         b.when_transition(pp0 * (one - nt(T_PP1)));
         b.when_transition(pp1 * (one - nt(T_PP2)));
         b.when_transition(pp2 * (one - nt(T_PP3)));
-        b.when_transition(pp3 * (one - srem_zero) * (one - nt(T_MSG_START)));
+        b.when_transition(pp3 * (one - srem_zero) * (one - nt(T_PKH0)));
         b.when_transition(pp3 * srem_zero * (one - nt(T_PEND)));
-        b.when_transition(psig * (one - srem_zero) * (one - nt(T_MSG_START)));
+        b.when_transition(psig * (one - srem_zero) * (one - nt(T_PKH0)));
         b.when_transition(psig * srem_zero * (one - nt(T_PEND)));
-        b.when_transition(nt(T_PSIG) * (one - pkh1));
+        b.when_transition(nt(T_PSIG) * (one - sp_end));
         b.when_transition(pend * (one - nt(T_CM0)));
         b.when_transition(out_end * inrun * (one - nt(T_CVC)));
         b.when_transition(cvc * (one - nt(T_CVM)));
@@ -1440,7 +1505,7 @@ impl Air for BlockAir {
             // Covenant: the covered digest the register holds.
             b.assert_zero(outs * (blk - l[R_COV + i]));
             // Signers: the key hash just computed, into the signers sponge.
-            b.when_transition(nt(T_PSIG) * (n[COL_INPUT + i] - n[R_SSP + i] - l[COL_ACC + i]));
+            b.when_transition(nt(T_PSIG) * (n[COL_INPUT + i] - n[R_SSP + i] - n[R_KH + i]));
             b.assert_zero(psig * (l[COL_INPUT + RATE + i] - l[R_SSP + RATE + i]));
             // Policy path: compress the node with its sibling by the index
             // bit, starting from the leaf sponge's digest (the last leaf row
@@ -1644,6 +1709,9 @@ pub struct SegmentWitness {
     pub nsp_in: [Fp; WIDTH],
     pub pos_in: u64,
     pub txs: Vec<TxWitness>,
+    /// The signatures of the whole block, as its signature segments
+    /// take them, and their set: where this segment's are looked up.
+    pub signed: Arc<Signed>,
 }
 
 /// A run of one transaction's items, `start..end` in input, output then
@@ -1828,7 +1896,12 @@ impl SegmentWitness {
                     ends: part.end == n_in + n_pol + n_out + n_ops,
                 });
             }
-            out_segments.push(SegmentWitness { height, root_in, isp_in, osp_in, nsp_in, pos_in, txs: out });
+            let signed = Arc::default();
+            out_segments.push(SegmentWitness { height, root_in, isp_in, osp_in, nsp_in, pos_in, txs: out, signed });
+        }
+        let signed = Arc::new(Signed::pack(SegmentWitness::signings(&out_segments)));
+        for segment in &mut out_segments {
+            segment.signed = signed.clone();
         }
         Ok(out_segments)
     }
@@ -1857,6 +1930,24 @@ impl SegmentWitness {
     /// Trace rows before padding; a trace needs at least one more.
     pub fn num_rows(&self) -> usize {
         self.txs.iter().map(TxWitness::num_rows).sum()
+    }
+
+    /// Every signature these segments rest on, in their order: each
+    /// input's over its transaction's body, and each of a policy
+    /// input's signers' over the body or the rebindable message.
+    pub fn signings(segments: &[SegmentWitness]) -> Vec<Signing> {
+        let mut out = Vec::new();
+        for tx in segments.iter().flat_map(|s| &s.txs) {
+            out.extend(tx.inputs.iter().map(|i| (i.pubkey, tx.message, i.signature.clone())));
+            if let Some(p) = &tx.policy {
+                let message = if p.rebind_channel().is_some() { p.rmsg } else { tx.message };
+                for wit in &p.input.witness {
+                    let CondWitness::Signatures(signers) = wit else { continue };
+                    out.extend(signers.iter().map(|s| (s.pubkey, message, s.signature.clone())));
+                }
+            }
+        }
+        out
     }
 }
 
@@ -1927,6 +2018,12 @@ struct Regs {
     ksp: [Fp; WIDTH],
     ssp: [Fp; WIDTH],
     csp: [Fp; WIDTH],
+    // a signature looked up
+    seed: [Fp; PUB_SEED_LEN],
+    kheight: u32,
+    sidx: u64,
+    kh: Digest,
+    spn: u32,
 }
 
 impl Regs {
@@ -1954,6 +2051,14 @@ impl Regs {
 
     /// Everything but the signature fragment's registers.
     fn write_rest(&self, row: &mut [Fp]) {
+        row[R_SEED..R_SEED + PUB_SEED_LEN].copy_from_slice(&self.seed);
+        row[R_KHEIGHT] = Fp::new(self.kheight);
+        row[R_SIDX] = Fp::from_u64(self.sidx);
+        row[R_KH..R_KH + DIGEST].copy_from_slice(&self.kh);
+        row[R_SPN] = Fp::new(self.spn);
+        row[C_SP_LAST] = Fp::new((self.spn == 0) as u32);
+        row[C_SP_INV] = if self.spn == 0 { Fp::ZERO } else { Fp::new(self.spn).inverse().unwrap() };
+        row[C_SP_END] = Fp::new((self.spn == 0) as u32) * row[T_SP];
         row[C_LEVEL] = Fp::new(self.level);
         let diff = Fp::new(self.level) - Fp::new((DEPTH - 1) as u32);
         let is_last = diff.is_zero();
@@ -2091,6 +2196,8 @@ struct Gen {
     regs: Regs,
     /// The block's height: every output's creation height.
     height: u32,
+    /// The block's signed set, where signatures are looked up.
+    signed: Arc<Signed>,
 }
 
 impl Gen {
@@ -2182,39 +2289,10 @@ impl Gen {
         r.amount = w.amount;
         r.is_out = false;
         r.in_left -= 1;
-        let msg = r.smsg;
 
-        // the signature
-        let mut xr = self.regs.xmss.clone();
-        let regs = &self.regs;
-        let root = xmss_fragment::generate(
-            &mut self.b,
-            &mut xr,
-            &XCOLS,
-            &XTYPES,
-            &msg,
-            &w.signature,
-            &w.pubkey,
-            &mut |row, _| regs.write_rest(row),
-        );
-        self.regs.xmss = xr;
-        self.regs.pkroot = root;
-
-        // key hash and commitment
-        let mut input = [Fp::ZERO; WIDTH];
-        input[..RATE].copy_from_slice(&root);
-        input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_PUBKEY, (DIGEST + PUB_SEED_LEN + 1) as u32));
-        self.b.start(input);
-        {
-            let row = self.b.last_row_mut();
-            row[T_PKH0] = Fp::ONE;
-            self.regs.write(row);
-        }
-        let mut seed_block = [Fp::ZERO; RATE];
-        seed_block[..PUB_SEED_LEN].copy_from_slice(&ps);
-        seed_block[PUB_SEED_LEN] = Fp::new(w.pubkey.height as u32);
-        self.absorb(seed_block, T_PKH1);
-        let pkh = self.b.acc();
+        // the signature, looked up
+        let root = w.pubkey.root;
+        let pkh = self.signature_rows(&w.signature, &w.pubkey);
         let mut input = [Fp::ZERO; WIDTH];
         input[..RATE].copy_from_slice(&pkh);
         input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_COMMITMENT, (DIGEST + 3) as u32));
@@ -2263,11 +2341,11 @@ impl Gen {
         self.regs.lsp = out;
     }
 
-    /// The key hash rows after a signature: the fragment's root hashed with
-    /// the public seed and tree height. Returns the key hash.
-    fn key_hash_rows(&mut self, root: Digest, pk: &PublicKey) -> Digest {
+    /// The key hash rows: the key's root hashed with its public seed
+    /// and tree height. Returns the key hash.
+    fn key_hash_rows(&mut self, pk: &PublicKey) -> Digest {
         let mut input = [Fp::ZERO; WIDTH];
-        input[..RATE].copy_from_slice(&root);
+        input[..RATE].copy_from_slice(&pk.root);
         input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_PUBKEY, (DIGEST + PUB_SEED_LEN + 1) as u32));
         self.b.start(input);
         {
@@ -2282,17 +2360,41 @@ impl Gen {
         self.b.acc()
     }
 
-    /// One signature's rows: the fragment, then the key hash rows.
+    /// One signature's rows: the key hash, the entry a signature
+    /// segment says of it, and the entry's path through the block's
+    /// signed set. Returns the key hash. Whether the signature verifies
+    /// is its signature segment's to say; here it must be in the set.
     fn signature_rows(&mut self, sig: &Sig, pk: &PublicKey) -> Digest {
         let msg = self.regs.smsg;
-        let mut xr = self.regs.xmss.clone();
-        let regs = &self.regs;
-        let root = xmss_fragment::generate(&mut self.b, &mut xr, &XCOLS, &XTYPES, &msg, sig, pk, &mut |row, _| {
-            regs.write_rest(row)
-        });
-        self.regs.xmss = xr;
-        self.regs.pkroot = root;
-        self.key_hash_rows(root, pk)
+        self.regs.pkroot = pk.root;
+        self.regs.seed = pk.pub_seed;
+        self.regs.kheight = pk.height as u32;
+        self.regs.sidx = sig.index;
+        let pkh = self.key_hash_rows(pk);
+        self.regs.kh = pkh;
+        let entry = crate::sig_air::entry_of(&pkh, &msg, sig.index);
+        let signed = self.signed.clone();
+        let leaf = signed.set.find(&entry);
+        crate::stark::refuse(leaf.is_some(), "a signature is not in the block's signed set");
+        let path = signed.set.path(leaf.unwrap_or(0));
+        let mut index = [Fp::ZERO; DIGEST];
+        index[0] = Fp::from_u64(sig.index);
+        for (ty, data) in [(T_ENT0, msg), (T_ENT1, index)] {
+            self.b.compress(data, false);
+            let row = self.b.last_row_mut();
+            row[ty] = Fp::ONE;
+            self.regs.write(row);
+        }
+        debug_assert_eq!(self.b.acc(), entry);
+        for (level, sibling) in path.siblings.iter().enumerate() {
+            self.regs.spn = (crate::signed::DEPTH - 1 - level) as u32;
+            self.b.compress(*sibling, (path.leaf >> level) & 1 == 1);
+            let row = self.b.last_row_mut();
+            row[T_SP] = Fp::ONE;
+            self.regs.write(row);
+        }
+        crate::stark::refuse(self.b.acc() == signed.set.root(), "the path does not reach the signed set's root");
+        pkh
     }
 
     fn policy(&mut self, w: &PolicyWitness) {
@@ -2708,8 +2810,13 @@ impl BlockAir {
             ksp: [Fp::ZERO; WIDTH],
             ssp: [Fp::ZERO; WIDTH],
             csp: [Fp::ZERO; WIDTH],
+            seed: [Fp::ZERO; PUB_SEED_LEN],
+            kheight: 0,
+            sidx: 0,
+            kh: EMPTY,
+            spn: 0,
         };
-        let mut g = Gen { b: HashTraceBuilder::new(NUM_COLS), regs, height: w.height };
+        let mut g = Gen { b: HashTraceBuilder::new(NUM_COLS), regs, height: w.height, signed: w.signed.clone() };
         let mut carry_in = Carry::CLOSED;
         let mut carry_out = Carry::CLOSED;
         let parts = w.txs.len();
@@ -2837,6 +2944,7 @@ impl BlockAir {
             sum_out: g.regs.sum_out,
             carry_in,
             carry_out,
+            signed: w.signed.set.root(),
         };
         let n = (g.b.len() + 1).max(min_rows).next_power_of_two();
         while g.b.len() < n {
@@ -2967,6 +3075,7 @@ mod tests {
             carry_in: Carry::CLOSED,
             carry_out: Carry { open: true, msg: digest(rng), bsp: state(rng), in_left: 3, out_left: 0, ops_left: 1 },
             height: 77,
+            signed: digest(rng),
         }
     }
 
@@ -2984,7 +3093,8 @@ mod tests {
         assert_eq!((v[PUB_POS_OUT], v[PUB_POS_OUT + 1]), (Fp::new((1 << 30) - 1), Fp::new((1 << 11) - 1)));
         assert_eq!(v[PUB_HEIGHT], Fp::new(77));
         assert_eq!(v[PUB_CARRY_OUT + CARRY_IN_LEFT], Fp::new(3));
-        assert_eq!(NUM_PUBLIC, 2 * DIGEST + 6 * WIDTH + 4 + 2 * LIMBS + 2 * CARRY_LEN + 1);
+        assert_eq!(v[PUB_SIGNED..PUB_SIGNED + DIGEST], p.signed);
+        assert_eq!(NUM_PUBLIC, 2 * DIGEST + 6 * WIDTH + 4 + 2 * LIMBS + 2 * CARRY_LEN + 1 + DIGEST);
         // Every value is someone's: changing any changes what is read,
         // or makes it nothing.
         for i in 0..NUM_PUBLIC {
@@ -3129,12 +3239,12 @@ mod tests {
         }
         // By rows, a transaction split between segments: the sums of
         // what was spent and made come out the same.
-        let segments = SegmentWitness::collect_by_rows(&snap, &txs, 1 << 12, 2).unwrap();
+        let segments = SegmentWitness::collect_by_rows(&snap, &txs, 1 << 9, 2).unwrap();
         assert!(segments.len() >= 2, "{} segments", segments.len());
         let (mut spent, mut made, mut root) = (0u128, 0u128, snap.root());
         for seg in &segments {
-            let (trace, public) = BlockAir::generate_trace_padded(seg, 12);
-            assert_eq!(trace.height(), 1 << 12);
+            let (trace, public) = BlockAir::generate_trace_padded(seg, 9);
+            assert_eq!(trace.height(), 1 << 9);
             assert_eq!(check_constraints(&BlockAir, &trace, &public.to_values()), Ok(()));
             assert_eq!(public.root_in, root);
             root = public.root_out;
