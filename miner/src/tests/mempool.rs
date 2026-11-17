@@ -76,10 +76,6 @@ fn spend(tag: u32, amount: u64, fee: u64) -> Vec<u8> {
     spend_at(tag, &[u64::from(tag) - 1], amount, fee, 100)
 }
 
-fn id_of(bytes: &[u8]) -> Digest {
-    TransactionRef::from_bytes(bytes).unwrap().txid()
-}
-
 fn none() -> (HashMap<Commitment, Vec<u64>>, HashMap<Commitment, u64>) {
     (HashMap::new(), HashMap::new())
 }
