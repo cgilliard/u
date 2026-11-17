@@ -23,6 +23,7 @@ pub mod hash_table;
 #[path = "tests/inflate.rs"]
 pub mod inflate;
 pub mod logger;
+pub mod mempool;
 pub mod merkle;
 pub mod miner;
 pub mod name;

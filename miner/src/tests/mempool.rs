@@ -1,0 +1,462 @@
+//! Tests of the pool, against a state that is three tables in memory;
+//! and what it costs to take the transactions of full blocks.
+
+use std::time::Instant;
+
+use super::*;
+use crate::output::{Output, commitment};
+use crate::poseidon2::Fp;
+use crate::transaction::UnsignedTransaction;
+use crate::xmss::{PublicKey, SecretKey};
+
+/// A state: what the pool asks of one, from tables.
+#[derive(Default)]
+struct Fake {
+    outputs: HashMap<u64, (Commitment, u32, bool)>,
+    commits: HashMap<u64, (Digest, u32)>,
+    names: HashMap<Key, Record>,
+}
+
+impl Ledger for Fake {
+    fn output(&self, position: u64) -> Result<Option<(Commitment, u32, bool)>, Error> {
+        Ok(self.outputs.get(&position).copied())
+    }
+
+    fn commit(&self, position: u64) -> Result<Option<(Digest, u32)>, Error> {
+        Ok(self.commits.get(&position).copied())
+    }
+
+    fn name(&self, key: Key) -> Result<Option<Record>, Error> {
+        Ok(self.names.get(&key).copied())
+    }
+
+    fn commits_up_to(&self, height: u32) -> Result<Vec<u64>, Error> {
+        let mut found: Vec<u64> = self.commits.iter().filter(|(_, c)| c.1 <= height).map(|(p, _)| *p).collect();
+        found.sort_unstable();
+        Ok(found)
+    }
+}
+
+impl Fake {
+    /// An unspent output of `amount` to key `tag`, at `position`.
+    fn fund(&mut self, position: u64, tag: u32, amount: u64) {
+        self.outputs.insert(position, (commitment(&pk(tag), amount), 0, true));
+    }
+}
+
+fn key(tag: u32) -> SecretKey {
+    let mut seed = [0u8; 32];
+    seed[..4].copy_from_slice(&tag.to_le_bytes());
+    SecretKey::generate(&seed)
+}
+
+fn pk(tag: u32) -> PublicKey {
+    key(tag).public_key()
+}
+
+fn d(n: u32) -> Digest {
+    core::array::from_fn(|i| Fp::new(n + i as u32))
+}
+
+/// A transaction of key `tag` spending an output of `amount` at each of
+/// `positions`, all but `fee` paid to key `to`.
+fn spend_at(tag: u32, positions: &[u64], amount: u64, fee: u64, to: u32) -> Vec<u8> {
+    let mut k = key(tag);
+    let inputs = positions.iter().map(|_| (k.public_key(), amount)).collect();
+    let total = amount * positions.len() as u64;
+    let mut tx =
+        UnsignedTransaction::new(inputs, vec![Output::new(&pk(to), total - fee)]).sign(|_, _, m| k.sign(m)).unwrap();
+    tx.set_positions(positions);
+    tx.to_bytes()
+}
+
+/// A transaction spending `amount` from key `tag` to key 100 with `fee`,
+/// the output of key `tag` being at position `tag - 1`.
+fn spend(tag: u32, amount: u64, fee: u64) -> Vec<u8> {
+    spend_at(tag, &[u64::from(tag) - 1], amount, fee, 100)
+}
+
+fn id_of(bytes: &[u8]) -> Digest {
+    TransactionRef::from_bytes(bytes).unwrap().txid()
+}
+
+fn none() -> (HashMap<Commitment, Vec<u64>>, HashMap<Commitment, u64>) {
+    (HashMap::new(), HashMap::new())
+}
+
+/// Two unspent outputs with one commitment (one key hash, one amount)
+/// are two outputs: spending one does not conflict with spending the
+/// other, a transaction may spend both, and a conflict is a second
+/// spend of the same position.
+#[test]
+fn outputs_sharing_a_commitment_are_told_apart() {
+    let mut state = Fake::default();
+    state.fund(0, 1, 500);
+    state.fund(1, 1, 500);
+    let mut pool = Mempool::with_policy(1 << 20, Policy::NONE);
+    // (Paid to a key by its first position: the id covers neither
+    // positions nor signatures, so these differ only by output.)
+    pool.insert(&spend_at(1, &[0], 500, 5, 100), &state, 1, 0).unwrap();
+    pool.insert(&spend_at(1, &[1], 500, 5, 101), &state, 1, 0).unwrap();
+    assert_eq!(pool.len(), 2);
+    // A second spend of position 0 conflicts with the first.
+    let again = spend_at(1, &[0], 500, 6, 100);
+    assert!(matches!(pool.insert(&again, &state, 1, 0), Err(Reject::ReplacementFee { .. })));
+    // Both at once is no duplicate; the same position twice is.
+    let mut other = Mempool::with_policy(1 << 20, Policy::NONE);
+    other.insert(&spend_at(1, &[0, 1], 500, 5, 100), &state, 1, 0).unwrap();
+    assert_eq!(other.insert(&spend_at(1, &[1, 1], 500, 5, 101), &state, 1, 0), Err(Reject::Malformed));
+}
+
+/// A reorganization that replays an output at a new position: the
+/// transaction spending it leaves the pool for the shelf, and comes
+/// back spending it where it now is.
+#[test]
+fn shelved_transactions_follow_their_outputs() {
+    let mut state = Fake::default();
+    state.fund(0, 1, 1000);
+    let mut pool = Mempool::with_policy(1 << 20, Policy::NONE);
+    let id = pool.insert(&spend(1, 1000, 5), &state, 1, 0).unwrap();
+    // The block that made it is replaced: the output is gone from
+    // position 0, and nothing says where it is.
+    let made = state.outputs.remove(&0).unwrap();
+    let (moved, created) = none();
+    assert_eq!(pool.revalidate(&state, 1, &moved, &created, 0), Ok((1, 0)));
+    assert!(pool.is_empty());
+    // The new branch makes it again at position 2.
+    state.outputs.insert(2, made);
+    let moved = HashMap::from([(made.0, vec![2u64])]);
+    assert_eq!(pool.revalidate(&state, 1, &moved, &created, 0), Ok((0, 1)));
+    let back: Vec<u64> = pool.get(&id).unwrap().spent_positions().collect();
+    assert_eq!(back, [2]);
+    // Its id and its signature are what they were.
+    assert!(pool.get(&id).unwrap().verify_signatures());
+    assert_eq!(pool.get(&id).unwrap().txid(), id);
+}
+
+/// A transaction that has waited its time is dropped, and its id is
+/// refused for as long again.
+#[test]
+fn transactions_expire_and_stay_refused() {
+    let mut state = Fake::default();
+    state.fund(0, 1, 1000);
+    let mut pool = Mempool::with_policy(1 << 20, Policy { expiry_secs: 100, ..Policy::NONE });
+    let tx = spend(1, 1000, 5);
+    let id = pool.insert(&tx, &state, 1, 1000).unwrap();
+    assert!(pool.expire(1050).is_empty());
+    assert_eq!(pool.expire(1100), [id]);
+    assert!(pool.is_empty());
+    assert_eq!(pool.expired().count(), 1);
+    assert_eq!(pool.insert(&tx, &state, 1, 1150), Err(Reject::Expired));
+    assert_eq!(pool.insert(&tx, &state, 1, 1200), Ok(id));
+    // And what the pool forgets with time.
+    pool.expire(1201);
+    assert_eq!(pool.expired().count(), 0);
+}
+
+/// A full pool takes what pays more than its lowest and drops that; what
+/// it then asks rises past what it dropped, and falls back with time.
+/// The oldest are spared.
+#[test]
+fn the_admission_minimum_rises_decays_and_spares_the_oldest() {
+    let mut state = Fake::default();
+    for tag in 1..=8 {
+        state.fund(u64::from(tag) - 1, tag, 100_000);
+    }
+    let size = spend(1, 100_000, 1000).len();
+    // Room for three, and nothing spared.
+    let mut pool = Mempool::with_policy(3 * size + size / 2, Policy { protect_bytes: 0, ..Policy::NONE });
+    let a = pool.insert(&spend(1, 100_000, 1000), &state, 1, 0).unwrap();
+    let b = pool.insert(&spend(2, 100_000, 2000), &state, 1, 0).unwrap();
+    let c = pool.insert(&spend(3, 100_000, 3000), &state, 1, 0).unwrap();
+    assert_eq!(pool.admission_fee(0), 0);
+    // What pays less than the lowest is not worth dropping it for.
+    assert_eq!(pool.insert(&spend(4, 100_000, 500), &state, 1, 0), Err(Reject::Full));
+    let e = pool.insert(&spend(5, 100_000, 5000), &state, 1, 0).unwrap();
+    assert!(!pool.contains(&a) && pool.contains(&b) && pool.contains(&c) && pool.contains(&e));
+    // The minimum is up: past what the dropped one paid.
+    let asked = pool.admission_fee(0);
+    assert!(asked > 0 && u128::from(asked) * size as u128 > 1000, "{asked}");
+    assert!(matches!(pool.insert(&spend(6, 100_000, 1), &state, 1, 0), Err(Reject::FeeTooLow { .. })));
+    // And down again, with time.
+    assert!(pool.admission_fee(HALF_LIFE_SECS) < asked);
+    assert_eq!(pool.admission_fee(1000 * HALF_LIFE_SECS), 0);
+
+    // With the oldest spared: the first stays though it pays the least.
+    let mut pool = Mempool::with_policy(3 * size + size / 2, Policy { protect_bytes: size, ..Policy::NONE });
+    let a = pool.insert(&spend(1, 100_000, 1), &state, 1, 0).unwrap();
+    let b = pool.insert(&spend(2, 100_000, 2000), &state, 1, 0).unwrap();
+    let c = pool.insert(&spend(3, 100_000, 3000), &state, 1, 0).unwrap();
+    assert!(pool.is_protected(&a) && !pool.is_protected(&b));
+    let e = pool.insert(&spend(5, 100_000, 5000), &state, 1, 0).unwrap();
+    assert!(pool.contains(&a) && !pool.contains(&b) && pool.contains(&c) && pool.contains(&e));
+}
+
+/// A block's reserve goes to the longest-waiting, whatever they pay;
+/// the rest by what they pay a byte, the most first.
+#[test]
+fn the_aged_reserve_goes_to_the_longest_waiting() {
+    let mut state = Fake::default();
+    for tag in 1..=3 {
+        state.fund(u64::from(tag) - 1, tag, 100_000);
+    }
+    let mut pool = Mempool::with_policy(1 << 20, Policy::NONE);
+    let old = pool.insert(&spend(1, 100_000, 10), &state, 1, 1).unwrap();
+    let low = pool.insert(&spend(2, 100_000, 5000), &state, 1, 2).unwrap();
+    let high = pool.insert(&spend(3, 100_000, 9000), &state, 1, 3).unwrap();
+    let size = pool.entry(&old).unwrap().size();
+    let ids = |chosen: Vec<TransactionRef<'_>>| chosen.iter().map(|tx| tx.txid()).collect::<Vec<_>>();
+    assert_eq!(ids(pool.select(&state, 2, 0, size, |_| true)), [old, high, low]);
+    assert_eq!(ids(pool.select(&state, 2, 0, 0, |_| true)), [high, low, old]);
+    // Only while they fit.
+    assert_eq!(ids(pool.select(&state, 2, 0, size, |chosen| chosen.len() <= 2)), [old, high]);
+    assert_eq!(pool.reserve_wait(0), 1);
+}
+
+/// What is not a spend the state allows is refused, each for its reason;
+/// one that pays enough more replaces what it conflicts with; and the
+/// pool follows the chain.
+#[test]
+fn pool_validates_replaces_and_revalidates() {
+    let mut state = Fake::default();
+    for tag in 1..=6 {
+        state.fund(u64::from(tag) - 1, tag, 1_000_000);
+    }
+    let mut pool = Mempool::with_policy(1 << 20, Policy::NONE);
+    assert_eq!(pool.insert(b"not a transaction", &state, 1, 0), Err(Reject::Malformed));
+    assert_eq!(pool.insert(&vec![0u8; MAX_TX_SIZE + 1], &state, 1, 0), Err(Reject::TooLarge(MAX_TX_SIZE + 1)));
+    // Outputs of more than the inputs.
+    let mut k = key(1);
+    let over = UnsignedTransaction::new(vec![(k.public_key(), 1_000_000)], vec![Output::new(&pk(100), 2_000_000)])
+        .sign(|_, _, m| k.sign(m))
+        .unwrap();
+    assert_eq!(pool.insert(&over.to_bytes(), &state, 1, 0), Err(Reject::NegativeFee));
+    // An output that is not there, one of another amount, one spent.
+    assert_eq!(pool.insert(&spend(50, 1_000_000, 5), &state, 1, 0), Err(Reject::UnknownInput(49)));
+    assert_eq!(pool.insert(&spend(1, 2_000_000, 5), &state, 1, 0), Err(Reject::UnknownInput(0)));
+    state.outputs.get_mut(&5).unwrap().2 = false;
+    assert_eq!(pool.insert(&spend(6, 1_000_000, 5), &state, 1, 0), Err(Reject::UnknownInput(5)));
+    // Signed by a key that is not the output's.
+    let mut other = key(2);
+    let forged = UnsignedTransaction::new(vec![(pk(1), 1_000_000)], vec![Output::new(&pk(100), 999_000)])
+        .sign(|_, _, m| other.sign(m))
+        .unwrap();
+    assert_eq!(pool.insert(&forged.to_bytes(), &state, 1, 0), Err(Reject::BadSignature));
+    assert!(pool.is_empty());
+
+    // What the main network's policy asks besides.
+    let mut strict = Mempool::new(1 << 20);
+    assert!(matches!(strict.insert(&spend(1, 1_000_000, 0), &state, 1, 0), Err(Reject::FeeTooLow { .. })));
+    assert_eq!(strict.insert(&spend(1, 1_000_000, 999_999), &state, 1, 0), Err(Reject::Dust { min: DUST }));
+
+    // Taken once; and replaced by what pays enough more.
+    let first = spend(1, 1_000_000, 100);
+    let id = pool.insert(&first, &state, 1, 0).unwrap();
+    assert_eq!(pool.insert(&first, &state, 1, 0), Err(Reject::Known));
+    let min = 100 + REPLACEMENT_FEE_PER_BYTE * first.len() as u64;
+    assert_eq!(pool.insert(&spend(1, 1_000_000, min - 1), &state, 1, 0), Err(Reject::ReplacementFee { min }));
+    let second = pool.insert(&spend(1, 1_000_000, min), &state, 1, 0).unwrap();
+    assert!(!pool.contains(&id) && pool.contains(&second));
+    assert_eq!((pool.len(), pool.ids()), (1, vec![second]));
+
+    // Its input spent by a block that makes its output: it has confirmed.
+    let paid = pool.get(&second).unwrap().outputs().get(0).commitment;
+    state.outputs.get_mut(&0).unwrap().2 = false;
+    let (moved, _) = none();
+    let created = HashMap::from([(paid, 600u64)]);
+    assert_eq!(pool.revalidate(&state, 2, &moved, &created, 700), Ok((1, 0)));
+    assert!(pool.is_empty() && pool.bytes() == 0);
+    assert_eq!(pool.confirmed().count(), 1);
+    // That block undone: it is back.
+    state.outputs.get_mut(&0).unwrap().2 = true;
+    let (moved, created) = none();
+    assert_eq!(pool.revalidate(&state, 1, &moved, &created, 700), Ok((0, 1)));
+    assert!(pool.contains(&second));
+}
+
+/// A reveal is pooled for the commit it names, while the name is free
+/// and the commit not past its time; a name is one transaction's; and a
+/// block takes a reveal only in its window.
+#[test]
+fn name_operations_are_checked_claimed_and_selected() {
+    let mut state = Fake::default();
+    state.fund(0, 1, 1_000_000);
+    state.fund(1, 2, 1_000_000);
+    let record = Record::new(b"alice", d(10), d(20), d(30)).unwrap();
+    let salt = d(40);
+    let hash = commit_hash(&name_hash(&record.elements()), &salt, &record.owner);
+    state.commits.insert(50, (hash, 10));
+    let reveal = |tag: u32, salt: Digest, commit: u64| {
+        let mut k = key(tag);
+        let ops = vec![NameOp::Reveal { record, salt, commit }];
+        let outputs = vec![Output::new(&pk(100), 999_000)];
+        let mut tx = UnsignedTransaction::with_ops(vec![(k.public_key(), 1_000_000)], outputs, ops)
+            .sign(|_, _, m| k.sign(m))
+            .unwrap();
+        tx.set_positions(&[u64::from(tag) - 1]);
+        tx.to_bytes()
+    };
+    let mut pool = Mempool::with_policy(1 << 20, Policy::NONE);
+    assert_eq!(pool.insert(&reveal(1, d(41), 50), &state, 20, 0), Err(Reject::Name(NameReject::NoCommit)));
+    assert_eq!(pool.insert(&reveal(1, salt, 51), &state, 20, 0), Err(Reject::Name(NameReject::NoCommit)));
+    let past = 10 + MAX_REVEAL + 1;
+    assert_eq!(pool.insert(&reveal(1, salt, 50), &state, past, 0), Err(Reject::Name(NameReject::Expired(10))));
+    let id = pool.insert(&reveal(1, salt, 50), &state, 20, 0).unwrap();
+    assert_eq!(pool.entry(&id).unwrap().claims, [Claim::Name(record.key()), Claim::Commit(50)]);
+    // The name and the commit are that transaction's.
+    assert_eq!(pool.insert(&reveal(2, salt, 50), &state, 20, 0), Err(Reject::NameConflict));
+    // A block takes it once its commit has waited.
+    assert!(pool.select(&state, 15, 12, 0, |_| true).is_empty());
+    assert_eq!(pool.select(&state, 22, 12, 0, |_| true).len(), 1);
+    // What may be swept: commits past their time.
+    assert!(Mempool::sweeps(&state, 100).is_empty());
+    assert_eq!(Mempool::sweeps(&state, past), [50]);
+    // The name registered by another: the reveal leaves the pool.
+    state.names.insert(record.key(), record);
+    let (moved, created) = none();
+    assert_eq!(pool.revalidate(&state, 23, &moved, &created, 0), Ok((1, 0)));
+    assert!(pool.is_empty());
+    assert_eq!(pool.insert(&reveal(2, salt, 50), &state, 23, 0), Err(Reject::Name(NameReject::Registered)));
+}
+
+/// The estimate is the lowest rate at which nearly all confirmed in
+/// time; and there is none until enough have been seen.
+#[test]
+fn estimates_follow_what_confirmed() {
+    let mut pool = Mempool::with_policy(1 << 20, Policy::NONE);
+    assert_eq!(pool.estimate(TARGET_BLOCK, 1000), None);
+    for _ in 0..30 {
+        pool.remember_confirmed(50, 100, 1000);
+    }
+    assert_eq!(pool.estimate(TARGET_BLOCK, 1000), Some(50));
+    // A lower rate that did not make it in time is not suggested.
+    for _ in 0..30 {
+        pool.remember_confirmed(20, 5000, 1000);
+    }
+    assert_eq!(pool.estimate(TARGET_BLOCK, 1000), Some(50));
+    // Given longer, it did.
+    assert_eq!(pool.estimate(TARGET_DAY, 1000), Some(20));
+    // An empty pool asks only its minimum.
+    assert_eq!(pool.suggest(TARGET_BLOCK, 5000, 1000), 0);
+}
+
+/// What the pool costs, for the transactions of full blocks: a block of
+/// the main network holds some 10,900 of them (two and a half inputs and
+/// as many outputs each), so a node sees about 18 a second and, with
+/// what it refuses, perhaps 40.
+/// `cargo test --release --lib mempool::tests::throughput -- --ignored --nocapture`
+/// (`TABMINER_MEMPOOL_TXS` sets how many are made, 2,000 unless given.)
+#[test]
+#[ignore = "a benchmark: run with --release"]
+fn throughput() {
+    /// What a node sees a second with full blocks, the refused included.
+    const SEEN: f64 = 40.0;
+    let n: usize = std::env::var("TABMINER_MEMPOOL_TXS").ok().and_then(|s| s.parse().ok()).unwrap_or(2000);
+    let policy = Policy::MAINNET;
+    let mut state = Fake::default();
+    let to = pk(u32::MAX);
+    // Transactions of two or three inputs and three or two outputs, each
+    // of a key of its own, paying from twice to fifty times the floor;
+    // and for every tenth another, signed by a key that is not its
+    // outputs'.
+    let t = Instant::now();
+    let mut txs: Vec<Vec<u8>> = Vec::with_capacity(n);
+    let mut forged: Vec<Vec<u8>> = Vec::new();
+    let made = |state: &mut Fake, i: usize, signer: u32| {
+        let k = key(i as u32 + 1);
+        let mut signer = key(signer);
+        let (ins, outs) = (2 + i % 2, 3 - i % 2);
+        let amount = 1_000_000_000u64;
+        let positions: Vec<u64> = (0..ins).map(|j| (4 * i + j) as u64).collect();
+        for p in &positions {
+            state.outputs.insert(*p, (commitment(&k.public_key(), amount), 0, true));
+        }
+        let fee = policy.min_fee(ins, outs) * (2 + i as u64 % 49);
+        let each = (amount * ins as u64 - fee) / outs as u64;
+        let outputs = (0..outs).map(|_| Output::new(&to, each)).collect();
+        let mut tx = UnsignedTransaction::new(vec![(k.public_key(), amount); ins], outputs)
+            .sign(|_, _, m| signer.sign(m))
+            .unwrap();
+        tx.set_positions(&positions);
+        tx.to_bytes()
+    };
+    for i in 0..n {
+        txs.push(made(&mut state, i, i as u32 + 1));
+    }
+    for i in (0..n).step_by(10) {
+        forged.push(made(&mut state, n + i, 1));
+    }
+    let bytes: usize = txs.iter().map(Vec::len).sum();
+    println!("\n  {n} transactions made in {:.1?}: {} bytes each on average", t.elapsed(), bytes / n);
+    let line = |what: &str, count: usize, took: std::time::Duration| {
+        let rate = count as f64 / took.as_secs_f64();
+        println!(
+            "  {what:<34} {rate:>10.0} a second ({:>7.1} us each): {:>6.0} times what is seen, {:.2}% of a core for it",
+            took.as_secs_f64() * 1e6 / count as f64,
+            rate / SEEN,
+            100.0 * SEEN / rate
+        );
+    };
+
+    // Taken: read, looked up, their signatures checked, and pooled.
+    let mut pool = Mempool::with_policy(DEFAULT_CAPACITY, policy);
+    let t = Instant::now();
+    for tx in &txs {
+        pool.insert(tx, &state, 1, 0).unwrap();
+    }
+    line("taken", n, t.elapsed());
+    assert_eq!((pool.len(), pool.bytes()), (n, bytes));
+    // Refused: already there; spending what is not there; badly signed.
+    let t = Instant::now();
+    for tx in &txs {
+        assert_eq!(pool.insert(tx, &state, 1, 0), Err(Reject::Known));
+    }
+    line("refused: already pooled", n, t.elapsed());
+    let (nothing, mut empty) = (Fake::default(), Mempool::with_policy(DEFAULT_CAPACITY, policy));
+    let t = Instant::now();
+    for tx in &txs {
+        assert!(matches!(empty.insert(tx, &nothing, 1, 0), Err(Reject::UnknownInput(_))));
+    }
+    line("refused: nothing to spend", n, t.elapsed());
+    let t = Instant::now();
+    for tx in &forged {
+        assert_eq!(empty.insert(tx, &state, 1, 0), Err(Reject::BadSignature));
+    }
+    line("refused: badly signed", forged.len(), t.elapsed());
+
+    // A pool with room for a quarter of them, given the least paying
+    // first: all but the first quarter push another out.
+    let mut order: Vec<&Vec<u8>> = txs.iter().collect();
+    let paying = |tx: &Vec<u8>| {
+        let tx = TransactionRef::from_bytes(tx).unwrap();
+        rate(tx.balance() as u64, tx.size())
+    };
+    order.sort_by_key(|tx| paying(tx));
+    let mut small = Mempool::with_policy(bytes / 4, Policy { protect_bytes: 0, ..policy });
+    let t = Instant::now();
+    let mut taken = 0;
+    for tx in &order {
+        taken += usize::from(small.insert(tx, &state, 1, 0).is_ok());
+    }
+    line("taken by a full pool", n, t.elapsed());
+    println!("    ({taken} taken, {} held at the end; it asks {} a byte)", small.len(), small.admission_fee(0));
+
+    // A block: a tenth of them confirmed, the pool looked over; and the
+    // next block's chosen.
+    let created: HashMap<Commitment, u64> = HashMap::new();
+    let moved: HashMap<Commitment, Vec<u64>> = HashMap::new();
+    for tx in txs.iter().step_by(10) {
+        for p in TransactionRef::from_bytes(tx).unwrap().spent_positions() {
+            state.outputs.get_mut(&p).unwrap().2 = false;
+        }
+    }
+    let t = Instant::now();
+    let (gone, back) = pool.revalidate(&state, 2, &moved, &created, 600).unwrap();
+    let took = t.elapsed();
+    println!("  after a block, a pool of {n} looked over in {took:.1?}: {gone} gone, {back} back");
+    assert_eq!((gone, back), (n.div_ceil(10), 0));
+    let t = Instant::now();
+    let chosen = pool.select(&state, 2, 0, RESERVE_BYTES, |chosen| chosen.len() <= 10_878);
+    println!("  a block's transactions chosen in {:.1?}: {} of {}", t.elapsed(), chosen.len(), pool.len());
+    assert_eq!(chosen.len(), pool.len().min(10_878));
+}

@@ -30,6 +30,7 @@ BENCHES=(
     store::state::tests::cost_at_scale
     aggregate::tree_tests::dev_block_timing
     name_air::tests::mainnet_name_segment_timing
+    mempool::tests::throughput
 )
 
 out=target/bench
