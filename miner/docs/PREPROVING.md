@@ -214,26 +214,33 @@ is a saving to look for afterwards, and not part of this.
    signature segment is filled with them is the fragment's business as
    it is in a transaction segment today.
 
-## 6. What a miner does with it
+## 6. What it gives miners reason to do
 
 What is left to prove after the parent is known still takes a miner
-time, more for a block with more in it. A miner must never have to
-choose between hashing sooner and taking fees, or it will choose to
-hash sooner and blocks will be empty.
+time, more for a block with more in it. A miner that waited for that
+proof before hashing would lose a share of every block's reward to it,
+and would do better to leave the transactions out. The design is sound
+only if a miner has no reason to do that, and it has none:
 
-So a miner makes two blocks on each parent. The first is of its reward
-and nothing else, ready as soon as the root, the wrap and the chain's
-step are proven; it hashes on that. Beside it, it proves the block of
-its waiting transactions, and when that is ready it hashes on that
-instead. Taking transactions then costs it no hashing, and gains it
-their fees from the moment the second block is ready.
+A miner that is after fees makes two blocks on each parent. The first
+is of its reward and nothing else, ready as soon as the root, the wrap
+and the chain's step are proven; it hashes on that. Beside it, it
+proves the block of its waiting transactions, and when that is ready it
+hashes on that instead. Taking transactions then costs it no hashing,
+and gains it their fees from the moment the second block is ready.
 
-The network's cost is the blocks found before the second is ready,
-which hold nothing: the share of them is the share of the block time
-that the second block takes longer than the first. That is what a
-miner's hardware buys down.
+So what the rules reward is: taking transactions; proving signatures as
+they arrive; and hardware that makes the second block ready sooner,
+since the blocks a miner finds before then earn it no fees.
 
-This is the miner's business and not consensus.
+The network's cost is those blocks, which hold nothing: their share is
+the share of the block time by which the second block is later than the
+first. Where blocks are not full, what they would have held waits for
+the next.
+
+This node does not mine so. It is the reference: it proves one block
+and hashes on it. A pool that wants the fees of large blocks will build
+the rest, and nothing in consensus is in its way.
 
 ## 7. Order of work
 
