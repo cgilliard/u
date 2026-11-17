@@ -23,4 +23,4 @@ pub const TARGET: [u64; 4] = [0, 0, 0, 1099511627776];
 /// Expected hashes per block at that target.
 pub const HASHES_PER_BLOCK: u64 = 65535;
 /// The genesis block id, as `tabminer show` prints it.
-pub const ID: &str = "0dc1f07685a7671700ce9e1de42ec46e8cdb3c2c917ee245b4bbef384915fd57";
+pub const ID: &str = "88d0016b13301e6eff66c96d608d226a99f6973add52502cf655be0d6353a825";

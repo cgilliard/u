@@ -24,6 +24,9 @@
 
 use core::fmt;
 
+use crate::hash::Digest;
+use crate::poseidon2::Fp;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The bytes are not the encoding of the thing named.
@@ -165,6 +168,12 @@ pub enum Error {
     BadProof,
     /// The body of a block of the branch is not kept.
     MissingBody,
+    /// A block kept before this one on its branch came with a proof
+    /// that is not accepted: that copy of it is dropped, and this block
+    /// waits for another. The block is named by the first half of its
+    /// id ([`Error::id_half`]), which is all an error has room for and
+    /// enough to tell one block of a node's side branches from another.
+    BadProofBefore([Fp; 4]),
     /// Leaves offered for a block are not the ones its header's
     /// auxiliary bytes commit to, or its header is not known.
     AuxMismatch,
@@ -195,6 +204,13 @@ pub enum Error {
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Error {
         Error::Io(e.kind())
+    }
+}
+
+impl Error {
+    /// The half of a block's id that [`Error::BadProofBefore`] names it by.
+    pub fn id_half(id: &Digest) -> [Fp; 4] {
+        [id[0], id[1], id[2], id[3]]
     }
 }
 
@@ -260,6 +276,9 @@ impl fmt::Display for Error {
             Error::Supply => f.write_str("the block makes coins it may not"),
             Error::BadProof => f.write_str("the block's proof is not accepted"),
             Error::MissingBody => f.write_str("a block of the branch has no body kept"),
+            Error::BadProofBefore(_) => {
+                f.write_str("a block before it on its branch came with a proof that is not accepted")
+            }
             Error::AuxMismatch => f.write_str("the leaves are not the header's"),
             Error::NameOwner => f.write_str("the name's owner did not sign the update"),
             Error::NotACommit(p) => write!(f, "position {p} holds no commit"),
@@ -339,6 +358,7 @@ mod tests {
             Error::Supply,
             Error::BadProof,
             Error::MissingBody,
+            Error::BadProofBefore([Fp::ZERO; 4]),
             Error::AuxMismatch,
             Error::NameOwner,
             Error::NotACommit(4),

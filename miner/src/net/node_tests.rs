@@ -1044,6 +1044,36 @@ fn a_block_that_breaks_a_rule_is_refused_once() {
     assert!(!w.nodes[1].table(&at(0)).may_ask(&at(0), now));
 }
 
+/// A block kept on a side branch has its proof looked at only when the
+/// branch is tried. If it does not hold then, whoever served that block
+/// answers for it, and not whoever served the block that had the branch
+/// tried.
+#[test]
+fn a_bad_proof_on_a_side_branch_is_held_against_who_served_it() {
+    let chains: Vec<_> = (0..3).map(|_| chain_of(easy())).collect();
+    let blocks = grow(&chains[0], 2, 1);
+    let headers: Vec<Header> = blocks.iter().map(|b| *BlockRef::from_bytes(b).unwrap().header()).collect();
+    let mut w = World::with(chains, &small_runs());
+    w.nodes[2].add_peer(at(0), false, 0);
+    w.nodes[2].add_peer(at(1), false, 0);
+    w.run(2 * SECOND);
+    let now = w.now;
+    assert!(w.nodes[2].table(&at(0)).may_ask(&at(0), now) && w.nodes[2].table(&at(1)).may_ask(&at(1), now));
+    // The first came from node 0 and was kept beside the chain; the
+    // second, from node 1, had the branch tried, and the first's proof
+    // did not hold.
+    let (first, second) = (headers[0], headers[1]);
+    let bad = Error::BadProofBefore(Error::id_half(&first.hash()));
+    w.nodes[2].with_list(|n, l| n.block_applied(l, now, first, 100, Some(at(0)), Ok(Applied::Side), &mut |_, _| {}));
+    w.nodes[2].with_list(|n, l| n.block_applied(l, now, second, 100, Some(at(1)), Err(bad), &mut |_, _| {}));
+    w.run(SECOND / 10);
+    let now = w.now;
+    assert!(!w.nodes[2].table(&at(0)).may_ask(&at(0), now), "who served the bad proof is passed over");
+    assert!(w.nodes[2].table(&at(1)).may_ask(&at(1), now), "who served the good block is not");
+    // It is held against them once: the block is theirs no more.
+    w.nodes[2].with_list(|_, l| assert!(l.sides.is_empty()));
+}
+
 /// Bodies are kept only for the blocks that can be undone. A node says
 /// from where it has them, and is asked for nothing below; one too far
 /// behind for anyone's bodies has the headers and waits for the state.

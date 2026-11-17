@@ -254,23 +254,12 @@ mod tests {
         assert!(block_work(t.shift_right(1)) > block_work(t));
     }
 
-    /// Mainnet's genesis is the one the generated file names: the same
-    /// block id as the original's, so the header, the empty body's
-    /// commitment and the empty state's root are all the original's.
+    /// Mainnet's genesis is the one the generated file names.
     #[test]
     fn mainnet_genesis_matches_the_generated_file() {
         let g = ChainParams::MAINNET.genesis();
         let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
         assert_eq!(hex(&digest_to_bytes(&g.header.hash())), crate::genesis::ID);
-        // The state tree here is two levels taller than the original's,
-        // so the root of the empty state is another and the id with it.
-        // Over the original's empty root the header is the original's
-        // genesis, to the byte: its id is the one the original printed.
-        let theirs = Header { state_root: *empty(40), ..g.header };
-        assert_eq!(
-            hex(&digest_to_bytes(&theirs.hash())),
-            "f4181d63f110290d0c6f03396a826432034093171eb832361c06c61c99d03e3c"
-        );
         assert_eq!(g.header.timestamp, crate::genesis::TIMESTAMP);
         assert_eq!(hex(&g.header.nonce), crate::genesis::BITCOIN_HASH_HEX);
         assert!(crate::genesis::BITCOIN_TIME <= g.header.timestamp, "the Bitcoin block must come first");

@@ -20,6 +20,19 @@
 //! Rules 5 to 8 are of the state before the block, so they are checked
 //! when the block joins the chain, not when it arrives.
 //!
+//! # A proof is not the block's
+//!
+//! A header commits to what its block does, and not to the proof that
+//! comes with it ([`crate::block`]): a miner looks for its nonce while
+//! it makes the proof. So one block can come with one proof or another,
+//! and with what is no proof at all, from a peer that would have a node
+//! think a good block bad. A proof that is not accepted is therefore
+//! never held against the block: the copy is dropped, its header kept
+//! as a header whose body is still to come, and the block is taken when
+//! it comes with a proof that holds. The same of a proof too long for
+//! the block's size, where the rest of the body is not. Whoever sent the
+//! copy answers for it ([`crate::net::node`]).
+//!
 //! # A commit's age is checked here
 //!
 //! Which outputs are commits the state does not say, and the table that
@@ -75,7 +88,8 @@ pub enum Applied {
 /// Whether an error is the block's own fault, for good: such a block is
 /// remembered as invalid. Not so: a parent not known yet, a time ahead
 /// of the clock (later it may not be), a body that is not the header's
-/// (the header may be good, with its own body), a body not kept, the
+/// (the header may be good, with its own body), a proof that is not
+/// accepted (the block may be good, with another), a body not kept, the
 /// store failing.
 pub(crate) fn condemns(e: &Error) -> bool {
     !matches!(
@@ -83,6 +97,8 @@ pub(crate) fn condemns(e: &Error) -> bool {
         Error::UnknownParent
             | Error::TimestampTooNew { .. }
             | Error::BadBodyCommitment
+            | Error::BadProof
+            | Error::BadProofBefore(_)
             | Error::MissingBody
             | Error::NoUndoRecord
             | Error::SetAside
@@ -119,6 +135,25 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Chain<B, V> {
         // failed on. The block itself if nothing else is said.
         let mut failed: Vec<Digest> = vec![id];
         let result = self.whole()?.session(|session| self.apply_in(session, block, now, &mut failed));
+        let mut result = result;
+        if result == Err(Error::BadProof) {
+            // The copy with the proof that did not hold is dropped, and
+            // its header waits for another. If it was a block kept
+            // before this one, this one's sender is not at fault, and
+            // the caller is told which block it was: whoever sent that
+            // one is.
+            let bad = failed[0];
+            self.write_blocks(|txn, blocks| {
+                if let Some(known) = self.known_in(txn, blocks, &bad)?.filter(|k| !k.header_only() && !k.invalid()) {
+                    blocks.put_entry(txn, &Known { status: Status::HeaderOnly, ..known }.entry())?;
+                    blocks.drop_kept(txn, known.header.height, &bad)?;
+                }
+                Ok(())
+            })?;
+            if bad != id {
+                result = Err(Error::BadProofBefore(Error::id_half(&bad)));
+            }
+        }
         let status = match &result {
             Err(Error::NoUndoRecord) => Some(Status::Aside),
             Err(e) if condemns(e) => Some(Status::Invalid),
@@ -219,9 +254,14 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Chain<B, V> {
         if header.body_commitment != body.commitment() {
             return Err(Error::BadBodyCommitment);
         }
-        let size = HEADER_SIZE + body.size();
-        if size > self.params.max_block_size {
-            return Err(Error::TooLarge(size));
+        // What the header commits to is too large for good; a proof
+        // that makes it so is the copy's fault.
+        let committed = HEADER_SIZE + body.size_without_proof();
+        if committed > self.params.max_block_size {
+            return Err(Error::TooLarge(committed));
+        }
+        if HEADER_SIZE + body.size() > self.params.max_block_size {
+            return Err(Error::BadProof);
         }
         Ok(())
     }
@@ -696,19 +736,20 @@ pub(crate) mod tests {
     /// it was; the block and those after it are invalid from then on.
     #[test]
     fn a_branch_with_a_bad_block_is_not_taken() {
-        let ours = open_with(easy(), 8, Marked);
-        let theirs = open(easy());
+        let ours = open(easy());
+        // Theirs pays one unit more from the second block on: a block
+        // that is theirs and makes more than ours may.
+        let theirs = open(ChainParams { emission: &[(1, PAY), (100, PAY + 1)], ..easy() });
         let a: Vec<Vec<u8>> = (0..2).map(|i| extend(&ours, &body(&[], &[out(10 + i, PAY)]))).collect();
         let b1 = extend(&theirs, &body(&[], &[out(20, PAY)]));
-        // The second says of its own proof that it is bad; they take it.
-        let b2 = extend(&theirs, &Body { proof: b"bad".to_vec(), ..body(&[0], &[out(21, 2 * PAY)]) });
-        let b3 = extend(&theirs, &body(&[], &[out(22, PAY)]));
-        let b4 = extend(&theirs, &body(&[], &[out(23, PAY)]));
+        let b2 = extend(&theirs, &body(&[0], &[out(21, 2 * PAY + 1)]));
+        let b3 = extend(&theirs, &body(&[], &[out(22, PAY + 1)]));
+        let b4 = extend(&theirs, &body(&[], &[out(23, PAY + 1)]));
         let before = (ours.tip().unwrap(), ours.state().root(), ours.state().file().space().0);
         assert_eq!(apply(&ours, &b1), Ok(Applied::Side));
         assert_eq!(apply(&ours, &b2), Ok(Applied::Side));
         // With the third the branch has more work, and is tried.
-        assert_eq!(apply(&ours, &b3), Err(Error::BadProof));
+        assert_eq!(apply(&ours, &b3), Err(Error::Supply));
         assert_eq!((ours.tip().unwrap(), ours.state().root()), (before.0, before.1));
         assert_eq!(ours.header_at(2).unwrap(), Some(header_of(&a[1])));
         assert_eq!(status(&ours, &b1), Some(Status::HeaderValid));
@@ -719,6 +760,72 @@ pub(crate) mod tests {
         assert_eq!(status(&ours, &b4), Some(Status::Invalid));
         // The chain goes on.
         extend(&ours, &body(&[1], &[out(12, 2 * PAY)]));
+    }
+
+    /// A proof that is not accepted is the copy's fault and not the
+    /// block's: the header commits to what the block does, so the same
+    /// block may come again with a proof that holds, and is taken then.
+    /// So of a block at the end of the chain, of one kept on a branch
+    /// until the branch is tried, and of a proof too long for a block.
+    #[test]
+    fn a_bad_proof_is_not_held_against_the_block() {
+        let with_proof = |bytes: &[u8], proof: &[u8]| {
+            let mut block = Block::from_bytes(bytes).unwrap();
+            block.body.proof = proof.to_vec();
+            block.to_bytes()
+        };
+        let ours = open_with(easy(), 8, Marked);
+        let theirs = open(easy());
+        // At the end of the chain: refused, nothing kept and nothing
+        // remembered against it, and taken with another proof.
+        let a1 = block(&ours, &body(&[], &[out(10, PAY)]));
+        let bad = with_proof(&a1, b"bad");
+        assert_eq!(header_of(&bad), header_of(&a1));
+        let before = (ours.tip().unwrap(), ours.state().root());
+        assert_eq!(apply(&ours, &bad), Err(Error::BadProof));
+        assert_eq!(apply(&ours, &bad), Err(Error::BadProof));
+        assert_eq!((ours.tip().unwrap(), ours.state().root()), before);
+        assert_eq!(status(&ours, &a1), None);
+        assert_eq!(apply(&ours, &a1), Ok(Applied::Extended));
+        // The copy with the bad proof is the block the chain has, now.
+        assert_eq!(apply(&ours, &bad), Ok(Applied::Known));
+        let a2 = extend(&ours, &body(&[], &[out(11, PAY)]));
+
+        // On a branch: kept as it came, its proof not looked at until
+        // the branch has the most work.
+        let b1 = extend(&theirs, &body(&[], &[out(20, PAY)]));
+        let b2 = extend(&theirs, &body(&[0], &[out(21, 2 * PAY)]));
+        let b3 = extend(&theirs, &body(&[], &[out(22, PAY)]));
+        let b2_bad = with_proof(&b2, b"bad");
+        let before = (ours.tip().unwrap(), ours.state().root());
+        assert_eq!(apply(&ours, &b1), Ok(Applied::Side));
+        assert_eq!(apply(&ours, &b2_bad), Ok(Applied::Side));
+        // The third's sender sent a good block, and is told which block
+        // it was. The second waits as a header for its body.
+        assert_eq!(apply(&ours, &b3), Err(Error::BadProofBefore(Error::id_half(&header_of(&b2).hash()))));
+        assert_eq!((ours.tip().unwrap(), ours.state().root()), before);
+        assert_eq!(ours.tip().unwrap(), header_of(&a2));
+        assert_eq!(status(&ours, &b1), Some(Status::HeaderValid));
+        assert_eq!(status(&ours, &b2), Some(Status::HeaderOnly));
+        assert_eq!(ours.body(&header_of(&b2).hash()).unwrap(), None);
+        assert_eq!(status(&ours, &b3), None);
+        // With its own proof it is kept again, and the branch is taken.
+        assert_eq!(apply(&ours, &b2), Ok(Applied::Side));
+        assert_eq!(apply(&ours, &b3), Ok(Applied::Reorganized { fork_height: 0, unwound: 2 }));
+        assert_eq!((ours.tip().unwrap(), ours.state().root()), (theirs.tip().unwrap(), theirs.state().root()));
+
+        // A proof that makes the block larger than a block may be, where
+        // the rest of it is not: the copy's fault too.
+        let size = |bytes: &[u8]| bytes.len();
+        let c1 = block(&theirs, &body(&[], &[out(30, PAY)]));
+        let small = open(ChainParams { max_block_size: size(&c1) + 10, ..easy() });
+        for x in [&b1, &b2, &b3] {
+            apply(&small, x).unwrap();
+        }
+        let long = with_proof(&c1, &[0; 11]);
+        assert_eq!(apply(&small, &long), Err(Error::BadProof));
+        assert_eq!(status(&small, &c1), None);
+        assert_eq!(apply(&small, &with_proof(&c1, &[0; 10])), Ok(Applied::Extended));
     }
 
     /// Names: a commit is revealed in its window and not before, swept

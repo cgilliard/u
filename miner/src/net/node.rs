@@ -160,6 +160,9 @@ struct Fetching {
 
 /// Announcements remembered: who said it had which block.
 const ANNOUNCED: usize = 256;
+/// How many blocks kept on side branches have who served them
+/// remembered: more than branches run to between two blocks that try one.
+const SIDES: usize = 256;
 
 /// Work on the chain that takes time: given to be done, and what came
 /// of it heard later ([`Applier`]).
@@ -306,8 +309,9 @@ pub(crate) struct Join {
     /// The block it is the state after.
     target: Header,
     id: Digest,
-    /// That block, whole, once fetched.
-    block: Option<Vec<u8>>,
+    /// That block, whole, once fetched, and who served it: its body is
+    /// its header's, its proof is whatever they sent.
+    block: Option<(Vec<u8>, SocketAddrV4)>,
     /// The top of the state in parts, checked against the block's
     /// header, and who served it.
     manifest: Option<(Manifest, SocketAddrV4)>,
@@ -374,6 +378,11 @@ pub(crate) struct List {
     outstanding: usize,
     /// Blocks given to be applied and not yet heard of.
     pub(crate) applying: Vec<Digest>,
+    /// Who served each block kept on a side branch, the newest last:
+    /// such a block's proof is not looked at until its branch is tried,
+    /// and if it does not hold then, it is they who answer for it
+    /// ([`SIDES`] of them, the oldest forgotten first).
+    sides: VecDeque<(Digest, SocketAddrV4)>,
     /// Bodies fetched and waiting for the blocks before them: the
     /// block whole, and who served it.
     pub(crate) held: Vec<(Digest, Vec<u8>, SocketAddrV4)>,
@@ -401,6 +410,7 @@ impl List {
             applier: Applier::Here(VecDeque::new()),
             outstanding: 0,
             applying: Vec::new(),
+            sides: VecDeque::new(),
             held: Vec::new(),
             join: None,
             fetching: Vec::new(),
@@ -1770,19 +1780,41 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 self.announce(now, header, len, from, out);
                 self.shared.post_others(self.me, Notice::Announce { header, len, except: from });
             }
-            Ok(Applied::Side) => self.shared.say(Event::Side { header, from }),
+            Ok(Applied::Side) => {
+                if let Some(from) = from {
+                    if l.sides.len() == SIDES {
+                        l.sides.pop_front();
+                    }
+                    l.sides.push_back((id, from));
+                }
+                self.shared.say(Event::Side { header, from })
+            }
             Ok(Applied::Known) => {}
             Err(e) => {
                 self.counts.blocks_refused += 1;
                 self.shared.say(Event::BlockRefused { header, from, why: e.to_string() });
-                // A body that is not the header's, or a block that
-                // breaks a rule: whoever served it answers for it.
+                // A body that is not the header's, a proof that does
+                // not hold (the block may be good, and is asked of
+                // another), or a block that breaks a rule: whoever
+                // served it answers for it.
                 if let Some(from) = from
-                    && (e == Error::BadBodyCommitment || condemns(&e))
+                    && (e == Error::BadBodyCommitment || e == Error::BadProof || condemns(&e))
                 {
                     self.tell(now, from, Notice::Strike(from));
                     self.tell(now, from, Notice::Failed(from));
                     self.tell(now, from, Notice::NotFrom(id, from));
+                }
+                // A block kept earlier on the branch, whose proof did
+                // not hold now that it was looked at: whoever served
+                // that one answers for it, and it is not asked of them
+                // again.
+                if let Error::BadProofBefore(bad) = e
+                    && let Some(at) = l.sides.iter().position(|(side, _)| Error::id_half(side) == bad)
+                    && let Some((side, served)) = l.sides.remove(at)
+                {
+                    self.tell(now, served, Notice::Strike(served));
+                    self.tell(now, served, Notice::Failed(served));
+                    self.tell(now, served, Notice::NotFrom(side, served));
                 }
             }
         }
@@ -1992,7 +2024,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 block.extend_from_slice(bytes);
                 let good = BlockRef::from_bytes(&block).is_ok_and(|b| b.body_commitment_matches());
                 if good {
-                    join.block = Some(block);
+                    join.block = Some((block, from));
                 }
                 good
             }
@@ -2040,7 +2072,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         // where the manifest says its outputs end.
         if !join.checked
             && !join.checking
-            && let (Some(block), Some((manifest, _))) = (&join.block, &join.manifest)
+            && let (Some((block, _)), Some((manifest, _))) = (&join.block, &join.manifest)
         {
             join.checking = true;
             let job = Job::Check { block: block.clone(), next: manifest.next };
@@ -2067,7 +2099,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             && !join.finishing
             && join.putting.is_empty()
             && self.chain.missing_parts().is_ok_and(|(parts, names)| parts.is_empty() && names.is_empty())
-            && let Some(block) = &join.block
+            && let Some((block, _)) = &join.block
         {
             join.finishing = true;
             let job = Job::Finish { target: join.id, body: block[HEADER_SIZE..].to_vec() };
@@ -2085,13 +2117,18 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         join.checking = false;
         match result {
             Ok(()) => join.checked = true,
-            // The block is its header's, so it is the manifest's word
-            // that failed: one peer's, unless one after another fails
-            // the same way.
+            // The block's body is its header's, but its proof is not
+            // under the header, and where its outputs end is the
+            // manifest's word: one of the two failed, and which is not
+            // known. Both are asked for again, of others, and both who
+            // served them are struck: one peer's fault, unless one
+            // after another fails the same way.
             Err(_) => {
-                if let Some((_, served)) = join.manifest.take() {
-                    join.unserved.push(served);
-                    self.tell(now, served, Notice::Strike(served));
+                let mut served: Vec<SocketAddrV4> = join.manifest.take().map(|(_, from)| from).into_iter().collect();
+                served.extend(join.block.take().map(|(_, from)| from).filter(|from| !served.contains(from)));
+                for from in served {
+                    join.unserved.push(from);
+                    self.tell(now, from, Notice::Strike(from));
                 }
                 join.refused += 1;
                 if join.refused >= self.cfg.sync.snapshot_attempts {

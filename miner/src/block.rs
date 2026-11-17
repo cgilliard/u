@@ -47,15 +47,22 @@
 //! not on chain; the proof attests to them. Output amounts are, so every
 //! node checks the supply outside the proof.
 //!
-//! The body commitment hashes all five.
+//! The body commitment hashes the first four: what the block does. The
+//! proof is not under it. A proof says that the body is valid and
+//! changes nothing of what the body is, so a header is of one body
+//! whatever proof comes with it, and a miner knows its header, and can
+//! look for its nonce, before the proof is made. What follows from that
+//! is the chain's to mind ([`crate::chain::apply`]): a proof that does
+//! not hold is the fault of the copy that carried it and of whoever
+//! sent it, never of the block.
 //!
 //! # Two forms
 //!
 //! A header is 204 bytes held in place: reading one, hashing it and
 //! checking its work use no heap. A body can be megabytes, so a node reads
 //! the one it is sent as a view: [`BodyRef`] and [`BlockRef`] borrow the
-//! encoded bytes, check the encoding once and hash it where it lies, the
-//! proof included, a block of the sponge at a time. The one thing a body
+//! encoded bytes, check the encoding once and hash it where it lies, a
+//! block of the sponge at a time. The one thing a body
 //! needs memory for is to see that no position is spent twice: a list of
 //! them, eight bytes each, held while it is sorted. [`Body`] and [`Block`]
 //! are the owned forms, for building a block.
@@ -64,7 +71,7 @@ use core::fmt;
 
 use crate::codec::{POSITION_BYTES, packed, read_digest, read_position, read_u32, read_u64, write_position};
 use crate::error::Error;
-use crate::hash::{DOM_BLOCK_BODY, DOM_BLOCK_PROOF, Digest, DomainHasher};
+use crate::hash::{DOM_BLOCK_BODY, Digest, DomainHasher};
 use crate::name::{BlockNameOp, OpKind, count_ops};
 use crate::output::OUTPUT_CAPACITY;
 pub use crate::output::{BLOCK_OUTPUT_SIZE, BlockOutput};
@@ -266,20 +273,19 @@ fn validate(
 
 /// Elements of the body commitment's input ([`body_commitment`]).
 fn commitment_len(inputs: usize, outputs: usize, ops: usize, reveals: usize, sweeps: usize) -> usize {
-    5 + 2 * (inputs + reveals + sweeps) + DIGEST * (2 * outputs + ops + 1)
+    5 + 2 * (inputs + reveals + sweeps) + DIGEST * (2 * outputs + ops)
 }
 
 /// The body's commitment from its items: each list of positions as its
 /// count and two limbs a position, the outputs as their count and each
 /// one's commitment and slot, the operations as their count and digests,
-/// then the positions reveals spend (their digests leave them out), the
-/// sweeps, and the proof's hash.
+/// then the positions reveals spend (their digests leave them out) and
+/// the sweeps. Not the proof: see the module's account of why.
 fn body_commitment(
     inputs: impl ExactSizeIterator<Item = u64>,
     outputs: impl ExactSizeIterator<Item = BlockOutput>,
     ops: impl ExactSizeIterator<Item = BlockNameOp> + Clone,
     sweeps: impl ExactSizeIterator<Item = u64>,
-    proof_hash: &Digest,
 ) -> Digest {
     let reveals = ops.clone().filter(|op| op.spends().is_some()).count();
     let len = commitment_len(inputs.len(), outputs.len(), ops.len(), reveals, sweeps.len());
@@ -303,23 +309,6 @@ fn body_commitment(
     ops.filter_map(|op| op.spends()).for_each(|p| position(&mut h, p));
     count(&mut h, sweeps.len());
     sweeps.for_each(|p| position(&mut h, p));
-    h.absorb(proof_hash);
-    h.finish()
-}
-
-/// Hash of the proof bytes, length bound: their length, then the bytes
-/// three to an element, absorbed as they are packed.
-pub fn proof_hash(proof: &[u8]) -> Digest {
-    let mut h = DomainHasher::new(DOM_BLOCK_PROOF, 1 + proof.len().div_ceil(3));
-    h.absorb(&[Fp::from_u64(proof.len() as u64)]);
-    let mut block = [Fp::ZERO; DIGEST];
-    for chunk in proof.chunks(3 * DIGEST) {
-        let n = chunk.len().div_ceil(3);
-        for (x, v) in block.iter_mut().zip(packed(chunk)) {
-            *x = v;
-        }
-        h.absorb(&block[..n]);
-    }
     h.finish()
 }
 
@@ -493,21 +482,16 @@ impl<'a> BodyRef<'a> {
         self.ops.len() + self.sweeps.len()
     }
 
-    /// Hash of the proof bytes, length bound.
-    pub fn proof_hash(&self) -> Digest {
-        proof_hash(self.proof)
-    }
-
     /// Commitment to inputs, outputs, name operations (by digest, plus the
-    /// positions reveals spend), sweeps and proof.
+    /// positions reveals spend) and sweeps: all of the body but its proof.
     pub fn commitment(&self) -> Digest {
-        self.commitment_with(&self.proof_hash())
+        body_commitment(self.inputs(), self.outputs(), self.ops(), self.sweeps())
     }
 
-    /// [`BodyRef::commitment`] with the proof's hash given: what a lite
-    /// block ([`Block::lite_bytes`]) carries in place of the proof.
-    pub fn commitment_with(&self, proof_hash: &Digest) -> Digest {
-        body_commitment(self.inputs(), self.outputs(), self.ops(), self.sweeps(), proof_hash)
+    /// The size of the body without its proof: what the header commits
+    /// to, so what a block can be held to for good.
+    pub fn size_without_proof(&self) -> usize {
+        self.bytes.len() - self.proof.len()
     }
 
     /// The body, owned.
@@ -639,26 +623,14 @@ impl Body {
         self.ops.iter().map(BlockNameOp::size).sum::<usize>() + self.sweeps.len() * POSITION_BYTES
     }
 
-    /// Hash of the proof bytes, length bound.
-    pub fn proof_hash(&self) -> Digest {
-        proof_hash(&self.proof)
-    }
-
     /// Commitment to inputs, outputs, name operations (by digest, plus the
-    /// positions reveals spend), sweeps and proof.
+    /// positions reveals spend) and sweeps: all of the body but its proof.
     pub fn commitment(&self) -> Digest {
-        self.commitment_with(&self.proof_hash())
-    }
-
-    /// [`Body::commitment`] with the proof's hash given: what a lite block
-    /// ([`Block::lite_bytes`]) carries in place of the proof.
-    pub fn commitment_with(&self, proof_hash: &Digest) -> Digest {
         body_commitment(
             self.inputs.iter().copied(),
             self.outputs.iter().copied(),
             self.ops.iter().copied(),
             self.sweeps.iter().copied(),
-            proof_hash,
         )
     }
 
@@ -723,40 +695,6 @@ impl Block {
     /// Whether the header commits to this body.
     pub fn body_commitment_matches(&self) -> bool {
         self.header.body_commitment == self.body.commitment()
-    }
-
-    /// The block without its proof: its bytes up to and with the proof's
-    /// length, then the proof's hash (32 bytes) in place of the proof. All
-    /// its body commitment needs: a node fetches so the blocks of a batch
-    /// whose proofs the batch's last block's chain proof attests, a few KB
-    /// rather than the proof's 200 or so each.
-    pub fn lite_bytes(&self) -> Vec<u8> {
-        let mut out = self.to_bytes();
-        out.truncate(out.len() - self.body.proof.len());
-        out.extend_from_slice(&digest_to_bytes(&self.body.proof_hash()));
-        out
-    }
-
-    /// A lite block's header and the body commitment its bytes make (the
-    /// proof's hash as given), or `None` if malformed: the header commits
-    /// to it if the lite block is the block's. Read where the bytes lie.
-    pub fn lite_commitment(bytes: &[u8]) -> Result<(Header, Digest), Error> {
-        Self::lite_decode(bytes).ok_or(Error::Malformed("lite block"))
-    }
-
-    fn lite_decode(bytes: &[u8]) -> Option<(Header, Digest)> {
-        let (head, body) = bytes.split_at_checked(HEADER_SIZE)?;
-        let header = Header::decode(head)?;
-        // The lists as in a block, then the proof's length (which the hash
-        // binds, not these four bytes) and its hash.
-        let (lists, rest) = BodyRef::lists(body)?;
-        let (_length, rest) = read_u32(rest)?;
-        let (hash, rest) = read_digest(rest)?;
-        if !rest.is_empty() {
-            return None;
-        }
-        lists.validate().ok()?;
-        Some((header, lists.commitment_with(&hash)))
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -1029,12 +967,13 @@ mod tests {
         let mut b = base.clone();
         b.outputs.swap(0, 1);
         assert_ne!(b.commitment(), c);
+        // But the proof: the header is of the body whatever proof it has.
         let mut b = base.clone();
         b.proof[50] ^= 1;
-        assert_ne!(b.commitment(), c);
+        assert_eq!(b.commitment(), c);
         let mut b = base.clone();
         b.proof.push(0);
-        assert_ne!(b.commitment(), c);
+        assert_eq!(b.commitment(), c);
         assert_ne!(Body::default().commitment(), [Fp::ZERO; DIGEST]);
         // A position's two limbs: its low 30 bits and the rest.
         let mut b = base.clone();
@@ -1042,20 +981,14 @@ mod tests {
         assert_ne!(b.commitment(), c);
     }
 
-    /// The commitment and the proof's hash are `hash_domain` of their
-    /// layouts: counts, positions as two limbs, outputs as commitment and
-    /// slot, operations as digests, the positions reveals spend, the
-    /// sweeps and the proof's hash; and the proof's length and its bytes
-    /// three to an element, whatever its length.
+    /// The commitment is `hash_domain` of its layout: counts, positions
+    /// as two limbs, outputs as commitment and slot, operations as
+    /// digests, the positions reveals spend and the sweeps. The proof is
+    /// no part of it: a body with another proof, or none, commits the
+    /// same.
     #[test]
     fn the_commitment_is_laid_out_as_documented() {
         use crate::hash::hash_domain;
-        for len in [0usize, 1, 2, 3, 23, 24, 25, 48, 100, 1000] {
-            let proof: Vec<u8> = (0..len).map(|i| (i * 7 + 1) as u8).collect();
-            let mut v = vec![Fp::from_u64(len as u64)];
-            v.extend(packed(&proof));
-            assert_eq!(proof_hash(&proof), hash_domain(DOM_BLOCK_PROOF, &v), "proof of {len} bytes");
-        }
         let far = OUTPUT_CAPACITY - 1;
         let body =
             Body { inputs: vec![3, far], outputs: outputs(), ops: ops(), sweeps: vec![6, 1 << 35], proof: vec![9; 50] };
@@ -1075,10 +1008,13 @@ mod tests {
         v.extend([limbs(12), limbs(14)].concat());
         v.push(Fp::new(2));
         v.extend([limbs(6), limbs(1 << 35)].concat());
-        v.extend(body.proof_hash());
         assert_eq!(v.len(), commitment_len(2, 2, 4, 2, 2));
         assert_eq!(body.commitment(), hash_domain(DOM_BLOCK_BODY, &v));
-        assert_eq!(body.commitment(), body.commitment_with(&proof_hash(&body.proof)));
+        for proof in [vec![], vec![1], vec![9; 51], vec![7; 200_000]] {
+            let other = Body { proof, ..body.clone() };
+            assert_eq!(other.commitment(), body.commitment());
+            assert_eq!(BodyRef::from_bytes(&other.to_bytes()).unwrap().commitment(), body.commitment());
+        }
     }
 
     #[test]
@@ -1094,6 +1030,8 @@ mod tests {
         assert_eq!(Block::from_bytes(&bytes[..100]), Err(Error::Malformed("block")));
         let mut other = block.clone();
         other.body.proof[0] ^= 1;
+        assert!(other.body_commitment_matches());
+        other.body.outputs[0].amount ^= 1;
         assert!(!other.body_commitment_matches());
     }
 
@@ -1127,12 +1065,16 @@ mod tests {
         assert_eq!(b.commit_positions(100).collect::<Vec<_>>(), body.commit_positions(100));
         assert_eq!(b.spent_positions().collect::<Vec<_>>(), body.spent_positions().collect::<Vec<_>>());
         assert_eq!(b.names_size(), body.names_size());
-        assert_eq!((b.proof_hash(), b.commitment()), (body.proof_hash(), body.commitment()));
-        assert_eq!(b.commitment_with(&d(5)), body.commitment_with(&d(5)));
+        assert_eq!(b.commitment(), body.commitment());
+        assert_eq!(b.size_without_proof(), body.size() - body.proof.len());
         assert!(format!("{view:?}").contains("outputs: 2"));
-        // Another proof: another body, and the header no longer commits to it.
+        // Another proof: the same body to the header, which commits to
+        // what the block does. Another output: another body.
         let mut other = bytes.clone();
         *other.last_mut().unwrap() ^= 1;
+        assert!(BlockRef::from_bytes(&other).unwrap().body_commitment_matches());
+        let mut other = bytes.clone();
+        other[HEADER_SIZE + 4 + 2 * POSITION_BYTES + 4 + 32 + 20] ^= 1;
         assert!(!BlockRef::from_bytes(&other).unwrap().body_commitment_matches());
         // A body at fault is refused as the owned form refuses it.
         for bad in [
@@ -1189,46 +1131,6 @@ mod tests {
         assert_eq!(empty.commitment(), Body::default().commitment());
     }
 
-    /// A lite block (the proof's hash in place of the proof) makes the body
-    /// commitment its header commits to; a wrong proof hash, an altered
-    /// body or a short one does not.
-    #[test]
-    fn lite_block_commits_as_the_block() {
-        let body =
-            Body { inputs: vec![1, 2], outputs: outputs(), ops: ops(), sweeps: vec![6], proof: vec![0xab; 3000] };
-        let mut h = header();
-        h.body_commitment = body.commitment();
-        let block = Block { header: h, body };
-        let lite = block.lite_bytes();
-        assert_eq!(lite.len(), block.to_bytes().len() - 3000 + 32);
-        assert_eq!(Block::lite_commitment(&lite), Ok((block.header, block.header.body_commitment)));
-        // the proof's hash changed: another commitment
-        let mut bad = lite.clone();
-        let n = bad.len();
-        bad[n - 32] ^= 1;
-        assert_ne!(Block::lite_commitment(&bad).map(|(_, c)| c), Ok(block.header.body_commitment));
-        // an output's amount changed: another commitment
-        let mut bad = lite.clone();
-        bad[HEADER_SIZE + 4 + 2 * POSITION_BYTES + 4 + 32 + 20] ^= 1;
-        assert_ne!(Block::lite_commitment(&bad).map(|(_, c)| c), Ok(block.header.body_commitment));
-        // cut short, or the hash's bytes not canonical: malformed
-        assert_ne!(Block::lite_commitment(&lite[..lite.len() - 1]).map(|(_, c)| c), Ok(block.header.body_commitment));
-        let mut bad = lite.clone();
-        bad[n - 4..].copy_from_slice(&[0xff; 4]);
-        assert!(Block::lite_commitment(&bad).is_err());
-        assert!(Block::lite_commitment(&[&lite[..], &[0]].concat()).is_err());
-        assert!(Block::lite_commitment(&lite[..HEADER_SIZE + 3]).is_err());
-        // The proof's length is bound by its hash, not by the four bytes
-        // before it: changing those changes nothing.
-        let mut same = lite.clone();
-        same[n - 36..n - 32].copy_from_slice(&7u32.to_le_bytes());
-        assert_eq!(Block::lite_commitment(&same), Block::lite_commitment(&lite));
-        // A body at fault is no lite block either.
-        let mut twice = block.clone();
-        twice.body.inputs = vec![1, 1];
-        assert!(Block::lite_commitment(&twice.lite_bytes()).is_err());
-    }
-
     /// The header, body and block decoders, fuzzed: no input makes them
     /// panic, a view's bytes are the bytes read, and what they decode
     /// encodes back to the same bytes.
@@ -1261,9 +1163,6 @@ mod tests {
         crate::test_util::fuzz_decoder("Block::from_bytes", &[block.to_bytes()], 20_000, |b| {
             assert_eq!(BlockRef::from_bytes(b).map(|v| v.to_block()), Block::from_bytes(b));
             Block::from_bytes(b).ok().map(|x| Some(x.to_bytes()))
-        });
-        crate::test_util::fuzz_decoder("Block::lite_commitment", &[block.lite_bytes()], 20_000, |b| {
-            Block::lite_commitment(b).ok().map(|_| None)
         });
     }
 
