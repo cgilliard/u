@@ -1,8 +1,10 @@
 pub mod aggregate;
+pub mod bip39;
 pub mod bits;
 pub mod block;
 pub mod block_air;
 pub mod block_proof;
+pub mod chacha20poly1305;
 pub mod chain;
 pub mod chain_verifier;
 pub mod challenger;
