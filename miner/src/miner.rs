@@ -235,7 +235,21 @@ pub fn choose<B: Backend + 'static>(
     Ok((chosen, sweeps))
 }
 
-/// [`mine_with`], of a block that carries nothing but its reward.
+/// What the block after `chain`'s last is to pay whoever makes it, if
+/// it carries the transactions `pooled`: its height, and what it may
+/// make with their fees. None if the chain has had its last block.
+pub fn reward_due<B: Backend + 'static, V>(
+    chain: &Chain<B, V>,
+    pooled: &[Transaction],
+) -> Result<Option<(u32, u64)>, Error> {
+    let height = chain.tip()?.height + 1;
+    let subsidy = chain.params().subsidy(height);
+    let fees: u64 = pooled.iter().map(|tx| tx.balance().clamp(0, u64::MAX as i128) as u64).sum();
+    Ok((subsidy > 0).then_some((height, subsidy.saturating_add(fees))))
+}
+
+/// [`mine_with`], of a block that carries nothing but its reward, paid
+/// to the key of hash `reward`.
 pub fn mine<B: Backend + 'static, S: ItemSource + Sync>(
     chain: &Chain<B, AggregateVerifier>,
     dataset: &S,
@@ -245,13 +259,14 @@ pub fn mine<B: Backend + 'static, S: ItemSource + Sync>(
     proved: &dyn Fn(Duration),
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<Mined, Error> {
-    mine_with(chain, dataset, reward, unix, start, &[], &[], proved, cancel)
+    let Some((_, due)) = reward_due(chain, &[])? else { return Ok(Mined::Finished) };
+    mine_with(chain, dataset, &Output::to_key_hash(reward, due), unix, start, &[], &[], proved, cancel)
 }
 
 /// Makes the block after `chain`'s last, of the transactions `pooled`
 /// and sweeping the commits at `sweeps` ([`choose`]), paying its reward
-/// and their fees to the key
-/// of hash `reward`. `unix` is the time by the calendar, in seconds,
+/// and their fees ([`reward_due`]) by the output `paid`, which is the
+/// maker's own. `unix` is the time by the calendar, in seconds,
 /// and `start` where the nonces tried begin (any number: so that two
 /// miners do not try the same). `proved` is called when the block's
 /// proof is made, with how long that took: from then the nonce is
@@ -264,7 +279,7 @@ pub fn mine<B: Backend + 'static, S: ItemSource + Sync>(
 pub fn mine_with<B: Backend + 'static, S: ItemSource + Sync>(
     chain: &Chain<B, AggregateVerifier>,
     dataset: &S,
-    reward: &Digest,
+    paid: &Output,
     unix: u64,
     start: u64,
     pooled: &[Transaction],
@@ -280,10 +295,13 @@ pub fn mine_with<B: Backend + 'static, S: ItemSource + Sync>(
         return Ok(Mined::Finished);
     }
     // The reward: a transaction that spends nothing, signed by nobody.
-    // It pays what the block may make and what its transactions leave.
+    // It pays what the block may make and what its transactions leave:
+    // an output made for another block's is not this block's.
     let fees: u64 = pooled.iter().map(|tx| tx.balance().clamp(0, u64::MAX as i128) as u64).sum();
-    let paid = Output::to_key_hash(reward, subsidy.saturating_add(fees));
-    let tx = UnsignedTransaction::new(vec![], vec![paid])
+    if paid.amount != subsidy.saturating_add(fees) {
+        return Ok(Mined::Stale);
+    }
+    let tx = UnsignedTransaction::new(vec![], vec![*paid])
         .sign(|_, _, _| Err::<Sig, ()>(()))
         .expect("a transaction without inputs needs no signature");
     let mut txs = vec![tx];
@@ -621,6 +639,9 @@ mod tests {
         let (chain, dataset) = dev();
         let mut key = crate::xmss::SecretKey::generate(&[5; 32]);
         let reward = crate::output::pubkey_hash(&key.public_key());
+        let paid_now = |chain: &Chain<MemBackend, AggregateVerifier>, pooled: &[Transaction]| {
+            Output::to_key_hash(&reward, reward_due(chain, pooled).unwrap().unwrap().1)
+        };
         // The first block pays the key; the second carries a spend of
         // that, all but a fee, back to it.
         let made = mine(&chain, &dataset, &reward, NOW, 3, &|_| {}, &|| false).unwrap();
@@ -647,7 +668,9 @@ mod tests {
         assert!(choose(&chain, &|f| f(&pool), 0).unwrap().0.is_empty());
         let (pooled, sweeps) = choose(&chain, &|f| f(&pool), MAX_SIGNATURES).unwrap();
         assert_eq!((pooled.len(), sweeps.len()), (1, 0));
-        let made = mine_with(&chain, &dataset, &reward, NOW, 7, &pooled, &sweeps, &|_| {}, &|| false).unwrap();
+        let made =
+            mine_with(&chain, &dataset, &paid_now(&chain, &pooled), NOW, 7, &pooled, &sweeps, &|_| {}, &|| false)
+                .unwrap();
         let Mined::Block { block, .. } = made else { panic!("{made:?}") };
         let view = BlockRef::from_bytes(&block).unwrap();
         assert_eq!(chain.apply_block(&view, NOW), Ok(Applied::Extended));
@@ -662,7 +685,9 @@ mod tests {
         assert_eq!(amounts, wanted);
         // The same transaction again, its output spent: the block is
         // not made, and nothing is wrong.
-        let again = mine_with(&chain, &dataset, &reward, NOW, 9, &pooled, &sweeps, &|_| {}, &|| false).unwrap();
+        let again =
+            mine_with(&chain, &dataset, &paid_now(&chain, &pooled), NOW, 9, &pooled, &sweeps, &|_| {}, &|| false)
+                .unwrap();
         assert!(matches!(again, Mined::Stale), "{again:?}");
     }
 

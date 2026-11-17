@@ -48,6 +48,7 @@
 //! Nothing here reads a clock or the chain: the time is given, and what
 //! the chain's state holds is asked through [`Unspent`].
 
+pub mod follow;
 pub mod records;
 
 use std::collections::{BTreeMap, BTreeSet};
