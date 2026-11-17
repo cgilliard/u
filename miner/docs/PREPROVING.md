@@ -214,7 +214,28 @@ is a saving to look for afterwards, and not part of this.
    signature segment is filled with them is the fragment's business as
    it is in a transaction segment today.
 
-## 6. Order of work
+## 6. What a miner does with it
+
+What is left to prove after the parent is known still takes a miner
+time, more for a block with more in it. A miner must never have to
+choose between hashing sooner and taking fees, or it will choose to
+hash sooner and blocks will be empty.
+
+So a miner makes two blocks on each parent. The first is of its reward
+and nothing else, ready as soon as the root, the wrap and the chain's
+step are proven; it hashes on that. Beside it, it proves the block of
+its waiting transactions, and when that is ready it hashes on that
+instead. Taking transactions then costs it no hashing, and gains it
+their fees from the moment the second block is ready.
+
+The network's cost is the blocks found before the second is ready,
+which hold nothing: the share of them is the share of the block time
+that the second block takes longer than the first. That is what a
+miner's hardware buys down.
+
+This is the miner's business and not consensus.
+
+## 7. Order of work
 
 1. The signature segment circuit and its tests, from `xmss_fragment`.
 2. The transaction segment without the fragment, with the path and `S`;
