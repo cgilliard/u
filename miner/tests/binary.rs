@@ -330,6 +330,9 @@ fn a_payment_is_made_at_the_prompt_and_mined() {
     println!("{}", back.trim_end());
     // (Unless a block had it already: then it is not to be taken back.)
     if back.contains("taken back: transaction") {
+        let after = "The transaction has been cancelled, but it could still end up in a block. \
+                     Call prune to remove the stale transaction from your wallet.";
+        assert!(back.contains(after), "{back}");
         assert!(ask(&mut maker, "sent").contains("pooled") || ask(&mut maker, "sent").starts_with("no payments"));
         wait("the payment taken back is not mined", &mut || ask(&mut maker, "sent").starts_with("no payments"));
         assert!(ask(&mut other, "prune").starts_with("1 outputs expected"));
@@ -337,7 +340,7 @@ fn a_payment_is_made_at_the_prompt_and_mined() {
         let log = std::fs::read_to_string(dirs[0].join("tabernacle.log")).unwrap();
         assert!(log.contains(" taken back: transaction "), "{log}");
     } else {
-        assert!(back.contains("already spent on chain"), "{back}");
+        assert!(back.contains("a block has it already"), "{back}");
     }
     assert!(ask(&mut maker, "bump 00").starts_with("error: no payment sent"));
     // Told to stop, each does, without failure.

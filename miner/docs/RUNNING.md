@@ -605,8 +605,22 @@ more, which pools take in place of the first:
 
 Each is signed from the next leaf of every key it spends from: a key
 signs eight times at the most, so a payment can be replaced seven
-times. What a replaced payment was to make is never made: `prune`
-forgets it, on the sender's node and on the recipient's.
+times.
+
+Taking a payment back does not settle it, and the node says so:
+
+```
+> cancel 8be2a771
+payment sent 8be2a771 taken back: transaction 41c07d9e, with a fee of 0.000004966
+The transaction has been cancelled, but it could still end up in a block. Call prune to remove the stale transaction from your wallet.
+```
+
+Until a block has one of the two, and that block is not undone, either
+may still be mined. Meanwhile each wallet counts what the first was to
+make as well: as pending on the sender's node, as unverified on the
+recipient's. `prune` forgets what will never be made, on each node; it
+is not done of itself, because only whoever runs the node can say when
+a block is deep enough to rely on.
 
 A wallet never signs twice from one leaf, and that is kept true even
 of a wallet whose file has gone back to an earlier state (a copy

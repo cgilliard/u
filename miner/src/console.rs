@@ -55,6 +55,13 @@ pub const HELP: &str = "commands:
   help                      this
   quit                      stop the node";
 
+/// What is said after a payment sent has been taken back, and after one
+/// has been sped up.
+const CANCELLED: &str = "The transaction has been cancelled, but it could still end up in a block. \
+Call prune to remove the stale transaction from your wallet.";
+const BUMPED: &str = "The transaction has been replaced, but the one before it could still end up in a block. \
+Call prune to remove the stale transaction from your wallet.";
+
 /// What came of a command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reply {
@@ -409,14 +416,14 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
 
     /// Pools what the wallet signed in place of a payment sent, and says
     /// what was done: `done`, with the transaction and its fee.
-    fn replaced(&self, done: &str, was: &crate::hash::Digest, signed: &crate::wallet::Signed) -> Said {
+    fn replaced(&self, done: &str, after: &str, was: &crate::hash::Digest, signed: &crate::wallet::Signed) -> Said {
         let (was, id) = (short(&digest_to_bytes(was)), short(&digest_to_bytes(&signed.tx.txid())));
         let fee = coins(signed.tx.balance().max(0) as u128);
         match self.hold.submit(&signed.tx.to_bytes(), (self.unix)()) {
             Ok(_) => {
                 let said = format!("payment sent {was} {done}: transaction {id}, with a fee of {fee}");
                 (self.log)(&format!("P{}", &said[1..]));
-                Ok(said)
+                Ok(format!("{said}\n{after}"))
             }
             Err(why) => {
                 let failed = format!("payment sent {was} {done}, but the pool does not take transaction {id}: {why}");
@@ -447,10 +454,16 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
                 let signed = {
                     let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
                     let snap = state.snapshot().map_err(|e| e.to_string())?;
-                    wallet.cancel_sent(&was, fee, &snap, (self.unix)()).map_err(|e| e.to_string())?
+                    wallet.cancel_sent(&was, fee, &snap, (self.unix)()).map_err(|e| match e {
+                        crate::wallet::WalletError::Landed => {
+                            "a block has it already: it cannot be taken back (what it spent is spent on chain)"
+                                .to_string()
+                        }
+                        e => e.to_string(),
+                    })?
                 };
                 drop(wallet);
-                self.replaced("taken back", &was, &signed)
+                self.replaced("taken back", CANCELLED, &was, &signed)
             }
             _ => Err(format!("more than one payment begun with an id that starts {id}")),
         }
@@ -464,10 +477,15 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         let signed = {
             let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
             let snap = state.snapshot().map_err(|e| e.to_string())?;
-            wallet.bump_sent(&was, fee, &snap, (self.unix)()).map_err(|e| e.to_string())?
+            wallet.bump_sent(&was, fee, &snap, (self.unix)()).map_err(|e| match e {
+                crate::wallet::WalletError::Landed => {
+                    "a block has it already: there is nothing to speed up".to_string()
+                }
+                e => e.to_string(),
+            })?
         };
         drop(wallet);
-        self.replaced("sped up", &was, &signed)
+        self.replaced("sped up", BUMPED, &was, &signed)
     }
 
     fn resend(&self, id: &str) -> Said {
