@@ -849,8 +849,11 @@ fn over_real_sockets_requests_are_logged_and_counted() {
         assert!(s[LATENCY] > 0 && s[BYTES_IN] > 0 && s[BYTES_SENT] > 0, "{s:?}");
         assert_eq!((s[PEERS], s[PEERS_LIVE], s[HEIGHT], s[FETCHING]), (1, 1, 12, 0), "{s:?}");
     }
-    // What one sent is what the other took in.
-    assert_eq!((stats[0][BYTES_SENT], stats[1][BYTES_SENT]), (stats[1][BYTES_IN], stats[0][BYTES_IN]));
+    // What one sent is what the other took in: but for a datagram or
+    // two on its way when the nodes were stopped, sent and never taken.
+    for (sent, taken) in [(stats[0][BYTES_SENT], stats[1][BYTES_IN]), (stats[1][BYTES_SENT], stats[0][BYTES_IN])] {
+        assert!(taken <= sent && sent - taken <= 2 * crate::net::MAX_DATAGRAM as u64, "sent {sent}, taken {taken}");
+    }
     assert_eq!((stats[0][BLOCKS], stats[1][BLOCKS]), (0, 12));
     let _ = std::fs::remove_dir_all(&dir);
 }
