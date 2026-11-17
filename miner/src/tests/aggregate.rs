@@ -274,7 +274,7 @@ fn chain_proofs_cover_history() {
     let wrap_of = |segs: &[SegmentWitness], st: &Statement, nm: &NameWitness| {
         let shape = plan_with(&SMALL, segs.len(), &mut PlanCache::new());
         let proof = prove_wrap(&SMALL, &shape, st, segs, nm, 2, &|_| {}, &|| false).unwrap();
-        (shape.wrap.unwrap(), proof, segs.len() - 1)
+        (shape.wrap.unwrap(), proof, plan_index(segs.len(), false))
     };
     let (w1, p1, i1) = wrap_of(&seg1, &st1, &nm1);
     let (w2, p2, i2) = wrap_of(&seg2, &st2, &nm2);
