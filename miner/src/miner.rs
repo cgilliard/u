@@ -236,6 +236,11 @@ pub fn mine<B: Backend + 'static, S: ItemSource + Sync>(
     else {
         return Ok(Mined::Cancelled);
     };
+    // The chain may have another last block by now, heard of while the
+    // last of the proof was made: then this block is for nothing.
+    if cancel() {
+        return Ok(Mined::Cancelled);
+    }
     body.proof = proof;
     let took = began.elapsed();
     // The proof is made: what is left is to find the nonce.

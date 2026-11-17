@@ -1743,13 +1743,6 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     ) {
         let id = header.hash();
         l.applying.retain(|a| *a != id);
-        // What came of a block made here, whatever it was: whoever made
-        // it is waiting to know.
-        if from.is_none() {
-            self.shared.settled.fetch_add(1, Ordering::Relaxed);
-            drop(self.shared.moved.0.lock().unwrap_or_else(|e| e.into_inner()));
-            self.shared.moved.1.notify_all();
-        }
         match result {
             // The chain's new last block: every peer is told, but the
             // one it came from.
@@ -1792,6 +1785,14 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     self.tell(now, from, Notice::NotFrom(id, from));
                 }
             }
+        }
+        // What came of a block made here, whatever it was: whoever made
+        // it is waiting to know. (Said last: so that the chain is seen
+        // to have moved, if it has, by whoever is woken by this.)
+        if from.is_none() {
+            self.shared.settled.fetch_add(1, Ordering::Relaxed);
+            drop(self.shared.moved.0.lock().unwrap_or_else(|e| e.into_inner()));
+            self.shared.moved.1.notify_all();
         }
         self.sync_blocks(l, now);
     }
