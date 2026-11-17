@@ -322,16 +322,14 @@ pub(super) struct Committed {
 /// How many of the lowest levels of a commitment's Merkle tree are left
 /// out of memory, at this blowup.
 ///
-/// A tree is twice its leaves, and at a high blowup the leaves are many
-/// times the table: at rate 1/32 the trees of a proof's commitments are
-/// gigabytes between them, held for the length of the proof. Leaving
-/// out the lowest two levels keeps a quarter of that. A path through
-/// what was left out is made again when a row is opened, from the four
-/// rows it is of, each computed from the coefficients: some passes more
-/// for each opening, where there are only as many openings as queries.
-/// At a low blowup the trees are small beside the rest, and whole.
+/// A tree is twice its leaves, and the leaves are several times the
+/// table, many times at a high blowup: the trees of a proof's
+/// commitments are held for the length of the proof. Leaving out the
+/// lowest two levels keeps a quarter of that. A path through what was
+/// left out is made again when a row is opened, from the four rows it
+/// is of ([`Committed::open_many`]).
 fn tree_skip(log_blowup: usize) -> usize {
-    if log_blowup >= 4 { 2 } else { 0 }
+    log_blowup.min(2)
 }
 
 impl Committed {
@@ -438,20 +436,66 @@ impl Committed {
         self.tree.root()
     }
 
-    /// The Merkle path of row `i`, leaf level first: read from the
-    /// tree, with the levels it leaves out made again from the rows of
-    /// `i`'s small tree.
-    fn open(&self, i: usize) -> Vec<Digest> {
-        if self.skip == 0 {
-            return self.tree.open(i);
-        }
+    /// Opens the rows `indices`: each row, and its Merkle path.
+    ///
+    /// A row that was not kept is computed again from the coefficients,
+    /// and so are the rows beside it under the levels of the tree that
+    /// were not kept. One row is a pass over every column's
+    /// coefficients; a whole coset of the extension is a transform of
+    /// every column, some ten passes' worth. Where many rows of a coset
+    /// are wanted, as at a low blowup with more queries than cosets,
+    /// the coset is computed whole, the rows taken from it, and it is
+    /// dropped: a coset at a time, never the extension.
+    fn open_many(&self, indices: &[usize]) -> Vec<(Vec<Fp>, Vec<Digest>)> {
+        let (b, n) = (1usize << self.log_blowup, self.coeffs[0].len());
         let size = 1usize << self.skip;
-        let first = i & !(size - 1);
-        let block: Vec<Digest> = (first..first + size).map(|k| crate::merkle::hash_row(&self.row_at(k))).collect();
-        let (mut path, root) = crate::merkle::block_path(&block, i - first);
-        debug_assert_eq!(root, self.tree.leaf(i >> self.skip));
-        path.extend(self.tree.siblings(i >> self.skip));
-        path
+        let block = |i: usize| (i & !(size - 1))..(i & !(size - 1)) + size;
+        let mut wanted: Vec<usize> = indices.iter().flat_map(|&i| block(i)).collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let is_kept = |i: usize| self.stride.is_some_and(|s| (i % b).is_multiple_of(s));
+        let mut rows: std::collections::HashMap<usize, Vec<Fp>> = std::collections::HashMap::new();
+        // The rows to compute, by the coset each is on.
+        let mut by_coset: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
+        for &i in &wanted {
+            if is_kept(i) {
+                rows.insert(i, self.row(i).to_vec());
+            } else {
+                by_coset.entry(i % b).or_default().push(i / b);
+            }
+        }
+        let singly: usize = by_coset.values().map(Vec::len).sum();
+        let transform = log2_strict(n) / 2 + 1;
+        if by_coset.len() * transform < singly {
+            let w_big = root_of_unity(log2_strict(n) + self.log_blowup);
+            for (j, at) in &by_coset {
+                let shift = self.shift.mul(&w_big.pow(*j as u64));
+                let cols: Vec<Vec<Fp>> = par_map_min(self.width, 1, |k| coset_evals(&self.coeffs[k], shift));
+                for &m in at {
+                    rows.insert(j + b * m, cols.iter().map(|col| col[m]).collect());
+                }
+            }
+        } else {
+            for (j, at) in &by_coset {
+                for &m in at {
+                    rows.insert(j + b * m, self.row_at(j + b * m));
+                }
+            }
+        }
+        indices
+            .iter()
+            .map(|&i| {
+                let row = rows[&i].clone();
+                if self.skip == 0 {
+                    return (row, self.tree.open(i));
+                }
+                let hashes: Vec<Digest> = block(i).map(|k| crate::merkle::hash_row(&rows[&k])).collect();
+                let (mut path, root) = crate::merkle::block_path(&hashes, i - block(i).start);
+                debug_assert_eq!(root, self.tree.leaf(i >> self.skip));
+                path.extend(self.tree.siblings(i >> self.skip));
+                (row, path)
+            })
+            .collect()
     }
 
     /// Row `i`, a point of the kept sub-coset.
@@ -952,30 +996,41 @@ pub fn try_prove_tables(
     let (fri_proof, indices) = fri::prove(&config.fri(), challenger, MULTIPLICATIVE_GENERATOR, inputs);
     timer.lap("fri")?;
 
-    let openings = indices
+    // The rows the queries ask for, a table at a time and a commitment
+    // at a time: every query's row of it together.
+    let mut by_table: Vec<std::vec::IntoIter<QueryOpening>> = states
         .iter()
-        .map(|&index| {
-            states
-                .iter()
-                .zip(&quotients)
-                .map(|(t, q)| {
-                    let i = index % t.big_n(log_blowup);
-                    let aux = t.aux.as_ref().map(|(c, _)| c);
-                    let pre = t.input.pre.map(|p| &p.committed);
-                    QueryOpening {
-                        trace_row: t.trace.row_at(i),
-                        trace_path: t.trace.open(i),
-                        aux_row: aux.map(|c| c.row_at(i)).unwrap_or_default(),
-                        aux_path: aux.map(|c| c.open(i)).unwrap_or_default(),
-                        pre_row: pre.map(|c| c.row_at(i)).unwrap_or_default(),
-                        pre_path: pre.map(|c| c.open(i)).unwrap_or_default(),
-                        quotient_row: q.committed.row_at(i),
-                        quotient_path: q.committed.open(i),
-                    }
+        .zip(&quotients)
+        .map(|(t, q)| {
+            let at: Vec<usize> = indices.iter().map(|&index| index % t.big_n(log_blowup)).collect();
+            let none = || vec![(Vec::new(), Vec::new()); at.len()];
+            let trace = t.trace.open_many(&at);
+            let aux = t.aux.as_ref().map_or_else(none, |(c, _)| c.open_many(&at));
+            let pre = t.input.pre.map_or_else(none, |p| p.committed.open_many(&at));
+            let quotient = q.committed.open_many(&at);
+            let opened: Vec<QueryOpening> = trace
+                .into_iter()
+                .zip(aux)
+                .zip(pre)
+                .zip(quotient)
+                .map(|(((trace, aux), pre), quotient)| QueryOpening {
+                    trace_row: trace.0,
+                    trace_path: trace.1,
+                    aux_row: aux.0,
+                    aux_path: aux.1,
+                    pre_row: pre.0,
+                    pre_path: pre.1,
+                    quotient_row: quotient.0,
+                    quotient_path: quotient.1,
                 })
-                .collect()
+                .collect();
+            opened.into_iter()
         })
         .collect();
+    let openings = (0..indices.len())
+        .map(|_| by_table.iter_mut().map(|table| table.next().expect("a row a query")).collect())
+        .collect();
+    timer.lap("queries")?;
 
     Ok(Proof { tables: parts, fri: fri_proof, openings, query_indices: indices, grinding: witnesses })
 }

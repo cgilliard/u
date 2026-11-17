@@ -203,23 +203,17 @@ pub fn quotient_stride(degree: usize, log_blowup: usize) -> usize {
     1 << log_blowup.saturating_sub(log_quotient_degree(degree))
 }
 
-/// Which rows of a table's trace and auxiliary extensions to keep.
+/// Which rows of a table's trace and auxiliary extensions to keep:
+/// those the quotient reads ([`quotient_stride`]), and no others.
 ///
-/// The quotient reads the rows of some cosets of the extension
-/// ([`quotient_stride`]), and those are always kept. Any other row that
-/// is opened can be computed again from the coefficients, at a cost of
-/// one pass over them. Where there are as many queries as cosets that
-/// costs more time than computing the whole extension did, so every row
-/// is kept: but only where that is little more than the quotient's rows
-/// (twice as many at the most). At a high blowup the whole extension is
-/// many times the quotient's rows (thirty-two cosets against eight, for
-/// a proof at rate 1/32), and held for the length of the proof it is
-/// most of the memory the proof takes: there the opened rows are
-/// computed again, which costs seconds where keeping them costs
-/// gigabytes.
+/// Any other row that is opened is computed again from the
+/// coefficients, singly or a coset of the extension at a time,
+/// whichever is less work for the rows wanted
+/// ([`super::prove::Committed::open_many`]). Kept whole, the extension
+/// is most of the memory a proof takes: twice what the quotient reads
+/// at rate 1/4, four times at rate 1/32.
 pub(super) fn kept_stride(config: &StarkConfig, degree: usize) -> usize {
-    let quotient = config.quotient_stride(degree);
-    if config.num_queries >= 1 << config.log_blowup && quotient <= 2 { 1 } else { quotient }
+    config.quotient_stride(degree)
 }
 
 /// Degree of a table's combined constraints: its AIR's, or with zero

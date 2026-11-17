@@ -203,10 +203,25 @@ fn opened_rows_are_computed_again_at_a_high_blowup() {
         let proof = prove_tables(&zk, &tables, &[], &mut transcript());
         assert_eq!(verify_tables(&zk, &specs, &[], &proof, &mut transcript()), Ok(()), "{queries} queries");
     }
-    // At a low blowup, with as many queries as cosets, every row is
-    // kept as it was: that is little more than the quotient reads.
-    let low = StarkConfig { log_blowup: 2, num_queries: 54, ..CONFIG };
-    assert_eq!(kept_stride(&low, 3), 1);
+    // At a low blowup, with many more queries than cosets, the same:
+    // half the extension is kept, and the rows of the other half are
+    // taken from its cosets, each computed whole and dropped.
+    for (log_n, queries) in [(6usize, 54usize), (9, 113)] {
+        let low = StarkConfig { log_blowup: 2, num_queries: queries, ..CONFIG };
+        assert_eq!(kept_stride(&low, 3), 2);
+        let (trace, public) = fib_trace(log_n);
+        let proof = prove(&low, &Fibonacci, &trace, &public, &mut transcript());
+        assert_eq!(
+            verify(&low, &Fibonacci, &public, &proof, &mut transcript()),
+            Ok(()),
+            "2^{log_n}, {queries} queries"
+        );
+        let air = Squaring { k: Fp::new(5) };
+        let start = Fp::new(3);
+        let trace = squaring_trace(&air, log_n, start);
+        let proof = prove(&low, &air, &trace, &[start], &mut transcript());
+        assert_eq!(verify(&low, &air, &[start], &proof, &mut transcript()), Ok(()), "2^{log_n}, {queries} queries");
+    }
 }
 
 #[test]
