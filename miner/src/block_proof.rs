@@ -270,7 +270,7 @@ pub fn check_chaining(
     // signature segments' entries make.
     let entries: Vec<[Digest; SLOTS]> = sigs.iter().map(|sig| sig.entries).collect();
     let signed = SignedSet::new(&entries).root();
-    if proofs.iter().any(|p| p.public.signed != signed) {
+    if proofs.iter().any(|p| p.public.signed != signed) || name.public.signed != signed {
         return Err(AggregateError::WrongSignedSet);
     }
     if first.public.root_in != s.prev_state_root
@@ -398,9 +398,24 @@ pub fn prove_body<B: Backend + 'static>(
         .map(|o| Record { commitment: o.commitment, memo: o.memo, amount: o.amount, height })
         .collect();
     let ops: Vec<NameOp> = txs.iter().flat_map(|tx| tx.ops.iter().cloned()).collect();
-    let name = NameWitness::collect(state, height, min_reveal, &spends, &made, &ops, sweeps)?;
+    let mut segments = segments;
+    let mut name = NameWitness::collect(state, height, min_reveal, &spends, &made, &ops, sweeps)?;
+    join_signed(&mut segments, &mut name);
     let proof = prove_block(config, &segments, &name);
     Ok(body_from_segments(&segments, &name, proof))
+}
+
+/// Makes one signed set of a block's signatures: its transaction
+/// segments' and its name segment's, in that order, for every one of
+/// them to look its own up in.
+pub fn join_signed(segments: &mut [SegmentWitness], name: &mut NameWitness) {
+    let mut signings = SegmentWitness::signings(segments);
+    signings.extend(name.signings());
+    let signed = std::sync::Arc::new(Signed::pack(signings));
+    for segment in segments.iter_mut() {
+        segment.signed = signed.clone();
+    }
+    name.signed = signed;
 }
 
 /// Limb count re-export for callers computing totals.
@@ -499,8 +514,14 @@ mod tests {
         };
         assert!(!v.verify(&st, &[]));
         assert!(!v.verify(&st, &[1, 2, 3]));
-        let empty =
-            NameWitness { root_in: EMPTY, pos_in: 0, height: 1, min_reveal: crate::name::MIN_REVEAL, ops: vec![] };
+        let empty = NameWitness {
+            root_in: EMPTY,
+            pos_in: 0,
+            height: 1,
+            min_reveal: crate::name::MIN_REVEAL,
+            ops: vec![],
+            signed: Default::default(),
+        };
         let name = prove_name_padded(&STARK, &empty, 4);
         assert_eq!(
             verify_block(&STARK, &NameAir::MAINNET, &st, &encode(&[], &name, &[])),

@@ -267,7 +267,12 @@ the rest, and nothing in consensus is in its way.
 5. The proof of proofs verifies a block's signature tree: done,
    `src/aggregate.rs` (section 8). A block with signatures has a root
    that takes the tree's top; a block without has the root it had.
-6. The name segment's update signature, looked up the same way.
+6. The name segment's update signature, looked up the same way:
+   done, `src/name_air.rs`. The owner a name is held by is a key's
+   hash already, so the segment makes no key hash: the entry is the
+   owner compressed with the update's message. A block's signed set is
+   of its transaction segments' signatures and then its name
+   segment's (`block_proof::join_signed`).
 7. The miner: nothing to do until there is a mempool; signature
    segments are proven with the block.
 8. The constants of the main network, made again once more with the

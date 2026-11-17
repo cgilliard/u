@@ -69,10 +69,12 @@
 //! absorbs it into the operations sponge; `slist` absorbs a swept position
 //! into the sweeps sponge.
 
+use std::sync::Arc;
+
 use crate::block_air::{DEPTH, absorb_op, absorb_sweep, initial_names_state, initial_sweeps_state};
 use crate::error::Error;
 use crate::field::Field;
-use crate::hash::{DOM_PUBKEY, Digest};
+use crate::hash::Digest;
 use crate::hash_machine::{
     COL_ABSORB, COL_ACC, COL_CHAIN, COL_COMPRESS, COL_DATA, COL_DIR, COL_LOAD, COL_PASS, COL_START, HashTraceBuilder,
     NUM_COLS as HM_COLS, eval_hash_machine,
@@ -84,6 +86,7 @@ use crate::name::{
 use crate::output::{Sig, memo_slot};
 use crate::poseidon2::{DIGEST, Fp, RATE, WIDTH, compress};
 use crate::poseidon2_air::{COL_INPUT, COL_OUTPUT};
+use crate::signed::{Signed, Signing};
 use crate::stark::{Air, Builder, Trace};
 use crate::store::backend::Backend;
 use crate::store::names::Names;
@@ -92,7 +95,7 @@ use crate::store::outputs::{Outputs, Record as OutputRecord};
 use crate::store::pagefile::Txn;
 use crate::store::sparse::EMPTY;
 use crate::store::state::State;
-use crate::xmss::{PUB_SEED_LEN, PublicKey};
+use crate::xmss::PublicKey;
 use crate::xmss_fragment::{self, Cols as XCols, Types as XTypes, bits_value};
 
 /// A commit's memo from its slot (the memo, then amount zero's limbs).
@@ -143,7 +146,13 @@ pub const T_DONE: usize = HM_COLS + 31;
 /// The commit output's second leaf row: `leafc`'s digest compressed with
 /// the commit's height, its creation height ([`crate::output::leaf`]).
 pub const T_LEAFC2: usize = HM_COLS + 32;
-const NUM_TYPES: usize = 33;
+/// The update's signature, looked up in the block's signed set
+/// ([`crate::signed`]): the owner's key hash compressed with the update
+/// message, that with the signing leaf's index, and the entry's path.
+pub const T_ENT0: usize = HM_COLS + 33;
+pub const T_ENT1: usize = HM_COLS + 34;
+pub const T_SP: usize = HM_COLS + 35;
+const NUM_TYPES: usize = 36;
 
 /// Row types and their lengths (rows per phase); `T_OPD` is 2 or 3.
 const PHASES: [(usize, usize); 9] = [
@@ -242,7 +251,14 @@ pub const R_WPOS_HI: usize = R_WPOS_LO + 1;
 pub const C_CB: usize = R_WPOS_HI + 1;
 pub const C_LIVE: usize = C_CB + RATE * CHAR_BITS;
 pub const C_LIVE_INV: usize = C_LIVE + RATE;
-pub const NUM_COLS: usize = C_LIVE_INV + RATE;
+// ---- a signature, looked up ----
+/// Levels of the path left after this row's, whether none is, and the
+/// last row of a path.
+pub const R_SPN: usize = C_LIVE_INV + RATE;
+pub const C_SP_LAST: usize = R_SPN + 1;
+pub const C_SP_INV: usize = C_SP_LAST + 1;
+pub const C_SP_END: usize = C_SP_INV + 1;
+pub const NUM_COLS: usize = C_SP_END + 1;
 
 // ---- public values ----
 pub const PUB_ROOT_IN: usize = 0;
@@ -253,7 +269,10 @@ pub const PUB_NSP: usize = PUB_POS_OUT + 2;
 pub const PUB_SSP: usize = PUB_NSP + WIDTH;
 pub const PUB_HEIGHT: usize = PUB_SSP + WIDTH;
 pub const PUB_COUNTS: usize = PUB_HEIGHT + 1;
-pub const NUM_PUBLIC: usize = PUB_COUNTS + 4;
+/// The root of the block's signed set: an update's signature is shown
+/// to be under it.
+pub const PUB_SIGNED: usize = PUB_COUNTS + 4;
+pub const NUM_PUBLIC: usize = PUB_SIGNED + DIGEST;
 
 fn pow2<F: Field>(k: usize) -> F {
     F::from_u32(1 << k)
@@ -323,6 +342,8 @@ impl Air for NameAir {
         let (msg_start, msg_abs, load, step) = (ty(T_MSG_START), ty(T_MSG_ABS), ty(T_LOAD), ty(T_STEP));
         let (xleaf, tree_start, tree_abs) = (ty(T_LEAF), ty(T_TREE_START), ty(T_TREE_ABS));
         let active = l[XCOLS.active()];
+        let (ent0, ent1, sp) = (ty(T_ENT0), ty(T_ENT1), ty(T_SP));
+        let (spn, sp_last, sp_end) = (l[R_SPN], l[C_SP_LAST], l[C_SP_END]);
         let idx: [F; IDX] = core::array::from_fn(|i| l[C_IDX + i]);
         for v in idx {
             b.assert_zero(v * v - v);
@@ -344,7 +365,12 @@ impl Air for NameAir {
 
         // The signature fragment, over the update message register.
         let msg: [F; DIGEST] = core::array::from_fn(|i| l[R_MSG + i]);
+        // No signature is checked here: an update's is looked up in the
+        // block's signed set. The fragment's columns stay for what else
+        // reads them (its bits and its sibling), and its rows never
+        // come; nor the key hash's, the owner being a key hash already.
         xmss_fragment::eval(b, &XCOLS, &XTYPES, &msg, nt(T_PKH0));
+        b.assert_zero(msg_start + msg_abs + load + step + xleaf + tree_start + tree_abs + pkh0 + pkh1);
 
         // machine op mapping
         let multi_start = (name + rec2 + rec + commit_t + cleaf + tleaf + tleaf2 + opd) * idx[0];
@@ -369,7 +395,7 @@ impl Air for NameAir {
         b.assert_eq(l[COL_LOAD], load);
         b.assert_eq(l[COL_CHAIN], step * active);
         b.assert_eq(l[COL_PASS], op + key + win + win2 + pload + tload + term + done + step * (one - active));
-        b.assert_zero(l[COL_COMPRESS]);
+        b.assert_eq(l[COL_COMPRESS], ent0 + ent1 + sp);
         b.when_first_row(one - op - done);
         b.when_first_row(one - idx[0]);
         b.when_last_row(one - done);
@@ -393,6 +419,9 @@ impl Air for NameAir {
             + nlist
             + slist
             + done
+            + ent0
+            + ent1
+            + sp
             + pkh0
             + pkh1
             + msg_start
@@ -506,10 +535,23 @@ impl Air for NameAir {
         b.when_transition(term * wk[WK_UPDATE] * (one - nt(T_UMSG)));
         b.when_transition(split * (one - ls) * (one - nt(T_SPLIT)));
         b.when_transition(split * ls * (one - nt(T_COMMIT)));
-        // Update signature.
-        b.when_transition(umsg * (one - nt(T_MSG_START)));
-        b.when_transition(pkh0 * (one - nt(T_PKH1)));
-        b.when_transition(pkh1 * (one - nt(T_OPD)));
+        // The update's signature: its entry, and the entry's path
+        // through the block's signed set.
+        b.when_transition(umsg * (one - nt(T_ENT0)));
+        b.when_transition(ent0 * (one - nt(T_ENT1)));
+        b.when_transition(ent1 * (one - nt(T_SP)));
+        b.when_transition((sp - sp_end) * (one - nt(T_SP)));
+        b.when_transition(sp_end * (one - nt(T_OPD)));
+        b.when_transition(nt(T_ENT0) * (one - umsg));
+        b.when_transition(nt(T_ENT1) * (one - ent0));
+        b.when_transition(nt(T_SP) * (one - ent1 - sp));
+        b.assert_zero(sp_last * sp_last - sp_last);
+        b.assert_zero(sp_last * spn);
+        b.assert_eq(spn * l[C_SP_INV], one - sp_last);
+        b.assert_eq(sp_end, sp * sp_last);
+        b.when_transition(ent1 * (n[R_SPN] - F::from_u32((crate::signed::DEPTH - 1) as u32)));
+        b.when_transition((sp - sp_end) * (n[R_SPN] - spn + one));
+        b.when_transition((one - ent1 - sp + sp_end) * n[R_SPN]);
         // Commit leaf and window.
         b.when_transition(leafc * (one - nt(T_LEAFC2)));
         b.when_transition(leafc2 * is_commit * (one - nt(T_PLOAD)));
@@ -581,8 +623,8 @@ impl Air for NameAir {
             // leaf value.
             b.when_transition(term * (wk[WK_COMMIT]) * (n[R_OPX + i] - l[R_C + i]));
             b.when_transition(term * (wk[WK_RDEL]) * (n[R_OPX + i] - l[R_VAL + i]));
-            b.when_transition(pkh1 * (n[R_OPX + i] - l[R_VAL + i]));
-            b.when_transition((one - term - pkh1) * (n[R_OPX + i] - l[R_OPX + i]));
+            b.when_transition(sp_end * (n[R_OPX + i] - l[R_VAL + i]));
+            b.when_transition((one - term - sp_end) * (n[R_OPX + i] - l[R_OPX + i]));
         }
 
         // ---------------- hashing phases ----------------
@@ -657,18 +699,20 @@ impl Air for NameAir {
         // umsg: the update message over the new record leaf value.
         start_cap(b, umsg, cap_const(crate::hash::DOM_UPDATE, DIGEST as u32));
         block_is(b, umsg, true, digest_block(R_VAL));
-        // pkh0, pkh1: the signer's key hash is the current owner.
+        // The entry a signature segment says of the owner's signature:
+        // the current owner, which is a key's hash, compressed with the
+        // update message just made, and that with the leaf that signed
+        // (whichever it was). Its path ends at the root of the block's
+        // signed set.
+        b.assert_zero(ent0 * (one - l[COL_DIR]));
+        b.assert_zero((ent1) * l[COL_DIR]);
         for i in 0..RATE {
-            b.when_transition(nt(T_PKH0) * (n[COL_INPUT + i] - l[COL_ACC + i]));
-            let seed = match i {
-                _ if i < PUB_SEED_LEN => l[XCOLS.pub_seed(i)],
-                PUB_SEED_LEN => xmss_fragment::height_value(l, &XCOLS),
-                _ => F::ZERO,
-            };
-            b.assert_zero(pkh1 * (data[i] - seed));
-            b.assert_zero(pkh1 * (l[COL_ACC + i] - l[R_OWNER2 + i]));
+            b.assert_zero(ent0 * (data[i] - l[R_OWNER2 + i]));
+            if i > 0 {
+                b.assert_zero(ent1 * data[i]);
+            }
+            b.assert_zero(sp_end * (l[COL_ACC + i] - b.public()[PUB_SIGNED + i]));
         }
-        start_cap(b, pkh0, cap_const(DOM_PUBKEY, (DIGEST + PUB_SEED_LEN + 1) as u32));
         // commit: name hash, salt (free), owner.
         start_cap(b, commit_t * idx[0], cap_const(crate::hash::DOM_COMMIT, 3 * DIGEST as u32));
         block_is(b, commit_t * idx[0], true, nameh);
@@ -923,9 +967,7 @@ impl OpWitness {
                 };
                 1 + 4 * 4 + 2 * 2 + trie_walk(trie) + split + 3 + 2 + 2 + 2 + OUTPUT_WALK_ROWS + 2 + 1
             }
-            OpWitness::Update { trie, pubkey, .. } => {
-                1 + 4 * 4 + 2 * 2 + trie_walk(trie) + 1 + xmss_fragment::rows(pubkey.height()) + 2 + 2 + 1
-            }
+            OpWitness::Update { trie, .. } => 1 + 4 * 4 + 2 * 2 + trie_walk(trie) + 1 + SIGNATURE_ROWS + 2 + 1,
         }
     }
 }
@@ -950,9 +992,14 @@ pub const COMMIT_ROWS: usize = 1 + 2 + 2 + OUTPUT_WALK_ROWS + 3 + 1;
 /// At least the rows a reveal takes.
 pub const REVEAL_ROWS_BOUND: usize =
     1 + 4 * 4 + 2 * 2 + WALK_ROWS_BOUND + KEY_BITS + 3 + 2 + 2 + 2 + OUTPUT_WALK_ROWS + 2 + 1;
-/// At least the rows an update signed by a key of `height` takes.
-pub const fn update_rows_bound(height: usize) -> usize {
-    1 + 4 * 4 + 2 * 2 + WALK_ROWS_BOUND + 1 + xmss_fragment::rows(height) + 2 + 2 + 1
+/// Rows of an update's signature looked up in the signed set: its
+/// entry's two rows and the path's.
+const SIGNATURE_ROWS: usize = 2 + crate::signed::DEPTH;
+/// At least the rows an update takes, whatever the height of the key
+/// that signed it: the signature itself is checked in a signature
+/// segment ([`crate::sig_air`]).
+pub const fn update_rows_bound(_height: usize) -> usize {
+    1 + 4 * 4 + 2 * 2 + WALK_ROWS_BOUND + 1 + SIGNATURE_ROWS + 2 + 1
 }
 
 /// The rows a sweep takes ([`OpWitness::rows`]).
@@ -972,6 +1019,10 @@ pub struct NameWitness {
     /// The network's reveal window ([`NameAir::min_reveal`]).
     pub min_reveal: u32,
     pub ops: Vec<OpWitness>,
+    /// The signatures of the whole block and their set
+    /// ([`crate::block_air::SegmentWitness::signed`]): where an update's
+    /// is looked up.
+    pub signed: Arc<Signed>,
 }
 
 /// The path of `position` up to the state's root: the outputs' tree's,
@@ -1134,7 +1185,11 @@ impl NameWitness {
                 let path = output_path(txn, &outputs, &registry, position)?;
                 out.push(OpWitness::Sweep { commit: commit.hash, memo, height: commit.height, position, path });
             }
-            Ok(NameWitness { root_in, pos_in, height, min_reveal, ops: out })
+            // The set of its own signatures, until it is joined with
+            // the transaction segments' ([`crate::block_proof::join_signed`]).
+            let mut witness = NameWitness { root_in, pos_in, height, min_reveal, ops: out, signed: Arc::default() };
+            witness.signed = Arc::new(Signed::pack(witness.signings()));
+            Ok(witness)
         })
     }
 
@@ -1184,8 +1239,23 @@ impl NameWitness {
             let (_, public) = crate::block_air::BlockAir::generate_trace(last);
             self.root_in = public.root_out;
             self.pos_in = public.pos_out;
+            self.signed = last.signed.clone();
         }
         self
+    }
+
+    /// The signatures this segment rests on, in order: each update's,
+    /// by the name's owner over the update's message.
+    pub fn signings(&self) -> Vec<Signing> {
+        self.ops
+            .iter()
+            .filter_map(|op| match op {
+                OpWitness::Update { new, pubkey, signature, .. } => {
+                    Some((*pubkey, names::update_message(new), signature.clone()))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// The swept positions, in order.
@@ -1212,6 +1282,8 @@ pub struct NamePublic {
     pub height: u32,
     /// Commits, reveals, updates, sweeps.
     pub counts: [u32; 4],
+    /// The root of the block's signed set.
+    pub signed: Digest,
 }
 
 impl NamePublic {
@@ -1227,6 +1299,7 @@ impl NamePublic {
         v.extend_from_slice(&self.ssp);
         v.push(Fp::new(self.height));
         v.extend(self.counts.iter().map(|c| Fp::new(*c)));
+        v.extend_from_slice(&self.signed);
         v
     }
 
@@ -1250,6 +1323,7 @@ impl NamePublic {
             ssp: state(PUB_SSP),
             height: v[PUB_HEIGHT].to_canonical(),
             counts: core::array::from_fn(|k| v[PUB_COUNTS + k].to_canonical()),
+            signed: digest(PUB_SIGNED),
         })
     }
 }
@@ -1288,6 +1362,8 @@ struct Regs {
     ssp: [Fp; WIDTH],
     pos: u64,
     wpos: u64,
+    /// Levels of a signature's path left.
+    spn: u32,
 }
 
 fn inv_or_zero(x: Fp) -> Fp {
@@ -1302,6 +1378,10 @@ impl Regs {
 
     /// Everything but the signature fragment's registers.
     fn write_rest(&self, row: &mut [Fp]) {
+        row[R_SPN] = Fp::new(self.spn);
+        row[C_SP_LAST] = Fp::new((self.spn == 0) as u32);
+        row[C_SP_INV] = inv_or_zero(Fp::new(self.spn));
+        row[C_SP_END] = Fp::new((self.spn == 0) as u32) * row[T_SP];
         row[R_KIND + self.kind] = Fp::ONE;
         row[R_WK + self.wk] = Fp::ONE;
         for k in 0..4 {
@@ -1426,6 +1506,8 @@ struct Gen {
     r: Regs,
     height: u32,
     min_reveal: u32,
+    /// The block's signed set, where an update's signature is looked up.
+    signed: Arc<Signed>,
 }
 
 impl Gen {
@@ -1828,33 +1910,33 @@ impl Gen {
                 self.r.msg = self.b.acc();
                 crate::stark::refuse(self.r.msg == names::update_message(new), "the signed message is the update's");
                 let msg = self.r.msg;
-                let mut xr = self.r.xmss.clone();
-                let regs = &self.r;
-                let root = xmss_fragment::generate(
-                    &mut self.b,
-                    &mut xr,
-                    &XCOLS,
-                    &XTYPES,
-                    &msg,
-                    signature,
-                    pubkey,
-                    &mut |row, _| {
-                        regs.write_rest(row);
-                        row[C_IDX] = Fp::ONE;
-                        row[C_EXIT] = Fp::ONE;
-                    },
+                crate::stark::refuse(
+                    crate::output::pubkey_hash(pubkey) == old.owner,
+                    "the signer is not the current owner",
                 );
-                self.r.xmss = xr;
-                let mut input = [Fp::ZERO; WIDTH];
-                input[..RATE].copy_from_slice(&root);
-                input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_PUBKEY, (DIGEST + PUB_SEED_LEN + 1) as u32));
-                self.b.start(input);
-                self.finish(T_PKH0, 0);
-                let mut seed_block = [Fp::ZERO; RATE];
-                seed_block[..PUB_SEED_LEN].copy_from_slice(&pubkey.pub_seed);
-                seed_block[PUB_SEED_LEN] = Fp::new(pubkey.height as u32);
-                self.absorb(T_PKH1, 0, seed_block);
-                crate::stark::refuse(self.b.acc() == old.owner, "the signer is not the current owner");
+                // The signature, looked up: the entry a signature
+                // segment says of it, and the entry's path.
+                let entry = crate::sig_air::entry_of(&old.owner, &msg, signature.index);
+                let signed = self.signed.clone();
+                let leaf = signed.set.find(&entry);
+                crate::stark::refuse(leaf.is_some(), "an update's signature is not in the block's signed set");
+                let path = signed.set.path_of(&entry);
+                self.b.compress(old.owner, true);
+                self.finish(T_ENT0, 0);
+                let mut index = [Fp::ZERO; DIGEST];
+                index[0] = Fp::from_u64(signature.index);
+                self.b.compress(index, false);
+                self.finish(T_ENT1, 0);
+                debug_assert_eq!(self.b.acc(), entry);
+                for (level, sibling) in path.siblings.iter().enumerate() {
+                    self.r.spn = (crate::signed::DEPTH - 1 - level) as u32;
+                    self.b.compress(*sibling, path.right(level));
+                    self.finish(T_SP, 0);
+                }
+                crate::stark::refuse(
+                    self.b.acc() == signed.set.root(),
+                    "the path does not reach the signed set's root",
+                );
                 crate::stark::refuse(new.owner != old.owner, "an update must change the owner");
                 self.r.opx = self.r.val;
                 self.digest_rows(&BlockNameOp::Update(new.clone()));
@@ -1907,8 +1989,15 @@ impl NameAir {
             ssp: initial_sweeps_state(),
             pos: w.pos_in,
             wpos: 0,
+            spn: 0,
         };
-        let mut g = Gen { b: HashTraceBuilder::new(NUM_COLS), r: regs, height: w.height, min_reveal: w.min_reveal };
+        let mut g = Gen {
+            b: HashTraceBuilder::new(NUM_COLS),
+            r: regs,
+            height: w.height,
+            min_reveal: w.min_reveal,
+            signed: w.signed.clone(),
+        };
         for op in &w.ops {
             g.op(op);
         }
@@ -1921,6 +2010,7 @@ impl NameAir {
             ssp: g.r.ssp,
             height: w.height,
             counts: g.r.cnt,
+            signed: w.signed.set.root(),
         };
         let n = (g.b.len() + 1).max(min_rows).next_power_of_two();
         while g.b.len() < n {

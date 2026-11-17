@@ -695,7 +695,7 @@ fn a_block_at_every_cap_fits_the_mainnet_segment() {
 #[test]
 fn layout_and_degree() {
     assert_eq!(measure_degree(&NameAir::MAINNET, NUM_PUBLIC), 3);
-    assert_eq!(NUM_PUBLIC, 57);
+    assert_eq!(NUM_PUBLIC, 57 + 8);
     println!("name segment: {NUM_COLS} columns");
 }
 
@@ -841,7 +841,14 @@ fn mainnet_name_segment_timing() {
     let alice = Record::new(b"alice", o1, d(11), d(12)).unwrap();
     let salt = d(500);
     let c = commit_hash(&name_hash(&alice.elements()), &salt, &o1);
-    let empty = NameWitness { min_reveal: MIN_REVEAL, root_in: w.root(), pos_in: 5, height: 1, ops: vec![] };
+    let empty = NameWitness {
+        min_reveal: MIN_REVEAL,
+        root_in: w.root(),
+        pos_in: 5,
+        height: 1,
+        ops: vec![],
+        signed: Default::default(),
+    };
     // One commit a block: positions 5 and 6. The first is revealed in
     // its window; the second is left to be swept.
     block(&w, 2, &[NameOp::Commit { commit: c, memo: crate::output::memo5(d(1)) }], &[]);
@@ -872,6 +879,77 @@ fn mainnet_name_segment_timing() {
         );
         assert_eq!(ok, Ok(()));
     }
+}
+
+/// An update's signature is looked up in the block's signed set, and
+/// nothing stands in for it: not another set, not another owner or
+/// message on the way to the entry, not a path that leads elsewhere.
+#[test]
+fn an_update_signature_is_looked_up_in_the_signed_set() {
+    let w = world("signed");
+    let (mut k1, k2) = (owner_key(1), owner_key(2));
+    let (o1, o2) = (pubkey_hash(&k1.public_key()), pubkey_hash(&k2.public_key()));
+    let alice = Record::new(b"alice", o1, d(11), d(12)).unwrap();
+    let c = commit_hash(&name_hash(&alice.elements()), &d(5), &o1);
+    block(&w, 10, &[NameOp::Commit { commit: c, memo: crate::output::memo5(d(41)) }], &[]);
+    block(&w, 30, &[NameOp::Reveal { record: alice.clone(), salt: d(5), commit: 5 }], &[]);
+    let handed = Record::new(b"alice", o2, d(13), d(14)).unwrap();
+    let ops = [NameOp::update(handed.clone(), &mut k1).unwrap()];
+    let witness = w.collect(31, &ops, &[]).unwrap();
+    // The witness has the set of its own signature: one entry, the
+    // owner's over the update's message.
+    let signings = witness.signings();
+    assert_eq!(signings.len(), 1);
+    let (pk, message, sig) = &signings[0];
+    assert_eq!((pubkey_hash(pk), *message), (o1, crate::name::update_message(&handed)));
+    let entry = crate::sig_air::entry(pk, message, sig.index);
+    assert_eq!(witness.signed.set.find(&entry), Some(0));
+    let (trace, public) = NameAir::generate_trace(&witness);
+    assert_eq!(public.signed, witness.signed.set.root());
+    let values = public.to_values();
+    assert_eq!(check_constraints(&NameAir::MAINNET, &trace, &values), Ok(()));
+    // Against another set's root the trace does not hold, and with a
+    // set that lacks the signature there is no trace.
+    let mut other = public;
+    other.signed[1] += Fp::ONE;
+    assert!(check_constraints(&NameAir::MAINNET, &trace, &other.to_values()).is_err());
+    let mut bare = witness.clone();
+    bare.signed = Default::default();
+    assert!(std::panic::catch_unwind(|| NameAir::generate_trace(&bare)).is_err());
+    let width = NUM_COLS;
+    let row_of = |ty: usize, which: usize| {
+        (0..trace.height()).filter(|&r| trace.values[r * width + ty] == Fp::ONE).nth(which).expect("such a row")
+    };
+    let breaks = |what: &str, change: &dyn Fn(&mut crate::stark::Trace)| {
+        let mut bad = trace.clone();
+        change(&mut bad);
+        assert!(check_constraints(&NameAir::MAINNET, &bad, &values).is_err(), "{what}");
+    };
+    use crate::hash_machine::COL_DIR;
+    breaks("owner", &|t| t.values[row_of(T_ENT0, 0) * width + COL_DATA] += Fp::ONE);
+    breaks("owner's side", &|t| t.values[row_of(T_ENT0, 0) * width + COL_DIR] = Fp::ZERO);
+    breaks("leaf's block", &|t| t.values[row_of(T_ENT1, 0) * width + COL_DATA + 1] += Fp::ONE);
+    breaks("sibling", &|t| t.values[row_of(T_SP, 7) * width + COL_DATA + 2] += Fp::ONE);
+    breaks("direction", &|t| {
+        let at = row_of(T_SP, 1) * width + COL_DIR;
+        t.values[at] = Fp::ONE - t.values[at];
+    });
+    breaks("levels left", &|t| t.values[row_of(T_SP, 2) * width + R_SPN] -= Fp::ONE);
+    breaks("the path's end", &|t| {
+        let at = row_of(T_SP, 3) * width;
+        t.values[at + C_SP_LAST] = Fp::ONE;
+        t.values[at + C_SP_END] = Fp::ONE;
+    });
+    breaks("a fragment row", &|t| {
+        let at = row_of(T_SP, 4) * width;
+        t.values[at + T_SP] = Fp::ZERO;
+        t.values[at + T_MSG_START] = Fp::ONE;
+    });
+    breaks("a key hash row", &|t| {
+        let at = row_of(T_SP, 4) * width;
+        t.values[at + T_SP] = Fp::ZERO;
+        t.values[at + T_PKH1] = Fp::ONE;
+    });
 }
 
 #[test]

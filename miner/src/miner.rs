@@ -208,6 +208,7 @@ pub fn mine<B: Backend + 'static, S: ItemSource + Sync>(
         pos_in: first.pos_in,
         height,
         ops: vec![],
+        signed: Default::default(),
     }
     .with_segments(&segments);
     let mut body = Body {

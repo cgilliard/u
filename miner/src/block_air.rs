@@ -2376,7 +2376,7 @@ impl Gen {
         let signed = self.signed.clone();
         let leaf = signed.set.find(&entry);
         crate::stark::refuse(leaf.is_some(), "a signature is not in the block's signed set");
-        let path = signed.set.path(leaf.unwrap_or(0));
+        let path = signed.set.path_of(&entry);
         let mut index = [Fp::ZERO; DIGEST];
         index[0] = Fp::from_u64(sig.index);
         for (ty, data) in [(T_ENT0, msg), (T_ENT1, index)] {

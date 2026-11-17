@@ -113,6 +113,7 @@ fn empty_names(segments: &[SegmentWitness], height: u32) -> NameWitness {
         pos_in: first.pos_in,
         height,
         ops: vec![],
+        signed: Default::default(),
     }
     .with_segments(segments)
 }
@@ -938,6 +939,7 @@ fn full_segments(
         pos_in: statement.end_output_position,
         height: 1,
         ops: vec![],
+        signed: Default::default(),
     };
     (w, statement, names)
 }
@@ -1065,6 +1067,7 @@ fn mainnet_chain_timing() {
             pos_in: st.end_output_position,
             height,
             ops: vec![],
+            signed: Default::default(),
         };
         (w, st, nm)
     };
@@ -1159,6 +1162,7 @@ fn write_fam_chain_proof() {
             pos_in: st.end_output_position,
             height,
             ops: vec![],
+            signed: Default::default(),
         };
         (w, st, nm)
     };

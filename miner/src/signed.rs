@@ -217,6 +217,15 @@ impl SignedSet {
         Path { leaf, siblings, sides }
     }
 
+    /// The path of the first leaf holding `entry`; of an entry the set
+    /// lacks, a path of nothing, which leads nowhere.
+    pub fn path_of(&self, entry: &Digest) -> Path {
+        match self.find(entry) {
+            Some(leaf) => self.path(leaf),
+            None => Path { leaf: 0, siblings: [NO_ENTRY; DEPTH], sides: 0 },
+        }
+    }
+
     /// The first leaf holding `entry`, if one does.
     pub fn find(&self, entry: &Digest) -> Option<u32> {
         self.places.get(&entry.map(|x| x.to_canonical())).copied()
