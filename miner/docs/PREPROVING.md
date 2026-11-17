@@ -255,12 +255,51 @@ the rest, and nothing in consensus is in its way.
 
 ## 7. Order of work
 
-1. The signature segment circuit and its tests, from `xmss_fragment`.
-   Done: `src/sig_air.rs`.
-2. The transaction segment without the fragment, with the path and `S`;
-   policy inputs the same.
-3. The name segment the same.
-4. `block_proof`, then the tree of signature proofs and the root.
-5. The miner: a store of signature proofs, filled in the background.
-6. The constants of the main network, made again once, with the change
-   of security parameters that is waiting for the same moment.
+1. The signature segment circuit: done, `src/sig_air.rs`. An entry
+   also says which leaf of the key signed.
+2. The signed set, its tree and paths: done, `src/signed.rs`.
+3. The transaction segment looks signatures up: done, `src/block_air.rs`
+   (`T_ENT0`, `T_ENT1`, `T_SP`; public value `PUB_SIGNED`). Policy
+   inputs the same. The fragment's columns are still in the circuit,
+   unused but for its bit columns and sibling register: to be taken out.
+4. `block_proof` (networks of quick blocks) proves and checks signature
+   segments: done.
+5. The proof of proofs: the set's root is carried through the nodes,
+   and the root holds it to the set of nothing, so the main network and
+   the recursive dev network take blocks without signatures only. To
+   do: section 8.
+6. The name segment's update signature, looked up the same way.
+7. The miner: nothing to do until there is a mempool; signature
+   segments are proven with the block.
+8. The constants of the main network, made again once more with the
+   change of security parameters.
+
+## 8. The signature tree in the proof of proofs (to build)
+
+How it is meant to fit what `src/aggregate.rs` has, so that a root's
+shape does not depend on how many signature segments a block has:
+
+- **Signature nodes.** A program that verifies up to four signature
+  segment proofs (`SigAir`, 256 public values each), makes each one's
+  root of 32 entries, and compresses the four (a missing one is the
+  empty tree's constant) two levels up; and one that does the same over
+  four signature nodes. Its output is its subtree's root with the
+  digest of the programs below, as a transaction node's is.
+- **Padding to the top.** Whatever level the topmost signature node is
+  at, it also climbs from its root to the tree's full depth beside
+  empty subtrees (at most twelve compressions), so what it says is the
+  whole set's root.
+- **A plan of its own.** The allowed topmost signature programs, one
+  for each count of signature segments, are the leaves of a second
+  Merkle tree, as the allowed wraps are of the first
+  (`plan_leaves`). All of them are padded to the same table heights.
+- **Two roots for each count of segments.** The root without
+  signatures holds the signed set to the set of nothing, as now, and
+  costs what it costs today: a block of a reward alone pays for no
+  signature proof. The root with signatures verifies one topmost
+  signature proof, checks by a path that its program is in the
+  signature plan, and holds the segments' signed set to what it says.
+  The plan of wraps has a leaf for each: twice as many.
+- **Proving.** Signature segments and their nodes are proven beside
+  the transaction segments; nothing in them is of the parent, so a
+  miner with a mempool proves them ahead and keeps them.
