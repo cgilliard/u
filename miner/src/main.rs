@@ -133,6 +133,7 @@ fn make_blocks(
     seed: SeedText<'static>,
     kept: &Path,
     prebuild: bool,
+    max_signatures: usize,
     reward: &tabminer::hash::Digest,
     main: &Arc<Logger>,
     stats: &Arc<Stats>,
@@ -230,7 +231,8 @@ fn make_blocks(
             let (hold, table, main, stats) = (hold.clone(), Arc::clone(&table), Arc::clone(main), Arc::clone(stats));
             let (reward, watch) = (*reward, ahead.is_none());
             std::thread::Builder::new().name("block".into()).spawn(move || {
-                let finished = make_block(&hold, &table, &reward, &main, &stats, seen, watch, start, on);
+                let finished =
+                    make_block(&hold, &table, &reward, &main, &stats, max_signatures, seen, watch, start, on);
                 let _ = done.send(finished);
             })
         };
@@ -274,6 +276,7 @@ fn make_block(
     reward: &tabminer::hash::Digest,
     main: &Logger,
     stats: &Stats,
+    max_signatures: usize,
     seen: u64,
     watch: bool,
     start: u64,
@@ -304,8 +307,28 @@ fn make_block(
             main.log(&format!("Mining block {height} on {parent}: proved in {took}"));
         }
     };
+    // What the block carries of the pool: none, if it cannot be
+    // chosen.
+    let (pooled, sweeps) = match miner::choose(hold.chain(), &|f| hold.pool(f), max_signatures) {
+        Ok(chosen) => chosen,
+        Err(e) => {
+            main.log(&format!("Error: choosing a block's transactions: {e}"));
+            (Vec::new(), Vec::new())
+        }
+    };
+    if let Some((height, _)) = &on
+        && !pooled.is_empty()
+    {
+        let signatures: usize = pooled.iter().map(|tx| tx.weight()).sum();
+        main.log(&format!(
+            "Block {height} carries {} transactions of the pool ({} signatures)",
+            commas(pooled.len() as u64),
+            commas(signatures as u64)
+        ));
+    }
     let dataset = table.read().unwrap_or_else(|e| e.into_inner());
-    match miner::mine(hold.chain(), &*dataset, reward, socket::unix(), start, &proved, &cancel) {
+    let unix = socket::unix();
+    match miner::mine_with(hold.chain(), &*dataset, reward, unix, start, &pooled, &sweeps, &proved, &cancel) {
         Ok(Mined::Block { block, header, hashes, solved, .. }) => {
             main.log(&format!(
                 "Won block {} ({}): {} hashes in {}",
@@ -330,6 +353,9 @@ fn make_block(
                 main.log(&format!("Let go {} ms after the chain was seen to move", at.elapsed().as_millis()));
             }
         }
+        // What was chosen no longer applies: again, in a moment, with
+        // what is chosen then.
+        Ok(Mined::Stale) => hold.wait_moved(seen, Duration::from_millis(200)),
         Ok(Mined::Finished) => return true,
         Err(e) => {
             main.log(&format!("Error: making a block: {e}"));
@@ -492,9 +518,10 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     }
     if let Some((seed, table, reward)) = mining {
         let (main, stats, prebuild) = (Arc::clone(&main), Arc::clone(&stats), c.prebuild_table);
+        let most = c.max_block_signatures;
         std::thread::Builder::new()
             .name("miner".into())
-            .spawn(move || make_blocks(&hold, seed, &table, prebuild, &reward, &main, &stats))
+            .spawn(move || make_blocks(&hold, seed, &table, prebuild, most, &reward, &main, &stats))
             .map_err(threads)?;
     }
 

@@ -79,6 +79,11 @@ const OPTIONS: &[(&str, &[Opt])] = &[
                 help: "make the whole table of the proof of work before any block\nis made, and not while blocks are made (it is kept in the\ndata directory either way, and made only once)",
             },
             Opt {
+                name: "max-block-signatures",
+                takes: Takes::Value("N"),
+                help: "signatures a block made here checks at the most: one for\neach input of the transactions it carries (default 256)",
+            },
+            Opt {
                 name: "reward-key",
                 takes: Takes::Value("HEX"),
                 help: "the key the rewards of blocks made here are paid to:\nits hash, as 64 hex digits",
@@ -370,6 +375,9 @@ pub struct Configuration {
     /// Whether the table of the proof of work is made whole before any
     /// block is.
     pub prebuild_table: bool,
+    /// Signatures a block made here checks at the most: what bounds the
+    /// transactions it carries.
+    pub max_block_signatures: usize,
     /// The hash of the key rewards are paid to, if one was given.
     pub reward: Option<crate::hash::Digest>,
     pub listen: SocketAddrV4,
@@ -723,6 +731,7 @@ impl Configuration {
             threads: count("threads", 0)?.unwrap_or(0),
             mine: !given.flag("no-mine"),
             prebuild_table: given.flag("prebuild-table"),
+            max_block_signatures: count("max-block-signatures", 0)?.unwrap_or(crate::miner::MAX_SIGNATURES),
             reward,
             listen,
             peers,
@@ -754,6 +763,7 @@ impl Configuration {
             ("Network", self.network.name().to_string()),
             ("Mining", yes(self.mine)),
             ("Prebuild Table", yes(self.prebuild_table)),
+            ("Max Block Signatures", commas(self.max_block_signatures as u64)),
         ]);
         lines.extend(self.reward.iter().map(|key| ("Reward Key", hex(&crate::poseidon2::digest_to_bytes(key)))));
         lines.extend([
@@ -885,6 +895,8 @@ mod tests {
         let c = read(&[]).unwrap();
         assert_eq!((c.network, c.mine, c.threads, c.keep), (Network::Mainnet, true, 0, 1008));
         assert!(!c.prebuild_table && read(&["--prebuild-table"]).unwrap().prebuild_table);
+        assert_eq!(c.max_block_signatures, 256);
+        assert_eq!(read(&["--max-block-signatures", "1024"]).unwrap().max_block_signatures, 1024);
         assert_eq!(c.listen.to_string(), "0.0.0.0:3737");
         assert_eq!(c.data_dir, Path::new("/home/chris/.tabernacle/tabminer"));
         assert_eq!(c.main_log, Path::new("/home/chris/.tabernacle/tabminer/tabernacle.log"));

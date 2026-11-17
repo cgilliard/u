@@ -3009,6 +3009,13 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
         Ok(id)
     }
 
+    /// Gives the pool, held, to `f`: for whoever chooses a block's
+    /// transactions. (Whoever takes the chain's state as well takes it
+    /// first.)
+    pub fn pool(&self, f: &mut dyn FnMut(&Mempool)) {
+        f(&self.shared.pool())
+    }
+
     /// Whether the transaction `id` is in the pool.
     pub fn pooled(&self, id: &Digest) -> bool {
         self.shared.pool().contains(id)

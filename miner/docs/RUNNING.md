@@ -438,6 +438,22 @@ of transactions yet.
 - On the dev networks, without `--reward-key`, rewards are paid to a
   key nobody has.
 
+**What a block carries.** A block made here carries transactions of
+the node's pool: the longest waiting first, a tenth of it, and then
+the best paying. How many is bounded by the signatures the block's
+proof checks, one for each input: 256 unless
+`--max-block-signatures` says otherwise (some hundred transactions; 0
+for blocks of nothing but their reward). Proving them is what takes
+the time, about as long again as a block of nothing for every 128, so
+a machine with more to prove with may be given more; a block's size
+allows a hundred times as many, which is for those who prove on many
+machines (`POOL_SCALING.md`). When a block carries any, the main log
+says so:
+
+```
+[2026-11-17 19:02:11:403] Block 7 carries 3 transactions of the pool (8 signatures)
+```
+
 **The table of the proof of work.** A miner hashes against a table: 1.1
 GB on mainnet (it doubles each year, to 32 GB), 64 KB and built in on
 the dev networks. Its memory is taken when the node starts making

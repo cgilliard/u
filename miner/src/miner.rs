@@ -5,8 +5,9 @@
 //! gives the block to the node, which applies it and tells its peers
 //! (`net::node::Hand`). Nothing here knows of the network.
 //!
-//! A block made here pays its reward to one key, and carries nothing
-//! else: there is no pool of transactions yet.
+//! A block made here pays its reward to one key, with the fees of the
+//! transactions it carries: those chosen for it from the pool
+//! ([`choose`]), no more of them than the miner is to prove.
 //!
 //! Where a block's proof builds on the proof of the block before it
 //! (every network but the dev network, whose proofs stand alone), that
@@ -17,8 +18,8 @@
 //! The steps, each given up if `cancel` says so (the chain has another
 //! last block, or the node is stopping):
 //!
-//! 1. The reward's transaction, and its witness against the state as
-//!    it is.
+//! 1. The reward's transaction, and the witnesses of it and of the
+//!    transactions chosen, against the state as it is.
 //! 2. The block's proof: what takes the time, where proofs are large.
 //! 3. The header, and a nonce whose hash meets the target: on every
 //!    thread there is, each trying its own nonces.
@@ -28,18 +29,31 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::aggregate::{AggregateVerifier, Statement};
-use crate::block::{Block, Body, BodyRef, Header};
-use crate::block_air::SegmentWitness;
+use crate::block::{Block, Body, BodyRef, HEADER_SIZE, Header};
+use crate::block_air::{ROWS_PER_OUTPUT, SegmentWitness, item_rows_of, pack_with};
+use crate::block_proof::{body_from_segments, join_signed};
 use crate::chain::Chain;
 use crate::chain::verify::BlockStatement;
 use crate::difficulty::Target;
 use crate::error::Error;
 use crate::hash::Digest;
-use crate::name_air::NameWitness;
-use crate::output::{Output, Sig};
+use crate::mempool::{Mempool, PROOF_BYTES, RESERVE_PERCENT};
+use crate::name::NameOp;
+use crate::name_air::{NameWitness, SWEEP_ROWS, op_rows_bound};
+use crate::output::{INPUT_SIZE, Output, Sig};
 use crate::pow::{ItemSource, LazyDataset, Nonce, hashimoto, nonce_from_u64};
 use crate::store::backend::Backend;
-use crate::transaction::UnsignedTransaction;
+use crate::store::outputs::Record;
+use crate::transaction::{Transaction, UnsignedTransaction};
+
+/// Signatures a block made here checks at the most, unless told
+/// otherwise: one for each input of its transactions (a policy input
+/// may be several). Two segments of signatures, some hundred
+/// transactions: what a machine with nothing but its processor proves
+/// in about the time it proves a block of nothing twice over. The
+/// block's size allows a hundred times as many, which is for those who
+/// prove on many machines (`POOL_SCALING.md`).
+pub const MAX_SIGNATURES: usize = 256;
 
 /// Whether to make blocks now, or to wait for a chain ahead of ours to
 /// come in ([`HoldOff::ask`]).
@@ -147,11 +161,96 @@ pub enum Mined {
     Block { block: Vec<u8>, header: Header, proved: Duration, hashes: u64, solved: Duration },
     /// Given up: `cancel` said so.
     Cancelled,
+    /// A transaction chosen for the block no longer applies: the state
+    /// has changed since it was chosen, and the pool has not yet been
+    /// looked over. To be tried again, with what is chosen then.
+    Stale,
     /// The chain has had its last block: there is none to make.
     Finished,
 }
 
-/// Makes the block after `chain`'s last, paying its reward to the key
+/// The transactions of the pool for the block after `chain`'s last,
+/// and the commits of names past their time that it is to sweep.
+///
+/// The longest waiting first, a tenth of the block, and then the best
+/// paying ([`Mempool::select`]), while the block checks no more than
+/// `max_signatures` signatures, its transactions are one segment's, its
+/// name operations fit their segment, and it is no larger than a block
+/// may be. `with_pool` gives the pool, held while they are chosen: the
+/// state is taken first, as by everyone that takes both.
+pub fn choose<B: Backend + 'static>(
+    chain: &Chain<B, AggregateVerifier>,
+    with_pool: &dyn Fn(&mut dyn FnMut(&Mempool)),
+    max_signatures: usize,
+) -> Result<(Vec<Transaction>, Vec<u64>), Error> {
+    let params = *chain.params();
+    let proofs = *chain.verifier().params();
+    let state = chain.whole()?;
+    let snap = state.snapshot()?;
+    let height = snap.tip().0 + 1;
+    let sweeps = Mempool::sweeps(&snap, height);
+    let mut chosen: Vec<Transaction> = Vec::new();
+    if max_signatures == 0 {
+        return Ok((chosen, sweeps));
+    }
+    with_pool(&mut |pool: &Mempool| {
+        // (What is chosen so far, decoded once: the choosing asks of
+        // all of it each time one more is tried.)
+        let mut so_far: Vec<Transaction> = Vec::new();
+        let reserve = max_signatures * INPUT_SIZE * RESERVE_PERCENT / 100;
+        let taken = pool.select(&snap, height, params.min_reveal, reserve, |trying| {
+            so_far.truncate(trying.len() - 1);
+            so_far.push(trying[trying.len() - 1].to_transaction());
+            if so_far.iter().map(Transaction::weight).sum::<usize>() > max_signatures {
+                return false;
+            }
+            let ops = || so_far.iter().flat_map(|tx| tx.ops.iter());
+            if sweeps.len() * SWEEP_ROWS + ops().map(op_rows_bound).sum::<usize>() >= proofs.name_rows() {
+                return false;
+            }
+            let spends: usize = so_far.iter().map(|tx| tx.inputs.len() + tx.policy_inputs.len()).sum();
+            let makes = 1 + so_far.iter().map(|tx| tx.outputs.len()).sum::<usize>();
+            let names =
+                ops().map(|op| op.block_op().size()).sum::<usize>() + sweeps.len() * crate::codec::POSITION_BYTES;
+            if HEADER_SIZE + Body::size_of(spends, makes, names, PROOF_BYTES) > params.max_block_size {
+                return false;
+            }
+            // One segment, with the reward's transaction before them.
+            let rows = |t: usize| match t {
+                0 => (vec![ROWS_PER_OUTPUT], false),
+                t => item_rows_of(&so_far[t - 1]),
+            };
+            let made = |t: usize| match t {
+                0 => 0..1,
+                t => {
+                    let tx = &so_far[t - 1];
+                    let before = tx.inputs.len() + tx.policy_inputs.len();
+                    before..before + tx.outputs.len()
+                }
+            };
+            pack_with(so_far.len() + 1, rows, made, proofs.segment_rows()).len() <= 1
+        });
+        chosen = taken.iter().map(|tx| tx.to_transaction()).collect();
+    });
+    Ok((chosen, sweeps))
+}
+
+/// [`mine_with`], of a block that carries nothing but its reward.
+pub fn mine<B: Backend + 'static, S: ItemSource + Sync>(
+    chain: &Chain<B, AggregateVerifier>,
+    dataset: &S,
+    reward: &Digest,
+    unix: u64,
+    start: u64,
+    proved: &dyn Fn(Duration),
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<Mined, Error> {
+    mine_with(chain, dataset, reward, unix, start, &[], &[], proved, cancel)
+}
+
+/// Makes the block after `chain`'s last, of the transactions `pooled`
+/// and sweeping the commits at `sweeps` ([`choose`]), paying its reward
+/// and their fees to the key
 /// of hash `reward`. `unix` is the time by the calendar, in seconds,
 /// and `start` where the nonces tried begin (any number: so that two
 /// miners do not try the same). `proved` is called when the block's
@@ -161,12 +260,15 @@ pub enum Mined {
 /// `dataset` is the table of the proof of work for that block's
 /// height: whole, or one that fills as it is read
 /// ([`crate::pow::LazyDataset`]).
-pub fn mine<B: Backend + 'static, S: ItemSource + Sync>(
+#[allow(clippy::too_many_arguments)]
+pub fn mine_with<B: Backend + 'static, S: ItemSource + Sync>(
     chain: &Chain<B, AggregateVerifier>,
     dataset: &S,
     reward: &Digest,
     unix: u64,
     start: u64,
+    pooled: &[Transaction],
+    sweeps: &[u64],
     proved: &dyn Fn(Duration),
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<Mined, Error> {
@@ -178,13 +280,17 @@ pub fn mine<B: Backend + 'static, S: ItemSource + Sync>(
         return Ok(Mined::Finished);
     }
     // The reward: a transaction that spends nothing, signed by nobody.
-    let paid = Output::to_key_hash(reward, subsidy);
+    // It pays what the block may make and what its transactions leave.
+    let fees: u64 = pooled.iter().map(|tx| tx.balance().clamp(0, u64::MAX as i128) as u64).sum();
+    let paid = Output::to_key_hash(reward, subsidy.saturating_add(fees));
     let tx = UnsignedTransaction::new(vec![], vec![paid])
         .sign(|_, _, _| Err::<Sig, ()>(()))
         .expect("a transaction without inputs needs no signature");
+    let mut txs = vec![tx];
+    txs.extend(pooled.iter().cloned());
     let rows = chain.verifier().params().segment_rows();
-    let (segments, prev_state_root, first_output_position) = {
-        let state = chain.whole()?;
+    let state = chain.whole()?;
+    let (mut segments, prev_state_root, first_output_position) = {
         let snap = state.snapshot()?;
         // (The state of the block being built on, or it has moved on.)
         // (The state before the first block is of no block.)
@@ -192,31 +298,55 @@ pub fn mine<B: Backend + 'static, S: ItemSource + Sync>(
         if at != tip.height || (at > 0 && id != tip.hash()) {
             return Ok(Mined::Cancelled);
         }
-        let segments = SegmentWitness::collect_by_rows(&snap, &[tx], rows, height)?;
+        let segments = match SegmentWitness::collect_by_rows(&snap, &txs, rows, height) {
+            Ok(segments) => segments,
+            // What a transaction of the pool spends is not there.
+            Err(Error::NoSuchOutput(_)) if !pooled.is_empty() => return Ok(Mined::Stale),
+            Err(e) => return Err(e),
+        };
         (segments, snap.root(), snap.outputs().next)
     };
+    let names = if pooled.is_empty() && sweeps.is_empty() {
+        let first = &segments[0];
+        NameWitness {
+            min_reveal: params.min_reveal,
+            root_in: first.root_in,
+            pos_in: first.pos_in,
+            height,
+            ops: vec![],
+            signed: Default::default(),
+        }
+        .with_segments(&segments)
+    } else {
+        // The name operations and the sweeps, on the state as the
+        // transactions leave it; and one set of the block's signatures,
+        // for every segment to look its own up in.
+        let mut spends: Vec<u64> = segments.iter().flat_map(|s| s.positions()).collect();
+        spends.sort_unstable();
+        let made: Vec<Record> = segments
+            .iter()
+            .flat_map(|s| s.block_outputs())
+            .map(|o| Record { commitment: o.commitment, memo: o.memo, amount: o.amount, height })
+            .collect();
+        let ops: Vec<NameOp> = txs.iter().flat_map(|tx| tx.ops.iter().cloned()).collect();
+        let mut names = match NameWitness::collect(&state, height, params.min_reveal, &spends, &made, &ops, sweeps) {
+            Ok(names) => names,
+            Err(Error::Io(kind)) => return Err(Error::Io(kind)),
+            // A name taken, a commit out of its window: the pool has
+            // not yet been looked over.
+            Err(_) => return Ok(Mined::Stale),
+        };
+        join_signed(&mut segments, &mut names);
+        names
+    };
+    drop(state);
     // What the proof of the block before speaks to, and that proof:
     // where this block's proof is to build on it.
     let before = match chain.verifier().needs_plan() && height > 1 {
         true => Some(before(chain, &tip, first_output_position)?),
         false => None,
     };
-    let first = &segments[0];
-    let names = NameWitness {
-        min_reveal: params.min_reveal,
-        root_in: first.root_in,
-        pos_in: first.pos_in,
-        height,
-        ops: vec![],
-        signed: Default::default(),
-    }
-    .with_segments(&segments);
-    let mut body = Body {
-        inputs: vec![],
-        outputs: segments.iter().flat_map(|s| s.block_outputs()).collect(),
-        proof: vec![],
-        ..Default::default()
-    };
+    let mut body = body_from_segments(&segments, &names, vec![]);
     let unproven = body.to_bytes();
     let unproven = BodyRef::from_bytes(&unproven)?;
     let state_root = chain.state_root_after(&unproven)?;
@@ -481,6 +611,59 @@ mod tests {
         let end = chain.whole().unwrap().snapshot().unwrap().outputs().next;
         let (statement, body) = before(&chain, &tip, end).unwrap();
         assert_eq!(chain.verifier().verify_chain_proof(tip.height, &statement, proof_of(&body)), Ok(()));
+    }
+
+    /// A block made here carries what was chosen for it from the pool,
+    /// and pays their fees with its reward: a block the chain takes.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "proves blocks; run with --release")]
+    fn a_block_carries_the_pools_transactions() {
+        let (chain, dataset) = dev();
+        let mut key = crate::xmss::SecretKey::generate(&[5; 32]);
+        let reward = crate::output::pubkey_hash(&key.public_key());
+        // The first block pays the key; the second carries a spend of
+        // that, all but a fee, back to it.
+        let made = mine(&chain, &dataset, &reward, NOW, 3, &|_| {}, &|| false).unwrap();
+        let Mined::Block { block, .. } = made else { panic!("{made:?}") };
+        assert_eq!(chain.apply_block(&BlockRef::from_bytes(&block).unwrap(), NOW), Ok(Applied::Extended));
+        let (paid, fee) = (chain.params().subsidy(1), 1_000_000);
+        let mut pool = Mempool::new(1 << 20);
+        let position = {
+            let state = chain.whole().unwrap();
+            let snap = state.snapshot().unwrap();
+            let theirs = crate::output::commitment(&key.public_key(), paid);
+            let position = (0..64).find(|p| snap.output(*p).unwrap().is_some_and(|(r, _)| r.commitment == theirs));
+            let mut tx = UnsignedTransaction::new(
+                vec![(key.public_key(), paid)],
+                vec![Output::new(&key.public_key(), paid - fee)],
+            )
+            .sign(|_, _, m| key.sign(m))
+            .unwrap();
+            tx.set_positions(&[position.unwrap()]);
+            pool.insert(&tx.to_bytes(), &snap, 2, NOW).unwrap();
+            position.unwrap()
+        };
+        // Nothing is chosen for a miner that is to prove no signatures.
+        assert!(choose(&chain, &|f| f(&pool), 0).unwrap().0.is_empty());
+        let (pooled, sweeps) = choose(&chain, &|f| f(&pool), MAX_SIGNATURES).unwrap();
+        assert_eq!((pooled.len(), sweeps.len()), (1, 0));
+        let made = mine_with(&chain, &dataset, &reward, NOW, 7, &pooled, &sweeps, &|_| {}, &|| false).unwrap();
+        let Mined::Block { block, .. } = made else { panic!("{made:?}") };
+        let view = BlockRef::from_bytes(&block).unwrap();
+        assert_eq!(chain.apply_block(&view, NOW), Ok(Applied::Extended));
+        // It spends that output, and makes two: the reward with the
+        // fee, and what the transaction paid.
+        let spent: Vec<u64> = view.body().inputs().collect();
+        assert_eq!(spent, [position]);
+        let mut amounts: Vec<u64> = view.body().outputs().map(|o| o.amount).collect();
+        amounts.sort_unstable();
+        let mut wanted = [chain.params().subsidy(2) + fee, paid - fee];
+        wanted.sort_unstable();
+        assert_eq!(amounts, wanted);
+        // The same transaction again, its output spent: the block is
+        // not made, and nothing is wrong.
+        let again = mine_with(&chain, &dataset, &reward, NOW, 9, &pooled, &sweeps, &|_| {}, &|| false).unwrap();
+        assert!(matches!(again, Mined::Stale), "{again:?}");
     }
 
     /// Told to give up, it does: while proving, or while looking for
