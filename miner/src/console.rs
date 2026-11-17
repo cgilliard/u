@@ -64,6 +64,10 @@ pub struct Console<B: Backend + 'static, W: Backend> {
     pub wallet: Option<Arc<Mutex<Wallet<W>>>>,
     /// The time by the calendar, in seconds.
     pub unix: fn() -> u64,
+    /// Told of what this node's own wallet does with a payment (begun,
+    /// answered, signed, given up): a line for the main log. Nothing of
+    /// anybody else's transactions is said there.
+    pub log: Arc<dyn Fn(&str) + Send + Sync>,
 }
 
 /// An amount of coins as it is written: its whole part with commas, and
@@ -262,25 +266,23 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         let snap = state.snapshot().map_err(|e| e.to_string())?;
         let slate = wallet.send(amount, fee, &snap, (self.unix)()).map_err(|e| e.to_string())?;
         let done = format!(
-            "payment {} begun: {} and a fee of {}, from {} outputs; to be answered and then finalized",
+            "payment {} begun: {} and a fee of {}, from {} outputs",
             &slate.id_hex()[..8],
             coins(slate.amount as u128),
             coins(slate.fee as u128),
             slate.inputs.len()
         );
-        Self::write(file, slate.to_text(), done)
+        (self.log)(&format!("P{}", &done[1..]));
+        Self::write(file, slate.to_text(), format!("{done}; to be answered and then finalized"))
     }
 
     fn receive(&self, file: &str, out: &str) -> Said {
         let mut slate = Self::read_slate(file)?;
         let mut wallet = self.wallet()?;
         wallet.receive_slate(&mut slate, (self.unix)()).map_err(|e| e.to_string())?;
-        let done = format!(
-            "payment {} answered: {} to this wallet, once its sender finalizes it",
-            &slate.id_hex()[..8],
-            coins(slate.amount as u128)
-        );
-        Self::write(out, slate.to_text(), done)
+        let done = format!("payment {} answered: {} to this wallet", &slate.id_hex()[..8], coins(slate.amount as u128));
+        (self.log)(&format!("P{}", &done[1..]));
+        Self::write(out, slate.to_text(), format!("{done}, once its sender finalizes it"))
     }
 
     fn finalize(&self, file: &str) -> Said {
@@ -290,14 +292,21 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         let signed = self.wallet()?.finalize(&slate, unix).map_err(|e| e.to_string())?;
         let id = short(&digest_to_bytes(&signed.tx.txid()));
         match self.hold.submit(&signed.tx.to_bytes(), unix) {
-            Ok(_) => Ok(format!(
-                "payment {} signed and pooled: transaction {id}, {} with a fee of {}",
-                &slate.id_hex()[..8],
-                coins(slate.amount as u128),
-                coins(slate.fee as u128)
-            )),
+            Ok(_) => {
+                let done = format!(
+                    "payment {} signed and pooled: transaction {id}, {} with a fee of {}",
+                    &slate.id_hex()[..8],
+                    coins(slate.amount as u128),
+                    coins(slate.fee as u128)
+                );
+                (self.log)(&format!("P{}", &done[1..]));
+                Ok(done)
+            }
             Err(why) => {
-                Err(format!("payment {} is signed, but the pool does not take it: {why}", &slate.id_hex()[..8]))
+                let failed =
+                    format!("payment {} is signed, but the pool does not take it: {why}", &slate.id_hex()[..8]);
+                (self.log)(&format!("Error: {failed}"));
+                Err(failed)
             }
         }
     }
@@ -319,7 +328,9 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         match found[..] {
             [one] => {
                 wallet.cancel_slate(&one).map_err(|e| e.to_string())?;
-                Ok(format!("payment {} given up", short(&one)))
+                let done = format!("payment {} given up", short(&one));
+                (self.log)(&format!("P{}", &done[1..]));
+                Ok(done)
             }
             [] => Err(format!("no payment begun with an id that starts {id}")),
             _ => Err(format!("more than one payment begun with an id that starts {id}")),

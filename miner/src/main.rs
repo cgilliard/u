@@ -577,7 +577,9 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     }
     // Commands are taken from the terminal on a thread of their own.
     if c.prompt {
-        let console = Console { hold: hold.clone(), wallet: wallet.clone(), unix: socket::unix };
+        let said = Arc::clone(&main);
+        let log = Arc::new(move |line: &str| said.log(line));
+        let console = Console { hold: hold.clone(), wallet: wallet.clone(), unix: socket::unix, log };
         let main = Arc::clone(&main);
         std::thread::Builder::new().name("prompt".into()).spawn(move || prompt(&console, &main)).map_err(threads)?;
     }

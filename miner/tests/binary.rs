@@ -309,6 +309,13 @@ fn a_payment_is_made_at_the_prompt_and_mined() {
     wait("the payment is not confirmed", &mut || confirmed(&mut other) == "12.5");
     let log = std::fs::read_to_string(dirs[0].join("tabernacle.log")).unwrap();
     assert!(log.contains("carries 1 transactions of the pool (1 signatures)"), "{log}");
+    // And each node's log says what its own wallet did, and nothing of
+    // the other's.
+    let theirs = std::fs::read_to_string(dirs[1].join("tabernacle.log")).unwrap();
+    assert!(log.contains("] Payment ") && log.contains(" begun: 12.5 and a fee of "), "{log}");
+    assert!(log.contains(" signed and pooled: transaction ") && !log.contains(" answered: "), "{log}");
+    assert!(theirs.contains(" answered: 12.5 to this wallet") && !theirs.contains(" begun: "), "{theirs}");
+    assert!(!theirs.contains("signed and pooled"), "{theirs}");
     let status = ask(&mut other, "status");
     assert!(status.contains("wallet: 12.5 confirmed") && status.contains("pool: 0 transactions"), "{status}");
     // Told to stop, each does, without failure.

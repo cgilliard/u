@@ -589,6 +589,17 @@ text in a file, passed between them however files are:
 3. The sender: `finalize payment.slate.received`. The transaction is
    signed, pooled and told to the node's peers; a block carries it.
 
+The main log has a line for each step this node's own wallet takes
+(and none for anybody else's transactions, which would fill it):
+
+```
+[2026-11-17 19:35:10:902] Payment 3f9a1c04 begun: 12.5 and a fee of 0.0000026, from 1 outputs
+[2026-11-17 19:35:11:310] Payment 3f9a1c04 signed and pooled: transaction 8be2a771, 12.5 with a fee of 0.0000026
+```
+
+and, on the recipient's node, `Payment 3f9a1c04 answered: 12.5 to this
+wallet`; a payment given up is said as that.
+
 Amounts are in coins, with up to ten decimals. A fee is coins in all,
 or `N/byte`; not given, it is the least the pool takes.
 
