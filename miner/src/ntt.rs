@@ -160,6 +160,39 @@ fn scale_by_powers(v: &mut [Fp], base: Fp) {
     }
 }
 
+/// The sum of `a[i] * b[i]`: a polynomial's value at a point, from its
+/// coefficients and the point's powers. Eight products at a time where
+/// the machine has the instructions for it, one at a time where it has
+/// not: the same sum either way.
+pub fn dot(a: &[Fp], b: &[Fp]) -> Fp {
+    assert_eq!(a.len(), b.len());
+    let (mut xs, mut ys) = (a.chunks_exact(8), b.chunks_exact(8));
+    let mut sum = Fp::ZERO;
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use crate::packed::{add, load_fp, mul, splat_fp, store_fp};
+        let mut lanes = splat_fp(Fp::ZERO);
+        for (x, y) in (&mut xs).zip(&mut ys) {
+            lanes = add(lanes, mul(load_fp(x), load_fp(y)));
+        }
+        let mut sums = [Fp::ZERO; 8];
+        store_fp(&mut sums, lanes);
+        for part in sums {
+            sum = sum.add(&part);
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    for (x, y) in (&mut xs).zip(&mut ys) {
+        for (p, q) in x.iter().zip(y) {
+            sum = sum.add(&p.mul(q));
+        }
+    }
+    for (p, q) in xs.remainder().iter().zip(ys.remainder()) {
+        sum = sum.add(&p.mul(q));
+    }
+    sum
+}
+
 /// `v[i] *= c`.
 #[inline]
 fn scale_const(v: &mut [Fp], c: Fp) {
@@ -321,6 +354,19 @@ mod tests {
             for i in 0..n << log_blowup {
                 assert_eq!(split[(i % b) * n + i / b], full[i], "log_n {log_n} blowup {log_blowup} point {i}");
             }
+        }
+    }
+
+    /// The sum of products is the sum of the products one by one, at
+    /// every length: whole eights, and what is left over.
+    #[test]
+    fn a_dot_product_is_its_products_added_up() {
+        let mut rng = crate::test_util::Rng::new(7);
+        for n in [0usize, 1, 7, 8, 9, 16, 63, 64, 1000, 1 << 12] {
+            let a: Vec<Fp> = (0..n).map(|_| Fp::new(rng.next_u64() as u32 % crate::poseidon2::P)).collect();
+            let b: Vec<Fp> = (0..n).map(|_| Fp::new(rng.next_u64() as u32 % crate::poseidon2::P)).collect();
+            let one_by_one = a.iter().zip(&b).fold(Fp::ZERO, |acc, (x, y)| acc.add(&x.mul(y)));
+            assert_eq!(dot(&a, &b), one_by_one, "{n}");
         }
     }
 

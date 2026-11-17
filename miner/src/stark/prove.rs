@@ -477,7 +477,7 @@ impl Committed {
             xp.push(p);
             p = p.mul(&x);
         }
-        par_map_min(self.width, 1, |k| self.coeffs[k].iter().zip(&xp).fold(Fp::ZERO, |acc, (c, p)| acc.add(&c.mul(p))))
+        par_map_min(self.width, 1, |k| crate::ntt::dot(&self.coeffs[k], &xp))
     }
 }
 
