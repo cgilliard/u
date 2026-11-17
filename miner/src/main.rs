@@ -135,7 +135,7 @@ fn make_blocks(
     prebuild: bool,
     reward: &tabminer::hash::Digest,
     main: &Arc<Logger>,
-    stats: &Stats,
+    stats: &Arc<Stats>,
 ) {
     // The table of the proof of work, for the height blocks are now
     // made at: what a file of it from an earlier run holds, and the
@@ -162,6 +162,8 @@ fn make_blocks(
     let _ = tabminer::random::fill(&mut start);
     let mut start = u64::from_le_bytes(start);
     let mut hold_off = HoldOff::new(hold.chain().params().schedule.block_time.max(1) as u64);
+    // Blocks given up that have not yet let go.
+    let mut letting_go: std::collections::VecDeque<std::thread::JoinHandle<()>> = Default::default();
     loop {
         let seen = hold.moves();
         // Not while the state is being taken; and not, for a while,
@@ -194,39 +196,13 @@ fn make_blocks(
             )),
             _ => {}
         }
-        // Given up when the chain has another last block; or when a
-        // chain ahead turns up that is to be waited for (looked for a
-        // few times a second, not at every hash).
-        let watch = ahead.is_none();
-        let looked = std::sync::Mutex::new(Instant::now());
-        // (When it was first seen to have another: for how long the
-        // giving up then took, which `TABMINER_TIMING` has said.)
-        let noticed = std::sync::Mutex::new(None::<Instant>);
-        let cancel = || {
-            if hold.moves() != seen {
-                noticed.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Instant::now);
-                return true;
-            }
-            let mut looked = looked.lock().unwrap_or_else(|e| e.into_inner());
-            if !watch || looked.elapsed() < Duration::from_millis(250) {
-                return false;
-            }
-            *looked = Instant::now();
-            hold.behind() != Behind::No
-        };
         start = start.wrapping_add(1 << 32);
         // Two steps, each said as it is begun: the block's proof is
         // made, and then the nonce is looked for.
-        let on = hold.chain().tip().map(|tip| (commas(tip.height as u64 + 1), short(&tip.hash())));
-        if let Ok((height, parent)) = &on {
+        let on = hold.chain().tip().ok().map(|tip| (commas(tip.height as u64 + 1), short(&tip.hash())));
+        if let Some((height, parent)) = &on {
             main.log(&format!("Proving block {height} on {parent}"));
         }
-        let proved = |took: Duration| {
-            if let Ok((height, parent)) = &on {
-                let took = short_seconds(took.as_millis() as u64);
-                main.log(&format!("Mining block {height} on {parent}: proved in {took}"));
-            }
-        };
         // The table grows with the chain, a year at a time: what it
         // has stays, and the rest is filled as the first was.
         let wanted = hold.chain().tip().map_or(0, |tip| pow.log_items_at(tip.height as u64 + 1));
@@ -237,39 +213,130 @@ fn make_blocks(
             }
             fill_table(&table, kept, main, prebuild);
         }
-        let dataset = table.read().unwrap_or_else(|e| e.into_inner());
-        match miner::mine(hold.chain(), &*dataset, reward, socket::unix(), start, &proved, &cancel) {
-            Ok(Mined::Block { block, header, hashes, solved, .. }) => {
-                main.log(&format!(
-                    "Won block {} ({}): {} hashes in {}",
-                    commas(header.height as u64),
-                    short(&header.hash()),
-                    commas(hashes),
-                    short_seconds(solved.as_millis() as u64)
-                ));
-                stats.add(socket::MINED, 1);
-                // Until what came of it is heard: it is the chain's
-                // last, or another got there first. Either way the next
-                // is begun at once, on whatever the last then is.
-                let settled = hold.settled();
-                hold.mined(block, socket::unix());
-                hold.wait_settled(settled, Duration::from_secs(10));
-            }
-            Ok(Mined::Cancelled) => {
-                let noticed = *noticed.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(at) = noticed
-                    && std::env::var_os("TABMINER_TIMING").is_some()
-                {
-                    main.log(&format!("Gave up {} ms after the chain was seen to move", at.elapsed().as_millis()));
-                }
-            }
-            Ok(Mined::Finished) => return,
-            Err(e) => {
-                main.log(&format!("Error: making a block: {e}"));
-                hold.wait_moved(seen, Duration::from_secs(1));
+        // The block is made on a thread of its own, which is not
+        // waited for when the chain has another last block: the next
+        // block is begun at once, and the one given up lets go where
+        // it next asks whether to go on, seconds later at the most.
+        // One may be letting go beside the one being made, and no
+        // more: an older one is waited for.
+        letting_go.retain(|attempt| !attempt.is_finished());
+        while letting_go.len() > 1 {
+            if let Some(old) = letting_go.pop_front() {
+                let _ = old.join();
             }
         }
+        let (done, ended) = std::sync::mpsc::channel::<bool>();
+        let attempt = {
+            let (hold, table, main, stats) = (hold.clone(), Arc::clone(&table), Arc::clone(main), Arc::clone(stats));
+            let (reward, watch) = (*reward, ahead.is_none());
+            std::thread::Builder::new().name("block".into()).spawn(move || {
+                let finished = make_block(&hold, &table, &reward, &main, &stats, seen, watch, start, on);
+                let _ = done.send(finished);
+            })
+        };
+        let attempt = match attempt {
+            Ok(attempt) => attempt,
+            Err(e) => return main.log(&format!("Error: no more blocks are made: no thread to make one on: {e}")),
+        };
+        // Until it has come to its end, or the chain has moved.
+        let ended = loop {
+            match ended.try_recv() {
+                Ok(finished) => break Some(finished),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break Some(false),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            if hold.moves() != seen {
+                break None;
+            }
+            hold.wait_moved(seen, Duration::from_millis(250));
+        };
+        match ended {
+            Some(true) => return,
+            Some(false) => {
+                if attempt.join().is_err() {
+                    return main.log("Error: no more blocks are made: making one failed");
+                }
+            }
+            None => letting_go.push_back(attempt),
+        }
     }
+}
+
+/// Makes one block on the chain's last, which was the last when the
+/// chain had moved `seen` times: given up when it has another, or
+/// (`watch`) when a chain ahead turns up that is to be waited for.
+/// Won, it is handed to the node, and what comes of it waited for.
+/// True if the chain has had its last block.
+#[allow(clippy::too_many_arguments)]
+fn make_block(
+    hold: &Handle<FileBackend, AggregateVerifier>,
+    table: &RwLock<LazyDataset<'static>>,
+    reward: &tabminer::hash::Digest,
+    main: &Logger,
+    stats: &Stats,
+    seen: u64,
+    watch: bool,
+    start: u64,
+    on: Option<(String, String)>,
+) -> bool {
+    // (A chain ahead is looked for a few times a second, not at every
+    // hash.)
+    let looked = std::sync::Mutex::new(Instant::now());
+    // (When the chain was first seen to have another last block: for
+    // how long the letting go then took, which `TABMINER_TIMING` has
+    // said.)
+    let noticed = std::sync::Mutex::new(None::<Instant>);
+    let cancel = || {
+        if hold.moves() != seen {
+            noticed.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Instant::now);
+            return true;
+        }
+        let mut looked = looked.lock().unwrap_or_else(|e| e.into_inner());
+        if !watch || looked.elapsed() < Duration::from_millis(250) {
+            return false;
+        }
+        *looked = Instant::now();
+        hold.behind() != Behind::No
+    };
+    let proved = |took: Duration| {
+        if let Some((height, parent)) = &on {
+            let took = short_seconds(took.as_millis() as u64);
+            main.log(&format!("Mining block {height} on {parent}: proved in {took}"));
+        }
+    };
+    let dataset = table.read().unwrap_or_else(|e| e.into_inner());
+    match miner::mine(hold.chain(), &*dataset, reward, socket::unix(), start, &proved, &cancel) {
+        Ok(Mined::Block { block, header, hashes, solved, .. }) => {
+            main.log(&format!(
+                "Won block {} ({}): {} hashes in {}",
+                commas(header.height as u64),
+                short(&header.hash()),
+                commas(hashes),
+                short_seconds(solved.as_millis() as u64)
+            ));
+            stats.add(socket::MINED, 1);
+            // Until what came of it is heard: it is the chain's
+            // last, or another got there first. Either way the next
+            // is begun at once, on whatever the last then is.
+            let settled = hold.settled();
+            hold.mined(block, socket::unix());
+            hold.wait_settled(settled, Duration::from_secs(10));
+        }
+        Ok(Mined::Cancelled) => {
+            let noticed = *noticed.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(at) = noticed
+                && std::env::var_os("TABMINER_TIMING").is_some()
+            {
+                main.log(&format!("Let go {} ms after the chain was seen to move", at.elapsed().as_millis()));
+            }
+        }
+        Ok(Mined::Finished) => return true,
+        Err(e) => {
+            main.log(&format!("Error: making a block: {e}"));
+            hold.wait_moved(seen, Duration::from_secs(1));
+        }
+    }
+    false
 }
 
 /// Fills what is missing of the table of the proof of work, on a thread
