@@ -1,6 +1,6 @@
 # Proving signatures ahead of the block
 
-A design, not yet built. It changes the circuits of a block's proof, so
+A design, being built (section 7 says how far). It changes the circuits of a block's proof, so
 it is a change to consensus, to be made before launch.
 
 ## 1. The problem
@@ -77,14 +77,23 @@ height 20. It is `xmss_fragment` under a small schedule of its own, as
 For each signature it checks, it makes an **entry**:
 
 ```text
-entry = H(DOM_SIGNED, key hash[8] ‖ message[8])
+entry = compress(key hash, message)
 ```
 
-and its one public value is the root of a small Merkle tree over its
-entries (32 leaves, the unused ones a fixed empty digest). Nothing in it
-is of any block: the key hash is of the key, and the message is whatever
-was signed, a transaction's body hash or a policy's rebindable message
-or a name update's message. All three are fixed by the transaction.
+and its public values are its entries, 32 of them, in the order checked
+(a slot with no signature says zeros). Whoever verifies the proof makes
+the small Merkle tree over them: a proof of proofs does, and hashing 32
+leaves there costs less than keeping a tree's nodes in the trace would.
+Nothing in a segment is of any block: the key hash is of the key, and
+the message is whatever was signed, a transaction's body hash or a
+policy's rebindable message or a name update's message. All three are
+fixed by the transaction.
+
+An entry is a compression of two digests, not a hash under a domain of
+its own: it is only ever a leaf of a tree of a fixed depth, read at
+that depth.
+
+Built: `src/sig_air.rs`.
 
 ### 3.2 The signature tree
 
@@ -245,6 +254,7 @@ the rest, and nothing in consensus is in its way.
 ## 7. Order of work
 
 1. The signature segment circuit and its tests, from `xmss_fragment`.
+   Done: `src/sig_air.rs`.
 2. The transaction segment without the fragment, with the path and `S`;
    policy inputs the same.
 3. The name segment the same.
