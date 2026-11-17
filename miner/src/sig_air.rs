@@ -86,9 +86,11 @@ pub const TYPES: Types = Types {
 };
 
 /// Entries a segment has room to say: more than the signatures by the
-/// tallest keys that fit a main network's segment, so that shorter keys
-/// are not held to fewer than fit.
-pub const SLOTS: usize = 32;
+/// tallest keys that fit a segment's rows
+/// ([`crate::signed::SEGMENT_LOG_ROWS`]), so that shorter keys are not
+/// held to fewer than fit. A segment is large because what verifies it
+/// costs the same however much is in it.
+pub const SLOTS: usize = 128;
 
 /// The message a signature is over: free where it starts, held to its
 /// entry.
@@ -358,10 +360,10 @@ mod tests {
     fn layout() {
         assert_eq!(measure_degree(&SigAir, NUM_PUBLIC), 3);
         assert_eq!(rows(20), 3 + 67 * 17 + 40 + 4);
-        assert_eq!((NUM_PUBLIC, NUM_COLS), (256, HM_COLS + 12 + xmss_fragment::LEN + 8 + 32));
+        assert_eq!((NUM_PUBLIC, NUM_COLS), (1024, HM_COLS + 12 + xmss_fragment::LEN + 8 + 128));
         // A main network's segment holds this many by the tallest keys,
         // and has a slot for each.
-        assert!((1 << 15) / rows(20) <= SLOTS);
+        assert!((1 << crate::signed::SEGMENT_LOG_ROWS) / rows(20) <= SLOTS);
     }
 
     /// Signatures by several keys of several heights, two by one key
@@ -414,9 +416,10 @@ mod tests {
 
     /// As many signatures as there are slots, by short keys.
     #[test]
+    #[cfg_attr(debug_assertions, ignore = "slow in debug builds; run with --release")]
     fn every_slot_can_be_filled() {
         let s: Vec<_> = (0..SLOTS).map(|j| signed(1, 1, (j % 2) as u64, msg(100 + j as u32))).collect();
-        let trace = SigAir::generate_trace(&s, 16);
+        let trace = SigAir::generate_trace(&s, log_rows(&s));
         assert_eq!(check_constraints(&SigAir, &trace, &said(&s)), Ok(()));
     }
 

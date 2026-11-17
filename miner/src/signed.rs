@@ -68,7 +68,7 @@ pub const ALONE: Digest = {
     d
 };
 
-const _: () = assert!(SLOTS.is_power_of_two() && FAN == 1 << NODE_PAIRS && DEPTH == 27);
+const _: () = assert!(SLOTS.is_power_of_two() && FAN == 1 << NODE_PAIRS && DEPTH == 29);
 
 /// Whether the step at `level` of a path (0 the lowest) hashes a
 /// digest alone, and is not a pair's.
@@ -237,7 +237,7 @@ pub type Signing = (PublicKey, Digest, Signature);
 
 /// Rows of a signature segment as [`Signed::pack`] fills one: a main
 /// network's segment.
-pub const SEGMENT_LOG_ROWS: usize = 15;
+pub const SEGMENT_LOG_ROWS: usize = 17;
 
 /// A block's signatures, as its signature segments take them, and the
 /// set they make.
@@ -285,7 +285,7 @@ mod tests {
     }
 
     fn segment(tag: u32, filled: usize) -> [Digest; SLOTS] {
-        core::array::from_fn(|j| if j < filled { entry(tag * 100 + j as u32) } else { NO_ENTRY })
+        core::array::from_fn(|j| if j < filled { entry(tag * 1000 + j as u32) } else { NO_ENTRY })
     }
 
     /// The whole tree the slow way, as its makers make it: every
@@ -309,7 +309,7 @@ mod tests {
         }
         assert_eq!(hashed(&NO_ENTRY), crate::poseidon2::hash(&NO_ENTRY));
         let which: Vec<usize> = (0..DEPTH).filter(|h| alone(*h)).collect();
-        assert_eq!(which, [0, 6, 9, 12, 15, 18, 21, 24]);
+        assert_eq!(which, [0, 8, 11, 14, 17, 20, 23, 26]);
     }
 
     #[test]
@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn every_entry_has_its_path() {
         for count in [1usize, 2, 3, 5, 17] {
-            let segments: Vec<[Digest; SLOTS]> = (0..count).map(|s| segment(s as u32, 32 - s)).collect();
+            let segments: Vec<[Digest; SLOTS]> = (0..count).map(|s| segment(s as u32, SLOTS - s)).collect();
             let set = SignedSet::new(&segments);
             assert_eq!(set.len(), count * SLOTS);
             // Three levels of nodes, then up beside nothing.

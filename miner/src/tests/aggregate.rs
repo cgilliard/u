@@ -753,8 +753,12 @@ fn a_spend_rests_on_the_signature_tree() {
     assert_eq!(verify_block(&SMALL, &wraps, &statement, &unsigned), Err(AggregateError::Rejected));
     // The top of the tree is what the set's root is, and no other
     // tree's top serves: of the same segment twice, say.
-    let sig = crate::block_proof::prove_signatures(&SMALL.segment, &signed.segments[0], Some(15));
-    let nothing = crate::block_proof::prove_signatures(&SMALL.segment, &[], Some(15));
+    let sig = crate::block_proof::prove_signatures(
+        &SMALL.segment,
+        &signed.segments[0],
+        Some(crate::signed::SEGMENT_LOG_ROWS),
+    );
+    let nothing = crate::block_proof::prove_signatures(&SMALL.segment, &[], Some(crate::signed::SEGMENT_LOG_ROWS));
     let node = |children: [&crate::block_proof::SigProof; 4]| {
         prove_sig_node(&SMALL, &plan, 1, &SigChildren::Segments(children), &|| false).unwrap()
     };
@@ -942,6 +946,58 @@ fn full_segments(
         signed: Default::default(),
     };
     (w, statement, names)
+}
+
+/// A block of `n` transactions that each spend two outputs and make
+/// two, and a reward: for measuring what a block with signatures costs.
+fn spending_block(params: &AggregatorParams, n: usize) -> (Vec<SegmentWitness>, Statement, NameWitness) {
+    let utxo = TestSet::new();
+    let miner = key(9).public_key();
+    // Keys of 32 leaves: each signs for sixteen transactions.
+    let mut keys: Vec<Key> = (0..n.div_ceil(16)).map(|i| Key::generate_with_height(&[i as u8 + 1; 32], 5)).collect();
+    for i in 0..2 * n {
+        let owner = keys[i / 32].public_key();
+        utxo.add_output(&TxOutput::new(&owner, 10).block_output(), 0).unwrap();
+    }
+    let mut txs: Vec<Transaction> = (0..n)
+        .map(|t| {
+            let k = &mut keys[t / 16];
+            let pk = k.public_key();
+            let outs = vec![TxOutput::new(&miner, 12), TxOutput::new(&miner, 8)];
+            let mut tx = UnsignedTransaction::new(vec![(pk, 10), (pk, 10)], outs).sign(|_, _, m| k.sign(m)).unwrap();
+            tx.set_positions(&[2 * t as u64, 2 * t as u64 + 1]);
+            tx
+        })
+        .collect();
+    txs.push(reward(&miner, 50));
+    let (prev_root, first) = (utxo.root(), utxo.next_position());
+    let segments = utxo.collect_by_rows(&txs, params.segment_rows(), 1).unwrap();
+    let new_root = utxo.root();
+    let body = Body {
+        inputs: segments.iter().flat_map(|s| s.positions()).collect(),
+        outputs: segments.iter().flat_map(|s| s.block_outputs()).collect(),
+        proof: vec![],
+        ..Default::default()
+    };
+    let statement = Statement::from_block(&BlockStatement {
+        height: 1,
+        prev_state_root: prev_root,
+        new_state_root: new_root,
+        first_output_position: first,
+        subsidy: 50,
+        body: BodyRef::from_bytes(&body.to_bytes()).unwrap(),
+        parent_work: test_work(params.pow),
+        parent_hash: test_genesis_header().hash(),
+    });
+    let names = NameWitness {
+        min_reveal: crate::name::MIN_REVEAL,
+        root_in: new_root,
+        pos_in: statement.end_output_position,
+        height: 1,
+        ops: vec![],
+        signed: segments[0].signed.clone(),
+    };
+    (segments, statement, names)
 }
 
 /// The plans built into the binary are mainnet's and the recursive dev
@@ -1273,8 +1329,24 @@ fn security_configs() {
             None => vec![1, 16],
         };
         for k in sizes {
-            let (segments, statement, names) = full_segments(name, &params, k);
-            let shape = plan_with(&params, k, &mut cache);
+            // (`SPENDS=<n>` for a block of `n` transactions of two inputs
+            // and two outputs each, in place of the blocks of rewards.)
+            let spends: Option<usize> = std::env::var("SPENDS").ok().and_then(|n| n.parse().ok());
+            let (segments, statement, names) = match spends {
+                Some(n) => spending_block(&params, n),
+                None => full_segments(name, &params, k),
+            };
+            let k = segments.len();
+            let shape = plan_for(&params, &segments, &mut cache);
+            if spends.is_some() {
+                let signed = &segments[0].signed;
+                let signatures: usize = signed.segments.iter().map(Vec::len).sum();
+                println!(
+                    "  {} transactions: {k} segments, {signatures} signatures in {} signature segments",
+                    spends.unwrap_or(0),
+                    signed.segments.len()
+                );
+            }
             // The most memory the process holds at once, from here.
             let _ = std::fs::write("/proc/self/clear_refs", "5");
             let t = std::time::Instant::now();
@@ -1303,6 +1375,10 @@ fn security_configs() {
             let t = std::time::Instant::now();
             let w = shape.wrap.unwrap();
             let ok = verify_block(&params, &|_, _| w, &statement, &proof);
+            if spends.is_some() {
+                println!("  block of {k}: proven in {elapsed:.1?}, {} bytes, verified {ok:?}", proof.len());
+                break;
+            }
             println!(
                 "  block of {k}: proven in {elapsed:.1?}, {} bytes, verified {:?} in {:.1?}; {}",
                 proof.len(),

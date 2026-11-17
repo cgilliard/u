@@ -464,6 +464,20 @@ impl Program {
         self.reserved = rows;
     }
 
+    /// The heights, as powers of two, the two tables would have were
+    /// the program padded towards `2^log_n` and `2^hash_log_n`
+    /// ([`Program::pad_to`]): those, if the program fits them. The rows
+    /// reserved to fill one table are reserved in the other too, so a
+    /// program much smaller than the machine table it is padded to has
+    /// a hash table the taller for it.
+    pub fn padded_heights(&self, log_n: usize, hash_log_n: usize) -> (usize, usize) {
+        let hashes = VmAir::hash_rows(self);
+        let fill = |rows: usize, log: usize| ((1usize << log) / 2 + 1).saturating_sub(rows);
+        let reserved = self.reserved.max(fill(self.instrs.len(), log_n)).max(fill(hashes, hash_log_n));
+        let log = |rows: usize| (rows + reserved).max(2).next_power_of_two().trailing_zeros() as usize;
+        (log(self.instrs.len()), log(hashes))
+    }
+
     /// Reserves rows so that the machine table has exactly `2^log_n` rows
     /// and the hash table `2^hash_log_n`, keeping the rows already
     /// reserved. Panics if that cannot be done (a table already taller, or
