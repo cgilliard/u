@@ -913,7 +913,7 @@ fn full_segments(
     segments: usize,
 ) -> (Vec<SegmentWitness>, Statement, NameWitness) {
     let miner = key(9).public_key();
-    let per = params.segment_rows() / crate::block_air::tx_rows(&reward(&miner, 1));
+    let per = rewards_per_segment(&params);
     let txs: Vec<Transaction> = (0..segments * per).map(|i| reward(&miner, 1 + i as u64)).collect();
     let subsidy: u64 = (1..=txs.len() as u64).sum();
     let utxo = TestSet::new();
@@ -946,6 +946,14 @@ fn full_segments(
         signed: Default::default(),
     };
     (w, statement, names)
+}
+
+/// As many reward transactions as a segment is packed with: each its
+/// rows, and room kept for putting the segment's outputs in the tree.
+fn rewards_per_segment(params: &AggregatorParams) -> usize {
+    let each = crate::block_air::tx_rows(&reward(&key(9).public_key(), 1));
+    let fits = |n: usize| n * each + crate::block_air::flush_rows_bound(n) < params.segment_rows();
+    (1..).take_while(|n| fits(*n)).last().expect("a segment holds a reward")
 }
 
 /// A block of `n` transactions that each spend two outputs and make
@@ -1093,7 +1101,7 @@ fn dev_recursive_chain_constants() {
 fn mainnet_chain_timing() {
     let params = AggregatorParams { max_segments: 16, ..AggregatorParams::MAINNET };
     let miner = key(9).public_key();
-    let per = params.segment_rows() / crate::block_air::tx_rows(&reward(&miner, 1));
+    let per = rewards_per_segment(&params);
     let utxo = TestSet::new();
     let subsidy: u64 = (1..=per as u64).sum();
     let block = |height: u32, parent: (Digest, Work)| {

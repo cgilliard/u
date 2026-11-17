@@ -1273,6 +1273,9 @@ impl Air for BlockAir {
             let shifted = if i + 1 < DEPTH { pbits[i + 1] } else { F::ZERO };
             b.when_transition((new_t * (one - is_last) + emp) * (n[R_PBITS + i] - shifted));
             b.when_transition((one - new_t - nt(T_ILIST) - fpop1 - emp) * (n[R_PBITS + i] - *bit));
+            // After a path nothing is left of it: the registers are
+            // nought until the next is set up.
+            b.when_transition(smt_end * n[R_PBITS + i]);
         }
         // output position: decomposed into the path bits entering the insert
         b.when_transition(fpop1 * (npos_lo - l[R_AP]));
@@ -1298,13 +1301,14 @@ impl Air for BlockAir {
                 (l[R_OLD + i], l[R_NEW + i], l[R_SIB + i], l[R_ROOT + i], l[COL_ACC + i], l[COL_OUTPUT + i]);
             // old: commitment entering ilist, zero entering an output insert, output after old rows
             b.when_transition(nt(T_ILIST) * (n[R_OLD + i] - acc));
-            b.when_transition(fpop1 * n[R_OLD + i]);
+            b.when_transition((fpop1 + smt_end) * n[R_OLD + i]);
             b.when_transition(emp * (n[R_OLD + i] - out));
             b.when_transition(old_t * (n[R_OLD + i] - out));
             b.when_transition((one - old_t - nt(T_ILIST) - fpop1 - emp - smt_end) * (n[R_OLD + i] - o));
             // new: zero on ilist, the output commitment entering an insert, output after new rows
             b.assert_zero(ilist * nw);
             b.when_transition(fpop1 * (n[R_NEW + i] - l[R_AN + i]));
+            b.when_transition(smt_end * n[R_NEW + i]);
             b.when_transition(new_t * (one - is_last) * (n[R_NEW + i] - out));
             b.when_transition((one - new_t - fpop1 - nt(T_ILIST)) * (n[R_NEW + i] - nw));
             // sibling: witness on old rows, copied to the new row
@@ -2568,6 +2572,10 @@ impl Gen {
         }
         crate::stark::refuse(old_node == self.regs.root, "old path does not reach the current root");
         self.regs.root = new_node;
+        // Nothing is left of the path in its registers.
+        self.regs.old = EMPTY;
+        self.regs.new = EMPTY;
+        self.regs.pbits = [Fp::ZERO; DEPTH];
     }
 
     fn input(&mut self, w: &InputWitness) {
