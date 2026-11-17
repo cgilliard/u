@@ -30,8 +30,8 @@ a laptop.
 - **What must wait for the parent block** is the state's part: a full
   block's 27 or so state segments, the dozen proofs that gather them,
   and three proofs at the end. On the measuring laptop that is about
-  eight minutes; on a few dozen cores, about two; and there is a floor
-  of about five proofs one after another that more machines do not
+  eight minutes; on a server or a few, two to three; and there is a
+  floor of six proofs one after another that more machines do not
   shorten.
 - **A header does not commit to its proof.** A miner looks for the
   nonce while the proof is being made, so proving time costs it no
@@ -217,7 +217,7 @@ What proving time costs is therefore not hashing but a risk: a nonce
 found before the proof is ready must wait, and another miner's block
 may arrive first. With a proof ready `t` after the parent, that is
 about `(t / 600 s)^2 / 2` of a miner's blocks: one in two hundred at
-one minute, one in fifty at two, one in ten at five.
+one minute, one in fifty at two, one in eight at five.
 
 A pool can remove even that for the reward. It hashes on a block of
 its reward alone, whose proof is the last three and ready soonest, and
@@ -279,8 +279,8 @@ burst: some 300 core-minutes a block, 30 cores kept busy.
 | Hardware (laptop-class cores) | Signatures keep up with full blocks | Proof ready after the parent |
 |---|---|---|
 | The laptop, 6 cores | No: a fifth of them | 8 minutes |
-| One server, 64 cores | Yes, with half to spare | about 2.5 minutes |
-| Three such servers | Yes | about 2 minutes: the critical path |
+| One server, 64 cores | Yes, with half to spare | about 3 minutes |
+| Three such servers | Yes | about 2.3 minutes: the critical path |
 
 The last line is the floor of section 5 at these costs: a segment, two
 levels of nodes, the root, the wrap and the chain step in sequence,
