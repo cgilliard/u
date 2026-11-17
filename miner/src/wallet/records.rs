@@ -68,6 +68,11 @@ impl<B: Backend> Records<B> {
         Ok(Records { file, tables })
     }
 
+    /// What the file is kept in.
+    pub fn backend(&self) -> &B {
+        self.file.backend()
+    }
+
     /// The bytes of table `table`: none, if nothing was ever put there.
     pub fn read(&self, table: usize) -> io::Result<Vec<u8>> {
         match &self.tables[table] {
