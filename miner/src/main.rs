@@ -4,11 +4,11 @@
 //! everything it needs is opened: the logs, the store, the port. Only
 //! when all of that is done does it say how it is configured and, in
 //! the next line, that it is ready: from then on it takes requests,
-//! until it is told to stop ([`interrupt`]).
+//! until it is ended: nothing is done about being told to stop, since
+//! nothing has to be put in order first (`docs/RUNNING.md`).
 
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -16,7 +16,6 @@ use tabminer::aggregate::{AggregateVerifier, AggregatorParams, Genesis};
 use tabminer::chain::Chain;
 use tabminer::chain::params::ChainParams;
 use tabminer::configuration::{Configuration, Network, hex};
-use tabminer::interrupt;
 use tabminer::logger::Logger;
 use tabminer::logger::fmt::{bytes, commas, seconds, short_seconds};
 use tabminer::logger::queued::Queued;
@@ -326,8 +325,8 @@ fn fill_table(table: &Arc<RwLock<LazyDataset<'static>>>, kept: &Path, main: &Arc
 }
 
 /// Runs the node: it returns only with why it could not start, or
-/// could not go on. Told to stop, the program ends where that is
-/// heard ([`interrupt::halt_when_told`]).
+/// could not go on. Told to stop, the program is ended by the
+/// operating system, where it stands.
 fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::convert::Infallible, String> {
     // On mainnet the rewards of blocks made here need somewhere to go:
     // there is no wallet yet to make a key for them.
@@ -411,7 +410,6 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
 
     // Everything is open: from here the node can do what it is for.
     let _stats_log = StatsLog::start(stat_log, Arc::clone(&stats), c.stats).map_err(threads)?;
-    interrupt::halt_when_told(Arc::clone(&main)).map_err(|e| format!("cannot listen for being told to stop: {e}"))?;
     c.announce(&main);
     Configuration::ready(&main);
 
@@ -434,8 +432,7 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     }
 
     let watch = Watch { requests: Some(&requests), stats: Some(&stats), main: Some(&main) };
-    let never = AtomicBool::new(false);
-    match socket::run_watched(&mut node, &socket, &never, clock, &socket::unix, &watch) {
+    match socket::run_for_ever(&mut node, &socket, clock, &socket::unix, &watch) {
         Ok(()) => Err("the node stopped of itself".into()),
         Err(e) => Err(format!("the port can no longer be listened on: {e}")),
     }

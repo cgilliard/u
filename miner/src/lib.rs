@@ -22,7 +22,6 @@ pub mod hash_table;
 #[cfg(test)]
 #[path = "tests/inflate.rs"]
 pub mod inflate;
-pub mod interrupt;
 pub mod logger;
 pub mod merkle;
 pub mod miner;

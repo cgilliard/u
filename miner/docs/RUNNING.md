@@ -395,28 +395,18 @@ tick after it happened.
 
 ### 3.4 Stopping
 
-On an interrupt (Ctrl-C, or the operating system's signal to end):
+On an interrupt (Ctrl-C, or the operating system's signal to end) the
+node is ended by the operating system, where it stands. The node does
+nothing about it, on purpose:
 
-```
-[2026-11-16 05:28:01:753] Received shut down signal, halting!
-```
-
-in the main log (not on the terminal, which is quiet once the node is
-ready), and the node ends, with 0. That is all, on purpose: the worst a node
-can do on being told to stop is not to, or to hang.
-
-- What takes the signal only sets a flag. A thread that does nothing
-  else sees it within a fiftieth of a second, writes the line to the
-  main log (`log_all`, on its own thread, waiting for no other), and ends the program.
-- Nothing is put in order first. The store is whole wherever it is cut
-  off; lines still queued for the request log, and the stats since the
-  last interval, are lost.
-- A second interrupt ends the program at once, from where the signal is
-  taken, whatever the first is waiting on.
-
-Taking a signal needs a call the standard library does not have: the C
-library's `signal`, the same on every platform the node is built for
-(`src/interrupt.rs`).
+- Nothing has to be put in order first. The store is whole wherever it
+  is cut off; lines still queued for the request log, and the stats
+  since the last interval, are lost.
+- Nothing is said: the main log ends with whatever its last line was.
+- No thread wakes to see whether the node has been told to stop. A node
+  with nothing to do does nothing: the receiver waits for a datagram,
+  each worker for one or for its next tick, and the logs for what they
+  next have to write.
 
 ---
 

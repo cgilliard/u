@@ -39,7 +39,7 @@ how the node ran before.
 |---|---|
 | The node | Reads the port, handles every datagram, decides everything, sends. Owns all of the node's state, with no locks. |
 | The applier | What is slow and touches the store: checks and applies blocks, checks and keeps headers, takes the parts of a state. Given work and heard from over channels. |
-| Request log, stats log, interrupt | Each its own (`RUNNING.md`). |
+| Request log, stats log | Each its own (`RUNNING.md`). |
 
 One thing that can block is still on the node's thread: making an
 object to serve (reading a block, or a part of a state, from the
@@ -150,7 +150,7 @@ one after another on one thread.
 
 Everything that writes the store.
 
-### 3.4 The logs and the interrupt, as today
+### 3.4 The logs, as today
 
 Workers put request lines on the request log's queue and add to the
 stats, both of which are already made for many threads.

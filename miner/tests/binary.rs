@@ -65,7 +65,7 @@ fn help_is_no_failure_and_an_unknown_option_is() {
 /// stop, it says so and stops, at once and without failure.
 #[cfg(unix)]
 #[test]
-fn a_node_starts_says_it_is_ready_and_halts_when_told() {
+fn a_node_starts_says_it_is_ready_and_ends_when_told() {
     use std::net::UdpSocket;
     use std::time::{Duration, Instant};
     let dir = scratch("run");
@@ -113,16 +113,16 @@ fn a_node_starts_says_it_is_ready_and_halts_when_told() {
     let told = Instant::now();
     assert!(Command::new("kill").args(["-INT", &node.0.id().to_string()]).status().unwrap().success());
     let status = node.0.wait().unwrap();
-    assert_eq!(status.code(), Some(0));
+    // (Ended by the signal itself: the node does nothing about it.)
+    assert_eq!(std::os::unix::process::ExitStatusExt::signal(&status), Some(2));
     assert!(told.elapsed() < Duration::from_secs(5));
-    // Nothing more was said on the terminal once it was ready: that
-    // it halted is in the main log, after what the terminal was told.
+    // Nothing more was said once it was ready, on the terminal or in
+    // the main log.
     assert_eq!(lines.count(), 0);
     let main = std::fs::read_to_string(dir.join("tabernacle.log")).unwrap();
     let logged: Vec<&str> = main.lines().collect();
     assert_eq!(logged[..said.len()], said.iter().map(String::as_str).collect::<Vec<_>>());
-    assert_eq!(logged.len(), said.len() + 1);
-    assert!(logged[said.len()].ends_with("] Received shut down signal, halting!"));
+    assert_eq!(logged.len(), said.len());
     assert!(std::fs::read_to_string(dir.join("stat.log")).unwrap().contains("AvgLatency(us)"));
 
     // A second node on the same port cannot start: it says why, and

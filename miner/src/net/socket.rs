@@ -217,6 +217,40 @@ where
     Chain<B, V>: Send + Sync,
     Worker<B, V>: Send,
 {
+    serve(node, socket, Some(stop), clock, unix, watch)
+}
+
+/// [`run_watched`] with nothing to stop it: it returns only if the
+/// port can no longer be read. No thread of it wakes to see whether it
+/// is to stop, so a node with nothing to do does nothing: the receiver
+/// waits for a datagram, and each worker for one or for what it has
+/// next to do of itself.
+pub fn run_for_ever<B: Backend + 'static, V: ProofVerifier + Sync>(
+    node: &mut Node<B, V>,
+    socket: &UdpSocket,
+    clock: Instant,
+    unix: &(dyn Fn() -> u64 + Sync),
+    watch: &Watch<'_>,
+) -> std::io::Result<()>
+where
+    Chain<B, V>: Send + Sync,
+    Worker<B, V>: Send,
+{
+    serve(node, socket, None, clock, unix, watch)
+}
+
+fn serve<B: Backend + 'static, V: ProofVerifier + Sync>(
+    node: &mut Node<B, V>,
+    socket: &UdpSocket,
+    stop: Option<&AtomicBool>,
+    clock: Instant,
+    unix: &(dyn Fn() -> u64 + Sync),
+    watch: &Watch<'_>,
+) -> std::io::Result<()>
+where
+    Chain<B, V>: Send + Sync,
+    Worker<B, V>: Send,
+{
     let (gauge, queue) = (node.hold(), node.request_queue());
     let (workers, shared) = node.parts();
     let (senders, queues): (Vec<SyncSender<Item>>, Vec<Receiver<Item>>) =
@@ -228,18 +262,25 @@ where
         let _ = wake[worker].try_send(Item::Wake);
     })));
     let gauge = &gauge;
+    // The receiver is through: said to the workers, whatever stopped it.
+    let done = AtomicBool::new(false);
+    let done = &done;
     let received = std::thread::scope(|scope| {
         for (k, (worker, queue)) in workers.iter_mut().zip(queues).enumerate() {
             // (The first of them says, now and then, how the node stands.)
             let gauge = (k == 0).then_some(gauge);
             std::thread::Builder::new()
                 .name(format!("worker {k}"))
-                .spawn_scoped(scope, move || work(worker, queue, socket, stop, clock, unix, watch, gauge))
+                .spawn_scoped(scope, move || work(worker, queue, socket, stop, done, clock, unix, watch, gauge))
                 .expect("a thread");
         }
         let received = receive(socket, stop, watch, |from| shared.worker_of(from), &senders);
-        // The receiver is through, for whatever reason: so are they.
-        stop.store(true, Ordering::Relaxed);
+        // The receiver is through, for whatever reason: so are they,
+        // woken to see it. (One whose queue is full is not waiting.)
+        done.store(true, Ordering::Relaxed);
+        for sender in &senders {
+            let _ = sender.try_send(Item::Wake);
+        }
         received
     });
     shared.set_waker(None);
@@ -250,16 +291,16 @@ where
 /// `owner` says its sender is of.
 fn receive(
     socket: &UdpSocket,
-    stop: &AtomicBool,
+    stop: Option<&AtomicBool>,
     watch: &Watch<'_>,
     owner: impl Fn(&SocketAddr) -> usize,
     queues: &[SyncSender<Item>],
 ) -> std::io::Result<()> {
-    // (Not for ever: so that being told to stop is seen.)
-    socket.set_read_timeout(Some(Duration::from_millis(50)))?;
+    // (Not for ever, where it may be told to stop: so that it is seen.)
+    socket.set_read_timeout(stop.map(|_| Duration::from_millis(50)))?;
     let mut told: Option<Instant> = None;
     let mut item = Item::Datagram { from: SocketAddr::from(([0, 0, 0, 0], 0)), len: 0, bytes: [0u8; MAX_DATAGRAM + 1] };
-    while !stop.load(Ordering::Relaxed) {
+    while !stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
         let Item::Datagram { from, len, bytes } = &mut item else { unreachable!() };
         // Nothing in time, or the machine's own complaint about a
         // datagram we sent, is no datagram.
@@ -297,7 +338,8 @@ fn work<B: Backend + 'static, V: ProofVerifier + Sync>(
     worker: &mut Worker<B, V>,
     queue: Receiver<Item>,
     socket: &UdpSocket,
-    stop: &AtomicBool,
+    stop: Option<&AtomicBool>,
+    done: &AtomicBool,
     clock: Instant,
     unix: &(dyn Fn() -> u64 + Sync),
     watch: &Watch<'_>,
@@ -313,18 +355,25 @@ fn work<B: Backend + 'static, V: ProofVerifier + Sync>(
     };
     // When how the node stands was last told: once a second is enough.
     let mut told: Option<Micros> = None;
-    while !stop.load(Ordering::Relaxed) {
+    while !done.load(Ordering::Relaxed) && !stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
         let t = now();
         let wake = worker.tick(t, unix(), &mut out);
         if let Some(gauge) = gauge
             && told.is_none_or(|at| t.saturating_sub(at) >= 1_000_000)
         {
             watch.levels(gauge);
+            // (And a main log that has had its time is put aside,
+            // though nothing is being said in it.)
+            if let Some(main) = watch.main {
+                main.rotate_if_due();
+            }
             told = Some(t);
         }
-        // Until the worker's own next timer, a twentieth of a second
-        // at the most (to see `stop`); or something comes.
-        let wait = wake.saturating_sub(t).clamp(50, 50_000);
+        // Until the worker's own next timer, or something comes: and
+        // where it may be told to stop, a twentieth of a second at the
+        // most, to see it.
+        let most = if stop.is_some() { 50_000 } else { 3_600_000_000 };
+        let wait = wake.saturating_sub(t).clamp(50, most);
         let mut take = |worker: &mut Worker<B, V>, item: Item| {
             if let Item::Datagram { from, len, bytes } = item {
                 let began = now();
@@ -375,7 +424,7 @@ mod tests {
         let senders_of: Vec<UdpSocket> = (0..2).map(|_| UdpSocket::bind("127.0.0.1:0").unwrap()).collect();
         let odd = |s: &UdpSocket| (s.local_addr().unwrap().port() % 2) as usize;
         std::thread::scope(|scope| {
-            scope.spawn(|| receive(&port, &stop, &watch, |from| (from.port() % 2) as usize, &senders).unwrap());
+            scope.spawn(|| receive(&port, Some(&stop), &watch, |from| (from.port() % 2) as usize, &senders).unwrap());
             // Ten from the first sender, then two from the second.
             for k in 0..10u8 {
                 senders_of[0].send_to(&[k; 20], to).unwrap();
