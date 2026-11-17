@@ -852,7 +852,9 @@ mod tests {
 
     /// The files there are, for the tests.
     fn load(path: &Path) -> std::io::Result<String> {
-        match path.to_str().unwrap() {
+        // (Whichever way the system writes the line between a
+        // directory and what is in it.)
+        match path.to_str().unwrap().replace('\\', "/").as_str() {
             "/work/here/my_config" => Ok("# a seed\n\n--max-peers 2000   # many\n--no-mine\n--peer 203.0.113.7:3737\n\
                  --data-dir /srv/my tab\n--log-rotate-seconds 2h\n"
                 .into()),
@@ -998,7 +1000,9 @@ mod tests {
     fn a_log_goes_where_the_nearest_option_says() {
         let logs = |args: &[&str]| {
             let c = read(args).unwrap();
-            [c.main_log, c.request_log, c.stat_log].map(|p| p.display().to_string())
+            // (With the line between a directory and what is in it
+            // written one way, whichever way the system writes it.)
+            [c.main_log, c.request_log, c.stat_log].map(|p| p.display().to_string().replace('\\', "/"))
         };
         assert_eq!(
             logs(&["--data-dir", "/srv/tab"]),
@@ -1278,8 +1282,12 @@ mod tests {
         assert!(lines[lines.len() - 1].ends_with("] Server is ready!"));
         let said: Vec<&str> = lines[2..lines.len() - 2].iter().map(|l| &l[26..]).collect();
         assert_eq!(said[0], "UDP Server Listening on: '0.0.0.0:3737'");
-        assert!(said.contains(&format!("Main Log:                '{data}/tabernacle.log'").as_str()), "{said:#?}");
-        assert!(said.contains(&format!("Request Log:             '{data}/request.log'").as_str()));
+        let within = |file: &str| dir.join(file).display().to_string();
+        assert!(
+            said.contains(&format!("Main Log:                '{}'", within("tabernacle.log")).as_str()),
+            "{said:#?}"
+        );
+        assert!(said.contains(&format!("Request Log:             '{}'", within("request.log")).as_str()));
         assert!(said.contains(&"Mining:                  'no'"));
         assert!(said.contains(&"Max Peers:               '2,000'"));
         assert!(said.contains(&"Peer:                    '203.0.113.7:3737'"));

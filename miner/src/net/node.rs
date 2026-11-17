@@ -1662,7 +1662,14 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             let Some(outcome) = outcome else {
                 return;
             };
-            let _ = self.shared.ready.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+            // (One fewer waiting to be heard of: never below none.)
+            let mut ready = self.shared.ready.load(Ordering::Relaxed);
+            while ready > 0 {
+                match self.shared.ready.compare_exchange_weak(ready, ready - 1, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => break,
+                    Err(now) => ready = now,
+                }
+            }
             self.shared.work(self.me);
             l.outstanding = l.outstanding.saturating_sub(1);
             match outcome {

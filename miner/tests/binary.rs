@@ -1,8 +1,11 @@
 //! The program itself, run as whoever keeps a node runs it.
 
+#[cfg(unix)]
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(unix)]
+use std::process::Stdio;
 
 const TABMINER: &str = env!("CARGO_BIN_EXE_tabminer");
 

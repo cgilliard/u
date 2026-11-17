@@ -64,9 +64,17 @@ cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
 objects=""
 for cpu in $variants; do
     export RUSTFLAGS="-C instrument-coverage -C target-cpu=$cpu"
-    # The test binaries, as cargo names them.
-    binaries=$(cargo test --locked --target-dir "$out/$cpu" --no-run --message-format=json \
-        | grep -o '"executable":"[^"]*"' | cut -d'"' -f4)
+    # What cargo built that can be run, as it names them: the test
+    # binaries, and the node itself, which the tests of the program run
+    # (its lines are counted too, but it is no test binary, and is not
+    # asked for a list of tests: it would take that for an option it
+    # does not know, and fail).
+    built=$(cargo test --locked --target-dir "$out/$cpu" --no-run --message-format=json \
+        | grep '"executable":"[^"]')
+    for binary in $(echo "$built" | grep -v '"profile":{[^}]*"test":true' | grep -o '"executable":"[^"]*"' | cut -d'"' -f4); do
+        objects="$objects --object=$binary"
+    done
+    binaries=$(echo "$built" | grep '"profile":{[^}]*"test":true' | grep -o '"executable":"[^"]*"' | cut -d'"' -f4)
     for binary in $binaries; do
         objects="$objects --object=$binary"
         if [ "$cpu" = native ]; then

@@ -1071,6 +1071,18 @@ fn security_configs() {
         ("plain", AggregatorParams { segment: cfg(54, 16), outer: cfg(54, 16), wrap: wrap(22, 16), ..m }),
         ("112", AggregatorParams { segment: cfg(50, 16), outer: cfg(50, 16), wrap: wrap(20, 16), ..m }),
         ("old", AggregatorParams { segment: cfg(42, 16), outer: cfg(42, 16), wrap: wrap(16, 20), ..m }),
+        // What 120 bits proven would take in queries (in the Johnson
+        // regime a query is worth half of what it is conjectured to
+        // be), all else as mainnet: about twice as many.
+        (
+            "proven",
+            AggregatorParams {
+                segment: StarkConfig { num_queries: 113, ..m.segment },
+                outer: StarkConfig { num_queries: 113, ..m.outer },
+                wrap: StarkConfig { num_queries: 45, ..m.wrap },
+                ..m
+            },
+        ),
     ];
     let pick = std::env::var("SEC").ok();
     for (name, params) in all {
