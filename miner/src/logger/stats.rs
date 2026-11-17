@@ -283,8 +283,11 @@ fn write(logger: &Logger, stats: &Stats, every: Every, stop: &(Mutex<bool>, Cond
         let (now, values) = (logger.now(), stats.read_fresh());
         if *stopped {
             // What happened since the last line, as a last interval of
-            // whatever length it was; and the whole.
-            if now > last_at {
+            // whatever length it was; and the whole. (Of no length at
+            // all, if it is told to stop in the millisecond a line was
+            // written and something has been counted since: the wholes
+            // add up all the same.)
+            if now > last_at || values != last {
                 logger.write_at(now, &stats.interval(now - last_at, &Moment::of(now), &last, &values));
             }
             return whole(now, &values);
