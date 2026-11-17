@@ -403,6 +403,10 @@ nothing about it, on purpose:
   is cut off; lines still queued for the request log, and the stats
   since the last interval, are lost.
 - Nothing is said: the main log ends with whatever its last line was.
+- A node started in the background by a shell (`tabminer ... &` in a
+  script) is started ignoring interrupts, as any program is, and does
+  nothing to change that: it is ended with the signal to end (`kill`),
+  not with an interrupt (`kill -INT`).
 - No thread wakes to see whether the node has been told to stop. A node
   with nothing to do does nothing: the receiver waits for a datagram,
   each worker for one or for its next tick, and the logs for what they

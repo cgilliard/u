@@ -109,12 +109,15 @@ fn a_node_starts_says_it_is_ready_and_ends_when_told() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    // Told to stop.
+    // Told to stop. (With the signal to end, not an interrupt: a
+    // program a shell started in the background, as these tests are
+    // when coverage is measured, is started ignoring interrupts, and
+    // a node does nothing to change that.)
     let told = Instant::now();
-    assert!(Command::new("kill").args(["-INT", &node.0.id().to_string()]).status().unwrap().success());
+    assert!(Command::new("kill").args(["-TERM", &node.0.id().to_string()]).status().unwrap().success());
     let status = node.0.wait().unwrap();
     // (Ended by the signal itself: the node does nothing about it.)
-    assert_eq!(std::os::unix::process::ExitStatusExt::signal(&status), Some(2));
+    assert_eq!(std::os::unix::process::ExitStatusExt::signal(&status), Some(15));
     assert!(told.elapsed() < Duration::from_secs(5));
     // Nothing more was said once it was ready, on the terminal or in
     // the main log.
@@ -197,8 +200,8 @@ fn two_nodes_make_blocks_and_take_each_others() {
         std::thread::sleep(Duration::from_millis(200));
     }
     for node in &mut nodes {
-        assert!(Command::new("kill").args(["-INT", &node.0.id().to_string()]).status().unwrap().success());
-        assert_eq!(std::os::unix::process::ExitStatusExt::signal(&node.0.wait().unwrap()), Some(2));
+        assert!(Command::new("kill").args(["-TERM", &node.0.id().to_string()]).status().unwrap().success());
+        assert_eq!(std::os::unix::process::ExitStatusExt::signal(&node.0.wait().unwrap()), Some(15));
     }
     // Each was told of the other's blocks and asked for them; and
     // nothing went wrong that the main log would say.
