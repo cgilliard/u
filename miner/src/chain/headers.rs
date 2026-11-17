@@ -267,6 +267,18 @@ impl<B: Backend + 'static, V> Chain<B, V> {
         self.known_in(snap.pages(), snap.blocks(), id)
     }
 
+    /// [`Chain::header_at`], as of the state `snap` holds: for whoever
+    /// holds one already. (To ask the chain itself while holding its
+    /// state is to take what keeps it twice, which waits for ever on
+    /// anyone waiting to write between the two.)
+    pub fn header_at_of(
+        &self,
+        snap: &crate::store::state::Snapshot<'_, B>,
+        height: u32,
+    ) -> Result<Option<Header>, Error> {
+        self.header_at_in(snap.pages(), snap.blocks(), height)
+    }
+
     /// The header of the chain's block at `height`.
     pub fn header_at(&self, height: u32) -> Result<Option<Header>, Error> {
         let store = self.store();

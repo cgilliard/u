@@ -1747,7 +1747,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         let mut header = Some(*tip);
         for _ in 0..taken.min(POOL_LOOKS_BACK) {
             let Some(h) = header else { break };
-            let Ok(Some(body)) = self.chain.body(&h.hash()) else { break };
+            // (Read from the state held: not from the chain again.)
+            let Ok(Some(body)) = self.chain.body_of(&snapshot, &h.hash()) else { break };
             let Ok(body) = BodyRef::from_bytes(&body) else { break };
             let outputs = body.outputs();
             // (A block's commits of names take the positions after its
@@ -1761,7 +1762,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 }
             }
             end = first;
-            header = h.height.checked_sub(1).and_then(|below| self.chain.header_at(below).ok().flatten());
+            header = h.height.checked_sub(1).and_then(|below| self.chain.header_at_of(&snapshot, below).ok().flatten());
         }
         let mut pool = self.shared.pool();
         let _ = pool.revalidate(&snapshot, height, &moved, &created, self.unix);

@@ -443,6 +443,14 @@ impl<B: Backend + 'static, V> Chain<B, V> {
         Ok(blocks.body(pages, known.header.height, id)?)
     }
 
+    /// [`Chain::body`], as of the state `snap` holds: for whoever holds
+    /// one already ([`Chain::header_at_of`]).
+    pub fn body_of(&self, snap: &crate::store::state::Snapshot<'_, B>, id: &Digest) -> Result<Option<Vec<u8>>, Error> {
+        let (pages, blocks): (_, &Blocks) = (snap.pages(), snap.blocks());
+        let Some(known) = self.known_in(pages, blocks, id)? else { return Ok(None) };
+        Ok(blocks.body(pages, known.header.height, id)?)
+    }
+
     /// The work of the chain as far as its last block.
     pub fn tip_work(&self) -> Result<U256, Error> {
         let store = self.store();

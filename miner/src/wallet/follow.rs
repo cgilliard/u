@@ -56,7 +56,7 @@ pub fn follow<B: Backend + 'static, V, W: Backend>(
     let mut undone_from = None;
     if wallet.synced() != Some((height, tip_bytes)) {
         let on_chain = |h: u32, id: &[u8; 32]| {
-            chain.header_at(h).ok().flatten().is_some_and(|header| digest_to_bytes(&header.hash()) == *id)
+            chain.header_at_of(&snap, h).ok().flatten().is_some_and(|header| digest_to_bytes(&header.hash()) == *id)
         };
         // The newest block looked at that is still of the chain: where
         // the wallet goes on from, and, if it is not the last it looked
@@ -81,9 +81,9 @@ pub fn follow<B: Backend + 'static, V, W: Backend>(
         let mut whole = from.is_some() && on_chain(height, &tip_bytes);
         let mut end = snap.outputs().next;
         for h in (from.unwrap_or(height + 1)..=height).rev() {
-            let body = chain.header_at(h).ok().flatten().and_then(|header| {
+            let body = chain.header_at_of(&snap, h).ok().flatten().and_then(|header| {
                 let id = header.hash();
-                Some((id, chain.body(&id).ok().flatten()?))
+                Some((id, chain.body_of(&snap, &id).ok().flatten()?))
             });
             let Some((id, body)) = body else {
                 whole = false;
@@ -132,7 +132,8 @@ pub fn follow<B: Backend + 'static, V, W: Backend>(
     let settled = chain.keep() as u32;
     for (c, h, block) in wallet.rewards() {
         if block != [0; 32] && height >= h.saturating_add(settled) {
-            let on_chain = chain.header_at(h).ok().flatten().is_some_and(|x| digest_to_bytes(&x.hash()) == block);
+            let on_chain =
+                chain.header_at_of(&snap, h).ok().flatten().is_some_and(|x| digest_to_bytes(&x.hash()) == block);
             match on_chain {
                 true => wallet.reward_settled(&c)?,
                 false => drop(wallet.forget(&c)?),
