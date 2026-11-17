@@ -90,7 +90,7 @@ impl Preprocessed {
     }
 
     pub fn root(&self) -> Digest {
-        self.committed.tree.root()
+        self.committed.root()
     }
 
     /// The committed table.
@@ -236,7 +236,16 @@ impl<'a> Timer<'a> {
 
     fn lap(&mut self, what: &str) -> Result<(), Error> {
         if self.on {
-            eprintln!("  {what}: {:?}", self.last.elapsed());
+            // With the memory held now and the most held in the phase
+            // (where the system says: on Linux), which is then counted
+            // afresh for the next.
+            let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+            let mb = |key: &str| {
+                let line = status.lines().find(|l| l.starts_with(key));
+                line.and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok()).unwrap_or(0) / 1024
+            };
+            eprintln!("  {what}: {:?}, {} MB held, {} MB at most", self.last.elapsed(), mb("VmRSS:"), mb("VmHWM:"));
+            let _ = std::fs::write("/proc/self/clear_refs", "5");
             self.last = std::time::Instant::now();
         }
         if self.cancel.is_some_and(|c| c()) { Err(Error::Cancelled) } else { Ok(()) }
@@ -301,7 +310,28 @@ pub(super) struct Committed {
     /// of `stride`): point `j + 2^log_blowup * m` at row `m` of block
     /// `j / stride`.
     kept: Vec<Vec<Fp>>,
+    /// The Merkle tree over the rows, from `skip` levels above the
+    /// leaves up: its own leaves are the roots of the small trees over
+    /// each `2^skip` rows in turn.
     tree: MerkleTree,
+    /// How many of the tree's lowest levels are not kept, but made
+    /// again from the rows when one is opened ([`tree_skip`]).
+    skip: usize,
+}
+
+/// How many of the lowest levels of a commitment's Merkle tree are left
+/// out of memory, at this blowup.
+///
+/// A tree is twice its leaves, and at a high blowup the leaves are many
+/// times the table: at rate 1/32 the trees of a proof's commitments are
+/// gigabytes between them, held for the length of the proof. Leaving
+/// out the lowest two levels keeps a quarter of that. A path through
+/// what was left out is made again when a row is opened, from the four
+/// rows it is of, each computed from the coefficients: some passes more
+/// for each opening, where there are only as many openings as queries.
+/// At a low blowup the trees are small beside the rest, and whole.
+fn tree_skip(log_blowup: usize) -> usize {
+    if log_blowup >= 4 { 2 } else { 0 }
 }
 
 impl Committed {
@@ -340,9 +370,18 @@ impl Committed {
         let n = coeffs[0].len();
         let b = 1usize << log_blowup;
         let w_big = root_of_unity(log2_strict(n) + log_blowup);
-        // Room for the whole tree: the leaves' buffer becomes it, where it is.
-        let mut leaves: Vec<Digest> = Vec::with_capacity(2 * n * b - 1);
-        leaves.resize(n * b, [Fp::ZERO; crate::poseidon2::DIGEST]);
+        // Room for the whole tree that is kept: the buffer of its lowest
+        // level becomes it, where it is. That level is the leaves, or
+        // the roots of the small trees over each `2^skip` of them.
+        let skip = tree_skip(log_blowup);
+        let lowest = (n * b) >> skip;
+        let mut leaves: Vec<Digest> = Vec::with_capacity(2 * lowest - 1);
+        leaves.resize(lowest, [Fp::ZERO; crate::poseidon2::DIGEST]);
+        // Cosets hashed and waiting for the coset beside them, by the
+        // level they are at: a row's leaves are in the cosets' order,
+        // so each coset is the sibling of the next, and each pair of
+        // those of the pair after.
+        let mut pending: Vec<(usize, Vec<Digest>)> = Vec::new();
         let mut hashes: Vec<Digest> = vec![[Fp::ZERO; crate::poseidon2::DIGEST]; n];
         let mut kept = Vec::new();
         let mut rows = zeroed_vec(n * width);
@@ -362,8 +401,25 @@ impl Committed {
             });
             drop(cols);
             crate::merkle::leaf_hashes_into(&rows, width, &mut hashes);
-            for (m, h) in hashes.iter().enumerate() {
-                leaves[j + b * m] = *h;
+            if skip == 0 {
+                for (m, h) in hashes.iter().enumerate() {
+                    leaves[j + b * m] = *h;
+                }
+            } else {
+                let (mut level, mut nodes) = (0, hashes.clone());
+                while level < skip && pending.last().is_some_and(|(l, _)| *l == level) {
+                    let (_, left) = pending.pop().expect("it is there");
+                    nodes = crate::merkle::compress_pairs(&left, &nodes);
+                    level += 1;
+                }
+                if level == skip {
+                    let (block, blocks) = (j >> skip, b >> skip);
+                    for (m, h) in nodes.iter().enumerate() {
+                        leaves[block + blocks * m] = *h;
+                    }
+                } else {
+                    pending.push((level, nodes));
+                }
             }
             if stride.is_some_and(|s| j.is_multiple_of(s)) {
                 kept.push(std::mem::replace(&mut rows, zeroed_vec(n * width)));
@@ -374,7 +430,28 @@ impl Committed {
             return Err(Error::Cancelled);
         }
         let tree = MerkleTree::from_leaf_hashes(leaves);
-        Ok(Committed { width, log_blowup, shift, stride, coeffs, kept, tree })
+        Ok(Committed { width, log_blowup, shift, stride, coeffs, kept, tree, skip })
+    }
+
+    /// The root of the Merkle tree over the rows.
+    fn root(&self) -> Digest {
+        self.tree.root()
+    }
+
+    /// The Merkle path of row `i`, leaf level first: read from the
+    /// tree, with the levels it leaves out made again from the rows of
+    /// `i`'s small tree.
+    fn open(&self, i: usize) -> Vec<Digest> {
+        if self.skip == 0 {
+            return self.tree.open(i);
+        }
+        let size = 1usize << self.skip;
+        let first = i & !(size - 1);
+        let block: Vec<Digest> = (first..first + size).map(|k| crate::merkle::hash_row(&self.row_at(k))).collect();
+        let (mut path, root) = crate::merkle::block_path(&block, i - first);
+        debug_assert_eq!(root, self.tree.leaf(i >> self.skip));
+        path.extend(self.tree.siblings(i >> self.skip));
+        path
     }
 
     /// Row `i`, a point of the kept sub-coset.
@@ -703,7 +780,7 @@ pub fn try_prove_tables(
             let commit = 1 << (log_n + log_blowup);
             let trace =
                 Committed::new(input.trace.width, commit, shift, Some(stride), cancel, |k| input.trace.column(k))?;
-            challenger.observe_digest(&trace.tree.root());
+            challenger.observe_digest(&trace.root());
             let aux_ext_w = lookup_columns(num_terms, input.air.air_lookup_group())
                 + if config.zk && num_terms > 0 { ZK_AUX } else { 0 };
             let rows = Constrained { log_n, blind: config.blind_rows() };
@@ -747,7 +824,7 @@ pub fn try_prove_tables(
                 let (e, k) = (j / DEGREE, j % DEGREE);
                 (0..n).map(|i| aux[i * ext_w + e].0[k]).collect()
             })?;
-            challenger.observe_digest(&committed.tree.root());
+            challenger.observe_digest(&committed.root());
             challenger.observe_ext(&total);
             t.aux = Some((committed, total));
             timer.lap("aux commit")?;
@@ -770,7 +847,7 @@ pub fn try_prove_tables(
                 powers(alpha, t.num_constraints + num_constraints_lookup(config, t.num_terms, t.input.air));
             let rng = rng.as_ref().map(|r| (r, zk_domain(k, 2)));
             let q = commit_quotient(t, config, public, lookup_ch.as_ref(), &alpha_powers, rng, &mut timer)?;
-            challenger.observe_digest(&q.committed.tree.root());
+            challenger.observe_digest(&q.committed.root());
             Ok(q)
         })
         .collect::<Result<_, Error>>()?;
@@ -789,10 +866,10 @@ pub fn try_prove_tables(
             let pre_coeffs = t.input.pre.map_or(&no_coeffs, |p| &p.committed.coeffs);
             let part = TableProof {
                 log_n: t.log_n,
-                trace_root: t.trace.tree.root(),
-                aux_root: t.aux.as_ref().map(|(c, _)| c.tree.root()),
+                trace_root: t.trace.root(),
+                aux_root: t.aux.as_ref().map(|(c, _)| c.root()),
                 lookup_sum: t.aux.as_ref().map_or(Fp4::ZERO, |(_, s)| *s),
-                quotient_root: q.committed.tree.root(),
+                quotient_root: q.committed.root(),
                 trace_at_zeta: eval_base_polys_at(&t.trace.coeffs, zeta),
                 trace_at_zeta_next: eval_base_polys_at(&t.trace.coeffs, zeta_next),
                 aux_at_zeta: eval_base_polys_at(aux_coeffs, zeta),
@@ -887,13 +964,13 @@ pub fn try_prove_tables(
                     let pre = t.input.pre.map(|p| &p.committed);
                     QueryOpening {
                         trace_row: t.trace.row_at(i),
-                        trace_path: t.trace.tree.open(i),
+                        trace_path: t.trace.open(i),
                         aux_row: aux.map(|c| c.row_at(i)).unwrap_or_default(),
-                        aux_path: aux.map(|c| c.tree.open(i)).unwrap_or_default(),
+                        aux_path: aux.map(|c| c.open(i)).unwrap_or_default(),
                         pre_row: pre.map(|c| c.row_at(i)).unwrap_or_default(),
-                        pre_path: pre.map(|c| c.tree.open(i)).unwrap_or_default(),
+                        pre_path: pre.map(|c| c.open(i)).unwrap_or_default(),
                         quotient_row: q.committed.row_at(i),
-                        quotient_path: q.committed.tree.open(i),
+                        quotient_path: q.committed.open(i),
                     }
                 })
                 .collect()

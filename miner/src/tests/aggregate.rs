@@ -1106,7 +1106,12 @@ fn security_configs() {
             let w = s.wrap.unwrap();
             println!("  {k} segments: root 2^{}/2^{}, wrap 2^{}/2^{}", s.log_n, s.hash_log_n, w.log_n, w.hash_log_n);
         }
-        for k in [1, 16] {
+        // (`BLOCKS=1` for the block of one segment alone.)
+        let sizes: Vec<usize> = match std::env::var("BLOCKS").ok().and_then(|b| b.parse().ok()) {
+            Some(k) => vec![k],
+            None => vec![1, 16],
+        };
+        for k in sizes {
             let (segments, statement, names) = full_segments(name, &params, k);
             let shape = plan_with(&params, k, &mut cache);
             // The most memory the process holds at once, from here.

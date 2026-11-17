@@ -136,6 +136,42 @@ impl MerkleTree {
     }
 }
 
+/// The parents of the pairs `(left[i], right[i])`: a level of a tree
+/// whose two halves are held apart, hashed several at a time on every
+/// thread as the levels of a [`MerkleTree`] are.
+pub fn compress_pairs(left: &[Digest], right: &[Digest]) -> Vec<Digest> {
+    assert_eq!(left.len(), right.len());
+    let mut out = vec![EMPTY; left.len()];
+    if out.len().is_multiple_of(LANES) {
+        par_chunks_mut(&mut out, PER_THREAD, |c, out| {
+            for (g, out) in out.chunks_exact_mut(LANES).enumerate() {
+                let first = c * PER_THREAD + g * LANES;
+                out.copy_from_slice(&compress_batch(core::array::from_fn(|l| (&left[first + l], &right[first + l]))));
+            }
+        });
+    } else {
+        for (i, out) in out.iter_mut().enumerate() {
+            *out = compress(&left[i], &right[i]);
+        }
+    }
+    out
+}
+
+/// The path of leaf `pos` through a small tree over the leaf hashes
+/// `block` (a power of two of them), leaf level first, and that tree's
+/// root: for a prover that keeps a large tree from some level up, and
+/// makes the levels under it again when a leaf is opened.
+pub fn block_path(block: &[Digest], pos: usize) -> (Vec<Digest>, Digest) {
+    assert!(block.len().is_power_of_two() && pos < block.len());
+    let (mut level, mut at, mut path) = (block.to_vec(), pos, Vec::new());
+    while level.len() > 1 {
+        path.push(level[at ^ 1]);
+        level = level.chunks_exact(2).map(|pair| compress(&pair[0], &pair[1])).collect();
+        at >>= 1;
+    }
+    (path, level[0])
+}
+
 /// Leaf hashes of the rows of a flat buffer of `row_len`-element rows.
 pub fn leaf_hashes(flat: &[Fp], row_len: usize) -> Vec<Digest> {
     assert!(row_len > 0 && flat.len().is_multiple_of(row_len));
@@ -315,6 +351,41 @@ pub fn batch_root(
 mod tests {
     use super::*;
     use crate::test_util::Rng;
+
+    /// A tree kept from some level up, with the levels under it made
+    /// again from a block of leaves, gives the paths the whole tree
+    /// gives.
+    #[test]
+    fn a_path_is_the_same_with_its_lowest_levels_made_again() {
+        let rows: Vec<Vec<Fp>> = (0..64u32).map(|i| vec![Fp::new(i), Fp::new(i * i + 7)]).collect();
+        let whole = MerkleTree::new(&rows);
+        let leaves: Vec<Digest> = rows.iter().map(|r| hash_row(r)).collect();
+        for skip in 0..=3 {
+            let size = 1usize << skip;
+            let roots: Vec<Digest> = leaves.chunks(size).map(|block| block_path(block, 0).1).collect();
+            let upper = MerkleTree::from_leaf_hashes(roots);
+            assert_eq!(upper.root(), whole.root());
+            for i in 0..64 {
+                let first = i & !(size - 1);
+                let (mut path, root) = block_path(&leaves[first..first + size], i - first);
+                assert_eq!(root, upper.leaf(i >> skip));
+                path.extend(upper.siblings(i >> skip));
+                assert_eq!(path, whole.open(i), "skip {skip}, leaf {i}");
+                assert!(verify(&whole.root(), 6, i, &rows[i], &path));
+            }
+        }
+    }
+
+    #[test]
+    fn pairs_are_compressed_as_one_by_one() {
+        for n in [1usize, 3, 8, 64, 1 << 12] {
+            let side =
+                |tag: u32| -> Vec<Digest> { (0..n as u32).map(|i| hash_row(&[Fp::new(i), Fp::new(tag)])).collect() };
+            let (left, right) = (side(1), side(2));
+            let one_by_one: Vec<Digest> = left.iter().zip(&right).map(|(l, r)| compress(l, r)).collect();
+            assert_eq!(compress_pairs(&left, &right), one_by_one, "{n}");
+        }
+    }
 
     #[test]
     fn open_and_verify_all_leaves() {

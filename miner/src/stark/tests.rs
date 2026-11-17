@@ -167,6 +167,48 @@ fn fibonacci_roundtrip() {
     }
 }
 
+/// At a high blowup only the rows the quotient reads are kept, however
+/// many queries there are, and a row that is opened is computed again
+/// from the coefficients: the proofs are the same proofs, with or
+/// without zero knowledge, at as many queries as cosets and more.
+#[test]
+fn opened_rows_are_computed_again_at_a_high_blowup() {
+    use super::config::kept_stride;
+    for queries in [8, 16, 40] {
+        let config = StarkConfig { log_blowup: 4, num_queries: queries, ..CONFIG };
+        // Sixteen cosets, of which the quotient reads few: no more are kept.
+        assert_eq!(kept_stride(&config, 2), config.quotient_stride(2));
+        assert!(kept_stride(&config, 2) > 2);
+        let (trace, public) = fib_trace(6);
+        let proof = prove(&config, &Fibonacci, &trace, &public, &mut transcript());
+        assert_eq!(verify(&config, &Fibonacci, &public, &proof, &mut transcript()), Ok(()), "{queries} queries");
+        let air = Squaring { k: Fp::new(5) };
+        let start = Fp::new(3);
+        let trace = squaring_trace(&air, 5, start);
+        let proof = prove(&config, &air, &trace, &[start], &mut transcript());
+        assert_eq!(verify(&config, &air, &[start], &proof, &mut transcript()), Ok(()), "{queries} queries");
+        // And with zero knowledge and lookups, over two tables (where
+        // the table has room for so many queries' blinding rows).
+        if queries > 8 {
+            continue;
+        }
+        let zk = StarkConfig { log_blowup: 4, num_queries: queries, ..ZK };
+        let real = 128 - zk.blind_rows();
+        let (send, recv) = zk_exchange([real as u32 / 4; 4]);
+        let tables = [
+            TableInput { air: &Sender, trace: &send, pre: None },
+            TableInput { air: &Receiver, trace: &recv, pre: None },
+        ];
+        let specs = [TableSpec { air: &Sender, pre_root: None }, TableSpec { air: &Receiver, pre_root: None }];
+        let proof = prove_tables(&zk, &tables, &[], &mut transcript());
+        assert_eq!(verify_tables(&zk, &specs, &[], &proof, &mut transcript()), Ok(()), "{queries} queries");
+    }
+    // At a low blowup, with as many queries as cosets, every row is
+    // kept as it was: that is little more than the quotient reads.
+    let low = StarkConfig { log_blowup: 2, num_queries: 54, ..CONFIG };
+    assert_eq!(kept_stride(&low, 3), 1);
+}
+
 #[test]
 fn squaring_with_two_quotient_chunks() {
     let air = Squaring { k: Fp::new(5) };
