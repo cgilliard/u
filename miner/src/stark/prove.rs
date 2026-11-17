@@ -81,9 +81,11 @@ impl Preprocessed {
     pub fn new(table: &Trace, log_blowup: usize, stride: usize) -> Preprocessed {
         let w = table.width;
         let log_n = log2_strict(table.height());
-        let committed = Committed::new(w, table.height() << log_blowup, MULTIPLICATIVE_GENERATOR, Some(stride), |k| {
-            table.column(k)
-        });
+        let committed =
+            Committed::new(w, table.height() << log_blowup, MULTIPLICATIVE_GENERATOR, Some(stride), None, |k| {
+                table.column(k)
+            })
+            .expect("nobody can call it off");
         Preprocessed { width: w, log_n, log_blowup, table: table.clone(), committed }
     }
 
@@ -305,23 +307,34 @@ pub(super) struct Committed {
 impl Committed {
     /// Interpolates the `width` columns `column(k)` (values on `H`) and
     /// commits to their extension to `big_n` points on `shift * H`.
+    ///
+    /// This is where most of a proof's time goes, so `cancel` is asked
+    /// as it goes (before each coset of the extension), and not only
+    /// between a proof's phases: [`Error::Cancelled`] once it says so.
     fn new(
         width: usize,
         big_n: usize,
         shift: Fp,
         stride: Option<usize>,
+        cancel: Option<Cancel<'_>>,
         column: impl Fn(usize) -> Vec<Fp> + Sync,
-    ) -> Committed {
+    ) -> Result<Committed, Error> {
         let coeffs: Vec<Vec<Fp>> = par_map_min(width, 1, |k| {
             let mut c = column(k);
             intt(&mut c);
             c
         });
         let log_blowup = log2_strict(big_n / coeffs[0].len());
-        Self::from_coeffs(coeffs, log_blowup, shift, stride)
+        Self::from_coeffs(coeffs, log_blowup, shift, stride, cancel)
     }
 
-    fn from_coeffs(coeffs: Vec<Vec<Fp>>, log_blowup: usize, shift: Fp, stride: Option<usize>) -> Committed {
+    fn from_coeffs(
+        coeffs: Vec<Vec<Fp>>,
+        log_blowup: usize,
+        shift: Fp,
+        stride: Option<usize>,
+        cancel: Option<Cancel<'_>>,
+    ) -> Result<Committed, Error> {
         const ROWS: usize = 256;
         let width = coeffs.len();
         let n = coeffs[0].len();
@@ -335,6 +348,9 @@ impl Committed {
         let mut rows = zeroed_vec(n * width);
         let mut s_j = shift;
         for j in 0..b {
+            if cancel.is_some_and(|c| c()) {
+                return Err(Error::Cancelled);
+            }
             let cols: Vec<Vec<Fp>> = par_map_min(width, 1, |k| coset_evals(&coeffs[k], s_j));
             par_chunks_mut(&mut rows, ROWS * width, |c, chunk| {
                 for (r, row) in chunk.chunks_exact_mut(width).enumerate() {
@@ -354,8 +370,11 @@ impl Committed {
             }
             s_j = s_j.mul(&w_big);
         }
+        if cancel.is_some_and(|c| c()) {
+            return Err(Error::Cancelled);
+        }
         let tree = MerkleTree::from_leaf_hashes(leaves);
-        Committed { width, log_blowup, shift, stride, coeffs, kept, tree }
+        Ok(Committed { width, log_blowup, shift, stride, coeffs, kept, tree })
     }
 
     /// Row `i`, a point of the kept sub-coset.
@@ -567,7 +586,7 @@ pub(super) fn commit_quotient(
     let base: Vec<Vec<Fp>> =
         (0..num_chunks * DEGREE).map(|jk| coeffs[jk / DEGREE].iter().map(|v| v.0[jk % DEGREE]).collect()).collect();
     timer.lap("quotient lde")?;
-    let committed = Committed::from_coeffs(base, log_blowup, shift, None);
+    let committed = Committed::from_coeffs(base, log_blowup, shift, None, timer.cancel)?;
     timer.lap("quotient commit")?;
     Ok(Quotient { coeffs, committed, chunks: num_chunks })
 }
@@ -681,14 +700,14 @@ pub fn try_prove_tables(
                 let needed = config.quotient_stride(degree);
                 assert!(needed.is_multiple_of(p.stride()), "preprocessed table lacks rows the quotient reads");
             }
-            let trace = Committed::new(input.trace.width, 1 << (log_n + log_blowup), shift, Some(stride), |k| {
-                input.trace.column(k)
-            });
+            let commit = 1 << (log_n + log_blowup);
+            let trace =
+                Committed::new(input.trace.width, commit, shift, Some(stride), cancel, |k| input.trace.column(k))?;
             challenger.observe_digest(&trace.tree.root());
             let aux_ext_w = lookup_columns(num_terms, input.air.air_lookup_group())
                 + if config.zk && num_terms > 0 { ZK_AUX } else { 0 };
             let rows = Constrained { log_n, blind: config.blind_rows() };
-            TableState {
+            Ok(TableState {
                 input: *input,
                 log_n,
                 rows,
@@ -699,9 +718,9 @@ pub fn try_prove_tables(
                 num_terms,
                 trace,
                 aux: None,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<_, Error>>()?;
     timer.lap("trace commit")?;
     let grinding = grinding_of(config, &states.iter().map(|t| (t.input.air, t.log_n)).collect::<Vec<_>>(), public);
     let mut witnesses = [Fp::ZERO; 4];
@@ -724,10 +743,10 @@ pub fn try_prove_tables(
             let ext_w = t.aux_ext_w();
             let n = 1usize << t.log_n;
             let stride = kept_stride(config, t.degree);
-            let committed = Committed::new(ext_w * DEGREE, t.big_n(log_blowup), t.shift, Some(stride), |j| {
+            let committed = Committed::new(ext_w * DEGREE, t.big_n(log_blowup), t.shift, Some(stride), cancel, |j| {
                 let (e, k) = (j / DEGREE, j % DEGREE);
                 (0..n).map(|i| aux[i * ext_w + e].0[k]).collect()
-            });
+            })?;
             challenger.observe_digest(&committed.tree.root());
             challenger.observe_ext(&total);
             t.aux = Some((committed, total));

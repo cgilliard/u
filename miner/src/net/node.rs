@@ -179,6 +179,9 @@ enum Job {
     /// The state, every part of it in, to make whole: with the body of
     /// its block.
     Finish { target: Digest, body: Vec<u8> },
+    /// The header of a block a peer announced, to check and keep: its
+    /// work is in it, and checking that is not done between datagrams.
+    Announced { header: Header, len: u32, from: SocketAddrV4, unix: u64 },
 }
 
 /// What became of one.
@@ -217,8 +220,28 @@ enum Outcome {
         target: Digest,
         result: Result<(), Error>,
     },
+    /// The header of a block announced, checked.
+    Announced {
+        header: Header,
+        len: u32,
+        from: SocketAddrV4,
+        verdict: Verdict,
+    },
     /// Work that was no work: nothing came of it.
     Nothing,
+}
+
+/// What the header of a block announced was found to be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    /// Kept: its body is wanted.
+    Good,
+    /// Its parent is not known here.
+    Orphan,
+    /// Not kept, and not the announcer's fault (or not yet known to be).
+    Harmless,
+    /// It breaks a rule.
+    Bad,
 }
 
 fn apply<B: Backend + 'static, V: ProofVerifier + Sync>(chain: &Chain<B, V>, job: Job) -> Option<Outcome> {
@@ -251,6 +274,17 @@ fn apply<B: Backend + 'static, V: ProofVerifier + Sync>(chain: &Chain<B, V>, job
             Outcome::Piece { object, from, result }
         }
         Job::Finish { target, body } => Outcome::Finished { target, result: chain.finish_receiving(&body) },
+        Job::Announced { header, len, from, unix } => {
+            let verdict = match chain.accept_header(&header, unix) {
+                Ok(_) => Verdict::Good,
+                Err(Error::UnknownParent) => Verdict::Orphan,
+                Err(Error::KnownInvalid | Error::SetAside | Error::TimestampTooNew { .. } | Error::Io(_)) => {
+                    Verdict::Harmless
+                }
+                Err(_) => Verdict::Bad,
+            };
+            Outcome::Announced { header, len, from, verdict }
+        }
     })
 }
 
@@ -429,6 +463,8 @@ enum Notice {
     /// What the node is after has changed: there may be something on
     /// the list that a peer of yours can serve.
     Work,
+    /// The header of a block this peer of yours announced was checked.
+    Announced { header: Header, len: u32, from: SocketAddrV4, verdict: Verdict },
 }
 
 /// What the workers of a node share besides the list.
@@ -865,7 +901,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             Notice::SentHeaders(addr) => self.peers.headers_arrived(&addr),
             Notice::NotFrom(id, addr) => self.announced.retain(|(told, from, _)| !(*told == id && *from == addr)),
             // (Seen to where there is somewhere to send: `mail`.)
-            Notice::Announce { .. } | Notice::Work => {}
+            Notice::Announce { .. } | Notice::Work | Notice::Announced { .. } => {}
         }
     }
 
@@ -875,6 +911,10 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         for notice in notices {
             match notice {
                 Notice::Announce { header, len, except } => self.announce(now, header, len, except, out),
+                Notice::Announced { header, len, from, verdict } => {
+                    let list = Arc::clone(&self.list);
+                    self.header_checked(&mut write(&list), now, header, len, from, verdict, out);
+                }
                 Notice::Work => {
                     let list = Arc::clone(&self.list);
                     let l = &mut *write(&list);
@@ -1468,12 +1508,39 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         let id = header.hash();
         // Its chain reaches there, whatever its last ping said.
         self.peers.reaches(&from, header.height, id);
+        // (And every worker is to know it at once: whether anybody
+        // holds a block is asked of what each last said of its peers.)
+        self.view(l, now);
         // One we have, body and all, is no news.
         if self.chain.known(&id).ok().flatten().is_some_and(|k| !k.header_only()) || l.applying.contains(&id) {
             return;
         }
-        match self.chain.accept_header(&header, self.unix) {
-            Ok(_) => {
+        // A header kept already is checked already.
+        if self.chain.known(&id).ok().flatten().is_some() {
+            return self.header_checked(l, now, header, len, from, Verdict::Good, out);
+        }
+        // A new header's work is to be checked, which takes as long as
+        // hashing does where there is no table to check it against:
+        // given to be done, and heard of later ([`Worker::header_checked`]).
+        self.work(l, Job::Announced { header, len, from, unix: self.unix });
+    }
+
+    /// The header of a block `from` announced has been checked: what
+    /// follows from what it was found to be.
+    #[allow(clippy::too_many_arguments)]
+    fn header_checked(
+        &mut self,
+        l: &mut List,
+        now: Micros,
+        header: Header,
+        len: u32,
+        from: SocketAddrV4,
+        verdict: Verdict,
+        out: Out<'_>,
+    ) {
+        let id = header.hash();
+        match verdict {
+            Verdict::Good => {
                 if self.announced.len() == ANNOUNCED {
                     self.announced.pop_front();
                 }
@@ -1483,16 +1550,16 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             // Its parent is unknown: we are more than a block behind it.
             // Its headers are asked for now, without waiting for its
             // next ping to say how far it has got.
-            Err(Error::UnknownParent) => {
+            Verdict::Orphan => {
                 let lately = l.probe.is_some_and(|(_, at, _)| now.saturating_sub(at) < self.cfg.sync.header_spacing);
                 if l.aim.is_none() && !lately && self.peers.may_ask(&from, now) {
                     self.ask_fork(l, now, from, Some((id, header.height)), out);
                 }
             }
             // Not the announcer's fault, or not yet known to be.
-            Err(Error::KnownInvalid | Error::SetAside | Error::TimestampTooNew { .. } | Error::Io(_)) => {}
+            Verdict::Harmless => {}
             // A header that breaks a rule.
-            Err(_) => {
+            Verdict::Bad => {
                 self.strike(&from, now);
             }
         }
@@ -1607,6 +1674,12 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     self.headers_kept(l, now, first, count, last, from, error.is_some());
                 }
                 Outcome::Nothing => {}
+                // What follows is of the peer that announced it: its own
+                // worker's to do.
+                Outcome::Announced { header, len, from, verdict } => match self.shared.owner(&from) {
+                    owner if owner == self.me => self.header_checked(l, now, header, len, from, verdict, out),
+                    owner => self.shared.post(owner, Notice::Announced { header, len, from, verdict }),
+                },
                 Outcome::Checked { target, result } => self.state_block_checked(l, now, target, result),
                 Outcome::Begun { target, result } => {
                     if let Some(join) = l.join.as_mut().filter(|j| j.id == target) {
