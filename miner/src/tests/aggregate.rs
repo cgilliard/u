@@ -1089,6 +1089,12 @@ fn security_configs() {
         if pick.as_ref().is_some_and(|p| !p.split(',').any(|x| x == name)) {
             continue;
         }
+        // (`SEGLOG=<n>` for segments of `2^n` rows in place of the network's.)
+        let params = match std::env::var("SEGLOG").ok().and_then(|n| n.parse().ok()) {
+            Some(segment_log_n) => AggregatorParams { segment_log_n, ..params },
+            None => params,
+        };
+        println!("  segments of 2^{} rows", params.segment_log_n);
         let bits = |c: &StarkConfig| c.num_queries * c.log_blowup + c.pow_bits;
         println!(
             "== {name}: segments/nodes {}+{} ({} bits), wrap {}x{}+{} ({} bits)",
