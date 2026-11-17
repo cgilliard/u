@@ -330,6 +330,84 @@ fn a_reward_is_recorded_and_forgotten() {
     assert!(again.rewards().is_empty() && again.outputs().len() == 1 && again.synced() == Some((1, [0; 32])));
 }
 
+/// A payment signed and not yet in a block is taken back, by another
+/// spend of the same outputs that pays more; or sped up, the same
+/// payment paying more. Each from the next leaf of every input.
+#[test]
+fn a_payment_sent_is_cancelled_or_sped_up() {
+    let mut chain = Outputs::default();
+    let mut alice = funded(&mut chain, 100 * COIN);
+    let mut bob = new();
+    let pay = |alice: &mut Wallet<MemBackend>, bob: &mut Wallet<MemBackend>, chain: &Outputs| {
+        let mut slate = alice.send(30 * COIN, None, chain, NOW).unwrap();
+        bob.receive_slate(&mut slate, NOW).unwrap();
+        alice.finalize(&slate, NOW).unwrap()
+    };
+    let first = pay(&mut alice, &mut bob, &chain);
+    let sent = alice.sent()[0].clone();
+    let id = first.tx.txid();
+    assert!(matches!(alice.cancel_sent(&[Fp::ZERO; 8], None, &chain, NOW), Err(WalletError::Unknown)));
+
+    // Sped up: the same output to the recipient, less change, more fee.
+    let min = Wallet::<MemBackend>::min_bump_fee(&sent);
+    assert!(matches!(alice.bump_sent(&id, Some(min - 1), &chain, NOW), Err(WalletError::FeeTooLow { .. })));
+    let bumped = alice.bump_sent(&id, Some(min), &chain, NOW).unwrap();
+    assert!(bumped.tx.verify_signatures() && bumped.tx.balance() == min as i128);
+    assert_eq!(bumped.tx.spent_positions(), first.tx.spent_positions());
+    assert_eq!(bumped.tx.outputs[1], first.tx.outputs[1]);
+    assert_ne!(bumped.tx.outputs[0], first.tx.outputs[0]);
+    // From the next leaf: no leaf signs twice.
+    assert_eq!((first.tx.inputs[0].signature.index, bumped.tx.inputs[0].signature.index), (0, 1));
+    assert!(matches!(alice.bump_sent(&id, None, &chain, NOW), Err(WalletError::Unknown)));
+    assert_eq!(alice.sent().iter().map(|s| s.txid).collect::<Vec<_>>(), [bumped.tx.txid()]);
+    assert_eq!(alice.resend(&bumped.tx.txid()).unwrap(), bumped.tx);
+
+    // Taken back: all of it to this wallet, but a fee that is more again.
+    let sent = alice.sent()[0].clone();
+    let min = Wallet::<MemBackend>::min_replacement_fee(&sent);
+    assert!(matches!(alice.cancel_sent(&sent.txid, Some(min - 1), &chain, NOW), Err(WalletError::FeeTooLow { .. })));
+    let back = alice.cancel_sent(&sent.txid, None, &chain, NOW).unwrap();
+    assert!(back.tx.verify_signatures() && back.tx.inputs[0].signature.index == 2);
+    assert_eq!(
+        (back.tx.outputs.len(), back.tx.outputs[0].amount, back.tx.balance()),
+        (1, 100 * COIN - min, min as i128)
+    );
+    // In a block: the wallet has it all but the fee, once what was
+    // never made is forgotten; and the recipient has nothing.
+    chain.take(&back.tx, &mut [&mut alice, &mut bob]);
+    assert_eq!(alice.settle_sent(&chain).unwrap(), 1);
+    assert!(alice.balance(&chain).unwrap().pending > 0);
+    assert_eq!(alice.prune_pending(&chain, &[]).unwrap(), 2);
+    assert_eq!(alice.balance(&chain).unwrap(), Balance { confirmed: (100 * COIN - min) as u128, ..Default::default() });
+    assert_eq!(bob.prune_pending(&chain, &[]).unwrap(), 1);
+    assert_eq!(bob.balance(&chain).unwrap(), Balance::default());
+    // What is in a block is not taken back.
+    let paid = pay(&mut alice, &mut bob, &chain);
+    chain.take(&paid.tx, &mut [&mut alice, &mut bob]);
+    assert!(matches!(alice.cancel_sent(&paid.tx.txid(), None, &chain, NOW), Err(WalletError::Landed)));
+    assert!(matches!(alice.bump_sent(&paid.tx.txid(), None, &chain, NOW), Err(WalletError::Landed)));
+    // What is kept is not forgotten: a pooled payment's outputs.
+    let third = pay(&mut alice, &mut bob, &chain);
+    let keep: Vec<Commitment> = third.tx.outputs.iter().map(|o| o.commitment).collect();
+    assert_eq!((alice.prune_pending(&chain, &keep).unwrap(), bob.prune_pending(&chain, &keep).unwrap()), (0, 0));
+}
+
+/// A leaf seen signed from elsewhere (a copy of the wallet, or its file
+/// as it was before) is not signed from again, nor any before it.
+#[test]
+fn a_leaf_signed_elsewhere_is_passed_over() {
+    let mut chain = Outputs::default();
+    let mut wallet = funded(&mut chain, 100 * COIN);
+    let c = wallet.outputs()[0].commitment;
+    assert_eq!(wallet.observe_signatures(&[(c, 2), ([Fp::ONE; 8], 5), (c, 12)]).unwrap(), 1);
+    assert_eq!(wallet.owned(&c).unwrap().used, 3);
+    // What is behind what the wallet knows changes nothing.
+    assert_eq!(wallet.observe_signatures(&[(c, 1)]).unwrap(), 0);
+    let mut t = wallet.t.clone();
+    assert_eq!(wallet.signing_key(&mut t, &c).unwrap().0.next_index(), 3);
+    assert_eq!(reopened(&wallet, "").unwrap().owned(&c).unwrap().used, 3);
+}
+
 #[test]
 fn base64_is_base64() {
     for (bytes, text) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foobar", "Zm9vYmFy")] {

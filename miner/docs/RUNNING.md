@@ -573,7 +573,11 @@ commands:
   receive FILE [OUT]
   finalize FILE
   slates                    the payments begun and not yet finalized
-  cancel ID
+  sent                      the payments signed and not yet in a block
+  cancel ID [FEE]
+  bump ID [FEE]
+  resend ID
+  prune
   scan                      find this wallet's outputs on the chain (after a restore)
   help
   quit
@@ -588,6 +592,26 @@ text in a file, passed between them however files are:
    `payment.slate.received` with its output added.
 3. The sender: `finalize payment.slate.received`. The transaction is
    signed, pooled and told to the node's peers; a block carries it.
+
+**A payment sent and not yet in a block** (`sent` lists them) can
+still be changed, by another spend of the same outputs that pays
+more, which pools take in place of the first:
+
+- `cancel ID` takes it back: what it spent is paid to this wallet
+  again, less a fee that is more than the payment's was.
+- `bump ID` pays the same to the same recipient with a higher fee,
+  taken from the change.
+- `resend ID` pools it again as it was signed.
+
+Each is signed from the next leaf of every key it spends from: a key
+signs eight times at the most, so a payment can be replaced seven
+times. What a replaced payment was to make is never made: `prune`
+forgets it, on the sender's node and on the recipient's.
+
+A wallet never signs twice from one leaf, and that is kept true even
+of a wallet whose file has gone back to an earlier state (a copy
+kept, a machine's snapshot): it watches the pool for spends of its
+own outputs, and passes over every leaf it sees used.
 
 The main log has a line for each step this node's own wallet takes
 (and none for anybody else's transactions, which would fill it):
@@ -612,7 +636,8 @@ not yet in a block.
 
 Not yet: paying an address or a name with no file passed (that needs
 the message layer), names, restoring a wallet from its words by a
-command of the program (the library can), replacing a payment sent.
+command of the program (the library can), outputs lost to a
+reorganization.
 
 ---
 

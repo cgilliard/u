@@ -318,6 +318,28 @@ fn a_payment_is_made_at_the_prompt_and_mined() {
     assert!(!theirs.contains("signed and pooled"), "{theirs}");
     let status = ask(&mut other, "status");
     assert!(status.contains("wallet: 12.5 confirmed") && status.contains("pool: 0 transactions"), "{status}");
+    // A second payment, taken back before a block has it: another
+    // spend of the same takes its place in both pools, and the other
+    // never has it.
+    let begun = ask(&mut maker, &format!("send-file 3 {slate}"));
+    assert!(begun.contains("begun: 3 and a fee of"), "{begun}");
+    assert!(ask(&mut other, &format!("receive {slate}")).contains("answered: 3 to this wallet"));
+    let signed = ask(&mut maker, &format!("finalize {slate}.received"));
+    let id = signed.split("transaction ").nth(1).unwrap()[..8].to_string();
+    let back = ask(&mut maker, &format!("cancel {id}"));
+    println!("{}", back.trim_end());
+    // (Unless a block had it already: then it is not to be taken back.)
+    if back.contains("taken back: transaction") {
+        assert!(ask(&mut maker, "sent").contains("pooled") || ask(&mut maker, "sent").starts_with("no payments"));
+        wait("the payment taken back is not mined", &mut || ask(&mut maker, "sent").starts_with("no payments"));
+        assert!(ask(&mut other, "prune").starts_with("1 outputs expected"));
+        assert_eq!(confirmed(&mut other), "12.5");
+        let log = std::fs::read_to_string(dirs[0].join("tabernacle.log")).unwrap();
+        assert!(log.contains(" taken back: transaction "), "{log}");
+    } else {
+        assert!(back.contains("already spent on chain"), "{back}");
+    }
+    assert!(ask(&mut maker, "bump 00").starts_with("error: no payment sent"));
     // Told to stop, each does, without failure.
     for mut node in [maker, other] {
         writeln!(node.1, "quit").unwrap();

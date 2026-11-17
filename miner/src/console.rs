@@ -38,8 +38,19 @@ pub const HELP: &str = "commands:
                             to keep in a file or copy; FILE `-` is the terminal, for
                             what a command writes)
   slates                    the payments begun and not yet finalized
-  cancel ID                 give up a payment begun (ID: the first digits of its id),
-                            freeing what it was to spend
+  sent                      the payments signed and not yet in a block
+  cancel ID [FEE]           give up a payment begun (ID: the first digits of its id),
+                            freeing what it was to spend; or take back a payment
+                            sent and not yet in a block, by another that pays what
+                            it spent back to this wallet (FEE as for send-file, at
+                            least the smallest that replaces it)
+  bump ID [FEE]             pay a payment sent the same with a higher fee, from its
+                            change
+  resend ID                 pool a payment sent again, as it was signed (after a
+                            restart dropped it, or a reorganization moved what it
+                            spends)
+  prune                     forget outputs expected that the chain does not hold and
+                            the pool will not make: of payments taken back, say
   scan                      find this wallet's outputs on the chain (after a restore)
   help                      this
   quit                      stop the node";
@@ -104,6 +115,23 @@ fn short(bytes: &[u8]) -> String {
 
 type Said = Result<String, String>;
 
+/// Has `wallet` note which of its outputs' leaves the pool's
+/// transactions were signed from: so that a wallet whose file has gone
+/// back to an earlier state never signs from one of them again. How
+/// many outputs it was behind on.
+pub fn observe<B: Backend + 'static, W: Backend>(
+    hold: &Handle<B, AggregateVerifier>,
+    wallet: &Mutex<Wallet<W>>,
+) -> Result<usize, String> {
+    let mut seen = Vec::new();
+    hold.pool(&mut |pool| {
+        for e in pool.entries() {
+            seen.extend(e.tx().inputs().map(|i| (i.commitment(), i.signature.index)));
+        }
+    });
+    wallet.lock().unwrap_or_else(|e| e.into_inner()).observe_signatures(&seen).map_err(|e| e.to_string())
+}
+
 impl<B: Backend + 'static, W: Backend> Console<B, W> {
     /// Does what `line` asks, and gives what is to be said of it.
     pub fn run(&self, line: &str) -> Reply {
@@ -123,11 +151,17 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             ("receive", [file, out]) => self.receive(file, out),
             ("finalize", [file]) => self.finalize(file),
             ("slates", []) => self.slates(),
-            ("cancel", [id]) => self.cancel(id),
+            ("sent", []) => self.sent(),
+            ("cancel", [id]) => self.cancel(id, None),
+            ("cancel", [id, fee]) => self.cancel(id, Some(fee)),
+            ("bump", [id]) => self.bump(id, None),
+            ("bump", [id, fee]) => self.bump(id, Some(fee)),
+            ("resend", [id]) => self.resend(id),
+            ("prune", []) => self.prune(),
             ("scan", []) => self.scan(),
             (
                 "status" | "peers" | "mempool" | "balance" | "outputs" | "send-file" | "receive" | "finalize"
-                | "slates" | "cancel" | "scan" | "help" | "quit" | "exit",
+                | "slates" | "sent" | "cancel" | "bump" | "resend" | "prune" | "scan" | "help" | "quit" | "exit",
                 _,
             ) => Err(format!("{command}: not what it takes (see help)")),
             _ => Err(format!("{command}: no such command (see help)")),
@@ -252,15 +286,28 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         Slate::from_text(&text).ok_or_else(|| format!("{file} holds no slate"))
     }
 
+    /// A fee as it is written: coins in all, or `N/byte`; the least
+    /// that will do if none is.
+    fn fee(text: Option<&&str>) -> Result<Fee, String> {
+        match text {
+            None => Ok(Fee::from(None)),
+            Some(text) => match text.strip_suffix("/byte") {
+                Some(rate) => Ok(Fee::PerByte(rate.parse().map_err(|_| format!("'{text}' is not a fee"))?)),
+                None => Ok(Fee::Total(parse_coins(text).ok_or_else(|| format!("'{text}' is not a fee"))?)),
+            },
+        }
+    }
+
+    fn observe(&self) -> Result<usize, String> {
+        match &self.wallet {
+            Some(wallet) => observe(&self.hold, wallet),
+            None => Ok(0),
+        }
+    }
+
     fn send_file(&self, amount: &str, fee: Option<&&str>, file: &str) -> Said {
         let amount = parse_coins(amount).ok_or_else(|| format!("'{amount}' is not an amount of coins"))?;
-        let fee = match fee {
-            None => Fee::from(None),
-            Some(text) => match text.strip_suffix("/byte") {
-                Some(rate) => Fee::PerByte(rate.parse().map_err(|_| format!("'{text}' is not a fee"))?),
-                None => Fee::Total(parse_coins(text).ok_or_else(|| format!("'{text}' is not a fee"))?),
-            },
-        };
+        let fee = Self::fee(fee)?;
         let mut wallet = self.wallet()?;
         let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
         let snap = state.snapshot().map_err(|e| e.to_string())?;
@@ -288,6 +335,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
     fn finalize(&self, file: &str) -> Said {
         let slate = Self::read_slate(file)?;
         let unix = (self.unix)();
+        self.observe()?;
         // (The wallet is let go of before the pool is asked for.)
         let signed = self.wallet()?.finalize(&slate, unix).map_err(|e| e.to_string())?;
         let id = short(&digest_to_bytes(&signed.tx.txid()));
@@ -320,7 +368,67 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         Ok(pending.iter().map(line).collect::<Vec<_>>().join("\n"))
     }
 
-    fn cancel(&self, id: &str) -> Said {
+    fn sent(&self) -> Said {
+        let wallet = self.wallet()?;
+        let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
+        let snap = state.snapshot().map_err(|e| e.to_string())?;
+        let mut lines = Vec::new();
+        for sent in wallet.sent() {
+            // (One whose inputs the chain no longer holds is in a block.)
+            let mut open = false;
+            for c in &sent.inputs {
+                if let Some(o) = wallet.owned(c) {
+                    open |= wallet.held(&o, &snap).map_err(|e| e.to_string())?;
+                }
+            }
+            if open {
+                lines.push(format!(
+                    "  {}  fee {}  {}",
+                    short(&digest_to_bytes(&sent.txid)),
+                    coins(sent.fee as u128),
+                    if self.hold.pooled(&sent.txid) { "pooled" } else { "not in the pool (resend)" }
+                ));
+            }
+        }
+        match lines.is_empty() {
+            true => Ok("no payments sent that are not in a block".to_string()),
+            false => Ok(lines.join("\n")),
+        }
+    }
+
+    /// The payment sent whose transaction's id starts `id`.
+    fn sent_of(wallet: &Wallet<W>, id: &str) -> Result<crate::hash::Digest, String> {
+        let hex = |d: &crate::hash::Digest| digest_to_bytes(d).iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let found: Vec<_> = wallet.sent().into_iter().map(|s| s.txid).filter(|t| hex(t).starts_with(id)).collect();
+        match found[..] {
+            [one] => Ok(one),
+            [] => Err(format!("no payment sent with an id that starts {id}")),
+            _ => Err(format!("more than one payment sent with an id that starts {id}")),
+        }
+    }
+
+    /// Pools what the wallet signed in place of a payment sent, and says
+    /// what was done: `done`, with the transaction and its fee.
+    fn replaced(&self, done: &str, was: &crate::hash::Digest, signed: &crate::wallet::Signed) -> Said {
+        let (was, id) = (short(&digest_to_bytes(was)), short(&digest_to_bytes(&signed.tx.txid())));
+        let fee = coins(signed.tx.balance().max(0) as u128);
+        match self.hold.submit(&signed.tx.to_bytes(), (self.unix)()) {
+            Ok(_) => {
+                let said = format!("payment sent {was} {done}: transaction {id}, with a fee of {fee}");
+                (self.log)(&format!("P{}", &said[1..]));
+                Ok(said)
+            }
+            Err(why) => {
+                let failed = format!("payment sent {was} {done}, but the pool does not take transaction {id}: {why}");
+                (self.log)(&format!("Error: {failed}"));
+                Err(failed)
+            }
+        }
+    }
+
+    fn cancel(&self, id: &str, fee: Option<&&str>) -> Said {
+        let fee = Self::fee(fee)?;
+        self.observe()?;
         let mut wallet = self.wallet()?;
         let hex = |id: &[u8; 32]| id.iter().map(|b| format!("{b:02x}")).collect::<String>();
         let found: Vec<[u8; 32]> =
@@ -332,9 +440,60 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
                 (self.log)(&format!("P{}", &done[1..]));
                 Ok(done)
             }
-            [] => Err(format!("no payment begun with an id that starts {id}")),
+            // Not a payment begun: one sent, then, to be taken back.
+            [] => {
+                let was = Self::sent_of(&wallet, id)
+                    .map_err(|_| format!("no payment begun or sent with an id that starts {id}"))?;
+                let signed = {
+                    let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
+                    let snap = state.snapshot().map_err(|e| e.to_string())?;
+                    wallet.cancel_sent(&was, fee, &snap, (self.unix)()).map_err(|e| e.to_string())?
+                };
+                drop(wallet);
+                self.replaced("taken back", &was, &signed)
+            }
             _ => Err(format!("more than one payment begun with an id that starts {id}")),
         }
+    }
+
+    fn bump(&self, id: &str, fee: Option<&&str>) -> Said {
+        let fee = Self::fee(fee)?;
+        self.observe()?;
+        let mut wallet = self.wallet()?;
+        let was = Self::sent_of(&wallet, id)?;
+        let signed = {
+            let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
+            let snap = state.snapshot().map_err(|e| e.to_string())?;
+            wallet.bump_sent(&was, fee, &snap, (self.unix)()).map_err(|e| e.to_string())?
+        };
+        drop(wallet);
+        self.replaced("sped up", &was, &signed)
+    }
+
+    fn resend(&self, id: &str) -> Said {
+        let wallet = self.wallet()?;
+        let was = Self::sent_of(&wallet, id)?;
+        let tx = wallet.resend(&was).map_err(|e| e.to_string())?;
+        drop(wallet);
+        match self.hold.submit(&tx.to_bytes(), (self.unix)()) {
+            Ok(_) => Ok(format!("payment sent {} pooled again", short(&digest_to_bytes(&was)))),
+            Err(why) => Err(format!("the pool does not take it: {why}")),
+        }
+    }
+
+    fn prune(&self) -> Said {
+        // (What the pool's transactions make may yet be made.)
+        let mut keep = Vec::new();
+        self.hold.pool(&mut |pool| {
+            for e in pool.entries() {
+                keep.extend(e.tx().outputs().iter().map(|o| o.commitment));
+            }
+        });
+        let mut wallet = self.wallet()?;
+        let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
+        let snap = state.snapshot().map_err(|e| e.to_string())?;
+        let gone = wallet.prune_pending(&snap, &keep).map_err(|e| e.to_string())?;
+        Ok(format!("{} outputs expected that will not be made were forgotten", commas(gone as u64)))
     }
 
     fn scan(&self) -> Said {

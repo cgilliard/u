@@ -58,7 +58,7 @@ use crate::bip39;
 use crate::chacha20poly1305;
 use crate::codec::{Reader, Writer, packed};
 use crate::hash::hash_domain;
-use crate::mempool::{MAX_TX_SIZE, MIN_FEE_PER_BYTE, Policy};
+use crate::mempool::{MAX_TX_SIZE, MIN_FEE_PER_BYTE, Policy, REPLACEMENT_FEE_PER_BYTE};
 use crate::output::{Commitment, EMPTY_MEMO, INPUT_SIZE, Key, Memo, OUTPUT_SIZE, Output, key_commitment, pubkey_hash};
 use crate::poseidon2::{DIGEST, Fp, digest_from_bytes, digest_to_bytes};
 use crate::store::Backend;
@@ -473,7 +473,7 @@ pub enum WalletError {
     },
     /// The slate is malformed or not at the expected stage.
     BadSlate(&'static str),
-    /// No pending slate with that id.
+    /// No pending slate or sent payment with that id.
     Unknown,
     /// An output has made all the signatures its leaves allow.
     Exhausted,
@@ -490,6 +490,9 @@ pub enum WalletError {
     Exists,
     /// An input has not been seen in a block yet.
     Unconfirmed,
+    /// The transaction's inputs are no longer unspent on chain: it (or
+    /// another spend of them) has landed.
+    Landed,
 }
 
 impl core::fmt::Display for WalletError {
@@ -500,13 +503,14 @@ impl core::fmt::Display for WalletError {
             WalletError::Corrupt(w) => write!(f, "corrupt wallet record: {w}"),
             WalletError::Insufficient { have, need } => write!(f, "insufficient funds: have {have}, need {need}"),
             WalletError::BadSlate(w) => write!(f, "bad slate: {w}"),
-            WalletError::Unknown => f.write_str("no pending slate with that id"),
+            WalletError::Unknown => f.write_str("no pending slate or sent payment with that id"),
             WalletError::Exhausted => f.write_str("an input has no signatures left"),
             WalletError::FeeTooLow { min } => write!(f, "the fee must be at least {min} base units"),
             WalletError::OldFormat => f.write_str("the wallet's file is of a format not known here"),
             WalletError::WrongPassword => f.write_str("wrong wallet password"),
             WalletError::Exists => f.write_str("a wallet already exists there"),
             WalletError::Unconfirmed => f.write_str("an input is not confirmed yet"),
+            WalletError::Landed => f.write_str("the inputs are already spent on chain"),
         }
     }
 }
@@ -1413,6 +1417,208 @@ impl<B: Backend> Wallet<B> {
             t.outputs.remove(&digest_to_bytes(&c));
         }
         self.commit(t, &[T_OUTPUTS, T_SLATES])
+    }
+
+    /// The smallest fee a cancellation of `sent` may pay: its fee plus
+    /// [`REPLACEMENT_FEE_PER_BYTE`] per byte of the replacement, its
+    /// inputs paid back to one output (see [`crate::mempool`]).
+    pub fn min_replacement_fee(sent: &Sent) -> u64 {
+        sent.fee + REPLACEMENT_FEE_PER_BYTE * Self::cancel_size(sent) as u64
+    }
+
+    fn cancel_size(sent: &Sent) -> usize {
+        16 + sent.inputs.len() * INPUT_SIZE + OUTPUT_SIZE
+    }
+
+    /// The smallest fee a bump of `sent` may pay: its fee plus the
+    /// increment per byte of the bump, which is its size.
+    pub fn min_bump_fee(sent: &Sent) -> u64 {
+        sent.fee + REPLACEMENT_FEE_PER_BYTE * sent.size as u64
+    }
+
+    /// The record of a payment sent, and its inputs as a transaction
+    /// spends them: an error if the chain no longer holds them.
+    fn sent_inputs(&self, txid: &Commitment, chain: &impl Unspent) -> Result<(Sent, Vec<(PublicKey, u64)>)> {
+        let sent = self.t.sent.get(&digest_to_bytes(txid)).cloned().ok_or(WalletError::Unknown)?;
+        let mut inputs = Vec::with_capacity(sent.inputs.len());
+        for c in &sent.inputs {
+            let o = self.owned(c).ok_or(WalletError::Corrupt("sent input"))?;
+            if !self.held(&o, chain)? {
+                return Err(WalletError::Landed);
+            }
+            inputs.push((self.key(&o.nonce).public_key(), o.amount));
+        }
+        Ok((sent, inputs))
+    }
+
+    /// Signs what is to take the place of the payment `sent`, spending
+    /// the same inputs, each from its next leaf, and puts its record in
+    /// place of the payment's: all of it, with whatever `t` already
+    /// holds of the change, written at once.
+    fn replace(
+        &mut self,
+        mut t: Tables,
+        sent: Sent,
+        unsigned: UnsignedTransaction,
+        fee: u64,
+        now: u64,
+    ) -> Result<Signed> {
+        let signed = self.sign(&mut t, unsigned, &sent.inputs)?;
+        t.sent.remove(&digest_to_bytes(&sent.txid));
+        let next = Sent {
+            txid: signed.tx.txid(),
+            inputs: sent.inputs,
+            fee,
+            size: signed.tx.size(),
+            created: now,
+            tx: signed.tx.clone(),
+        };
+        t.sent.insert(digest_to_bytes(&next.txid), next);
+        self.commit(t, &[T_OUTPUTS, T_SENT])?;
+        Ok(signed)
+    }
+
+    /// Cancels a finalized payment that is not yet confirmed: signs a
+    /// replacement spending the same inputs back to a fresh output of this
+    /// wallet with `fee` (at least [`Wallet::min_replacement_fee`]), using
+    /// each input's next leaf. The payment's record now points at the
+    /// replacement, which can itself be cancelled while leaves remain.
+    pub fn cancel_sent(
+        &mut self,
+        txid: &Commitment,
+        fee: impl Into<Fee>,
+        chain: &impl Unspent,
+        now: u64,
+    ) -> Result<Signed> {
+        let (sent, inputs) = self.sent_inputs(txid, chain)?;
+        let min = Self::min_replacement_fee(&sent);
+        let fee = match fee.into() {
+            Fee::Total(f) => f,
+            Fee::PerByte(r) => min.max(r.saturating_mul(Self::cancel_size(&sent) as u64)),
+        };
+        if fee < min {
+            return Err(WalletError::FeeTooLow { min });
+        }
+        let total: u128 = inputs.iter().map(|(_, amount)| *amount as u128).sum();
+        if total <= fee as u128 {
+            return Err(WalletError::Insufficient { have: total, need: fee as u128 + 1 });
+        }
+        let mut t = self.t.clone();
+        let back = self.receive_in(&mut t, (total - fee as u128) as u64, now)?;
+        self.replace(t, sent, UnsignedTransaction::new(inputs, vec![back]), fee, now)
+    }
+
+    /// Speeds up a finalized payment that is not yet confirmed: signs a
+    /// replacement with the same outputs but the change, which pays the
+    /// higher `fee` (at least [`Wallet::min_bump_fee`]; at a rate, that
+    /// rate on its size), using each input's next leaf. Change that would
+    /// fall below the dust limit goes to the fee whole. The recipient's
+    /// output stands: the payment's record moves to the replacement.
+    pub fn bump_sent(
+        &mut self,
+        txid: &Commitment,
+        fee: impl Into<Fee>,
+        chain: &impl Unspent,
+        now: u64,
+    ) -> Result<Signed> {
+        let (sent, inputs) = self.sent_inputs(txid, chain)?;
+        let min = Self::min_bump_fee(&sent);
+        let fee = match fee.into() {
+            Fee::Total(f) => f,
+            Fee::PerByte(r) => min.max(r.saturating_mul(sent.size as u64)),
+        };
+        if fee < min {
+            return Err(WalletError::FeeTooLow { min });
+        }
+        // The change: the one output of the transaction this wallet holds.
+        let change = sent.tx.outputs.iter().rposition(|o| self.owned(&o.commitment).is_some());
+        let i = change.ok_or(WalletError::BadSlate("no change to pay a higher fee from; cancel it instead"))?;
+        let more = fee - sent.fee;
+        let old = sent.tx.outputs[i];
+        let have = old.amount;
+        let mut outputs = sent.tx.outputs.clone();
+        let mut t = self.t.clone();
+        let fee = if have >= more && have - more >= Policy::MAINNET.dust {
+            outputs[i] = self.receive_in(&mut t, have - more, now)?;
+            fee
+        } else if have >= more {
+            outputs.remove(i);
+            sent.fee + have
+        } else {
+            return Err(WalletError::Insufficient { have: have as u128 + sent.fee as u128, need: fee as u128 });
+        };
+        let unsigned = UnsignedTransaction::with_ops(inputs, outputs, sent.tx.ops.clone());
+        self.replace(t, sent, unsigned, fee, now)
+    }
+
+    /// A sent transaction as it was signed, to send again: its inputs at
+    /// the positions this wallet now knows for their outputs (a
+    /// reorganization may have moved them; positions are not signed).
+    pub fn resend(&self, txid: &Commitment) -> Result<Transaction> {
+        let sent = self.t.sent.get(&digest_to_bytes(txid)).cloned().ok_or(WalletError::Unknown)?;
+        let mut tx = sent.tx;
+        let mut positions = tx.spent_positions();
+        if sent.inputs.len() == positions.len() {
+            for (p, c) in positions.iter_mut().zip(&sent.inputs) {
+                if let Some(q) = self.owned(c).and_then(|o| o.position) {
+                    *p = q;
+                }
+            }
+            tx.set_positions(&positions);
+        }
+        Ok(tx)
+    }
+
+    /// Forgets unspent outputs the chain does not hold: outputs of
+    /// blocks or payments that never landed (the change of a payment
+    /// replaced, say). The change of a pending slate stays, as do the
+    /// rewards not yet settled and anything in `keep`: the outputs of
+    /// pooled transactions, which may yet land. Returns how many went.
+    pub fn prune_pending(&mut self, chain: &impl Unspent, keep: &[Commitment]) -> Result<usize> {
+        let mut t = self.t.clone();
+        let mut in_flight: BTreeSet<Id> = keep.iter().map(digest_to_bytes).collect();
+        in_flight.extend(t.slates.values().filter_map(|p| p.change.as_ref().map(digest_to_bytes)));
+        in_flight.extend(t.rewards.keys().copied());
+        let mut gone = 0;
+        for o in self.outputs() {
+            let id = digest_to_bytes(&o.commitment);
+            let held = self.held(&o, chain)?;
+            let waiting = in_flight.contains(&id);
+            if o.state == State::Unspent && !waiting && !held {
+                t.outputs.remove(&id);
+                gone += 1;
+            }
+            if held || (o.state == State::Unspent && !waiting) {
+                t.answered.remove(&id);
+            }
+        }
+        self.commit(t, &[T_OUTPUTS, T_ANSWERED])?;
+        Ok(gone)
+    }
+
+    /// Notes signatures seen on the network (pooled spends) from the
+    /// wallet's outputs, `(commitment, leaf)`: a leaf the wallet took for
+    /// unused (its file gone back to a copy kept, a machine's snapshot)
+    /// is skipped, with every leaf before it, so it never signs twice.
+    /// Returns how many outputs were behind.
+    pub fn observe_signatures(&mut self, seen: &[(Commitment, u64)]) -> Result<usize> {
+        let mut t = self.t.clone();
+        let mut behind = 0;
+        for (c, leaf) in seen {
+            let Some(o) = t.outputs.get_mut(&digest_to_bytes(c)) else { continue };
+            let base = if o.recovered { LEAVES_PER_HALF } else { 0 };
+            let Some(offset) = (*leaf as u32).checked_sub(base).filter(|&x| x < LEAVES_PER_HALF) else { continue };
+            // Its place in this copy's order, from the start leaf.
+            let k = (offset + LEAVES_PER_HALF - u32::from(o.start)) % LEAVES_PER_HALF;
+            if u32::from(o.used) <= k {
+                o.used = (k + 1) as u8;
+                behind += 1;
+            }
+        }
+        if behind > 0 {
+            self.commit(t, &[T_OUTPUTS])?;
+        }
+        Ok(behind)
     }
 
     /// The pending slates: each one's id, and what it is to pay.

@@ -562,6 +562,14 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
                     _ => {}
                 }
                 failed = followed.is_err();
+                // Pooled spends of its outputs: a leaf signed from
+                // elsewhere (a copy of this wallet, or its file as it
+                // was before) is never signed from again.
+                if let Ok(behind @ 1..) = tabminer::console::observe(&hold, &wallet) {
+                    main.log(&format!(
+                        "The wallet: {behind} outputs were signed from leaves it took for unused (its file is an earlier one?): passed over"
+                    ));
+                }
                 hold.wait_moved(seen, Duration::from_secs(60));
             }
         };
