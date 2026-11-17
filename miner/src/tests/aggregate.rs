@@ -193,8 +193,11 @@ fn nodes_chain_open_transactions() {
         subsidy: 30,
         ..s.statement.clone()
     };
-    let c =
-        compile_node(&SMALL, &seg_children(&s.proofs[..2]), Output::Statement(&short, &s.name_proof, &s.work_proof));
+    let c = compile_node(
+        &SMALL,
+        &seg_children(&s.proofs[..2]),
+        Output::Statement(&short, &s.name_proof, &s.work_proof, None),
+    );
     assert!(matches!(VmAir::execute(&c.prog, &c.inputs), Err(Error::VmAssertion(_))));
 }
 
@@ -488,8 +491,11 @@ fn root_program_accepts_and_rejects() {
         stark::verify(&SMALL.segment, &NameAir::MAINNET, &s.name_proof.public.to_values(), &s.name_proof.proof, tr),
         Ok(())
     );
-    let c =
-        compile_node(&SMALL, &seg_children(&s.proofs), Output::Statement(&s.statement, &s.name_proof, &s.work_proof));
+    let c = compile_node(
+        &SMALL,
+        &seg_children(&s.proofs),
+        Output::Statement(&s.statement, &s.name_proof, &s.work_proof, None),
+    );
     let exec = match VmAir::execute(&c.prog, &c.inputs) {
         Ok(e) => e,
         Err(Error::VmAssertion(i)) => panic!("root rejected at {i}: {:?}", c.prog.instrs[i]),
@@ -508,7 +514,7 @@ fn root_program_accepts_and_rejects() {
     assert_ne!(plan(&SMALL, 1).digest, shape.digest);
 
     let rejects_with = |st: &Statement, proofs: &[SegmentProof], name: &NameProof| {
-        let c = compile_node(&SMALL, &seg_children(proofs), Output::Statement(st, name, &s.work_proof));
+        let c = compile_node(&SMALL, &seg_children(proofs), Output::Statement(st, name, &s.work_proof, None));
         matches!(VmAir::execute(&c.prog, &c.inputs), Err(Error::VmAssertion(_)))
     };
     let rejects = |st: &Statement, proofs: &[SegmentProof]| rejects_with(st, proofs, &s.name_proof);
@@ -628,7 +634,7 @@ fn aggregator_size() {
         let seg = SegmentProof { public, proof: dummy };
         let zero = Statement::zero(&params.work_shape());
         let (nm, wk) = (dummy_name(&params), dummy_work(&params));
-        let c = compile_node(&params, &[Child::Segment(&seg)], Output::Statement(&zero, &nm, &wk));
+        let c = compile_node(&params, &[Child::Segment(&seg)], Output::Statement(&zero, &nm, &wk, None));
         let mut hist = std::collections::BTreeMap::new();
         for ins in &c.prog.instrs {
             let name = format!("{ins:?}");
@@ -655,7 +661,7 @@ fn aggregator_size() {
         };
         let zero = Statement::zero(&params.work_shape());
         let (nm, wk) = (dummy_name(&params), dummy_work(&params));
-        let leaf = compile_node(&params, &[Child::Segment(&seg)], Output::Statement(&zero, &nm, &wk)).prog;
+        let leaf = compile_node(&params, &[Child::Segment(&seg)], Output::Statement(&zero, &nm, &wk, None)).prog;
         let np = NodeProof {
             record: seg.public,
             digest: [Fp::ZERO; DIGEST],
@@ -678,6 +684,151 @@ fn aggregator_size() {
             np.proof.to_bytes().len()
         );
     }
+}
+
+/// A block with a spend: its root takes the top of the signature
+/// tree, whose one segment says the spend's entry, and the block's
+/// proof verifies as a block with signatures and as nothing else.
+#[test]
+#[ignore = "slow: one job each in .github/workflows/test.yml"]
+fn a_spend_rests_on_the_signature_tree() {
+    let utxo = TestSet::new();
+    let miner = key(9).public_key();
+    let mut owner = Key::generate_with_height(&[7; 32], 2);
+    utxo.add_output(&TxOutput::new(&owner.public_key(), 70).block_output(), 0).unwrap();
+    let mut spend = UnsignedTransaction::new(vec![(owner.public_key(), 70)], vec![TxOutput::new(&miner, 70)])
+        .sign(|_, _, m| owner.sign(m))
+        .unwrap();
+    spend.set_positions(&[0]);
+    let entry = crate::sig_air::entry(&owner.public_key(), &spend.txid(), spend.inputs[0].signature.index);
+    // (Alone in its block: two segments, as many as a root is over.)
+    let txs = [spend];
+    let (prev_root, first) = (utxo.root(), utxo.next_position());
+    let segments = utxo.collect_by_rows(&txs, SMALL.segment_rows(), 1).unwrap();
+    let new_root = utxo.root();
+    assert!(has_signatures(&segments));
+    let signed = segments[0].signed.clone();
+    assert_eq!((signed.segments.len(), signed.set.find(&entry)), (1, Some(0)));
+    let body = Body {
+        inputs: segments.iter().flat_map(|s| s.positions()).collect(),
+        outputs: segments.iter().flat_map(|s| s.block_outputs()).collect(),
+        proof: vec![],
+        ..Default::default()
+    };
+    let statement = Statement::from_block(&BlockStatement {
+        height: 1,
+        prev_state_root: prev_root,
+        new_state_root: new_root,
+        first_output_position: first,
+        subsidy: 0,
+        body: BodyRef::from_bytes(&body.to_bytes()).unwrap(),
+        parent_work: test_work(SMALL.pow),
+        parent_hash: test_genesis_header().hash(),
+    });
+    let names = empty_names(&segments, 1);
+    let mut cache = PlanCache::new();
+    let shape = plan_for(&SMALL, &segments, &mut cache);
+    let plan = shape.sig.expect("a block with signatures has a root that takes their tree");
+    let bare = plan_with(&SMALL, segments.len(), &mut cache);
+    assert!(bare.sig.is_none());
+    assert_ne!((shape.digest, shape.wrap.unwrap().digest), (bare.digest, bare.wrap.unwrap().digest));
+    // The tree's programs: one a level, each of its own, of one shape.
+    for (i, d) in plan.digests.iter().enumerate() {
+        assert!(plan.digests[..i].iter().all(|other| other != d), "level {}", i + 1);
+    }
+    let steps = Mutex::new(Vec::new());
+    let proof = prove_block_with(&SMALL, &shape, &statement, &segments, &names, 2, &|p| {
+        steps.lock().unwrap().push(format!("{p:?}"))
+    });
+    let steps = steps.into_inner().unwrap();
+    assert_eq!(steps.iter().filter(|s| s.starts_with("Signatures")).count(), 1, "{steps:?}");
+    assert_eq!(steps.iter().filter(|s| s.starts_with("SignatureNode")).count(), 1, "{steps:?}");
+    let wraps = |_: usize, signed: bool| if signed { shape.wrap.unwrap() } else { bare.wrap.unwrap() };
+    assert_eq!(verify_block(&SMALL, &wraps, &statement, &proof), Ok(()));
+    // Said to be a block without signatures, it is checked against the
+    // other root's wrap, and is not that.
+    let mut unsigned = proof.clone();
+    unsigned[3] &= 0x7f;
+    assert_eq!(verify_block(&SMALL, &wraps, &statement, &unsigned), Err(AggregateError::Rejected));
+    // The top of the tree is what the set's root is, and no other
+    // tree's top serves: of the same segment twice, say.
+    let sig = crate::block_proof::prove_signatures(&SMALL.segment, &signed.segments[0], Some(15));
+    let nothing = crate::block_proof::prove_signatures(&SMALL.segment, &[], Some(15));
+    let node = |children: [&crate::block_proof::SigProof; 4]| {
+        prove_sig_node(&SMALL, &plan, 1, &SigChildren::Segments(children), &|| false).unwrap()
+    };
+    let top = node([&sig, &nothing, &nothing, &nothing]);
+    assert_eq!(top.top, signed.set.root());
+    assert_eq!(
+        top.root,
+        crate::signed::node_root(&[
+            crate::signed::segment_root(&sig.entries),
+            crate::signed::segment_root(&nothing.entries),
+            crate::signed::segment_root(&nothing.entries),
+            crate::signed::segment_root(&nothing.entries),
+        ])
+    );
+    let twice = node([&sig, &sig, &nothing, &nothing]);
+    assert_ne!(twice.top, top.top);
+    // The root's program, given the other top: the segments were proven
+    // against another set, and the program does not run.
+    let proofs: Vec<SegmentProof> =
+        segments.iter().map(|w| prove_segment_padded(&SMALL.segment, w, SMALL.segment_log_n)).collect();
+    let name_proof = prove_name_padded(&SMALL.segment, &names, SMALL.name_log_n);
+    let work_proof = small_work_proof();
+    assert!(proofs.len() <= SMALL.fan_in, "the root is over the segments themselves");
+    let runs = |top: &SigNodeProof, plan: &SigPlan| {
+        let output = Output::Statement(&statement, &name_proof, &work_proof, Some((top, plan)));
+        let c = compile_node(&SMALL, &seg_children(&proofs), output);
+        VmAir::generate_trace(&c.prog, &c.inputs).is_ok()
+    };
+    assert!(runs(&top, &plan));
+    assert!(!runs(&twice, &plan));
+    // Nor a top of a program that is none of the tree's.
+    let mut other = plan;
+    other.digests[0][0] += Fp::ONE;
+    assert!(!runs(&top, &other));
+}
+
+/// More signature segments than one node holds: a second level over
+/// two nodes of the first and two of nothing, whose top is the root of
+/// the set of all the segments.
+#[test]
+#[ignore = "slow: one job each in .github/workflows/test.yml"]
+fn a_signature_tree_of_two_levels() {
+    let mut owner = Key::generate_with_height(&[8; 32], 3);
+    // Five segments, of a signature each: as a miner might have them
+    // that proved each transaction's as it came.
+    let segments: Vec<Vec<crate::signed::Signing>> = (0..5u32)
+        .map(|i| {
+            let message: Digest = core::array::from_fn(|k| Fp::new(1000 * i + k as u32));
+            vec![(owner.public_key(), message, owner.sign(&message).unwrap())]
+        })
+        .collect();
+    let entries: Vec<_> = segments.iter().map(|s| Signed::entries(s)).collect();
+    let signed = Signed { set: crate::signed::SignedSet::new(&entries), segments };
+    let plan = sig_plan(&SMALL, &mut PlanCache::new());
+    let steps = Mutex::new(Vec::new());
+    let top =
+        prove_sig_tree(&SMALL, &plan, &signed, &|p| steps.lock().unwrap().push(format!("{p:?}")), &|| false).unwrap();
+    let steps = steps.into_inner().unwrap();
+    assert_eq!(steps.iter().filter(|s| s.starts_with("Signatures")).count(), 5, "{steps:?}");
+    assert_eq!(steps.iter().filter(|s| s.starts_with("SignatureNode { level: 1")).count(), 2, "{steps:?}");
+    assert_eq!(steps.iter().filter(|s| s.starts_with("SignatureNode { level: 2")).count(), 1, "{steps:?}");
+    assert_eq!(top.digest, plan.digests[1]);
+    assert_eq!(top.top, signed.set.root());
+    // Every entry's path ends at what the tree's top says.
+    for (s, group) in signed.segments.iter().enumerate() {
+        let (pk, message, sig) = &group[0];
+        let entry = crate::sig_air::entry(pk, message, sig.index);
+        assert_eq!(signed.set.path((s * crate::sig_air::SLOTS) as u32).root(&entry), top.top);
+    }
+    // The proof is of the second level's program, with that output.
+    let public = VmAir::public_values(&top.digest, &sig_output(&top.root, &top.top));
+    let specs = VmAir::specs(&top.digest);
+    assert!(stark::verify_tables(&SMALL.outer, &specs, &public, &top.proof, &mut outer_transcript()).is_ok());
+    let other = VmAir::public_values(&top.digest, &sig_output(&top.root, &top.root));
+    assert!(stark::verify_tables(&SMALL.outer, &specs, &other, &top.proof, &mut outer_transcript()).is_err());
 }
 
 #[test]
@@ -1147,7 +1298,7 @@ fn security_configs() {
             let wrap_line = times.lock().unwrap().iter().rev().find(|l| l.starts_with("Wrap")).cloned();
             let t = std::time::Instant::now();
             let w = shape.wrap.unwrap();
-            let ok = verify_block(&params, &|_| w, &statement, &proof);
+            let ok = verify_block(&params, &|_, _| w, &statement, &proof);
             println!(
                 "  block of {k}: proven in {elapsed:.1?}, {} bytes, verified {:?} in {:.1?}; {}",
                 proof.len(),
@@ -1229,7 +1380,7 @@ fn wrap_program_accepts_and_rejects() {
         &SMALL,
         &shape,
         &s.proofs,
-        Output::Statement(&s.statement, &s.name_proof, &s.work_proof),
+        Output::Statement(&s.statement, &s.name_proof, &s.work_proof, None),
         &|_| {},
         &|| false,
     )
@@ -1287,7 +1438,7 @@ fn mainnet_wrap_timing() {
         &params,
         &shape,
         &[seg],
-        Output::Statement(&s.statement, &name, &params.prove_work(&s.statement.parent_work)),
+        Output::Statement(&s.statement, &name, &params.prove_work(&s.statement.parent_work), None),
         &|_| {},
         &|| false,
     )

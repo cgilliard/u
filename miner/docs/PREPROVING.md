@@ -264,42 +264,46 @@ the rest, and nothing in consensus is in its way.
    unused but for its bit columns and sibling register: to be taken out.
 4. `block_proof` (networks of quick blocks) proves and checks signature
    segments: done.
-5. The proof of proofs: the set's root is carried through the nodes,
-   and the root holds it to the set of nothing, so the main network and
-   the recursive dev network take blocks without signatures only. To
-   do: section 8.
+5. The proof of proofs verifies a block's signature tree: done,
+   `src/aggregate.rs` (section 8). A block with signatures has a root
+   that takes the tree's top; a block without has the root it had.
 6. The name segment's update signature, looked up the same way.
 7. The miner: nothing to do until there is a mempool; signature
    segments are proven with the block.
 8. The constants of the main network, made again once more with the
    change of security parameters.
 
-## 8. The signature tree in the proof of proofs (to build)
+## 8. The signature tree in the proof of proofs
 
-How it is meant to fit what `src/aggregate.rs` has, so that a root's
-shape does not depend on how many signature segments a block has:
+As built (`src/aggregate.rs`, "The signature tree"; the tree's shape is
+`src/signed.rs`):
 
-- **Signature nodes.** A program that verifies up to four signature
-  segment proofs (`SigAir`, 256 public values each), makes each one's
-  root of 32 entries, and compresses the four (a missing one is the
-  empty tree's constant) two levels up; and one that does the same over
-  four signature nodes. Its output is its subtree's root with the
-  digest of the programs below, as a transaction node's is.
-- **Padding to the top.** Whatever level the topmost signature node is
-  at, it also climbs from its root to the tree's full depth beside
-  empty subtrees (at most twelve compressions), so what it says is the
-  whole set's root.
-- **A plan of its own.** The allowed topmost signature programs, one
-  for each count of signature segments, are the leaves of a second
-  Merkle tree, as the allowed wraps are of the first
-  (`plan_leaves`). All of them are padded to the same table heights.
-- **Two roots for each count of segments.** The root without
-  signatures holds the signed set to the set of nothing, as now, and
-  costs what it costs today: a block of a reward alone pays for no
-  signature proof. The root with signatures verifies one topmost
-  signature proof, checks by a path that its program is in the
-  signature plan, and holds the segments' signed set to what it says.
-  The plan of wraps has a leaf for each: twice as many.
-- **Proving.** Signature segments and their nodes are proven beside
-  the transaction segments; nothing in them is of the parent, so a
-  miner with a mempool proves them ahead and keeps them.
+- **The tree is shaped by what the machine of a proof of proofs can
+  hash.** It compresses the digest it has just made with one it is
+  given, and must hash what it is given as an input before it can
+  compress it. So a segment's root is over its entries each hashed
+  alone and then compressed in pairs, and a node's is over its four
+  children's roots, each hashed alone and compressed in pairs. Hashing
+  a digest alone is compressing it with a fixed digest, so a path is 27
+  compressions and nothing else, and a transaction segment checks it
+  with one kind of row.
+- **Every node has four children.** Where there are fewer, the rest are
+  proofs of nothing (a segment with no signature, a node over four of
+  nothing), made once and kept. So there is one program a level, seven
+  in all, each fixing the program of the level below, all padded to one
+  pair of table heights.
+- **A node says two things:** its own subtree's root, and what the whole
+  set's root is if nothing is beside it. A tree of few segments ends at
+  a low level, and the block's root takes the top of whatever level,
+  holding its program to one of the seven.
+- **Two roots for each count of segments.** Without signatures the root
+  holds the signed set to the set of nothing and verifies no signature
+  proof: a block of a reward alone costs what it did. With signatures
+  it verifies the tree's top and holds the segments' signed set to what
+  that says. The plan of allowed wraps has a leaf for each: twice as
+  many.
+- **Nothing in the tree is of the block or its parent.** It is proven
+  beside the block for now; a miner with a mempool proves it ahead.
+
+Not done: signature segments are proven one after another, and every
+block proves its own, there being nothing yet that keeps them.

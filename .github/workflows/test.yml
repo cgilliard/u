@@ -125,6 +125,8 @@ jobs:
       matrix:
         test:
           # slow-tests:begin
+          - aggregate::tree_tests::a_spend_rests_on_the_signature_tree
+          - aggregate::tree_tests::a_signature_tree_of_two_levels
           - aggregate::tree_tests::aggregate_proof_roundtrip
           - aggregate::tree_tests::aggregate_tree_roundtrip
           - aggregate::tree_tests::chain_proofs_cover_history

@@ -359,6 +359,19 @@ impl Compiler {
         self.sponge = None;
     }
 
+    /// Compresses the digest just made with the digest at `sib`: on its
+    /// left, or with `right` on its right. What a program makes a tree
+    /// of its own with, where [`Compiler::merkle_root`] climbs one that
+    /// is committed.
+    pub fn compress_with(&mut self, sib: Addr, right: bool) {
+        let dir = if right { A_ONE } else { A_ZERO };
+        self.prog.compress(sib, dir, 0);
+        let s: Digest = core::array::from_fn(|i| self.val(sib + i as Addr).0[0]);
+        let d = self.digest;
+        self.digest = if right { compress(&s, &d) } else { compress(&d, &s) };
+        self.sponge = None;
+    }
+
     fn squeeze(&mut self) -> Addr {
         let out = self.prog.squeeze();
         for i in 0..DIGEST {

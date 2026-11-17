@@ -371,7 +371,8 @@ use crate::block_air::{
     initial_outputs_state,
 };
 use crate::block_proof::{
-    DOM_NAME_PROOF, DOM_SEGMENT_PROOF, NameProof, SegmentProof, prove_name_padded, prove_segment_padded,
+    DOM_NAME_PROOF, DOM_SEGMENT_PROOF, DOM_SIG_PROOF, NameProof, SegmentProof, SigProof, prove_name_padded,
+    prove_segment_padded, prove_signatures,
 };
 use crate::chain::verify::ProofVerifier;
 use crate::chain_verifier::DOM_CHAIN_PROOF;
@@ -388,6 +389,8 @@ use crate::name_air::{
 use crate::poseidon2::P;
 use crate::pow_air::{DOM_WORK_PROOF, RangeAir, TextAir};
 use crate::recursion::{Compiler, dummy_proof};
+use crate::sig_air::{NUM_PUBLIC as SIG_PUBLIC, SLOTS, SigAir};
+use crate::signed::{FAN, NODE_LEVELS, SEGMENT_DEPTH, SEGMENT_LOG_ROWS, Signed};
 use crate::stark::{self, Preprocessed};
 use crate::vm_air::{Addr, NUM_PUBLIC as VM_PUBLIC, PUB_OUTPUT, Program, VmAir};
 
@@ -484,8 +487,10 @@ pub enum Output<'a> {
     /// The combined span record (inner nodes).
     Record,
     /// The block statement, after binding the span, the name segment and
-    /// the parent's work segment to it (the root).
-    Statement(&'a Statement, &'a NameProof, &'a WorkProof),
+    /// the parent's work segment to it (the root); and, of a block with
+    /// signatures, the top of its signature tree, with the programs a
+    /// top may be.
+    Statement(&'a Statement, &'a NameProof, &'a WorkProof, Option<(&'a SigNodeProof, &'a SigPlan)>),
 }
 
 /// Copies `words` into a fresh block, zero padded to a multiple of eight,
@@ -609,7 +614,7 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
             c.hash_scalars(out, SEGMENT_PUBLIC + DIGEST);
             c.assert_public();
         }
-        Output::Statement(statement, name, work) => {
+        Output::Statement(statement, name, work, sigs) => {
             // The name segment: its record as inputs, then its proof, and
             // its descriptor last in the tree digest.
             let nm = c.scalar_inputs(&name.public.to_values());
@@ -687,14 +692,39 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
             // Every transaction segment created its outputs at the block's
             // height.
             c.assert_eq(at(first, PUB_HEIGHT), at(st, ST_HEIGHT));
-            // The signed set the segments were proven against is the
-            // set of nothing: until the root verifies the proofs of a
-            // block's signature segments (`docs/PREPROVING.md`), a block
-            // proven this way rests on no signature, and so spends
-            // nothing. A reward, which is all a first block is, needs
-            // none.
-            for (i, v) in crate::signed::empty_roots()[crate::signed::DEPTH].iter().enumerate() {
-                c.assert_scalar(at(first, PUB_SIGNED + i), *v);
+            match sigs {
+                // The signed set the segments were proven against is
+                // the set of nothing: a block proven this way rests on
+                // no signature, and so spends nothing, and pays for the
+                // proof of none. A reward needs none.
+                None => {
+                    for (i, v) in crate::signed::empty_root().iter().enumerate() {
+                        c.assert_scalar(at(first, PUB_SIGNED + i), *v);
+                    }
+                }
+                // Or it is what the top of the block's signature tree
+                // says: a proof of one of the programs a top may be, one
+                // for each level a tree can end at.
+                Some((top, plan)) => {
+                    let (said, pubv) = verify_sig_child(&mut c, params, top);
+                    let mut chosen = c.scalar(Fp::ZERO);
+                    let mut digest = [c.scalar(Fp::ZERO); DIGEST];
+                    for allowed in &plan.digests {
+                        let flag = c.scalar_inputs(&[Fp::new((*allowed == top.digest) as u32)]);
+                        let square = c.mul(flag, flag);
+                        c.assert_eq(square, flag);
+                        chosen = c.add(chosen, flag);
+                        for (i, word) in digest.iter_mut().enumerate() {
+                            let value = c.scalar(allowed[i]);
+                            *word = c.muladd(flag, value, *word);
+                        }
+                    }
+                    c.assert_scalar(chosen, Fp::ONE);
+                    for (i, word) in digest.iter().enumerate() {
+                        c.assert_eq(pubv + i as Addr, *word);
+                    }
+                    c.assert_block(at(first, PUB_SIGNED), at(said, DIGEST), DIGEST);
+                }
             }
             // Operation counts within the caps: the count is one of 0..=cap.
             for (k, kind) in [OpKind::Commit, OpKind::Reveal, OpKind::Update, OpKind::Sweep].into_iter().enumerate() {
@@ -793,6 +823,357 @@ pub fn compile_wrap(
 }
 
 // ---------------------------------------------------------------------------
+// The signature tree
+// ---------------------------------------------------------------------------
+//
+// A block's signatures are checked in signature segments
+// ([`crate::sig_air`]), and their entries are the leaves of the block's
+// signed set ([`crate::signed`]). The tree over them is made here, by
+// nodes of four: a node of the first level verifies four signature
+// segment proofs and makes of each one's entries its root, a node above
+// verifies four nodes of the level below, and each compresses its four
+// roots into its own.
+//
+// A node also says what the whole set's root is if nothing is beside
+// it: its root climbed to the top beside empty subtrees. So a tree of
+// few segments ends at a low level, and the block's root takes the top
+// of whatever level ([`Output::Statement`]).
+//
+// Every node has four children. Where a block has fewer, the rest are
+// proofs of nothing: of a segment with no signature, or of a node over
+// four of nothing, made once and kept ([`nothing`]). So there is one
+// program for each level, each fixing the program of the level below,
+// and all padded to one pair of table heights ([`SigPlan`]): a parent,
+// and the block's root, verify a child of one shape whatever is under
+// it. Nothing here is of the block or its parent: a miner can make all
+// of it before either is known.
+
+/// A proven node of the signature tree.
+#[derive(Clone, Debug)]
+pub struct SigNodeProof {
+    /// The root of the node's own subtree.
+    pub root: Digest,
+    /// The root of the whole set, if nothing is beside this node.
+    pub top: Digest,
+    /// Program digest.
+    pub digest: Digest,
+    pub proof: stark::Proof,
+}
+
+/// The programs of the signature tree, by level, and the table heights
+/// they are all padded to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SigPlan {
+    pub digests: [Digest; NODE_LEVELS],
+    pub log_n: usize,
+    pub hash_log_n: usize,
+}
+
+/// The four children of a signature node.
+pub enum SigChildren<'a> {
+    Segments([&'a SigProof; FAN]),
+    /// Nodes of the level below, and the program each must be of.
+    Nodes([&'a SigNodeProof; FAN], Digest),
+}
+
+/// What a signature node's proof outputs: its root and its top.
+pub fn sig_output(root: &Digest, top: &Digest) -> Digest {
+    let mut v = root.to_vec();
+    v.extend_from_slice(top);
+    crate::poseidon2::hash(&v)
+}
+
+/// What the whole set's root is if nothing is beside a node of `level`
+/// with this root.
+pub fn sig_top(level: usize, root: &Digest) -> Digest {
+    let empty = crate::signed::empty_roots();
+    let mut node = *root;
+    for l in level..NODE_LEVELS {
+        let nothing = empty[SEGMENT_DEPTH + 3 * l];
+        node = crate::signed::node_root(&[node, nothing, nothing, nothing]);
+    }
+    node
+}
+
+/// A digest as eight words the program fixes.
+fn fixed_digest(c: &mut Compiler, d: &Digest) -> Addr {
+    let at = c.scalar_inputs(d);
+    for (i, v) in d.iter().enumerate() {
+        c.assert_scalar(at + i as Addr, *v);
+    }
+    at
+}
+
+/// Leaves the root of the tree over the digests at `leaves` (a power of
+/// two of them) as the digest just made: each hashed alone, and those
+/// compressed in pairs ([`crate::signed`]).
+fn hashed_tree(c: &mut Compiler, leaves: &[Addr]) {
+    if let [leaf] = leaves {
+        c.hash_scalars(*leaf, DIGEST);
+        return;
+    }
+    let (left, right) = leaves.split_at(leaves.len() / 2);
+    hashed_tree(c, left);
+    let left = c.squeeze_digest();
+    hashed_tree(c, right);
+    c.compress_with(left, true);
+}
+
+/// Verifies a signature node's machine proof under the program digest
+/// its public values claim. Returns where its root and top are (sixteen
+/// words) and its public values: the caller holds the digest to what it
+/// may be.
+fn verify_sig_child(c: &mut Compiler, params: &AggregatorParams, node: &SigNodeProof) -> (Addr, Addr) {
+    let mut v = node.root.to_vec();
+    v.extend_from_slice(&node.top);
+    let said = c.scalar_inputs(&v);
+    let pubv = c.scalar_inputs(&VmAir::public_values(&node.digest, &sig_output(&node.root, &node.top)));
+    c.hash_scalars(said, 2 * DIGEST);
+    let out = c.squeeze_digest();
+    c.assert_block(pubv + PUB_OUTPUT as Addr, out, DIGEST);
+    let tables: [(&dyn stark::DynAir, Option<Addr>); 2] = [(&VmAir, Some(pubv)), (&HashTableAir, None)];
+    c.verify_stark(&tables, &params.outer, &[Fp::new(DOM_AGGREGATE_PROOF)], pubv, VM_PUBLIC, &node.proof);
+    (said, pubv)
+}
+
+/// The program of a signature node of `level` (1 the lowest) over
+/// `children`, padded to `pad` unless the heights are being found.
+pub fn compile_sig_node(
+    params: &AggregatorParams,
+    level: usize,
+    children: &SigChildren<'_>,
+    pad: Option<(usize, usize)>,
+) -> Compiler {
+    assert!((1..=NODE_LEVELS).contains(&level));
+    let mut c = Compiler::new();
+    let roots: Vec<Addr> = match children {
+        SigChildren::Segments(segments) => {
+            assert_eq!(level, 1, "segments are under the first level");
+            segments
+                .iter()
+                .map(|sig| {
+                    let said = c.scalar_inputs(&sig.values());
+                    assert_eq!(
+                        sig.proof.tables[0].log_n, SEGMENT_LOG_ROWS,
+                        "signature segment proof has the wrong height"
+                    );
+                    let prefix = [Fp::new(DOM_SIG_PROOF)];
+                    c.verify_stark(&[(&SigAir, None)], &params.segment, &prefix, said, SIG_PUBLIC, &sig.proof);
+                    let entries: Vec<Addr> = (0..SLOTS).map(|j| said + (j * DIGEST) as Addr).collect();
+                    hashed_tree(&mut c, &entries);
+                    c.squeeze_digest()
+                })
+                .collect()
+        }
+        SigChildren::Nodes(nodes, program) => {
+            assert!(level > 1, "nodes are under the levels above the first");
+            nodes
+                .iter()
+                .map(|node| {
+                    let (said, pubv) = verify_sig_child(&mut c, params, node);
+                    for (i, v) in program.iter().enumerate() {
+                        c.assert_scalar(pubv + i as Addr, *v);
+                    }
+                    said
+                })
+                .collect()
+        }
+    };
+    hashed_tree(&mut c, &roots);
+    let root = c.squeeze_digest();
+    // Up to the top beside nothing: at each level a node of this one
+    // and three empty ones.
+    let empty = crate::signed::empty_roots();
+    let mut top = root;
+    for l in level..NODE_LEVELS {
+        let nothing = crate::signed::hashed(&empty[SEGMENT_DEPTH + 3 * l]);
+        let beside = fixed_digest(&mut c, &nothing);
+        let pair = fixed_digest(&mut c, &crate::poseidon2::compress(&nothing, &nothing));
+        c.hash_scalars(top, DIGEST);
+        c.compress_with(beside, false);
+        c.compress_with(pair, false);
+        top = c.squeeze_digest();
+    }
+    let words: Vec<Addr> = (0..DIGEST as Addr).map(|i| root + i).chain((0..DIGEST as Addr).map(|i| top + i)).collect();
+    let block = concat(&mut c, &words);
+    c.hash_scalars(block, words.len());
+    c.assert_public();
+    if let Some((log_n, hash_log_n)) = pad {
+        c.prog.pad_to(log_n, hash_log_n);
+    }
+    c
+}
+
+/// A signature segment proof of the right shape, for planning.
+fn dummy_sig(params: &AggregatorParams) -> SigProof {
+    SigProof {
+        entries: [crate::signed::NO_ENTRY; SLOTS],
+        proof: dummy_proof(&[(&SigAir, SEGMENT_LOG_ROWS)], &params.segment, SIG_PUBLIC),
+    }
+}
+
+/// A signature node proof of these heights, for planning.
+fn dummy_sig_node(params: &AggregatorParams, log_n: usize, hash_log_n: usize) -> SigNodeProof {
+    SigNodeProof {
+        root: [Fp::ZERO; DIGEST],
+        top: [Fp::ZERO; DIGEST],
+        digest: [Fp::ZERO; DIGEST],
+        proof: dummy_proof(&[(&VmAir, log_n), (&HashTableAir, hash_log_n)], &params.outer, VM_PUBLIC),
+    }
+}
+
+/// The signature tree's programs: compiled once, and kept in `cache`.
+pub fn sig_plan(params: &AggregatorParams, cache: &mut PlanCache) -> SigPlan {
+    if let Some(plan) = cache.sig {
+        return plan;
+    }
+    let heights = |c: &Compiler| {
+        (c.prog.height().trailing_zeros() as usize, VmAir::hash_height(&c.prog).trailing_zeros() as usize)
+    };
+    let sig = dummy_sig(params);
+    let segments = SigChildren::Segments([&sig; FAN]);
+    // The heights every node is padded to: those of the tallest, where
+    // a node over nodes is over nodes of those heights.
+    let mut pad = heights(&compile_sig_node(params, 1, &segments, None));
+    loop {
+        let child = dummy_sig_node(params, pad.0, pad.1);
+        let over = heights(&compile_sig_node(params, 2, &SigChildren::Nodes([&child; FAN], [Fp::ZERO; DIGEST]), None));
+        let both = (pad.0.max(over.0), pad.1.max(over.1));
+        if both == pad {
+            break;
+        }
+        pad = both;
+    }
+    let mut digests = [[Fp::ZERO; DIGEST]; NODE_LEVELS];
+    digests[0] = compile_sig_node(params, 1, &segments, Some(pad)).prog.digest(params.outer.log_blowup);
+    let child = dummy_sig_node(params, pad.0, pad.1);
+    for level in 2..=NODE_LEVELS {
+        let children = SigChildren::Nodes([&child; FAN], digests[level - 2]);
+        digests[level - 1] = compile_sig_node(params, level, &children, Some(pad)).prog.digest(params.outer.log_blowup);
+    }
+    let plan = SigPlan { digests, log_n: pad.0, hash_log_n: pad.1 };
+    cache.sig = Some(plan);
+    plan
+}
+
+/// Proofs of nothing, made once: of a signature segment with no
+/// signature (level 0), and of a node of each level over four of
+/// nothing, by the configurations they were made under.
+type Nothing = (StarkConfig, StarkConfig, usize, Option<SigProof>, Option<SigNodeProof>);
+static NOTHING: Mutex<Vec<Nothing>> = Mutex::new(Vec::new());
+
+fn nothing_segment(params: &AggregatorParams) -> SigProof {
+    let found = NOTHING.lock().unwrap().iter().find(|n| n.0 == params.segment && n.2 == 0).and_then(|n| n.3.clone());
+    if let Some(proof) = found {
+        return proof;
+    }
+    let proof = prove_signatures(&params.segment, &[], Some(SEGMENT_LOG_ROWS));
+    NOTHING.lock().unwrap().push((params.segment, params.outer, 0, Some(proof.clone()), None));
+    proof
+}
+
+fn nothing_node(
+    params: &AggregatorParams,
+    plan: &SigPlan,
+    level: usize,
+    cancel: stark::Cancel<'_>,
+) -> Option<SigNodeProof> {
+    let found = NOTHING
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|n| n.0 == params.segment && n.1 == params.outer && n.2 == level)
+        .and_then(|n| n.4.clone());
+    if let Some(proof) = found {
+        return Some(proof);
+    }
+    let proof = if level == 1 {
+        let segment = nothing_segment(params);
+        prove_sig_node(params, plan, 1, &SigChildren::Segments([&segment; FAN]), cancel)?
+    } else {
+        let below = nothing_node(params, plan, level - 1, cancel)?;
+        prove_sig_node(params, plan, level, &SigChildren::Nodes([&below; FAN], plan.digests[level - 2]), cancel)?
+    };
+    NOTHING.lock().unwrap().push((params.segment, params.outer, level, None, Some(proof.clone())));
+    Some(proof)
+}
+
+/// Proves one node of the signature tree.
+pub fn prove_sig_node(
+    params: &AggregatorParams,
+    plan: &SigPlan,
+    level: usize,
+    children: &SigChildren<'_>,
+    cancel: stark::Cancel<'_>,
+) -> Option<SigNodeProof> {
+    let roots: [Digest; FAN] = match children {
+        SigChildren::Segments(segments) => core::array::from_fn(|i| crate::signed::segment_root(&segments[i].entries)),
+        SigChildren::Nodes(nodes, _) => core::array::from_fn(|i| nodes[i].root),
+    };
+    let root = crate::signed::node_root(&roots);
+    let top = sig_top(level, &root);
+    let c = compile_sig_node(params, level, children, Some((plan.log_n, plan.hash_log_n)));
+    let (trace, hashes) =
+        VmAir::generate_trace(&c.prog, &c.inputs).expect("signature node program rejects its own witness");
+    let digest = plan.digests[level - 1];
+    let pre = committed_program(&c.prog, &params.outer, &digest);
+    let public = VmAir::public_values(&pre.root(), &sig_output(&root, &top));
+    let tables = VmAir::tables(&trace, &hashes, &pre);
+    let proof = stark::try_prove_tables(&params.outer, &tables, &public, &mut outer_transcript(), Some(cancel)).ok()?;
+    Some(SigNodeProof { root, top, digest, proof })
+}
+
+/// Proves a block's signature tree: its signature segments, and the
+/// nodes over them up to the one that holds them all. `None` if
+/// `cancel` fired.
+///
+/// # Panics
+///
+/// If there are no signatures: a block without any has no tree.
+pub fn prove_sig_tree(
+    params: &AggregatorParams,
+    plan: &SigPlan,
+    signed: &Signed,
+    progress: &(dyn Fn(Progress) + Sync),
+    cancel: stark::Cancel<'_>,
+) -> Option<SigNodeProof> {
+    assert!(!signed.segments.is_empty(), "a block without signatures has no signature tree");
+    let count = signed.segments.len();
+    let mut segments: Vec<SigProof> = Vec::with_capacity(count);
+    for (index, signings) in signed.segments.iter().enumerate() {
+        if cancel() {
+            return None;
+        }
+        let t = std::time::Instant::now();
+        segments.push(prove_signatures(&params.segment, signings, Some(SEGMENT_LOG_ROWS)));
+        progress(Progress::Signatures { index, count, elapsed: t.elapsed() });
+    }
+    let nothing = nothing_segment(params);
+    let mut level = 1;
+    let mut nodes: Vec<SigNodeProof> = Vec::with_capacity(count.div_ceil(FAN));
+    for four in segments.chunks(FAN) {
+        let t = std::time::Instant::now();
+        let children: [&SigProof; FAN] = core::array::from_fn(|i| four.get(i).unwrap_or(&nothing));
+        nodes.push(prove_sig_node(params, plan, level, &SigChildren::Segments(children), cancel)?);
+        progress(Progress::SignatureNode { level, elapsed: t.elapsed() });
+    }
+    while nodes.len() > 1 {
+        let nothing = nothing_node(params, plan, level, cancel)?;
+        level += 1;
+        let mut above = Vec::with_capacity(nodes.len().div_ceil(FAN));
+        for four in nodes.chunks(FAN) {
+            let t = std::time::Instant::now();
+            let children: [&SigNodeProof; FAN] = core::array::from_fn(|i| four.get(i).unwrap_or(&nothing));
+            let children = SigChildren::Nodes(children, plan.digests[level - 2]);
+            above.push(prove_sig_node(params, plan, level, &children, cancel)?);
+            progress(Progress::SignatureNode { level, elapsed: t.elapsed() });
+        }
+        nodes = above;
+    }
+    nodes.pop()
+}
+
+// ---------------------------------------------------------------------------
 // Tree planning
 // ---------------------------------------------------------------------------
 
@@ -812,6 +1193,10 @@ pub struct Shape {
     pub tree: Digest,
     /// The wrap program over this node, for the root.
     pub wrap: Option<Wrap>,
+    /// Of a root that takes the top of a signature tree: the programs a
+    /// top may be. `None` of a root of a block without signatures, and
+    /// of every node that is not a root.
+    pub sig: Option<SigPlan>,
 }
 
 /// Program digest and table heights of the wrap over a root, and its tree
@@ -848,9 +1233,10 @@ fn split(k: usize, fan_in: usize) -> Vec<usize> {
     groups
 }
 
-/// What a node program depends on: whether it is the root, and per child
-/// whether it is a segment (`None`) or a node with the given table heights.
-type NodeType = (bool, Vec<Option<(usize, usize)>>);
+/// What a node program depends on: whether it is the root, whether as
+/// a root it takes the top of a signature tree, and per child whether
+/// it is a segment (`None`) or a node with the given table heights.
+type NodeType = (bool, bool, Vec<Option<(usize, usize)>>);
 
 /// Program digest and table heights of a compiled program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -879,6 +1265,8 @@ pub struct PlanCache {
     wraps: HashMap<(usize, usize), Compiled>,
     /// The heights every wrap is padded to ([`wrap_pad`]).
     wrap_pad: Option<(usize, usize)>,
+    /// The signature tree's programs ([`sig_plan`]).
+    sig: Option<SigPlan>,
 }
 
 impl PlanCache {
@@ -904,9 +1292,32 @@ pub fn plan(params: &AggregatorParams, k: usize) -> Shape {
 
 /// As [`plan`], compiling only the program types `cache` lacks.
 pub fn plan_with(params: &AggregatorParams, k: usize, cache: &mut PlanCache) -> Shape {
+    plan_signed(params, k, false, cache)
+}
+
+/// The tree for these segments: with a root that takes the top of a
+/// signature tree if the block they are of has signatures.
+pub fn plan_for(params: &AggregatorParams, segments: &[SegmentWitness], cache: &mut PlanCache) -> Shape {
+    plan_signed(params, segments.len(), has_signatures(segments), cache)
+}
+
+/// Whether the block these segments are of has signatures.
+pub fn has_signatures(segments: &[SegmentWitness]) -> bool {
+    segments.first().is_some_and(|w| !w.signed.segments.is_empty())
+}
+
+/// Where the wrap of `k` segments, with or without signatures, is among
+/// the allowed wraps ([`plan_leaves`]).
+pub fn plan_index(k: usize, signed: bool) -> usize {
+    2 * (k - 1) + signed as usize
+}
+
+/// As [`plan_with`], of a block with signatures if `signed`: its root
+/// takes the top of a signature tree.
+pub fn plan_signed(params: &AggregatorParams, k: usize, signed: bool, cache: &mut PlanCache) -> Shape {
     assert!(k >= 1 && k <= params.max_segments, "segment count {k} out of range");
     let pad = wrap_pad(params, cache);
-    let mut root = plan_node(params, k, true, cache);
+    let mut root = plan_node(params, k, true, signed, cache);
     let wrap = *cache.wraps.entry((root.log_n, root.hash_log_n)).or_insert_with(|| {
         let dummy = dummy_root(params, &root);
         Compiled::of(
@@ -943,11 +1354,13 @@ fn wrap_pad(params: &AggregatorParams, cache: &mut PlanCache) -> (usize, usize) 
     if let Some(pad) = cache.wrap_pad {
         return pad;
     }
-    let mut root = plan_node(params, params.max_segments, true, cache);
-    for k in 1..=params.fan_in.min(params.max_segments) {
-        let r = plan_node(params, k, true, cache);
-        root.log_n = root.log_n.max(r.log_n);
-        root.hash_log_n = root.hash_log_n.max(r.hash_log_n);
+    let mut root = plan_node(params, params.max_segments, true, false, cache);
+    for signed in [false, true] {
+        for k in (1..=params.fan_in.min(params.max_segments)).chain([params.max_segments]) {
+            let r = plan_node(params, k, true, signed, cache);
+            root.log_n = root.log_n.max(r.log_n);
+            root.hash_log_n = root.hash_log_n.max(r.hash_log_n);
+        }
     }
     let p = compile_wrap(params, &dummy_root(params, &root), &Statement::zero(&params.work_shape()), None).prog;
     let pad = (p.height().trailing_zeros() as usize, VmAir::hash_height(&p).trailing_zeros() as usize);
@@ -958,7 +1371,7 @@ fn wrap_pad(params: &AggregatorParams, cache: &mut PlanCache) -> (usize, usize) 
 fn dummy_record() -> SegmentPublic {
     let mut record = SegmentPublic::from_values(&vec![Fp::ZERO; SEGMENT_PUBLIC]).unwrap();
     // (What a root holds its segments' signed set to.)
-    record.signed = crate::signed::empty_roots()[crate::signed::DEPTH];
+    record.signed = crate::signed::empty_root();
     record
 }
 
@@ -982,7 +1395,7 @@ fn dummy_name(params: &AggregatorParams) -> NameProof {
     }
 }
 
-fn plan_node(params: &AggregatorParams, k: usize, root: bool, cache: &mut PlanCache) -> Shape {
+fn plan_node(params: &AggregatorParams, k: usize, root: bool, signed: bool, cache: &mut PlanCache) -> Shape {
     if k == 1 && !root {
         return Shape {
             children: vec![],
@@ -992,21 +1405,23 @@ fn plan_node(params: &AggregatorParams, k: usize, root: bool, cache: &mut PlanCa
             hash_log_n: 0,
             tree: [Fp::ZERO; DIGEST],
             wrap: None,
+            sig: None,
         };
     }
+    let sig = (root && signed).then(|| sig_plan(params, cache));
     let sizes = if k <= params.fan_in { vec![1; k] } else { split(k, params.fan_in) };
     // Equal sizes plan equally; full subtrees repeat.
     let mut children: Vec<Shape> = Vec::with_capacity(sizes.len());
     for (i, &n) in sizes.iter().enumerate() {
         let shape = match sizes[..i].iter().position(|&m| m == n) {
             Some(j) => children[j].clone(),
-            None => plan_node(params, n, false, cache),
+            None => plan_node(params, n, false, false, cache),
         };
         children.push(shape);
     }
     let kinds: Vec<Option<(usize, usize)>> =
         children.iter().map(|c| (!c.is_segment()).then_some((c.log_n, c.hash_log_n))).collect();
-    let compiled = *cache.nodes.entry((root, kinds.clone())).or_insert_with(|| {
+    let compiled = *cache.nodes.entry((root, sig.is_some(), kinds.clone())).or_insert_with(|| {
         let segment_dummy = SegmentProof {
             public: dummy_record(),
             proof: dummy_proof(&[(&BlockAir, params.segment_log_n)], &params.segment, SEGMENT_PUBLIC),
@@ -1029,8 +1444,9 @@ fn plan_node(params: &AggregatorParams, k: usize, root: bool, cache: &mut PlanCa
         let zero = Statement::zero(&params.work_shape());
         let name_dummy = dummy_name(params);
         let work_dummy = if root { Some(dummy_work(params)) } else { None };
+        let top_dummy = sig.map(|plan| dummy_sig_node(params, plan.log_n, plan.hash_log_n));
         let output = match &work_dummy {
-            Some(w) => Output::Statement(&zero, &name_dummy, w),
+            Some(w) => Output::Statement(&zero, &name_dummy, w, top_dummy.as_ref().zip(sig.as_ref())),
             None => Output::Record,
         };
         Compiled::of(&compile_node(params, &child_refs, output).prog, params.outer.log_blowup)
@@ -1044,6 +1460,7 @@ fn plan_node(params: &AggregatorParams, k: usize, root: bool, cache: &mut PlanCa
         hash_log_n: compiled.hash_log_n,
         tree: if root { root_tree_digest(&descriptors) } else { tree_digest(&descriptors) },
         wrap: None,
+        sig,
         children,
     }
 }
@@ -1077,6 +1494,10 @@ pub enum Progress {
     Wrap { log_n: usize, hash_log_n: usize, elapsed: std::time::Duration },
     /// The chain step over the wrap and the previous block's proof.
     Chain { elapsed: std::time::Duration },
+    /// Signature segment `index` of `count` is proven.
+    Signatures { index: usize, count: usize, elapsed: std::time::Duration },
+    /// A node of the signature tree, of this level, is proven.
+    SignatureNode { level: usize, elapsed: std::time::Duration },
 }
 
 /// Recently used committed programs, most recent last. A program type's
@@ -1152,7 +1573,7 @@ fn prove_node(
     let record = combine_records(&records);
     let out_digest = match &output {
         Output::Record => node_output(&record, &shape.tree),
-        Output::Statement(s, _, _) => s.output(&params.work_shape(), &shape.tree),
+        Output::Statement(s, _, _, _) => s.output(&params.work_shape(), &shape.tree),
     };
     let c = compile_node(params, &children, output);
     let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).expect("node program rejects its own witness");
@@ -1179,7 +1600,8 @@ pub fn prove_block(
     segments: &[SegmentWitness],
     names: &NameWitness,
 ) -> Vec<u8> {
-    prove_block_with(params, &plan(params, segments.len()), statement, segments, names, segments.len(), &|_| {})
+    let shape = plan_for(params, segments, &mut PlanCache::new());
+    prove_block_with(params, &shape, statement, segments, names, segments.len(), &|_| {})
 }
 
 /// As [`prove_block`], with the tree `shape` already planned for
@@ -1216,7 +1638,7 @@ pub fn prove_block_cancellable(
     let proof = prove_wrap(params, shape, statement, segments, names, jobs, progress, cancel)?;
     let bytes = proof.to_bytes();
     let mut w = Writer::with_capacity(bytes.len() + 4);
-    w.u32(segments.len() as u32);
+    w.u32(segments.len() as u32 | (shape.sig.is_some() as u32) << 31);
     w.0.extend_from_slice(&bytes);
     Some(w.finish())
 }
@@ -1251,6 +1673,7 @@ pub fn prove_wrap(
     cancel: stark::Cancel<'_>,
 ) -> Option<stark::Proof> {
     assert_eq!(shape.segments, segments.len(), "shape planned for a different segment count");
+    assert_eq!(shape.sig.is_some(), has_signatures(segments), "shape planned for a block with signatures, or without");
     let count = segments.len();
     // Job `count` is the name segment, job `count + 1` the parent's work
     // (unless proven for an earlier template on the same parent).
@@ -1294,8 +1717,15 @@ pub fn prove_wrap(
     let name_proof = name_done.into_inner().unwrap().unwrap();
     let work_proof = work_done.into_inner().unwrap().unwrap();
     remember_work(params, &work_proof);
-    let root =
-        prove_node(params, shape, &proofs, Output::Statement(statement, &name_proof, &work_proof), progress, cancel)?;
+    // The signature tree: nothing in it is of the parent, and a miner
+    // that had the transactions earlier would have it already.
+    let top = match &shape.sig {
+        Some(plan) => Some(prove_sig_tree(params, plan, &segments[0].signed, progress, cancel)?),
+        None => None,
+    };
+    let sigs = top.as_ref().zip(shape.sig.as_ref());
+    let output = Output::Statement(statement, &name_proof, &work_proof, sigs);
+    let root = prove_node(params, shape, &proofs, output, progress, cancel)?;
     let wrap = shape.wrap.expect("shape is a planned root");
     let t = std::time::Instant::now();
     let c = compile_wrap(params, &root, statement, Some((wrap.log_n, wrap.hash_log_n)));
@@ -1335,17 +1765,20 @@ fn chain_transcript() -> Challenger {
     c
 }
 
-/// The allowed wraps: one leaf `H(wrap digest || wrap tree)` per segment
-/// count `1..=max_segments`, padded with empty leaves to a power of two.
+/// The allowed wraps: a leaf `H(wrap digest || wrap tree)` for each
+/// segment count `1..=max_segments`, without signatures and with
+/// ([`plan_index`]), padded with empty leaves to a power of two.
 ///
 /// Panics if a count's wrap has other table heights than one segment's:
 /// the chain program verifies every wrap at those heights
 /// ([`wrap_heights`]), so such a count could never be proven.
 pub fn plan_leaves(params: &AggregatorParams, cache: &mut PlanCache) -> Vec<Digest> {
     let heights = wrap_heights(params, cache);
-    let mut leaves: Vec<Digest> = (1..=params.max_segments)
-        .map(|k| {
-            let w = plan_with(params, k, cache).wrap.expect("planned root");
+    let mut leaves: Vec<Digest> = (0..2 * params.max_segments)
+        .map(|index| {
+            let (k, signed) = (index / 2 + 1, index % 2 == 1);
+            debug_assert_eq!(plan_index(k, signed), index);
+            let w = plan_signed(params, k, signed, cache).wrap.expect("planned root");
             assert_eq!(
                 (w.log_n, w.hash_log_n),
                 heights,
@@ -1356,7 +1789,7 @@ pub fn plan_leaves(params: &AggregatorParams, cache: &mut PlanCache) -> Vec<Dige
             crate::poseidon2::hash(&v)
         })
         .collect();
-    leaves.resize(params.max_segments.next_power_of_two(), [Fp::ZERO; DIGEST]);
+    leaves.resize((2 * params.max_segments).next_power_of_two(), [Fp::ZERO; DIGEST]);
     leaves
 }
 
@@ -1858,17 +2291,18 @@ pub fn verify_chain(
 /// checked against and the tree digest its output commits to.
 pub fn verify_block(
     params: &AggregatorParams,
-    wrap: &dyn Fn(usize) -> Wrap,
+    wrap: &dyn Fn(usize, bool) -> Wrap,
     statement: &Statement,
     proof: &[u8],
 ) -> Result<(), AggregateError> {
     let mut r = Reader(proof);
-    let k = r.u32().ok_or(AggregateError::Malformed)? as usize;
+    let count = r.u32().ok_or(AggregateError::Malformed)?;
+    let (k, signed) = ((count & !(1 << 31)) as usize, count >> 31 == 1);
     if k == 0 || k > params.max_segments {
         return Err(AggregateError::BadSegmentCount(k));
     }
     let proof = stark::Proof::from_bytes(r.0).map_err(|_| AggregateError::Malformed)?;
-    let wrap = wrap(k);
+    let wrap = wrap(k, signed);
     let public = VmAir::public_values(&wrap.digest, &statement.output(&params.work_shape(), &wrap.tree));
     stark::verify_tables(&params.wrap, &VmAir::specs(&wrap.digest), &public, &proof, &mut wrap_transcript())
         .map_err(|_| AggregateError::Rejected)
@@ -1878,10 +2312,10 @@ pub fn verify_block(
 /// chain programs, fixed by the circuits. Regenerate with the ignored test
 /// `aggregate::tests::mainnet_chain_constants` after any circuit change.
 pub const MAINNET_CHAIN: Option<ChainSetupConst> = Some(ChainSetupConst {
-    plan_root: [952769755, 1153110668, 1030048717, 1651406492, 209312122, 1607595087, 280743953, 3448780],
-    plan_depth: 14,
-    base: [276321651, 1055300781, 523473802, 1381950826, 1398566606, 1070500608, 1061150267, 964968716],
-    step: [1868199776, 1573722582, 438457980, 1866808241, 1107245528, 1659623599, 213068850, 1985327834],
+    plan_root: [1851583461, 395712981, 1692629973, 1112940520, 1060882929, 1804974122, 200987927, 631233911],
+    plan_depth: 15,
+    base: [147948443, 1385126077, 1805547243, 353145590, 283982446, 260663067, 62353353, 1034143132],
+    step: [819077861, 1644691686, 711125461, 1759646295, 1152613062, 1529983932, 269384436, 1791758561],
     log_n: 17,
     hash_log_n: 15,
 });
@@ -1896,10 +2330,10 @@ const MAINNET_PLAN: &[u8] = include_bytes!("mainnet_plan.bin");
 /// with mainnet's emission), as [`MAINNET_CHAIN`]; regenerated by
 /// `dev_recursive_chain_constants`.
 pub const DEV_RECURSIVE_CHAIN: Option<ChainSetupConst> = Some(ChainSetupConst {
-    plan_root: [725410324, 516848298, 1748565333, 1483224258, 156013505, 1883473776, 875582339, 521297579],
-    plan_depth: 6,
-    base: [1341366484, 708155754, 1018368082, 1408262858, 167518950, 1556406719, 1878171668, 1252754311],
-    step: [1265757493, 1578459573, 418260693, 1981118534, 1323860752, 481299187, 362694223, 202207674],
+    plan_root: [1230966051, 64177962, 1135234121, 1630169736, 1372905145, 973020752, 1052167913, 1677876990],
+    plan_depth: 7,
+    base: [1604419897, 1593419584, 1073287342, 97015450, 1132653132, 581541589, 437877618, 1651122723],
+    step: [630622584, 1762915139, 316600886, 1454412354, 1891601018, 1489414294, 388689119, 1429165263],
     log_n: 16,
     hash_log_n: 12,
 });
@@ -1984,18 +2418,24 @@ impl AggregateVerifier {
     /// The planned tree for `k` segments. Program types compiled for
     /// earlier counts are reused, so once warm this only hashes.
     pub fn shape(&self, k: usize) -> Shape {
+        self.shape_signed(k, false)
+    }
+
+    /// [`AggregateVerifier::shape`], of a block with signatures if
+    /// `signed`.
+    pub fn shape_signed(&self, k: usize, signed: bool) -> Shape {
         let mut plans = self.plans.lock().unwrap();
-        let s = plan_with(&self.params, k, &mut plans.0);
-        plans.1.insert(k, s.wrap.expect("planned root"));
+        let s = plan_signed(&self.params, k, signed, &mut plans.0);
+        plans.1.insert(plan_index(k, signed), s.wrap.expect("planned root"));
         s
     }
 
     /// The planned wrap a `k`-segment block proof is checked against.
-    pub fn wrap(&self, k: usize) -> Wrap {
-        if let Some(w) = self.plans.lock().unwrap().1.get(&k) {
+    pub fn wrap(&self, k: usize, signed: bool) -> Wrap {
+        if let Some(w) = self.plans.lock().unwrap().1.get(&plan_index(k, signed)) {
             return *w;
         }
-        self.shape(k).wrap.expect("planned root")
+        self.shape_signed(k, signed).wrap.expect("planned root")
     }
 
     /// The constants and plan leaves built into the binary for these
@@ -2051,7 +2491,7 @@ impl AggregateVerifier {
             .chunks_exact(32)
             .map(crate::poseidon2::digest_from_bytes)
             .collect::<Option<Vec<_>>>()
-            .filter(|l| l.len() == self.params.max_segments.next_power_of_two())?;
+            .filter(|l| l.len() == (2 * self.params.max_segments).next_power_of_two())?;
         let t = crate::merkle::MerkleTree::from_leaf_hashes(leaves);
         (t.root() == root).then_some(t)
     }
@@ -2078,7 +2518,7 @@ impl AggregateVerifier {
     /// Verifies a wrap encoding (segment count and wrap proof), as
     /// [`prove_block_cancellable`] makes.
     pub fn verify_statement(&self, statement: &Statement, proof: &[u8]) -> Result<(), AggregateError> {
-        verify_block(&self.params, &|k| self.wrap(k), statement, proof)
+        verify_block(&self.params, &|k, signed| self.wrap(k, signed), statement, proof)
     }
 
     /// Proves the block at `height`: its segments and name segment, tree
@@ -2103,7 +2543,8 @@ impl AggregateVerifier {
             progress(Progress::Segment { index: segments.len() - 1, count: segments.len(), elapsed: t.elapsed() });
             return (!cancel()).then_some(proof);
         }
-        let shape = self.shape(segments.len());
+        let signed = has_signatures(segments);
+        let shape = self.shape_signed(segments.len(), signed);
         let wrap_proof = prove_wrap(&self.params, &shape, statement, segments, names, jobs, progress, cancel)?;
         let prev_proof = match prev {
             Some((_, _, bytes, _)) => {
@@ -2113,7 +2554,7 @@ impl AggregateVerifier {
         };
         let setup = *self.setup();
         let tree = self.plan_tree();
-        let index = segments.len() - 1;
+        let index = plan_index(segments.len(), signed);
         let w = ChainWitness {
             height,
             statement,

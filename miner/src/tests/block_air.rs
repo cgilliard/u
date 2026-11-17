@@ -40,7 +40,7 @@ impl TestSet {
     }
 
     /// Adds an output made at `height`; returns its position.
-    fn add_output(&self, o: &BlockOutput, height: u32) -> Result<u64, Error> {
+    pub(crate) fn add_output(&self, o: &BlockOutput, height: u32) -> Result<u64, Error> {
         let position = self.next_position();
         self.block(&[], &[Record { commitment: o.commitment, memo: o.memo, amount: o.amount, height }]);
         Ok(position)
@@ -1499,9 +1499,9 @@ fn layout_and_degree() {
     // A signature is looked up, not checked: two rows of its entry and
     // one a level of the signed set, whatever the key's height. Then
     // two rows a level of the state tree, of which there are forty-two.
-    assert_eq!(ROWS_PER_SIGNATURE, 2 + 19);
+    assert_eq!(ROWS_PER_SIGNATURE, 2 + 27);
     assert_eq!((input_rows(4), input_rows(20)), (ROWS_PER_INPUT, ROWS_PER_INPUT));
-    assert_eq!(ROWS_PER_INPUT, 21 + 6 + 1 + 84 + 2);
+    assert_eq!(ROWS_PER_INPUT, 29 + 6 + 1 + 84 + 2);
     assert_eq!(ROWS_PER_OUTPUT, 93);
     assert_eq!(NUM_PUBLIC, 128 + 2 * 28 + 1 + 8);
 }

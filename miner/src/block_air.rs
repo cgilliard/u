@@ -2388,7 +2388,7 @@ impl Gen {
         debug_assert_eq!(self.b.acc(), entry);
         for (level, sibling) in path.siblings.iter().enumerate() {
             self.regs.spn = (crate::signed::DEPTH - 1 - level) as u32;
-            self.b.compress(*sibling, (path.leaf >> level) & 1 == 1);
+            self.b.compress(*sibling, path.right(level));
             let row = self.b.last_row_mut();
             row[T_SP] = Fp::ONE;
             self.regs.write(row);
