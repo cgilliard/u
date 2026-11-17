@@ -350,3 +350,171 @@ fn a_payment_is_made_at_the_prompt_and_mined() {
     }
     dirs.iter().for_each(|d| drop(std::fs::remove_dir_all(d)));
 }
+
+/// A node of the dev network with a wallet and a prompt, as a test
+/// drives it: what is typed to it, and what it says.
+#[cfg(all(unix, feature = "dev"))]
+struct Prompted {
+    node: Running,
+    typed: std::process::ChildStdin,
+    said: std::process::ChildStdout,
+}
+
+#[cfg(all(unix, feature = "dev"))]
+impl Prompted {
+    /// Starts a node in `dir` listening on `listen`, with these peers,
+    /// making blocks or not: `new` if it has no wallet yet, when its
+    /// words are looked for.
+    fn start(dir: &std::path::Path, listen: &str, peers: &[String], mines: bool, new: bool) -> Prompted {
+        use std::io::Write;
+        let mut command = Command::new(TABMINER);
+        command.args(["--network", "dev", "--threads", "2", "--data-dir", &dir.display().to_string()]);
+        command.args(["--listen", listen]);
+        for peer in peers {
+            command.args(["--peer", peer]);
+        }
+        if !mines {
+            command.arg("--no-mine");
+        }
+        let node = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let mut node = Running(node);
+        let (mut typed, said) = (node.0.stdin.take().unwrap(), node.0.stdout.take().unwrap());
+        // (A new wallet: no password.)
+        if new {
+            writeln!(typed).unwrap();
+        }
+        let mut lines = BufReader::new(node.0.stderr.take().unwrap()).lines();
+        let before: Vec<String> =
+            lines.by_ref().map(|l| l.unwrap()).take_while(|l| !l.ends_with("Server is ready!")).collect();
+        assert_eq!(before.iter().any(|l| l.starts_with("    ")), new, "{before:#?}");
+        std::thread::spawn(move || lines.for_each(drop));
+        let mut node = Prompted { node, typed, said };
+        assert_eq!(node.until_prompt(), "");
+        node
+    }
+
+    /// What it says up to its next prompt.
+    fn until_prompt(&mut self) -> String {
+        use std::io::Read;
+        let (mut said, mut byte) = (Vec::new(), [0u8; 1]);
+        while !(said.ends_with(b"> ") && (said.len() == 2 || said[said.len() - 3] == b'\n')) {
+            assert_eq!(self.said.read(&mut byte).unwrap(), 1, "the node stopped: {}", String::from_utf8_lossy(&said));
+            said.push(byte[0]);
+        }
+        String::from_utf8(said[..said.len() - 2].to_vec()).unwrap()
+    }
+
+    fn ask(&mut self, command: &str) -> String {
+        use std::io::Write;
+        writeln!(self.typed, "{command}").unwrap();
+        self.until_prompt()
+    }
+
+    fn confirmed(&mut self) -> String {
+        self.ask("balance").lines().next().unwrap().trim_start_matches("confirmed").trim().to_string()
+    }
+
+    fn height(&mut self) -> u64 {
+        let status = self.ask("status");
+        status.split_whitespace().nth(1).unwrap().replace(',', "").parse().unwrap()
+    }
+
+    fn stop(mut self) {
+        use std::io::Write;
+        writeln!(self.typed, "quit").unwrap();
+        assert_eq!(self.node.0.wait().unwrap().code(), Some(0));
+    }
+}
+
+/// The chain goes over to another branch under two wallets, between
+/// nodes that are running. A payment mined on the branch given up is
+/// in no block: its sender's node says so, as its recipient's does of
+/// what it was paid; the payment goes back to the pools, and from them
+/// to the node whose branch it is now, which never had it; mined there,
+/// each wallet has what it had. A payment that no block has is put back
+/// in the pool of a node that was stopped and started; and one that
+/// spent what only the branch given up had is never mined.
+#[cfg(all(unix, feature = "dev"))]
+#[cfg_attr(debug_assertions, ignore = "proves blocks; run with --release")]
+#[test]
+fn a_payment_survives_the_chain_going_over_to_another_branch() {
+    use std::time::{Duration, Instant};
+    let dirs = [scratch("reorg-a"), scratch("reorg-b"), scratch("reorg-c")];
+    let port = 45_000 + std::process::id() % 15_000;
+    let at = |i: u32| format!("127.0.0.1:{}", port + i);
+    let wait = |what: &str, done: &mut dyn FnMut() -> bool| {
+        let began = Instant::now();
+        while !done() {
+            assert!(began.elapsed() < Duration::from_secs(300), "{what}");
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    };
+    let log = |i: usize| std::fs::read_to_string(dirs[i].join("tabernacle.log")).unwrap();
+    let slate = dirs[0].join("payment.slate").display().to_string();
+    let pay = |maker: &mut Prompted, other: &mut Prompted, amount: &str| {
+        assert!(maker.ask(&format!("send-file {amount} {slate}")).contains("begun"));
+        assert!(other.ask(&format!("receive {slate}")).contains("answered"));
+        let signed = maker.ask(&format!("finalize {slate}.received"));
+        assert!(signed.contains("signed and pooled"), "{signed}");
+    };
+
+    // A makes blocks, and B follows it. C takes the first of them, and
+    // is stopped: what it has is where the branches will part.
+    let mut maker = Prompted::start(&dirs[0], &at(0), &[at(1)], true, true);
+    let mut other = Prompted::start(&dirs[1], &at(1), &[at(0)], false, true);
+    wait("the maker has made no blocks", &mut || maker.height() >= 4);
+    let shared = maker.height();
+    let mut third = Prompted::start(&dirs[2], &at(2), &[at(0)], false, true);
+    wait("the third has not the first blocks", &mut || third.height() >= shared);
+    third.stop();
+
+    // A pays B, in a block of its own branch; and stops making blocks.
+    pay(&mut maker, &mut other, "12.5");
+    wait("the payment is not confirmed", &mut || other.confirmed() == "12.5");
+    maker.stop();
+    let mut maker = Prompted::start(&dirs[0], &at(0), &[at(1)], false, false);
+    let ours = maker.height();
+    // A second payment, which no block has, since nobody makes any: it
+    // is not in the pool of a node stopped and started, and is put
+    // back there.
+    pay(&mut maker, &mut other, "3");
+    maker.stop();
+    let mut maker = Prompted::start(&dirs[0], &at(0), &[at(1)], false, false);
+    wait("the payment that no block has is not pooled again", &mut || {
+        log(0).contains("was in no block and not pooled: pooled again")
+    });
+    assert!(maker.ask("sent").contains("pooled"));
+
+    // C makes blocks on what it has, where nobody knows of it, until
+    // its branch is the longer; then it is where A and B find it.
+    let mut third = Prompted::start(&dirs[2], &at(3), &[], true, false);
+    wait("the third's branch is not the longer", &mut || third.height() > ours + 3);
+    third.stop();
+    let mut third = Prompted::start(&dirs[2], &at(3), &[at(0), at(1)], true, false);
+
+    // The first payment is mined again, on that branch: the other has
+    // it, where it now is.
+    wait("the payment is not mined on the other branch", &mut || {
+        log(1).contains("outputs that were lost are in the chain again")
+    });
+    assert_eq!(other.confirmed(), "12.5");
+    assert!(third.height() > ours);
+    let (a, b) = (log(0), log(1));
+    assert!(a.contains("Reorganized to block"), "{a}");
+    assert!(a.contains("The wallet: 1 payments sent are in no block any more"), "{a}");
+    assert!(b.contains("The wallet: 1 outputs are in no block any more"), "{b}");
+    assert!(log(2).contains("carries 1 transactions"), "{}", log(2));
+    // The second spent the reward of a block of the branch given up
+    // (the largest the maker had, with the first payment's fee): there
+    // is no such output now, and no block will ever have that payment.
+    // Its sender has nothing waiting; its recipient has what was never
+    // more than expected, until it is pruned.
+    assert_eq!(maker.ask("sent"), "no payments sent that are not in a block\n");
+    assert!(other.ask("balance").contains("unverified  3"));
+    assert!(other.ask("prune").starts_with("1 outputs expected"));
+    assert_eq!(other.ask("balance"), "confirmed   12.5\n");
+    for node in [maker, other, third] {
+        node.stop();
+    }
+    dirs.iter().for_each(|d| drop(std::fs::remove_dir_all(d)));
+}

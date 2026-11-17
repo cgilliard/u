@@ -122,7 +122,11 @@ fn shelved_transactions_follow_their_outputs() {
     // The new branch makes it again at position 2.
     state.outputs.insert(2, made);
     let moved = HashMap::from([(made.0, vec![2u64])]);
+    assert!(pool.take_returned().is_empty());
     assert_eq!(pool.revalidate(&state, 1, &moved, &created, 0), Ok((0, 1)));
+    // What comes back is said, once, for whoever is to tell of it.
+    assert_eq!(pool.take_returned(), [(id, pool.entry(&id).unwrap().size())]);
+    assert!(pool.take_returned().is_empty());
     let back: Vec<u64> = pool.get(&id).unwrap().spent_positions().collect();
     assert_eq!(back, [2]);
     // Its id and its signature are what they were.

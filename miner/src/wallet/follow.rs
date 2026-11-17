@@ -3,11 +3,20 @@
 //!
 //! After every change of the chain's last block the wallet is told of
 //! the outputs of the blocks it has not looked at ([`follow`]): which of
-//! them are its own, and where each is. Where the blocks cannot be gone
-//! through one by one (the chain went over to another branch, or the
-//! wallet has been away for longer than blocks' bodies are kept) it
-//! looks through the unspent outputs for its own instead, by their
-//! memos.
+//! them are its own, and where each is.
+//!
+//! Where the chain has gone over to another branch, the wallet finds
+//! where the branches part (the newest block it remembers looking at
+//! that is still of the chain) and goes through the blocks of the new
+//! branch from there: as many blocks as the branch is long, whatever
+//! the chain holds. Nothing below is touched: outputs take their
+//! positions in order, so what was made before the branches part is
+//! where it was.
+//!
+//! Only where there are no blocks to go through (the wallet is further
+//! behind than blocks' bodies are kept, or knows nothing of how far it
+//! had looked) does it look through all the unspent outputs for its
+//! own instead, by their memos.
 
 use super::{Reconciled, Wallet, WalletError};
 use crate::block::BodyRef;
@@ -42,22 +51,33 @@ pub fn follow<B: Backend + 'static, V, W: Backend>(
     let snap = state.snapshot()?;
     let (height, tip) = snap.tip();
     let tip_bytes = digest_to_bytes(&tip);
+    // From where outputs may have been undone: none, unless the chain
+    // went back on blocks the wallet had looked at.
+    let mut undone_from = None;
     if wallet.synced() != Some((height, tip_bytes)) {
-        // The blocks since the last looked at, if that one is still of
-        // the chain: each with where its outputs begin. The newest
-        // block's are the last before the next position, and each
-        // block's before those of the one after it (its commits of
-        // names taking the positions after its outputs).
         let on_chain = |h: u32, id: &[u8; 32]| {
             chain.header_at(h).ok().flatten().is_some_and(|header| digest_to_bytes(&header.hash()) == *id)
         };
-        let from = match wallet.synced() {
-            Some((h, id)) if h <= height && on_chain(h, &id) => Some(h + 1),
+        // The newest block looked at that is still of the chain: where
+        // the wallet goes on from, and, if it is not the last it looked
+        // at, where the branches part.
+        let known = wallet.recent().find(|(h, id, _)| *h <= height && on_chain(*h, id)).copied();
+        let from = match (known, wallet.synced()) {
+            (Some((h, _, next)), synced) => {
+                if synced.is_some_and(|(last, _)| last != h) {
+                    undone_from = Some(next);
+                }
+                Some(h + 1)
+            }
             // A wallet with nothing in it has nothing to find.
-            None if wallet.outputs().is_empty() => Some(height + 1),
-            _ => None,
+            (None, _) if wallet.outputs().is_empty() => Some(height + 1),
+            (None, _) => None,
         };
-        let mut blocks: Vec<(u64, Vec<Digest>, u32, [u8; 32])> = Vec::new();
+        // The blocks from there up, each with where its outputs begin.
+        // The newest block's are the last before the next position, and
+        // each block's before those of the one after it (its commits of
+        // names taking the positions after its outputs).
+        let mut blocks: Vec<(u64, Vec<Digest>, u32, [u8; 32], u64)> = Vec::new();
         let mut whole = from.is_some() && on_chain(height, &tip_bytes);
         let mut end = snap.outputs().next;
         for h in (from.unwrap_or(height + 1)..=height).rev() {
@@ -78,22 +98,24 @@ pub fn follow<B: Backend + 'static, V, W: Backend>(
                 whole = false;
                 break;
             };
-            blocks.push((first, made, h, digest_to_bytes(&id)));
+            blocks.push((first, made, h, digest_to_bytes(&id), end));
             end = first;
         }
         if whole {
-            for (first, made, h, id) in blocks.iter().rev() {
-                wallet.locate(*first, made, *h, id)?;
+            for (first, made, h, id, end) in blocks.iter().rev() {
+                wallet.locate(*first, made, *h, id, *end)?;
                 done.blocks += 1;
             }
             // (Nothing to go through: it is here all the same.)
             if blocks.is_empty() {
-                wallet.locate(0, &[], height, &tip_bytes)?;
+                wallet.locate(0, &[], height, &tip_bytes, snap.outputs().next)?;
             }
         } else {
             wallet.relocate(&snap, now)?;
-            wallet.locate(0, &[], height, &tip_bytes)?;
+            wallet.locate(0, &[], height, &tip_bytes, snap.outputs().next)?;
             done.looked_through = true;
+            // (Anything may have been undone.)
+            undone_from = Some(0);
         }
     }
     // A wallet restored from its phrase finds what is its own, once.
@@ -101,7 +123,7 @@ pub fn follow<B: Backend + 'static, V, W: Backend>(
         done.found = wallet.scan(&snap, now)?;
         wallet.clear_scan_pending()?;
     }
-    done.changed = wallet.reconcile(&snap, height, chain.keep() as u32)?;
+    done.changed = wallet.reconcile(&snap, height, chain.keep() as u32, undone_from)?;
     // Rewards of blocks found, once no reorganization reaches them:
     // done with if the block is the chain's, forgotten if it is not.
     let settled = chain.keep() as u32;
@@ -230,7 +252,10 @@ mod tests {
         // Their branch is longer, and has no such block: ours is undone.
         give(&ours, &grow(&theirs, 2, 7));
         let (did_a, did_b) = both(&mut alice, &mut bob);
-        assert!(did_a.looked_through && did_b.looked_through);
+        // Found by the blocks of the new branch alone, two of them:
+        // the unspent outputs were not looked through.
+        assert!(!did_a.looked_through && !did_b.looked_through);
+        assert_eq!((did_a.blocks, did_b.blocks), (2, 2));
         assert_eq!(did_a.changed, Reconciled { undone: 1, lost: 1, ..Default::default() });
         assert_eq!(did_b.changed, Reconciled { lost: 1, ..Default::default() });
         let undone = balance(&ours, &alice).unwrap();

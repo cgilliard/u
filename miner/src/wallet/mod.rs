@@ -78,6 +78,11 @@ const T_REWARDS: usize = 4;
 const T_ANSWERED: usize = 5;
 const T_LANDED: usize = 6;
 const T_LOST: usize = 7;
+const T_RECENT: usize = 8;
+
+/// Blocks looked at that the wallet remembers, at the most: as far back
+/// as it can find where the chain parted from what it knew.
+const RECENT: usize = 2048;
 
 /// A slate of this wallet's making: the reference's, less its sender and
 /// its receipt.
@@ -748,6 +753,11 @@ struct Tables {
     /// Outputs that were in the chain and are not: by commitment, the
     /// chain's height when that was first seen.
     lost: BTreeMap<Id, u32>,
+    /// The blocks last looked at, the newest last: each one's height,
+    /// its id, and the position the next output after it takes. Where
+    /// the chain has gone over to another branch, the newest of these
+    /// that is still of the chain is where the branches part.
+    recent: std::collections::VecDeque<(u32, [u8; 32], u64)>,
 }
 
 /// A table of records each named by 32 bytes.
@@ -795,6 +805,11 @@ impl Tables {
             T_ANSWERED => put_entries(self.answered.iter().map(|id| (id, Vec::new()))),
             T_LANDED => put_entries(self.landed.iter().map(|(id, height)| (id, height.to_le_bytes().to_vec()))),
             T_LOST => put_entries(self.lost.iter().map(|(id, height)| (id, height.to_le_bytes().to_vec()))),
+            T_RECENT => put_entries(self.recent.iter().map(|(height, id, next)| {
+                let mut b = height.to_le_bytes().to_vec();
+                b.extend_from_slice(&next.to_le_bytes());
+                (id, b)
+            })),
             _ => unreachable!("no such table"),
         }
     }
@@ -839,6 +854,13 @@ impl Tables {
         }
         for (id, b) in get_entries(&table(T_LOST)?).ok_or(WalletError::Corrupt("lost"))? {
             t.lost.insert(id, height(b).ok_or(WalletError::Corrupt("lost output"))?);
+        }
+        for (id, b) in get_entries(&table(T_RECENT)?).ok_or(WalletError::Corrupt("recent"))? {
+            if b.len() != 12 {
+                return Err(WalletError::Corrupt("recent block"));
+            }
+            let next = u64::from_le_bytes(b[4..].try_into().unwrap());
+            t.recent.push_back((u32::from_le_bytes(b[..4].try_into().unwrap()), id, next));
         }
         Ok(t)
     }
@@ -1029,9 +1051,17 @@ impl<B: Backend> Wallet<B> {
 
     /// Records the positions of this wallet's outputs among `outputs`,
     /// the commitments of the outputs a block made from position `first`
-    /// on, and that every block up to that one (of this height and id)
-    /// has been looked at. Returns how many were this wallet's.
-    pub fn locate(&mut self, first: u64, outputs: &[Commitment], height: u32, block: &[u8; 32]) -> Result<usize> {
+    /// on, and that every block up to that one (of this height and id,
+    /// the next output after it taking the position `end`) has been
+    /// looked at. Returns how many were this wallet's.
+    pub fn locate(
+        &mut self,
+        first: u64,
+        outputs: &[Commitment],
+        height: u32,
+        block: &[u8; 32],
+        end: u64,
+    ) -> Result<usize> {
         let mut t = self.t.clone();
         let mut found = 0;
         for (i, c) in outputs.iter().enumerate() {
@@ -1043,17 +1073,33 @@ impl<B: Backend> Wallet<B> {
             }
         }
         t.synced = Some((height, *block));
-        let dirty: &[usize] = if found > 0 { &[T_META, T_OUTPUTS, T_ANSWERED] } else { &[T_META] };
+        // (Blocks are looked at in order: what is remembered of this
+        // height or above is of a branch gone from.)
+        while t.recent.back().is_some_and(|(h, _, _)| *h >= height) {
+            t.recent.pop_back();
+        }
+        t.recent.push_back((height, *block, end));
+        while t.recent.len() > RECENT {
+            t.recent.pop_front();
+        }
+        let dirty: &[usize] = if found > 0 { &[T_META, T_RECENT, T_OUTPUTS, T_ANSWERED] } else { &[T_META, T_RECENT] };
         self.commit(t, dirty)?;
         Ok(found)
     }
 
-    /// Forgets how far the outputs have been looked at: after blocks
-    /// were undone, so that they are looked at again from `to`.
+    /// The blocks last looked at, the newest first: each one's height,
+    /// its id, and the position the next output after it takes.
+    pub fn recent(&self) -> impl Iterator<Item = &(u32, [u8; 32], u64)> {
+        self.t.recent.iter().rev()
+    }
+
+    /// Forgets how far the outputs have been looked at: so that they
+    /// are looked for again from `to`, or from nothing known.
     pub fn set_synced(&mut self, to: Option<(u32, [u8; 32])>) -> Result<()> {
         let mut t = self.t.clone();
         t.synced = to;
-        self.commit(t, &[T_META])
+        t.recent.clear();
+        self.commit(t, &[T_META, T_RECENT])
     }
 
     /// Unspent, unreserved outputs the chain holds that can still sign,
@@ -1713,7 +1759,18 @@ impl<B: Backend> Wallet<B> {
     /// An output that was in the chain and is not any more is lost:
     /// kept apart from what is coming, found again if a block makes it
     /// again, and forgotten once it has been gone for `depth` blocks.
-    pub fn reconcile(&mut self, chain: &impl Unspent, height: u32, depth: u32) -> Result<Reconciled> {
+    ///
+    /// Outputs can only be lost where blocks were undone: `undone_from`
+    /// is the position from which the outputs made were of blocks that
+    /// are undone (none, where none was), and only those are looked up.
+    /// Those lost already are looked up each time, for their return.
+    pub fn reconcile(
+        &mut self,
+        chain: &impl Unspent,
+        height: u32,
+        depth: u32,
+        undone_from: Option<u64>,
+    ) -> Result<Reconciled> {
         let mut t = self.t.clone();
         let mut did = Reconciled::default();
         let mut changed = false;
@@ -1739,10 +1796,16 @@ impl<B: Backend> Wallet<B> {
             }
             changed = true;
         }
-        for o in self.outputs() {
-            if o.state != State::Unspent || o.position.is_none() {
-                continue;
-            }
+        // What may be newly lost, and what is lost already.
+        let made_above = |o: &Owned| undone_from.is_some_and(|from| o.position.is_some_and(|p| p >= from));
+        let candidates: Vec<Owned> = self
+            .t
+            .outputs
+            .iter()
+            .filter(|(id, o)| o.state == State::Unspent && (self.t.lost.contains_key(*id) || made_above(o)))
+            .map(|(_, o)| *o)
+            .collect();
+        for o in candidates {
             let id = digest_to_bytes(&o.commitment);
             match (self.held(&o, chain)?, t.lost.get(&id).copied()) {
                 (false, None) => {

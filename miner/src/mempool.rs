@@ -405,6 +405,9 @@ pub struct Mempool {
     /// Transactions seen confirmed: their rate (base units a byte), how
     /// long they waited here, and when, oldest first.
     confirmed: VecDeque<(u64, u64, u64)>,
+    /// Transactions that came back from the shelf and have not been
+    /// told of since ([`Mempool::take_returned`]).
+    returned: Vec<Digest>,
 }
 
 /// The cheap checks of a transaction on its own: all but its signatures,
@@ -529,6 +532,7 @@ impl Mempool {
             rolling: 0,
             rolling_at: 0,
             confirmed: VecDeque::new(),
+            returned: Vec::new(),
         }
     }
 
@@ -998,6 +1002,7 @@ impl Mempool {
                     check_ops(&e.tx(), ledger, height).is_ok() && e.claims.iter().all(|c| !self.claims.contains_key(c));
             }
             if ok && self.make_room(e.size(), e.rate(), now).is_ok() {
+                self.returned.push(e.txid);
                 self.add(e);
                 back += 1;
             } else {
@@ -1007,6 +1012,16 @@ impl Mempool {
         // Shelved entries that are spent for good age out with the shelf.
         self.shelf = keep;
         Ok((gone.len(), back))
+    }
+
+    /// The transactions that have come back from the shelf since this
+    /// was last asked, and are still pooled: each one's id and size. A
+    /// transaction that comes back is one its block was undone under:
+    /// peers that did not have that block have never heard of it, and
+    /// whoever keeps the pool tells them.
+    pub fn take_returned(&mut self) -> Vec<(Digest, usize)> {
+        let ids = std::mem::take(&mut self.returned);
+        ids.into_iter().filter_map(|id| Some((id, self.txs.get(&id)?.size()))).collect()
     }
 
     /// Transactions for a block at `height` while `fits` accepts the

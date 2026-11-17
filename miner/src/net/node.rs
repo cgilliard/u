@@ -1766,6 +1766,14 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         let mut pool = self.shared.pool();
         let _ = pool.revalidate(&snapshot, height, &moved, &created, self.unix);
         pool.expire(self.unix);
+        // What a block undone has given back to the pool is told to
+        // every peer: those on the branch the chain has gone over to
+        // never had it.
+        let back = pool.take_returned();
+        drop(pool);
+        for (id, len) in back {
+            self.shared.relay(id, len as u32, None);
+        }
     }
 
     /// The bodies the best header's branch still lacks: fetches those

@@ -653,6 +653,15 @@ it, and nothing has to be done:
   as coming, and not spent from. If a block makes it again it is found,
   wherever it then is; if none has by the time it has been gone as
   long as blocks can be undone, it is forgotten.
+- What this costs is as much as the branch is long, not as much as
+  the chain holds: the wallet remembers the blocks it last looked at,
+  finds where the branches part, and goes through the blocks of the
+  new branch from there. Only a wallet with no blocks to go through
+  (restored from its words, or further behind than blocks' bodies are
+  kept) looks through all the unspent outputs for its own.
+- A payment that spent what only the branch given up had (the reward
+  of a block that is no more) is never mined: it is no longer listed
+  by `sent`, and what it was to make is forgotten by `prune`.
 - The main log says what was taken and what came back:
 
 ```
