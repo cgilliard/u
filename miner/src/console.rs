@@ -65,7 +65,8 @@ pub const HELP: &str = "commands:
                             what the name is to say; `-` or nothing for nothing yet)
   name-reveal NAME [WAIT [FEE]]
                             reveal a committed name once its commit is WAIT blocks
-                            old (the network's least if not given, or if less)
+                            old: at least 1; as many as the wallet waits before it
+                            spends an output (--min-confirmations) if not given
   name-update NAME VALUE [FEE]
                             change what a name says, putting it under a fresh key
   name-offer NAME FILE [VALUE]
@@ -193,7 +194,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             ("name-commit", [name]) => self.name_commit(name, "-", None),
             ("name-commit", [name, value]) => self.name_commit(name, value, None),
             ("name-commit", [name, value, fee]) => self.name_commit(name, value, Some(fee)),
-            ("name-reveal", [name]) => self.name_reveal(name, "0", None),
+            ("name-reveal", [name]) => self.name_reveal(name, "", None),
             ("name-reveal", [name, wait]) => self.name_reveal(name, wait, None),
             ("name-reveal", [name, wait, fee]) => self.name_reveal(name, wait, Some(fee)),
             ("name-update", [name, value]) => self.name_update(name, value, None),
@@ -680,10 +681,15 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
     }
 
     fn name_reveal(&self, name: &str, wait: &str, fee: Option<&&str>) -> Said {
-        let wait: u32 = wait.parse().map_err(|_| format!("'{wait}' is not a number of blocks"))?;
         let fee = Self::fee(fee)?;
         self.observe()?;
         let mut wallet = self.wallet()?;
+        // Not said: as long as the wallet waits before it spends an
+        // output, for the same reason.
+        let wait: u32 = match wait {
+            "" => wallet.min_confirmations(),
+            wait => wait.parse().map_err(|_| format!("'{wait}' is not a number of blocks"))?,
+        };
         let op = {
             let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
             let snap = state.snapshot().map_err(|e| e.to_string())?;

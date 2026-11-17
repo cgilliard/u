@@ -72,13 +72,13 @@ pub const CHARSET: &[u8; 37] = b"abcdefghijklmnopqrstuvwxyz0123456789_";
 pub const CHAR_MAX: u32 = CHARSET.len() as u32;
 
 /// Most reveals in a block. Every reveal needs a commit, so names come at
-/// most one a block over time ([`MAX_COMMITS`]): 52,560 a year. Two let
+/// most one a block over time ([`MAX_COMMITS`]): 52,560 a year. Five let
 /// reveals catch up after a burst rather than bid for one slot, so a
-/// commit finds one within its window. Sub-names give names to as many
+/// commit finds one within its window, with room to spare. Sub-names give names to as many
 /// users as their owners admit, so few top-level ones are needed; a name
 /// never expires, so a slow allocation keeps the namespace from being
 /// taken early.
-pub const MAX_REVEALS: usize = 2;
+pub const MAX_REVEALS: usize = 5;
 /// Most commits in a block: one, the long-run rate of new names.
 pub const MAX_COMMITS: usize = 1;
 /// Most updates in a block.
@@ -87,7 +87,14 @@ pub const MAX_UPDATES: usize = 8;
 pub const MAX_SWEEPS: usize = 16;
 /// A commit made in the block at height `h` can be revealed in blocks
 /// `h + MIN_REVEAL` to `h + MAX_REVEAL`, and swept after that.
-pub const MIN_REVEAL: u32 = 12;
+///
+/// The least is one: a reveal is in a later block than its commit, and
+/// that is all the chain asks. A commit a few blocks deep can be undone
+/// by a reorganization of as many, and whoever saw the reveal could
+/// then commit to the name first: how deep is deep enough is for
+/// whoever registers the name to say, not the chain (the wallet waits
+/// as long as it waits before it spends an output, unless told).
+pub const MIN_REVEAL: u32 = 1;
 pub const MAX_REVEAL: u32 = 288;
 
 /// Whether a commit made at `commit_height` can be revealed at `height`,

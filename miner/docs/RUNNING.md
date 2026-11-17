@@ -651,10 +651,20 @@ second:
 
 1. `name-commit alice` pools a transaction that commits to the name
    and says nothing of it.
-2. Once that has been in the chain for as long as the network asks (12
-   blocks; no more than 288, after which the commit is swept away),
-   `name-reveal alice` pools one that reveals it. `names` shows the
-   name as owned when a block has it.
+2. `name-reveal alice` pools one that reveals it, once the commit has
+   been in the chain a while. `names` shows the name as owned when a
+   block has it.
+
+How long the commit is to have waited is for whoever registers the
+name to say. The chain asks only that the reveal be in a later block
+than the commit (and no more than 288 later, after which the commit
+is swept away). But a commit a few blocks deep is undone by a
+reorganization of as many, and whoever saw the reveal could then
+commit to the name first. So `name-reveal alice` waits as many blocks
+as the wallet waits before it spends an output (six, or what
+`--min-confirmations` says); `name-reveal alice 1` reveals in the
+next block, and `name-reveal alice 30` waits for thirty. A block
+carries five reveals at the most, and one commit.
 
 What a name says is 64 hex digits (32 bytes: what it is to be found
 by, once there are addresses to put there). `name-update alice VALUE`

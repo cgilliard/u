@@ -532,7 +532,6 @@ fn an_age_outside_the_window_cannot_wrap_around() {
     // below zero its difference is.
     let cases = [
         (10 + MIN_REVEAL - 1, false, T_WIN, 1),
-        (10 + 3, false, T_WIN, MIN_REVEAL - 3),
         (10, false, T_WIN, MIN_REVEAL),
         (10 + MAX_REVEAL + 1, false, T_WIN2, 1),
         (10 + MAX_REVEAL + 500, false, T_WIN2, 500),
@@ -637,8 +636,8 @@ fn broken_name_rules_are_rejected_by_the_constraints() {
     let mut verdicts: Vec<(&str, Cheat)> = Vec::new();
     let none = |_: &mut NameWitness| {};
     verdicts.push((
-        "a reveal before its commit is old enough (1 block)",
-        cheat(&w, 11, &[reveal(&alice, 1, 5)], &[], none),
+        "a reveal before its commit is old enough (at its commit's own height)",
+        cheat(&w, 10, &[reveal(&alice, 1, 5)], &[], none),
     ));
     verdicts
         .push(("a reveal after its commit expired", cheat(&w, 11 + MAX_REVEAL + 1, &[reveal(&bob, 2, 6)], &[], none)));

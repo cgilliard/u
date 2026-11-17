@@ -102,7 +102,7 @@ impl ChainParams {
         max_future_drift: 2 * 3600,
         median_time_window: 11,
         emission: MAINNET_EMISSION,
-        min_reveal: 3,
+        min_reveal: crate::name::MIN_REVEAL,
         schedule: Schedule { block_time: 1, half_life: 60, from_first_block: true },
     };
 
@@ -277,6 +277,6 @@ mod tests {
         assert!(ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2]);
         assert_eq!(ChainParams::DEV.genesis(), ChainParams::DEV.genesis());
         assert_eq!(ChainParams::DEV.pow, PowParams::DEV);
-        assert!(ChainParams::DEV.min_reveal < ChainParams::MAINNET.min_reveal);
+        assert_eq!(ChainParams::DEV.min_reveal, ChainParams::MAINNET.min_reveal);
     }
 }

@@ -976,6 +976,11 @@ impl<B: Backend> Wallet<B> {
         self.min_confirmations = blocks.max(1);
     }
 
+    /// Blocks an output is to have been in before the wallet spends it.
+    pub fn min_confirmations(&self) -> u32 {
+        self.min_confirmations
+    }
+
     /// Whether the chain holds `o` where the wallet last saw it, and
     /// has for as many blocks as the wallet waits before it spends.
     fn ripe(&self, o: &Owned, chain: &impl Unspent) -> Result<bool> {
