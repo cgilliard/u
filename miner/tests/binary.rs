@@ -148,7 +148,7 @@ fn a_node_starts_says_it_is_ready_and_ends_when_told() {
     );
     assert_eq!(said.lines().count(), 1);
     assert!(Command::new("kill").args(["-TERM", &first.0.id().to_string()]).status().unwrap().success());
-    assert_eq!(first.0.wait().unwrap().code(), Some(0));
+    assert_eq!(std::os::unix::process::ExitStatusExt::signal(&first.0.wait().unwrap()), Some(15));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&other);
 }
@@ -198,7 +198,7 @@ fn two_nodes_make_blocks_and_take_each_others() {
     }
     for node in &mut nodes {
         assert!(Command::new("kill").args(["-INT", &node.0.id().to_string()]).status().unwrap().success());
-        assert_eq!(node.0.wait().unwrap().code(), Some(0));
+        assert_eq!(std::os::unix::process::ExitStatusExt::signal(&node.0.wait().unwrap()), Some(2));
     }
     // Each was told of the other's blocks and asked for them; and
     // nothing went wrong that the main log would say.
