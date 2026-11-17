@@ -1422,22 +1422,35 @@ fn soundness_parameters() {
     }
     table("segment BlockAir", &BlockAir, BLOCK_PUBLIC);
     table("name segment NameAir", &NameAir::MAINNET, NAME_PUBLIC);
+    table("signature segment SigAir", &SigAir, SIG_PUBLIC);
     table("machine VmAir", &VmAir, crate::vm_air::NUM_PUBLIC);
     table("hash HashTableAir", &crate::hash_table::HashTableAir, crate::vm_air::NUM_PUBLIC);
     let m = AggregatorParams::MAINNET;
-    for k in [1, 16] {
-        let s = plan(&m, k);
-        let w = s.wrap.unwrap();
-        println!("{k} segments: root 2^{}/2^{}, wrap 2^{}/2^{}", s.log_n, s.hash_log_n, w.log_n, w.hash_log_n);
+    let mut cache = PlanCache::new();
+    for k in [1, 4, 16, 64, 1 << 14] {
+        for signed in [false, true] {
+            let s = plan_signed(&m, k, signed, &mut cache);
+            let w = s.wrap.unwrap();
+            let inner = s.children.iter().filter(|c| !c.is_segment()).map(|c| (c.log_n, c.hash_log_n)).max();
+            println!(
+                "{k} segments, signatures {signed}: root 2^{}/2^{}, wrap 2^{}/2^{}, tallest node under the root {inner:?}",
+                s.log_n, s.hash_log_n, w.log_n, w.hash_log_n
+            );
+        }
     }
+    let sig = sig_plan(&m, &mut cache);
+    println!("signature nodes: 2^{}/2^{}; signature segments 2^{SEGMENT_LOG_ROWS}", sig.log_n, sig.hash_log_n);
+    let chain = MAINNET_CHAIN.unwrap();
+    println!("chain step: 2^{}/2^{}", chain.log_n, chain.hash_log_n);
     // The grinding of the largest proof of each kind.
     let full = plan(&m, 16);
     let wrap = full.wrap.unwrap();
     let hash = crate::hash_table::HashTableAir;
     type Kind<'a> = (&'a str, StarkConfig, Vec<(&'a dyn DynAir, usize)>, usize);
-    let kinds: [Kind<'_>; 4] = [
+    let kinds: [Kind<'_>; 5] = [
         ("segment", m.segment, vec![(&BlockAir, m.segment_log_n)], BLOCK_PUBLIC),
         ("name segment", m.segment, vec![(&NameAir::MAINNET, m.name_log_n)], NAME_PUBLIC),
+        ("signature segment", m.segment, vec![(&SigAir, SEGMENT_LOG_ROWS)], SIG_PUBLIC),
         ("node", m.outer, vec![(&VmAir, full.log_n), (&hash, full.hash_log_n)], crate::vm_air::NUM_PUBLIC),
         ("wrap", m.wrap, vec![(&VmAir, wrap.log_n), (&hash, wrap.hash_log_n)], crate::vm_air::NUM_PUBLIC),
     ];
