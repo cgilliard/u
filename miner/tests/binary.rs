@@ -250,7 +250,7 @@ fn a_payment_is_made_at_the_prompt_and_mined() {
     let start = |i: usize, mines: bool| {
         let mut command = Command::new(TABMINER);
         command
-            .args(["--network", "dev", "--threads", "2"])
+            .args(["--network", "dev", "--threads", "2", "--min-confirmations", "1"])
             .args(["--data-dir", &dirs[i].display().to_string(), "--listen", &at(i as u32)])
             .args(["--peer", &at(1 - i as u32)]);
         if !mines {
@@ -369,6 +369,8 @@ impl Prompted {
         use std::io::Write;
         let mut command = Command::new(TABMINER);
         command.args(["--network", "dev", "--threads", "2", "--data-dir", &dir.display().to_string()]);
+        // (Its wallet spends what one block has: these chains are short.)
+        command.args(["--min-confirmations", "1"]);
         command.args(["--listen", listen]);
         for peer in peers {
             command.args(["--peer", peer]);

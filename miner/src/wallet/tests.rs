@@ -9,11 +9,17 @@ const COIN: u64 = crate::chain::params::COIN;
 /// The chain's outputs: each one's commitment, memo and amount, and
 /// whether it is unspent, at the position of its place in the list.
 #[derive(Default)]
-struct Outputs(Vec<(Commitment, Memo, u64, bool)>);
+struct Outputs(Vec<(Commitment, Memo, u64, bool)>, u32);
 
 impl Unspent for Outputs {
     fn holds(&self, position: u64, commitment: &Commitment) -> io::Result<bool> {
         Ok(self.0.get(position as usize).is_some_and(|(c, _, _, live)| *live && c == commitment))
+    }
+
+    /// (Every output is of the first block, and the chain is as long
+    /// as the second number says: one block, if it says nothing.)
+    fn confirmations(&self, position: u64, commitment: &Commitment) -> io::Result<Option<u32>> {
+        Ok(self.holds(position, commitment)?.then_some(self.1.max(1)))
     }
 
     fn each(&self, f: &mut dyn FnMut(u64, &Commitment, &Memo, u64)) -> io::Result<()> {
@@ -49,8 +55,12 @@ impl Outputs {
     }
 }
 
+/// A wallet that spends what one block has, as these tests' chains are
+/// of one block.
 fn new() -> Wallet<MemBackend> {
-    Wallet::open(MemBackend::new()).unwrap().0
+    let mut wallet = Wallet::open(MemBackend::new()).unwrap().0;
+    wallet.set_min_confirmations(1);
+    wallet
 }
 
 /// A wallet with one confirmed output of `amount`.
@@ -64,7 +74,9 @@ fn funded(chain: &mut Outputs, amount: u64) -> Wallet<MemBackend> {
 /// The wallet as it is found when its file is opened again.
 fn reopened(wallet: &Wallet<MemBackend>, password: &str) -> Result<Wallet<MemBackend>> {
     let image = wallet.records.backend().image(Lost::None);
-    Wallet::open_with(MemBackend::from_image(image), &mut |_| Ok(password.to_string())).map(|(w, _)| w)
+    let (mut wallet, _) = Wallet::open_with(MemBackend::from_image(image), &mut |_| Ok(password.to_string()))?;
+    wallet.set_min_confirmations(1);
+    Ok(wallet)
 }
 
 /// A wallet is made with a phrase, which is all it is made of: the same
@@ -161,7 +173,10 @@ fn a_payment_is_agreed_by_slate() {
     let mut chain = Outputs::default();
     let mut alice = funded(&mut chain, 100 * COIN);
     let mut bob = new();
-    assert_eq!(alice.balance(&chain).unwrap(), Balance { confirmed: 100 * COIN as u128, ..Default::default() });
+    assert_eq!(
+        alice.balance(&chain).unwrap(),
+        Balance { confirmed: 100 * COIN as u128, spendable: 100 * COIN as u128, ..Default::default() }
+    );
 
     let slate = alice.send(30 * COIN, None, &chain, NOW).unwrap();
     let fee = Wallet::<MemBackend>::min_fee(1);
@@ -212,8 +227,11 @@ fn a_payment_is_agreed_by_slate() {
     // of the payment is done with.
     chain.take(&signed.tx, &mut [&mut alice, &mut bob]);
     let (a, b) = (alice.balance(&chain).unwrap(), bob.balance(&chain).unwrap());
-    assert_eq!(a, Balance { confirmed: (70 * COIN - fee) as u128, ..Default::default() });
-    assert_eq!(b, Balance { confirmed: 30 * COIN as u128, ..Default::default() });
+    assert_eq!(
+        a,
+        Balance { confirmed: (70 * COIN - fee) as u128, spendable: (70 * COIN - fee) as u128, ..Default::default() }
+    );
+    assert_eq!(b, Balance { confirmed: 30 * COIN as u128, spendable: 30 * COIN as u128, ..Default::default() });
     // (Once its block is deep enough to rely on.)
     assert_eq!((alice.reconcile(&chain, 10, 5, Some(0)).unwrap(), alice.sent().len()), (Reconciled::default(), 1));
     assert!(alice.unconfirmed(&chain).unwrap().is_empty());
@@ -270,6 +288,7 @@ fn outputs_are_found_again_and_leaves_are_not_used_twice() {
     chain.0[2].3 = false;
 
     let mut restored = Wallet::restore(MemBackend::new(), &phrase.unwrap(), "", "").unwrap();
+    restored.set_min_confirmations(1);
     assert_eq!(restored.balance(&chain).unwrap(), Balance::default());
     // The two that are unspent, and nothing of anyone else's.
     assert_eq!(restored.scan(&chain, NOW).unwrap(), (2, 4 * COIN as u128));
@@ -383,7 +402,10 @@ fn a_payment_sent_is_cancelled_or_sped_up() {
     assert_eq!(alice.reconcile(&chain, 1, 0, Some(0)).unwrap().settled, 1);
     assert!(alice.balance(&chain).unwrap().pending > 0);
     assert_eq!(alice.prune_pending(&chain, &[]).unwrap(), 2);
-    assert_eq!(alice.balance(&chain).unwrap(), Balance { confirmed: (100 * COIN - min) as u128, ..Default::default() });
+    assert_eq!(
+        alice.balance(&chain).unwrap(),
+        Balance { confirmed: (100 * COIN - min) as u128, spendable: (100 * COIN - min) as u128, ..Default::default() }
+    );
     assert_eq!(bob.prune_pending(&chain, &[]).unwrap(), 1);
     assert_eq!(bob.balance(&chain).unwrap(), Balance::default());
     // What is in a block is not taken back.
@@ -450,6 +472,36 @@ fn what_a_block_undone_took_with_it_is_put_right() {
     assert_eq!(bob.reconcile(&chain, 29, 10, Some(0)).unwrap(), Reconciled::default());
     assert_eq!(bob.reconcile(&chain, 30, 10, Some(0)).unwrap(), Reconciled { forgotten: 1, ..Default::default() });
     assert!(bob.outputs().is_empty() && bob.balance(&chain).unwrap() == Balance::default());
+}
+
+/// The wallet spends what has been in the chain long enough, and not
+/// before: what a block just made, a block may yet unmake.
+#[test]
+fn what_is_spent_has_been_in_the_chain_a_while() {
+    let mut chain = Outputs::default();
+    let mut wallet = Wallet::open(MemBackend::new()).unwrap().0;
+    let out = wallet.receive(100 * COIN, NOW).unwrap();
+    chain.make(&[out], &mut [&mut wallet]);
+    // Six blocks, unless told otherwise: confirmed from the first, and
+    // not to be spent until the sixth.
+    for blocks in 1..=5 {
+        chain.1 = blocks;
+        let b = wallet.balance(&chain).unwrap();
+        assert_eq!((b.confirmed, b.spendable), (100 * COIN as u128, 0), "{blocks}");
+        assert!(matches!(wallet.send(COIN, None, &chain, NOW), Err(WalletError::Insufficient { have: 0, .. })));
+    }
+    chain.1 = MIN_CONFIRMATIONS;
+    assert_eq!(wallet.balance(&chain).unwrap().spendable, 100 * COIN as u128);
+    let slate = wallet.send(COIN, None, &chain, NOW).unwrap();
+    wallet.cancel_slate(&slate.id).unwrap();
+    // Told otherwise.
+    chain.1 = 2;
+    wallet.set_min_confirmations(3);
+    assert!(wallet.send(COIN, None, &chain, NOW).is_err());
+    wallet.set_min_confirmations(2);
+    assert!(wallet.send(COIN, None, &chain, NOW).is_ok());
+    wallet.set_min_confirmations(0);
+    assert_eq!(wallet.min_confirmations, 1);
 }
 
 /// A leaf seen signed from elsewhere (a copy of the wallet, or its file

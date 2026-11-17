@@ -242,6 +242,9 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         let wallet = self.wallet()?;
         let b = follow::balance(self.hold.chain(), &wallet).map_err(|e| e.to_string())?;
         let mut out = format!("confirmed   {}", coins(b.confirmed));
+        if b.spendable != b.confirmed {
+            out.push_str(&format!("\n  of which, in the chain long enough to spend: {}", coins(b.spendable)));
+        }
         let rest = [
             ("pending", b.pending),
             ("unverified", b.unverified),

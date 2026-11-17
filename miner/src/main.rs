@@ -712,6 +712,7 @@ fn open_wallet(
             wallet.forget(&c).map_err(whose)?;
         }
     }
+    wallet.set_min_confirmations(c.min_confirmations);
     follow(hold.chain(), &mut wallet, socket::unix()).map_err(whose)?;
     Ok(Arc::new(Mutex::new(wallet)))
 }

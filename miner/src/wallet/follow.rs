@@ -220,6 +220,9 @@ mod tests {
         let (ours, theirs) = (chain(), chain());
         let mut alice = Wallet::open(MemBackend::new()).unwrap().0;
         let mut bob = Wallet::open(MemBackend::new()).unwrap().0;
+        // (They spend what one block has: the branches here are short.)
+        alice.set_min_confirmations(1);
+        bob.set_min_confirmations(1);
         let both = |alice: &mut Wallet<MemBackend>, bob: &mut Wallet<MemBackend>| {
             (follow(&ours, alice, NOW).unwrap(), follow(&ours, bob, NOW).unwrap())
         };

@@ -551,6 +551,10 @@ pub struct Balance {
     pub unverified: u128,
     /// Picked as inputs of a pending slate, not yet signed.
     pub reserved: u128,
+    /// As much of what is confirmed as has been in the chain for as
+    /// many blocks as this wallet waits before it spends
+    /// ([`Wallet::set_min_confirmations`]).
+    pub spendable: u128,
     /// Signed away by a payment that has not confirmed: about to leave.
     pub locked: u128,
     /// Unspent, once in the chain and no longer: the block that made
@@ -588,14 +592,30 @@ pub struct Signed {
 pub trait Unspent {
     /// Whether the output at `position` is unspent, and of `commitment`.
     fn holds(&self, position: u64, commitment: &Commitment) -> io::Result<bool>;
+    /// How many blocks the output at `position` has been in, the one
+    /// that made it counted: none, unless it is unspent and of
+    /// `commitment`.
+    fn confirmations(&self, position: u64, commitment: &Commitment) -> io::Result<Option<u32>>;
     /// Calls `f` with every unspent output: its position, commitment,
     /// memo and amount.
     fn each(&self, f: &mut dyn FnMut(u64, &Commitment, &Memo, u64)) -> io::Result<()>;
 }
 
+/// Blocks an output is to have been in before this wallet spends it,
+/// unless told otherwise: an output of a block that is undone is no
+/// output, and what spent it no payment, so what is spent is what the
+/// chain is unlikely to go back on. A rule of the wallet's, not of the
+/// chain's, which lets an output be spent in the block after its own.
+pub const MIN_CONFIRMATIONS: u32 = 6;
+
 impl<B: Backend + 'static> Unspent for Snapshot<'_, B> {
     fn holds(&self, position: u64, commitment: &Commitment) -> io::Result<bool> {
         Ok(self.output(position)?.is_some_and(|(r, live)| live && r.commitment == *commitment))
+    }
+
+    fn confirmations(&self, position: u64, commitment: &Commitment) -> io::Result<Option<u32>> {
+        let found = self.output(position)?.filter(|(r, live)| *live && r.commitment == *commitment);
+        Ok(found.map(|(r, _)| (self.tip().0 + 1).saturating_sub(r.height)))
     }
 
     fn each(&self, f: &mut dyn FnMut(u64, &Commitment, &Memo, u64)) -> io::Result<()> {
@@ -870,6 +890,8 @@ pub struct Wallet<B: Backend> {
     records: Records<B>,
     master: [Fp; DIGEST],
     t: Tables,
+    /// Blocks an output is to have been in before it is spent.
+    min_confirmations: u32,
 }
 
 impl<B: Backend> Wallet<B> {
@@ -894,7 +916,7 @@ impl<B: Backend> Wallet<B> {
                 (secret, Some(phrase))
             }
         };
-        Ok((Wallet { records, master: master_of(&secret.seed), t }, created))
+        Ok((Wallet { records, master: master_of(&secret.seed), t, min_confirmations: MIN_CONFIRMATIONS }, created))
     }
 
     /// [`Wallet::open_with`], with no password asked for or given.
@@ -915,7 +937,7 @@ impl<B: Backend> Wallet<B> {
         t.secret = secret.seal(password)?;
         t.scan_pending = true;
         records.write(&[(T_META, &t.encode(T_META))])?;
-        Ok(Wallet { records, master: master_of(&secret.seed), t })
+        Ok(Wallet { records, master: master_of(&secret.seed), t, min_confirmations: MIN_CONFIRMATIONS })
     }
 
     /// Puts `t` in place of what the wallet keeps: the tables `dirty` on
@@ -926,6 +948,22 @@ impl<B: Backend> Wallet<B> {
         self.records.write(&changes)?;
         self.t = t;
         Ok(())
+    }
+
+    /// Has the wallet spend only outputs that have been in the chain for
+    /// `blocks` blocks, the one that made each counted: one at the
+    /// least ([`MIN_CONFIRMATIONS`] unless this is said).
+    pub fn set_min_confirmations(&mut self, blocks: u32) {
+        self.min_confirmations = blocks.max(1);
+    }
+
+    /// Whether the chain holds `o` where the wallet last saw it, and
+    /// has for as many blocks as the wallet waits before it spends.
+    fn ripe(&self, o: &Owned, chain: &impl Unspent) -> Result<bool> {
+        match o.position {
+            Some(p) => Ok(chain.confirmations(p, &o.commitment)?.is_some_and(|n| n >= self.min_confirmations)),
+            None => Ok(false),
+        }
     }
 
     /// Whether a restore is waiting for its first scan.
@@ -1102,12 +1140,13 @@ impl<B: Backend> Wallet<B> {
         self.commit(t, &[T_META, T_RECENT])
     }
 
-    /// Unspent, unreserved outputs the chain holds that can still sign,
-    /// largest first.
+    /// Unspent, unreserved outputs that can still sign and that the
+    /// chain has held for as many blocks as the wallet waits, largest
+    /// first.
     pub fn spendable(&self, chain: &impl Unspent) -> Result<Vec<Owned>> {
         let mut keep: Vec<Owned> = Vec::new();
         for o in self.outputs() {
-            if o.state == State::Unspent && o.signatures_left() > 0 && self.held(&o, chain)? {
+            if o.state == State::Unspent && o.signatures_left() > 0 && self.ripe(&o, chain)? {
                 keep.push(o);
             }
         }
@@ -1124,7 +1163,12 @@ impl<B: Backend> Wallet<B> {
         for o in self.outputs() {
             let held = self.held(&o, chain)?;
             match (o.state, held) {
-                (State::Unspent, true) => b.confirmed += o.amount as u128,
+                (State::Unspent, true) => {
+                    b.confirmed += o.amount as u128;
+                    if self.ripe(&o, chain)? {
+                        b.spendable += o.amount as u128;
+                    }
+                }
                 (State::Unspent, false) if self.t.lost.contains_key(&digest_to_bytes(&o.commitment)) => {
                     b.lost += o.amount as u128
                 }

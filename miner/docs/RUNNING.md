@@ -638,6 +638,15 @@ The main log has a line for each step this node's own wallet takes
 and, on the recipient's node, `Payment 3f9a1c04 answered: 12.5 to this
 wallet`; a payment given up is said as that.
 
+**What the wallet spends** is what has been in the chain a while: six
+blocks, the one that made an output counted, unless
+`--min-confirmations` says otherwise. An output of a block that is
+undone is no output, and a payment that spent it no payment; a
+miner's newest reward, the largest it has, is of the block most likely
+to be. The chain has no such rule (an output may be spent in the
+block after its own): this is the wallet's own care. `balance` says
+how much of what is confirmed is there to spend yet.
+
 Amounts are in coins, with up to ten decimals. A fee is coins in all,
 or `N/byte`; not given, it is the least the pool takes.
 

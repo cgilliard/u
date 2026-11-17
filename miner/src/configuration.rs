@@ -99,6 +99,11 @@ const OPTIONS: &[(&str, &[Opt])] = &[
                 help: "the wallet's password is the first line of FILE, and is not\nasked for",
             },
             Opt {
+                name: "min-confirmations",
+                takes: Takes::Value("N"),
+                help: "blocks an output is to have been in before the wallet\nspends it, the one that made it counted (default 6)",
+            },
+            Opt {
                 name: "no-prompt",
                 takes: Takes::Nothing,
                 help: "take no commands from the terminal, and ask it nothing:\nfor a node run by another program",
@@ -398,6 +403,8 @@ pub struct Configuration {
     pub wallet: bool,
     /// Where the wallet's password is read from, if not asked for.
     pub password_file: Option<PathBuf>,
+    /// Blocks an output is to have been in before the wallet spends it.
+    pub min_confirmations: u32,
     /// Whether commands are taken from the terminal.
     pub prompt: bool,
     pub listen: SocketAddrV4,
@@ -748,6 +755,8 @@ impl Configuration {
             max_block_signatures: count("max-block-signatures", 0)?.unwrap_or(crate::miner::MAX_SIGNATURES),
             wallet,
             password_file,
+            min_confirmations: count("min-confirmations", 1)?
+                .map_or(crate::wallet::MIN_CONFIRMATIONS, |n| n.min(u32::MAX as usize) as u32),
             prompt: !given.flag("no-prompt"),
             listen,
             peers,
@@ -782,6 +791,7 @@ impl Configuration {
             ("Max Block Signatures", commas(self.max_block_signatures as u64)),
         ]);
         lines.push(("Wallet", yes(self.wallet)));
+        lines.push(("Min Confirmations", commas(self.min_confirmations as u64)));
         lines.extend([
             ("Threads", if self.threads == 0 { "one a core".to_string() } else { commas(self.threads as u64) }),
             ("Request Queue Size", commas(self.net.request_queue as u64)),
@@ -1128,7 +1138,9 @@ mod tests {
     #[test]
     fn a_node_that_makes_blocks_has_a_wallet() {
         let c = read(&[]).unwrap();
-        assert!(c.wallet && c.prompt && c.password_file.is_none());
+        assert!(c.wallet && c.prompt && c.password_file.is_none() && c.min_confirmations == 6);
+        assert_eq!(read(&["--min-confirmations", "1"]).unwrap().min_confirmations, 1);
+        assert_eq!(wrong(&["--min-confirmations", "0"]), "--min-confirmations: 0 is under the least it may be (1)");
         assert!(c.lines().contains(&("Wallet".to_string(), "yes".to_string())));
         let c = read(&["--no-mine", "--no-wallet", "--no-prompt", "--password-file", "secret"]).unwrap();
         assert!(!c.wallet && !c.prompt && c.password_file.as_deref() == Some(Path::new("/work/here/secret")));
