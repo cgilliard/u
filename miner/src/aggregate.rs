@@ -149,6 +149,20 @@ impl AggregatorParams {
         assert_eq!(proven.mix, work.mix, "the work's mix is not hashimoto's");
         WorkProof { work: *work, proof }
     }
+
+    /// [`AggregatorParams::prove_work`], given up once `cancel` says so.
+    pub fn try_prove_work(&self, work: &Work, cancel: crate::stark::Cancel<'_>) -> Option<WorkProof> {
+        let (proof, proven) = crate::pow_air::try_prove_work(
+            self.work_setup(),
+            &self.segment,
+            work.log_items,
+            &work.pow_hash,
+            &work.nonce,
+            cancel,
+        )?;
+        assert_eq!(proven.mix, work.mix, "the work's mix is not hashimoto's");
+        Some(WorkProof { work: *work, proof })
+    }
 }
 
 /// A proven [`Work`].
@@ -374,8 +388,8 @@ use crate::block_air::{
     initial_outputs_state,
 };
 use crate::block_proof::{
-    DOM_NAME_PROOF, DOM_SEGMENT_PROOF, DOM_SIG_PROOF, NameProof, SegmentProof, SigProof, prove_name_padded,
-    prove_segment_padded, prove_signatures,
+    DOM_NAME_PROOF, DOM_SEGMENT_PROOF, DOM_SIG_PROOF, NameProof, SegmentProof, SigProof, prove_signatures,
+    try_prove_name_padded, try_prove_segment_padded, try_prove_signatures,
 };
 use crate::chain::verify::ProofVerifier;
 use crate::chain_verifier::DOM_CHAIN_PROOF;
@@ -1168,22 +1182,22 @@ pub fn prove_sig_tree(
         if cancel() {
             return None;
         }
-        let proven: Vec<SigProof> = std::thread::scope(|s| {
+        let proven: Option<Vec<SigProof>> = std::thread::scope(|s| {
             let handles: Vec<_> = two
                 .iter()
                 .enumerate()
                 .map(|(i, signings)| {
                     s.spawn(move || {
                         let t = std::time::Instant::now();
-                        let proof = prove_signatures(&params.segment, signings, Some(SEGMENT_LOG_ROWS));
+                        let proof = try_prove_signatures(&params.segment, signings, Some(SEGMENT_LOG_ROWS), cancel)?;
                         progress(Progress::Signatures { index: 2 * pair + i, count, elapsed: t.elapsed() });
-                        proof
+                        Some(proof)
                     })
                 })
                 .collect();
             handles.into_iter().map(|h| h.join().expect("signature segment prover panicked")).collect()
         });
-        segments.extend(proven);
+        segments.extend(proven?);
     }
     let nothing = nothing_segment(params);
     let mut level = 1;
@@ -1730,16 +1744,26 @@ pub fn prove_wrap(
                     // The work first, if it is a job: the longest one.
                     let index = if jobs_total == count + 2 { (taken + count + 1) % jobs_total } else { taken };
                     let t = std::time::Instant::now();
+                    // Each is given up where it stands once the chain has
+                    // moved on: a proof for a parent that is no longer
+                    // the last block is for nothing, and the next
+                    // block's waits on it.
                     if index == count + 1 {
-                        let p = params.prove_work(&statement.parent_work);
+                        let Some(p) = params.try_prove_work(&statement.parent_work, cancel) else { break };
                         progress(Progress::Work { elapsed: t.elapsed() });
                         *work_done.lock().unwrap() = Some(p);
                     } else if index == count {
-                        let p = prove_name_padded(&params.segment, names, params.name_log_n);
+                        let Some(p) = try_prove_name_padded(&params.segment, names, params.name_log_n, cancel) else {
+                            break;
+                        };
                         progress(Progress::Name { elapsed: t.elapsed() });
                         *name_done.lock().unwrap() = Some(p);
                     } else {
-                        let p = prove_segment_padded(&params.segment, &segments[index], params.segment_log_n);
+                        let witness = &segments[index];
+                        let Some(p) = try_prove_segment_padded(&params.segment, witness, params.segment_log_n, cancel)
+                        else {
+                            break;
+                        };
                         progress(Progress::Segment { index, count, elapsed: t.elapsed() });
                         *done[index].lock().unwrap() = Some(p);
                     }
@@ -1750,9 +1774,10 @@ pub fn prove_wrap(
     if cancel() {
         return None;
     }
-    let proofs: Vec<SegmentProof> = done.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
-    let name_proof = name_done.into_inner().unwrap().unwrap();
-    let work_proof = work_done.into_inner().unwrap().unwrap();
+    // (Whatever was given up is not there: then so is this.)
+    let proofs: Vec<SegmentProof> = done.into_iter().map(|m| m.into_inner().unwrap()).collect::<Option<_>>()?;
+    let name_proof = name_done.into_inner().unwrap()?;
+    let work_proof = work_done.into_inner().unwrap()?;
     remember_work(params, &work_proof);
     // The signature tree: nothing in it is of the parent, and a miner
     // that had the transactions earlier would have it already.

@@ -1038,6 +1038,32 @@ fn work_transcript() -> crate::challenger::Challenger {
     c
 }
 
+/// [`prove_work`], given up once `cancel` says so: asked when the
+/// witness is made, and then as the proof goes.
+pub fn try_prove_work(
+    setup: &WorkSetup<'_>,
+    config: &StarkConfig,
+    log_items: u32,
+    pow_hash: &Digest,
+    nonce: &Nonce,
+    cancel: crate::stark::Cancel<'_>,
+) -> Option<(Proof, Work)> {
+    let w = witness(&setup.seed, log_items, pow_hash, nonce);
+    if cancel() {
+        return None;
+    }
+    let (perm, mix) = (setup.shape.perm_air(), setup.shape.mix_air());
+    let inputs = [
+        TableInput { air: &TextAir, trace: &w.text, pre: Some(&setup.pre) },
+        TableInput { air: &perm, trace: &w.perm, pre: None },
+        TableInput { air: &RangeAir, trace: &w.range, pre: None },
+        TableInput { air: &mix, trace: &w.mix, pre: None },
+    ];
+    let proof =
+        crate::stark::try_prove_tables(config, &inputs, &w.public, &mut work_transcript(), Some(cancel)).ok()?;
+    Some((proof, Work { pow_hash: *pow_hash, nonce: *nonce, mix: fold_mix(&w.mix_out), log_items }))
+}
+
 /// Proves a header's work: that `hashimoto(pow_hash, nonce)` in the table
 /// of `2^log_items` items, its items computed from the seed file, gives
 /// the mix of the [`Work`] returned.

@@ -5,7 +5,7 @@
 use super::*;
 use crate::block::{Body, BodyRef};
 use crate::block_air::circuit_tests::TestSet;
-use crate::block_proof::prove_segment_padded;
+use crate::block_proof::{prove_name_padded, prove_segment_padded};
 use crate::error::Error;
 use crate::output::{Key, Output as TxOutput, Sig};
 use crate::pow::SeedText;

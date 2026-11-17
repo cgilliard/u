@@ -82,6 +82,25 @@ pub fn prove_name_padded(config: &StarkConfig, witness: &NameWitness, log_n: usi
     NameProof { public, proof }
 }
 
+/// [`prove_name_padded`], given up once `cancel` says so: asked when
+/// the trace is made, and then as the proof goes.
+pub fn try_prove_name_padded(
+    config: &StarkConfig,
+    witness: &NameWitness,
+    log_n: usize,
+    cancel: stark::Cancel<'_>,
+) -> Option<NameProof> {
+    let (trace, public) = NameAir::generate_trace_padded(witness, log_n);
+    if cancel() {
+        return None;
+    }
+    let air = NameAir { min_reveal: witness.min_reveal };
+    let tables = [stark::TableInput { air: &air, trace: &trace, pre: None }];
+    let proof =
+        stark::try_prove_tables(config, &tables, &public.to_values(), &mut name_transcript(), Some(cancel)).ok()?;
+    Some(NameProof { public, proof })
+}
+
 /// A proven signature segment: the entries it says, and its proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SigProof {
@@ -108,6 +127,26 @@ pub fn prove_signatures(config: &StarkConfig, signings: &[Signing], log_n: Optio
     SigProof { entries, proof }
 }
 
+/// [`prove_signatures`], given up once `cancel` says so: asked when
+/// the trace is made, and then as the proof goes.
+pub fn try_prove_signatures(
+    config: &StarkConfig,
+    signings: &[Signing],
+    log_n: Option<usize>,
+    cancel: stark::Cancel<'_>,
+) -> Option<SigProof> {
+    let log_n = log_n.unwrap_or_else(|| crate::sig_air::log_rows(signings));
+    let trace = SigAir::generate_trace(signings, log_n);
+    if cancel() {
+        return None;
+    }
+    let entries = Signed::entries(signings);
+    let values: Vec<Fp> = entries.iter().flatten().copied().collect();
+    let tables = [stark::TableInput { air: &SigAir, trace: &trace, pre: None }];
+    let proof = stark::try_prove_tables(config, &tables, &values, &mut sig_transcript(), Some(cancel)).ok()?;
+    Some(SigProof { entries, proof })
+}
+
 /// A proven segment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SegmentProof {
@@ -128,6 +167,23 @@ pub fn prove_segment_padded(config: &StarkConfig, witness: &SegmentWitness, log_
     let (trace, public) = BlockAir::generate_trace_padded(witness, log_n);
     let proof = stark::prove(config, &BlockAir, &trace, &public.to_values(), &mut transcript());
     SegmentProof { public, proof }
+}
+
+/// [`prove_segment_padded`], given up once `cancel` says so: asked
+/// when the trace is made, and then as the proof goes.
+pub fn try_prove_segment_padded(
+    config: &StarkConfig,
+    witness: &SegmentWitness,
+    log_n: usize,
+    cancel: stark::Cancel<'_>,
+) -> Option<SegmentProof> {
+    let (trace, public) = BlockAir::generate_trace_padded(witness, log_n);
+    if cancel() {
+        return None;
+    }
+    let tables = [stark::TableInput { air: &BlockAir, trace: &trace, pre: None }];
+    let proof = stark::try_prove_tables(config, &tables, &public.to_values(), &mut transcript(), Some(cancel)).ok()?;
+    Some(SegmentProof { public, proof })
 }
 
 /// Proves every segment, the name segment and the signature segments
