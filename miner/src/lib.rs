@@ -42,6 +42,7 @@ pub mod random;
 pub mod recursion;
 pub mod sha256;
 pub mod sig_air;
+pub mod signed;
 pub mod stark;
 pub mod store;
 #[cfg(test)]
