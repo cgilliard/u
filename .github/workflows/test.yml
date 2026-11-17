@@ -140,6 +140,8 @@ jobs:
           - aggregate::tree_tests::mainnet_wrap_timing
           - aggregate::tree_tests::proving_can_be_cancelled
           - aggregate::tree_tests::security_configs
+          - aggregate::tree_tests::security_configs_of_before
+          - aggregate::tree_tests::security_configs_with_twice_the_queries
           - aggregate::tree_tests::soundness_parameters
           - aggregate::tree_tests::spanning_transaction_roundtrip
           - aggregate::tree_tests::the_chain_connects_only_proven_blocks

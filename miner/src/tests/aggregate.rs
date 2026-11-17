@@ -1275,12 +1275,37 @@ fn write_fam_chain_proof() {
     println!("wrote {} bytes: a proof of {} bytes", out.len(), bytes.len());
 }
 
-/// Candidate security levels: table heights over the segment counts,
-/// and blocks of one and sixteen full segments proven and verified.
-/// `SEC` picks configurations by name (all by default).
+/// The main network's parameters: table heights over the segment
+/// counts, and blocks of one and sixteen full segments proven and
+/// verified, with the time, the memory and the proof's size. What it
+/// measures can be asked for otherwise ([`security_blocks`]).
 #[test]
-#[ignore = "proves mainnet blocks under several parameter sets; run with --release"]
+#[ignore = "proves mainnet blocks; run with --release"]
 fn security_configs() {
+    security_blocks("mainnet", &[1, 16]);
+}
+
+/// The same under the candidate with about twice the queries.
+#[test]
+#[ignore = "proves mainnet blocks with twice the queries; run with --release"]
+fn security_configs_with_twice_the_queries() {
+    security_blocks("proven", &[1, 16]);
+}
+
+/// The same under what the parameters were, for comparison.
+#[test]
+#[ignore = "proves mainnet blocks under earlier parameter sets; run with --release"]
+fn security_configs_of_before() {
+    security_blocks("plain,112,old", &[1, 16]);
+}
+
+/// Blocks of full segments proven and verified under the parameter
+/// sets `names`, of `sizes` segments each. Set from outside: `SEC` for
+/// other sets by name, `BLOCKS=<k>` for one size, `SEGLOG=<n>` for
+/// segments of `2^n` rows, `SPENDS=<n>` for a block of `n` transactions
+/// with signatures in place of the blocks of rewards, `STAGES=1` for
+/// the memory held at each stage.
+fn security_blocks(names: &str, sizes: &[usize]) {
     let m = AggregatorParams::MAINNET;
     let cfg = |q: usize, pow: usize| StarkConfig { num_queries: q, pow_bits: pow, commit_bits: 0, ..m.segment };
     let wrap = |q: usize, pow: usize| StarkConfig { num_queries: q, pow_bits: pow, commit_bits: 0, ..m.wrap };
@@ -1303,9 +1328,9 @@ fn security_configs() {
             },
         ),
     ];
-    let pick = std::env::var("SEC").ok();
+    let pick = std::env::var("SEC").unwrap_or_else(|_| names.to_string());
     for (name, params) in all {
-        if pick.as_ref().is_some_and(|p| !p.split(',').any(|x| x == name)) {
+        if !pick.split(',').any(|x| x == name) {
             continue;
         }
         // (`SEGLOG=<n>` for segments of `2^n` rows in place of the network's.)
@@ -1331,10 +1356,9 @@ fn security_configs() {
             let w = s.wrap.unwrap();
             println!("  {k} segments: root 2^{}/2^{}, wrap 2^{}/2^{}", s.log_n, s.hash_log_n, w.log_n, w.hash_log_n);
         }
-        // (`BLOCKS=1` for the block of one segment alone.)
         let sizes: Vec<usize> = match std::env::var("BLOCKS").ok().and_then(|b| b.parse().ok()) {
             Some(k) => vec![k],
-            None => vec![1, 16],
+            None => sizes.to_vec(),
         };
         for k in sizes {
             // (`SPENDS=<n>` for a block of `n` transactions of two inputs
