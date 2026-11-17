@@ -520,3 +520,73 @@ fn a_payment_survives_the_chain_going_over_to_another_branch() {
     }
     dirs.iter().for_each(|d| drop(std::fs::remove_dir_all(d)));
 }
+
+/// A name, between running nodes: committed to, revealed when its
+/// commit has waited, changed, and given to the wallet of another node;
+/// each step a transaction the wallet makes and a block carries.
+#[cfg(all(unix, feature = "dev"))]
+#[cfg_attr(debug_assertions, ignore = "proves blocks; run with --release")]
+#[test]
+fn a_name_is_registered_changed_and_given_at_the_prompt() {
+    use std::time::{Duration, Instant};
+    let dirs = [scratch("name-a"), scratch("name-b")];
+    let port = 47_000 + std::process::id() % 15_000;
+    let at = |i: u32| format!("127.0.0.1:{}", port + i);
+    let wait = |what: &str, done: &mut dyn FnMut() -> bool| {
+        let began = Instant::now();
+        while !done() {
+            assert!(began.elapsed() < Duration::from_secs(240), "{what}");
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    };
+    let mut maker = Prompted::start(&dirs[0], &at(0), &[at(1)], true, true);
+    let mut other = Prompted::start(&dirs[1], &at(1), &[at(0)], false, true);
+    wait("the maker has no rewards", &mut || maker.confirmed() != "0");
+    assert_eq!(maker.ask("names"), "no names\n");
+    assert_eq!(maker.ask("name alice"), "alice is not registered\n");
+    assert!(maker.ask("name-commit Alice").starts_with("error: Alice is not a valid name"));
+
+    // Committed to: which says nothing of the name. Revealed once the
+    // commit has been in the chain for as long as the network asks.
+    let committed = maker.ask("name-commit alice");
+    assert!(committed.starts_with("Name alice: committed to: transaction "), "{committed}");
+    assert!(maker.ask("names").contains("committed, not yet revealed"));
+    assert!(maker.ask("name-commit alice").starts_with("error: the wallet has already committed"));
+    let mut early = false;
+    wait("the name is not revealed", &mut || {
+        let said = maker.ask("name-reveal alice");
+        early |= said.contains("not on chain yet") || said.contains("blocks old; wait");
+        said.starts_with("Name alice: revealed: transaction ")
+    });
+    assert!(early, "it was revealed without waiting");
+    wait("the name is not registered", &mut || maker.ask("names").contains("  owned  "));
+    let nothing = "0".repeat(64);
+    assert!(maker.ask("name alice").starts_with(&format!("alice says {nothing}\n")));
+    assert_eq!(other.ask("name alice"), maker.ask("name alice"));
+
+    // Changed: what it says, as every node then has it.
+    let says = "01000000".repeat(8);
+    assert!(maker.ask("name-update alice nonsense").starts_with("error: 'nonsense' is not what a name says"));
+    assert!(maker.ask(&format!("name-update alice {says}")).starts_with("Name alice: changed: transaction "));
+    assert!(maker.ask("names").contains("owned, a change signed"));
+    wait("the name is not changed", &mut || other.ask("name alice").starts_with(&format!("alice says {says}\n")));
+    wait("the wallet has not seen the change", &mut || maker.ask("names").contains(&format!("  owned  says {says}")));
+
+    // Given to the other node's wallet: which writes the record, for
+    // the owner to sign over.
+    let offer = dirs[1].join("alice.offer").display().to_string();
+    assert!(other.ask(&format!("name-offer alice {offer}")).starts_with("Name alice: an offer written"));
+    assert!(other.ask("names").contains("offered to this wallet"));
+    assert!(maker.ask(&format!("name-transfer {offer}")).starts_with("Name alice: signed over: transaction "));
+    assert!(maker.ask("names").contains("being given away"));
+    wait("the name has not been given", &mut || other.ask("names").contains("  owned  "));
+    wait("the name has not left its giver", &mut || maker.ask("names") == "no names\n");
+    assert!(other.ask("name alice").starts_with(&format!("alice says {nothing}\n")));
+    let log = std::fs::read_to_string(dirs[0].join("tabernacle.log")).unwrap();
+    for step in ["committed to", "revealed", "changed", "signed over"] {
+        assert!(log.contains(&format!("] Name alice: {step}: transaction ")), "{step}: {log}");
+    }
+    maker.stop();
+    other.stop();
+    dirs.iter().for_each(|d| drop(std::fs::remove_dir_all(d)));
+}

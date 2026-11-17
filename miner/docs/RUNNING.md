@@ -578,7 +578,14 @@ commands:
   bump ID [FEE]
   resend ID
   prune
-  scan                      find this wallet's outputs on the chain (after a restore)
+  names                     this wallet's names, and its commits not yet revealed
+  name NAME                 look a name up on the chain
+  name-commit NAME [VALUE [FEE]]
+  name-reveal NAME [WAIT [FEE]]
+  name-update NAME VALUE [FEE]
+  name-offer NAME FILE [VALUE]
+  name-transfer FILE [FEE]
+  scan                      find this wallet's outputs and names on the chain
   help
   quit
 ```
@@ -638,6 +645,30 @@ The main log has a line for each step this node's own wallet takes
 and, on the recipient's node, `Payment 3f9a1c04 answered: 12.5 to this
 wallet`; a payment given up is said as that.
 
+**A name** (1 to 32 of `a`-`z`, `0`-`9` and `_`) is registered in two
+steps, so that nobody who sees the first can take the name before the
+second:
+
+1. `name-commit alice` pools a transaction that commits to the name
+   and says nothing of it.
+2. Once that has been in the chain for as long as the network asks (12
+   blocks; no more than 288, after which the commit is swept away),
+   `name-reveal alice` pools one that reveals it. `names` shows the
+   name as owned when a block has it.
+
+What a name says is 64 hex digits (32 bytes: what it is to be found
+by, once there are addresses to put there). `name-update alice VALUE`
+changes it, and puts the name under a fresh key. A name is given to
+another wallet by that wallet writing a record for it
+(`name-offer alice FILE`), which the owner signs over
+(`name-transfer FILE`). `name alice` says what the chain has for a
+name, on any node.
+
+Each step is a transaction of the wallet's own, which pays its fee and
+is in `sent` until a block has it: it is taken back or sped up as a
+payment is, and the name goes back to where it was. A wallet made
+again from its twelve words finds its names with its outputs.
+
 **What the wallet spends** is what has been in the chain a while: six
 blocks, the one that made an output counted, unless
 `--min-confirmations` says otherwise. An output of a block that is
@@ -687,8 +718,8 @@ which is nothing until its sender finalizes and a block carries it.
 Reserved: picked for a payment begun. Locked: signed away by a payment
 not yet in a block. Lost: was in the chain, and is in no block now.
 
-Not yet: paying an address or a name with no file passed (that needs
-the message layer), names, restoring a wallet from its words by a
+Not yet: paying an address or a name with no file passed and names
+under names (both need the message layer), restoring a wallet from its words by a
 command of the program (the library can).
 
 ---

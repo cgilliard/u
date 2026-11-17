@@ -14,10 +14,15 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::aggregate::AggregateVerifier;
 use crate::chain::params::{COIN, DECIMALS};
 use crate::logger::fmt::commas;
+use crate::name::NameOp;
 use crate::net::node::Handle;
 use crate::poseidon2::digest_to_bytes;
 use crate::store::Backend;
+use crate::wallet::names::{NameStage, Registry};
 use crate::wallet::{Fee, Slate, State, Wallet, follow};
+
+/// What an offer of a name as text is marked with.
+pub const OFFER_MARKER: &str = "TAB NAME OFFER";
 
 /// What the prompt says its commands are.
 pub const HELP: &str = "commands:
@@ -52,7 +57,24 @@ pub const HELP: &str = "commands:
                             spends)
   prune                     forget outputs expected that the chain does not hold and
                             the pool will not make: of payments taken back, say
-  scan                      find this wallet's outputs on the chain (after a restore)
+  names                     this wallet's names, and its commits not yet revealed
+  name NAME                 look a name up on the chain
+  name-commit NAME [VALUE [FEE]]
+                            start registering NAME: pool a transaction committing to
+                            it, which says nothing of the name (VALUE: 64 hex digits,
+                            what the name is to say; `-` or nothing for nothing yet)
+  name-reveal NAME [WAIT [FEE]]
+                            reveal a committed name once its commit is WAIT blocks
+                            old (the network's least if not given, or if less)
+  name-update NAME VALUE [FEE]
+                            change what a name says, putting it under a fresh key
+  name-offer NAME FILE [VALUE]
+                            write a record for NAME under a key of yours, for its
+                            owner to sign over with name-transfer: an offer, as text
+                            (`-----BEGIN TAB NAME OFFER-----`); FILE `-` says it here
+  name-transfer FILE [FEE]  sign a name over to the offer in FILE
+  scan                      find this wallet's outputs and names on the chain (after a
+                            restore)
   help                      this
   quit                      stop the node";
 
@@ -166,10 +188,25 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             ("bump", [id, fee]) => self.bump(id, Some(fee)),
             ("resend", [id]) => self.resend(id),
             ("prune", []) => self.prune(),
+            ("names", []) => self.names(),
+            ("name", [name]) => self.name(name),
+            ("name-commit", [name]) => self.name_commit(name, "-", None),
+            ("name-commit", [name, value]) => self.name_commit(name, value, None),
+            ("name-commit", [name, value, fee]) => self.name_commit(name, value, Some(fee)),
+            ("name-reveal", [name]) => self.name_reveal(name, "0", None),
+            ("name-reveal", [name, wait]) => self.name_reveal(name, wait, None),
+            ("name-reveal", [name, wait, fee]) => self.name_reveal(name, wait, Some(fee)),
+            ("name-update", [name, value]) => self.name_update(name, value, None),
+            ("name-update", [name, value, fee]) => self.name_update(name, value, Some(fee)),
+            ("name-offer", [name, file]) => self.name_offer(name, file, "-"),
+            ("name-offer", [name, file, value]) => self.name_offer(name, file, value),
+            ("name-transfer", [file]) => self.name_transfer(file, None),
+            ("name-transfer", [file, fee]) => self.name_transfer(file, Some(fee)),
             ("scan", []) => self.scan(),
             (
                 "status" | "peers" | "mempool" | "balance" | "outputs" | "send-file" | "receive" | "finalize"
-                | "slates" | "sent" | "cancel" | "bump" | "resend" | "prune" | "scan" | "help" | "quit" | "exit",
+                | "slates" | "sent" | "cancel" | "bump" | "resend" | "prune" | "scan" | "help" | "quit" | "exit"
+                | "names" | "name" | "name-commit" | "name-reveal" | "name-update" | "name-offer" | "name-transfer",
                 _,
             ) => Err(format!("{command}: not what it takes (see help)")),
             _ => Err(format!("{command}: no such command (see help)")),
@@ -511,17 +548,25 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
 
     fn prune(&self) -> Said {
         // (What the pool's transactions make may yet be made.)
-        let mut keep = Vec::new();
+        let (mut keep, mut commits) = (Vec::new(), Vec::new());
         self.hold.pool(&mut |pool| {
             for e in pool.entries() {
                 keep.extend(e.tx().outputs().iter().map(|o| o.commitment));
+                commits.extend(e.tx().ops().filter_map(|op| match op {
+                    NameOp::Commit { commit, .. } => Some(commit),
+                    _ => None,
+                }));
             }
         });
         let mut wallet = self.wallet()?;
         let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
         let snap = state.snapshot().map_err(|e| e.to_string())?;
         let gone = wallet.prune_pending(&snap, &keep).map_err(|e| e.to_string())?;
-        Ok(format!("{} outputs expected that will not be made were forgotten", commas(gone as u64)))
+        let mut out = format!("{} outputs expected that will not be made were forgotten", commas(gone as u64));
+        for name in wallet.prune_commits(&snap, &commits).map_err(|e| e.to_string())? {
+            out.push_str(&format!("\nthe commit to {name} forgotten: it never reached the chain"));
+        }
+        Ok(out)
     }
 
     fn scan(&self) -> Said {
@@ -529,7 +574,165 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
         let snap = state.snapshot().map_err(|e| e.to_string())?;
         let (found, total) = wallet.scan(&snap, (self.unix)()).map_err(|e| e.to_string())?;
-        Ok(format!("{} outputs found that were not known, {} in all", commas(found as u64), coins(total)))
+        let (names, commits) = wallet.scan_names(&snap, (self.unix)()).map_err(|e| e.to_string())?;
+        Ok(format!(
+            "{} outputs found that were not known, {} in all; {} names; {} commits not yet revealed",
+            commas(found as u64),
+            coins(total),
+            commas(names as u64),
+            commas(commits as u64)
+        ))
+    }
+
+    /// What a name says, as it is written: 64 hex digits; nothing, for
+    /// `-`.
+    fn value(text: &str) -> Result<crate::hash::Digest, String> {
+        if text == "-" {
+            return Ok([crate::poseidon2::Fp::ZERO; 8]);
+        }
+        let bytes: Vec<u8> = match text.len() == 64 && text.is_ascii() {
+            true => (0..32).filter_map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok()).collect(),
+            false => Vec::new(),
+        };
+        crate::poseidon2::digest_from_bytes(&bytes)
+            .filter(|_| bytes.len() == 32)
+            .ok_or_else(|| format!("'{text}' is not what a name says: 64 hex digits, or - for nothing"))
+    }
+
+    fn hex(d: &crate::hash::Digest) -> String {
+        digest_to_bytes(d).iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn names(&self) -> Said {
+        let wallet = self.wallet()?;
+        let mut lines = Vec::new();
+        for n in wallet.owned_names() {
+            let stage = match (n.stage, n.transferring, n.pending.is_some()) {
+                (_, true, _) => "being given away",
+                (NameStage::Owned, _, true) => "owned, a change signed",
+                (NameStage::Owned, _, _) => "owned",
+                (NameStage::Revealed, _, _) => "revealed, not yet in the chain",
+                (NameStage::Offered, _, _) => "offered to this wallet",
+            };
+            lines.push(format!("  {:<32}  {stage}  says {}", String::from_utf8_lossy(&n.name), Self::hex(&n.value)));
+        }
+        for c in wallet.pending_commits() {
+            let name =
+                c.name.as_deref().map_or("(a name not known: reveal it by name)".into(), String::from_utf8_lossy);
+            lines.push(format!("  {name:<32}  committed, not yet revealed"));
+        }
+        match lines.is_empty() {
+            true => Ok("no names".to_string()),
+            false => Ok(lines.join("\n")),
+        }
+    }
+
+    fn name(&self, name: &str) -> Said {
+        let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
+        let snap = state.snapshot().map_err(|e| e.to_string())?;
+        match Registry::record(&snap, name.as_bytes()).map_err(|e| e.to_string())? {
+            Some(record) => {
+                Ok(format!("{name} says {}\n  its owner's key: {}", Self::hex(&record.value), Self::hex(&record.owner)))
+            }
+            None => Ok(format!("{name} is not registered")),
+        }
+    }
+
+    /// Has a transaction of the wallet's carry `op`, and pools it:
+    /// `done` is what is then said, with the transaction. If none can
+    /// carry it, it is as if the operation had not been made.
+    fn carry(&self, wallet: &mut Wallet<W>, op: NameOp, fee: Fee, done: &str) -> Said {
+        let unix = (self.unix)();
+        let signed = {
+            let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
+            let snap = state.snapshot().map_err(|e| e.to_string())?;
+            wallet.carry(vec![op.clone()], fee, &snap, unix)
+        };
+        let signed = match signed {
+            Ok(signed) => signed,
+            Err(e) => {
+                wallet.undo_name_op(&op).map_err(|e| e.to_string())?;
+                return Err(e.to_string());
+            }
+        };
+        let id = short(&digest_to_bytes(&signed.tx.txid()));
+        match self.hold.submit(&signed.tx.to_bytes(), unix) {
+            Ok(_) => {
+                let said =
+                    format!("{done}: transaction {id}, with a fee of {}", coins(signed.tx.balance().max(0) as u128));
+                (self.log)(&said);
+                Ok(said)
+            }
+            Err(why) => {
+                let failed = format!("{done}, but the pool does not take transaction {id}: {why}");
+                (self.log)(&format!("Error: {failed}"));
+                Err(failed)
+            }
+        }
+    }
+
+    fn name_commit(&self, name: &str, value: &str, fee: Option<&&str>) -> Said {
+        let (value, fee) = (Self::value(value)?, Self::fee(fee)?);
+        self.observe()?;
+        let mut wallet = self.wallet()?;
+        let op = wallet.name_commit(name.as_bytes(), value, (self.unix)()).map_err(|e| e.to_string())?;
+        self.carry(&mut wallet, op, fee, &format!("Name {name}: committed to"))
+    }
+
+    fn name_reveal(&self, name: &str, wait: &str, fee: Option<&&str>) -> Said {
+        let wait: u32 = wait.parse().map_err(|_| format!("'{wait}' is not a number of blocks"))?;
+        let fee = Self::fee(fee)?;
+        self.observe()?;
+        let mut wallet = self.wallet()?;
+        let op = {
+            let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
+            let snap = state.snapshot().map_err(|e| e.to_string())?;
+            let (height, least) = (snap.tip().0 + 1, self.hold.chain().params().min_reveal);
+            wallet.name_reveal(name.as_bytes(), wait, least, &snap, height, (self.unix)()).map_err(|e| e.to_string())?
+        };
+        self.carry(&mut wallet, op, fee, &format!("Name {name}: revealed"))
+    }
+
+    fn name_update(&self, name: &str, value: &str, fee: Option<&&str>) -> Said {
+        let (value, fee) = (Self::value(value)?, Self::fee(fee)?);
+        self.observe()?;
+        let mut wallet = self.wallet()?;
+        let (op, _) = wallet.name_update(name.as_bytes(), value).map_err(|e| e.to_string())?;
+        self.carry(&mut wallet, op, fee, &format!("Name {name}: changed"))
+    }
+
+    fn name_offer(&self, name: &str, file: &str, value: &str) -> Said {
+        let value = Self::value(value)?;
+        let record = self.wallet()?.name_offer(name.as_bytes(), value, (self.unix)()).map_err(|e| e.to_string())?;
+        let b64 = crate::wallet::base64_encode(&record.to_bytes());
+        let mut text = format!("-----BEGIN {OFFER_MARKER}-----\n");
+        for line in b64.as_bytes().chunks(64) {
+            text.push_str(core::str::from_utf8(line).expect("base64 is ASCII"));
+            text.push('\n');
+        }
+        text.push_str(&format!("-----END {OFFER_MARKER}-----\n"));
+        let done = format!("Name {name}: an offer written, for its owner to sign over with name-transfer");
+        (self.log)(&done);
+        Self::write(file, text, done)
+    }
+
+    fn name_transfer(&self, file: &str, fee: Option<&&str>) -> Said {
+        let fee = Self::fee(fee)?;
+        let text = std::fs::read_to_string(Path::new(file)).map_err(|e| format!("cannot read {file}: {e}"))?;
+        let (begin, end) = (format!("-----BEGIN {OFFER_MARKER}-----"), format!("-----END {OFFER_MARKER}-----"));
+        let record = text
+            .find(&begin)
+            .and_then(|at| {
+                let body = &text[at + begin.len()..];
+                let b64: String = body[..body.find(&end)?].chars().filter(|c| !c.is_whitespace()).collect();
+                crate::name::Record::from_bytes(&crate::wallet::base64_decode(&b64)?).ok()
+            })
+            .ok_or_else(|| format!("{file} holds no offer of a name"))?;
+        self.observe()?;
+        let mut wallet = self.wallet()?;
+        let name = record.name.as_str().to_string();
+        let (op, _) = wallet.name_transfer(record).map_err(|e| e.to_string())?;
+        self.carry(&mut wallet, op, fee, &format!("Name {name}: signed over"))
     }
 }
 
