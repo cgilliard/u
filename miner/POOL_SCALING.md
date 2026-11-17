@@ -28,9 +28,9 @@ a laptop.
   and used at whatever block the transactions end up in. For a full
   block this is about five-sixths of all the proving.
 - **What must wait for the parent block** is the state's part: a full
-  block's 27 or so state segments, the dozen proofs that gather them,
+  block's 30 or so state segments, the dozen proofs that gather them,
   and three proofs at the end. On the measuring laptop that is about
-  eight minutes; on a server or a few, two to three; and there is a
+  nine minutes; on a server or a few, two to three; and there is a
   floor of six proofs one after another that more machines do not
   shorten.
 - **A header does not commit to its proof.** A miner looks for the
@@ -89,15 +89,16 @@ signature tree, and its root verifies one proof fewer.
 | Segments a block may have | 16,384 state, 16,384 signature |
 
 A transaction of 2.5 inputs and 2.5 outputs is 165 bytes of a block and
-about 360 rows of a state segment. A block with 1.6 MB of them holds
-9,696: 24,240 inputs and as many outputs.
+about 360 rows of a state segment. A block is 2 MB, and its proof about
+205 KB of that: the 1.795 MB left holds 10,878 such transactions, about
+27,200 inputs and as many outputs.
 
 | A full block | |
 |---|---|
-| State segments | about 27 |
+| State segments | about 30 |
 | Nodes over them | about 10, in two levels |
-| Signature segments | about 221 |
-| Signature nodes | about 75, in four levels |
+| Signature segments | about 248 |
+| Signature nodes | about 83, in four levels |
 
 ## 3. What can be made ahead
 
@@ -271,21 +272,21 @@ From the counts of section 2 and the costs of section 8.
 
 | Work for one full block | Proofs | On the laptop |
 |---|---|---|
-| Signature segments | 221 | about 21 minutes |
-| Signature nodes | 75 | about 22 minutes |
-| **Made ahead** | | **about 43 minutes** |
-| State segments | 27 | about 3 minutes |
+| Signature segments | 248 | about 24 minutes |
+| Signature nodes | 83 | about 24 minutes |
+| **Made ahead** | | **about 48 minutes** |
+| State segments | 30 | about 3 minutes |
 | Nodes | 10 | about 4 minutes |
 | Root, wrap, chain step | 3 | about 1.3 minutes |
-| **After the parent** | | **about 8 minutes** |
+| **After the parent** | | **about 9 minutes** |
 
-A full block every ten minutes is therefore about 43 minutes of this
-laptop's work on signatures, steadily, and about 8 on the state in a
-burst: some 300 core-minutes a block, 30 cores kept busy.
+A full block every ten minutes is therefore about 48 minutes of this
+laptop's work on signatures, steadily, and about 9 on the state in a
+burst: some 340 core-minutes a block, 34 cores kept busy.
 
 | Hardware (laptop-class cores) | Signatures keep up with full blocks | Proof ready after the parent |
 |---|---|---|
-| The laptop, 6 cores | No: a fifth of them | 8 minutes |
+| The laptop, 6 cores | No: a fifth of them | 9 minutes |
 | One server, 64 cores | Yes, with half to spare | about 3 minutes |
 | Three such servers | Yes | about 2.3 minutes: the critical path |
 
@@ -316,19 +317,19 @@ only where it begins:
 
 | Step | Proofs at once | Cores | For about |
 |---|---|---|---|
-| State segments | 27 | 160 | 12 s |
+| State segments | 30 | 180 | 12 s |
 | Nodes, first level | 7 | 40 | 25 s |
 | Nodes, second level | 2 | 12 | 25 s |
 | Root, then wrap, then chain step | 1 | 6 | 75 s |
 
 | In ten minutes, for full blocks | Core-minutes |
 |---|---|
-| Signatures, made ahead | about 260 |
+| Signatures, made ahead | about 290 |
 | The critical path | about 50 |
 | Three servers have | 1,920 |
 
-The cluster is a sixth busy. Its size is not for the amount of work,
-which one server has room for, but for the twelve seconds in which 27
+The cluster is under a fifth busy. Its size is not for the amount of work,
+which one server has room for, but for the twelve seconds in which 30
 segments are proven at once.
 
 ### Below the floor
