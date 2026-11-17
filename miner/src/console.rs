@@ -24,7 +24,8 @@ pub const HELP: &str = "commands:
   status                    the chain's last block, peers, the pool, the wallet's total
   peers                     how many peers are known, and how many are live
   mempool                   the transactions waiting to be mined
-  balance                   confirmed, pending, unverified, reserved and locked funds
+  balance                   confirmed, pending, unverified, reserved, locked and lost
+                            funds
   outputs                   the wallet's outputs
   send-file AMOUNT [FEE] FILE
                             start a payment by file: write the slate to FILE for the
@@ -241,9 +242,14 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         let wallet = self.wallet()?;
         let b = follow::balance(self.hold.chain(), &wallet).map_err(|e| e.to_string())?;
         let mut out = format!("confirmed   {}", coins(b.confirmed));
-        for (what, amount) in
-            [("pending", b.pending), ("unverified", b.unverified), ("reserved", b.reserved), ("locked", b.locked)]
-        {
+        let rest = [
+            ("pending", b.pending),
+            ("unverified", b.unverified),
+            ("reserved", b.reserved),
+            ("locked", b.locked),
+            ("lost", b.lost),
+        ];
+        for (what, amount) in rest {
             if amount > 0 {
                 out.push_str(&format!("\n{what:<11} {}", coins(amount)));
             }
@@ -260,6 +266,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             let held = wallet.held(&o, &snap).map_err(|e| e.to_string())?;
             let what = match (o.state, held) {
                 (State::Unspent, true) => "confirmed",
+                (State::Unspent, false) if wallet.is_lost(&o.commitment) => "lost",
                 (State::Unspent, false) => "pending",
                 (State::Reserved, _) => "reserved",
                 (State::Spent, true) => "locked",

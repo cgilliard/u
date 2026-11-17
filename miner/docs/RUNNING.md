@@ -641,17 +641,37 @@ wallet`; a payment given up is said as that.
 Amounts are in coins, with up to ten decimals. A fee is coins in all,
 or `N/byte`; not given, it is the least the pool takes.
 
+**When the chain goes over to another branch** the wallet goes with
+it, and nothing has to be done:
+
+- A payment sent whose block was undone is unconfirmed again. Its
+  record is kept until its block is as deep as blocks can be undone,
+  so the wallet has it to send again, and does: a payment of this
+  wallet's that no block has is kept in the pool, put back there after
+  a reorganization, a restart, or a pool too full to keep it.
+- An output whose block was undone is lost: shown apart, not counted
+  as coming, and not spent from. If a block makes it again it is found,
+  wherever it then is; if none has by the time it has been gone as
+  long as blocks can be undone, it is forgotten.
+- The main log says what was taken and what came back:
+
+```
+[2026-11-17 21:04:10:318] The wallet: 1 payments sent are in no block any more: they are to be mined again
+[2026-11-17 21:04:10:318] The wallet: 1 outputs are in no block any more: lost, unless a block makes them again
+[2026-11-17 21:04:10:402] The wallet: payment sent 8be2a771 was in no block and not pooled: pooled again
+[2026-11-17 21:14:51:977] The wallet: 1 outputs that were lost are in the chain again
+```
+
 **What a balance says.** Confirmed: unspent, and in the chain.
 Pending: the wallet's own, not yet in the chain (change, the reward of
 a block being made). Unverified: an output added to another's slate,
 which is nothing until its sender finalizes and a block carries it.
 Reserved: picked for a payment begun. Locked: signed away by a payment
-not yet in a block.
+not yet in a block. Lost: was in the chain, and is in no block now.
 
 Not yet: paying an address or a name with no file passed (that needs
 the message layer), names, restoring a wallet from its words by a
-command of the program (the library can), outputs lost to a
-reorganization.
+command of the program (the library can).
 
 ---
 

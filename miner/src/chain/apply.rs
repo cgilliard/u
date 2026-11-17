@@ -594,6 +594,16 @@ pub(crate) mod tests {
         extend(chain, &body(&[], outputs))
     }
 
+    /// Extends `chain` by a block that spends the outputs at `spends`
+    /// and makes `outputs`. The block, whole.
+    pub(crate) fn extend_spending<V: ProofVerifier + Sync>(
+        chain: &Chain<MemBackend, V>,
+        spends: &[u64],
+        outputs: &[BlockOutput],
+    ) -> Vec<u8> {
+        extend(chain, &body(spends, outputs))
+    }
+
     /// Extends `chain` by `n` blocks, each making one output: `tag`
     /// tells one run of blocks from another on the same parent. The
     /// blocks, whole.

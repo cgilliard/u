@@ -9,7 +9,7 @@
 //! looks through the unspent outputs for its own instead, by their
 //! memos.
 
-use super::{Wallet, WalletError};
+use super::{Reconciled, Wallet, WalletError};
 use crate::block::BodyRef;
 use crate::chain::Chain;
 use crate::hash::Digest;
@@ -25,6 +25,9 @@ pub struct Followed {
     pub looked_through: bool,
     /// Outputs a restore's first scan found, and their total.
     pub found: (usize, u128),
+    /// What holding the wallet against the chain changed: payments
+    /// undone, outputs lost and found again.
+    pub changed: Reconciled,
 }
 
 /// Brings `wallet` up to `chain`'s last block, at `now`: nothing is done
@@ -98,7 +101,7 @@ pub fn follow<B: Backend + 'static, V, W: Backend>(
         done.found = wallet.scan(&snap, now)?;
         wallet.clear_scan_pending()?;
     }
-    wallet.settle_sent(&snap)?;
+    done.changed = wallet.reconcile(&snap, height, chain.keep() as u32)?;
     // Rewards of blocks found, once no reorganization reaches them:
     // done with if the block is the chain's, forgotten if it is not.
     let settled = chain.keep() as u32;
@@ -128,7 +131,8 @@ pub fn balance<B: Backend + 'static, V, W: Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain::apply::tests::{extend_with, grow};
+    use crate::block::BlockRef;
+    use crate::chain::apply::tests::{extend_spending, extend_with, grow};
     use crate::chain::headers::tests::{easy, seed, table};
     use crate::chain::params::COIN;
     use crate::chain::verify::AcceptAllProofs;
@@ -173,5 +177,90 @@ mod tests {
         wallet.set_synced(None).unwrap();
         assert!(follow(&chain, &mut wallet, NOW).unwrap().looked_through);
         assert_eq!(balance(&chain, &wallet).unwrap().confirmed, 3000 * COIN as u128);
+    }
+
+    /// Gives `chain` these blocks, made on another.
+    fn give(chain: &Chain<MemBackend, AcceptAllProofs>, blocks: &[Vec<u8>]) {
+        for b in blocks {
+            chain.apply_block(&BlockRef::from_bytes(b).unwrap(), crate::chain::headers::tests::NOW).unwrap();
+        }
+    }
+
+    /// The chain goes over to another branch, and the wallets go with
+    /// it. A payment in a block that is undone is unconfirmed again, to
+    /// be sent again as it was signed; what the block made is lost, and
+    /// found again where the other branch makes it; and a payment whose
+    /// block is deep enough is done with.
+    #[test]
+    fn wallets_follow_the_chain_over_to_another_branch() {
+        use crate::output::Output;
+        use crate::wallet::{Balance, Reconciled};
+        let (ours, theirs) = (chain(), chain());
+        let mut alice = Wallet::open(MemBackend::new()).unwrap().0;
+        let mut bob = Wallet::open(MemBackend::new()).unwrap().0;
+        let both = |alice: &mut Wallet<MemBackend>, bob: &mut Wallet<MemBackend>| {
+            (follow(&ours, alice, NOW).unwrap(), follow(&ours, bob, NOW).unwrap())
+        };
+        // A block both branches have pays alice; she pays bob, in a
+        // block of ours alone.
+        let reward = 1500 * COIN;
+        let funded = extend_with(&ours, &[alice.receive(reward, NOW).unwrap().block_output()]);
+        give(&theirs, std::slice::from_ref(&funded));
+        both(&mut alice, &mut bob);
+        let mut slate = {
+            let state = ours.state();
+            alice.send(100 * COIN, None, &state.snapshot().unwrap(), NOW).unwrap()
+        };
+        bob.receive_slate(&mut slate, NOW).unwrap();
+        let signed = alice.finalize(&slate, NOW).unwrap();
+        // (A block carrying it: what it spends, what it makes, and the
+        // block's own reward with its fee.)
+        let carrying = |chain: &Chain<MemBackend, AcceptAllProofs>, tx: &crate::transaction::Transaction, tag: u32| {
+            let paid = Output::to_key_hash(&[crate::poseidon2::Fp::new(tag); 8], reward + tx.balance() as u64);
+            let mut made: Vec<_> = tx.outputs.iter().map(|o| o.block_output()).collect();
+            made.push(paid.block_output());
+            extend_spending(chain, &tx.spent_positions(), &made)
+        };
+        carrying(&ours, &signed.tx, 1);
+        both(&mut alice, &mut bob);
+        let (a, b) = (balance(&ours, &alice).unwrap(), balance(&ours, &bob).unwrap());
+        assert_eq!((a.locked, b.confirmed), (0, 100 * COIN as u128));
+        assert!(a.confirmed > 0 && a.confirmed < 1400 * COIN as u128);
+
+        // Their branch is longer, and has no such block: ours is undone.
+        give(&ours, &grow(&theirs, 2, 7));
+        let (did_a, did_b) = both(&mut alice, &mut bob);
+        assert!(did_a.looked_through && did_b.looked_through);
+        assert_eq!(did_a.changed, Reconciled { undone: 1, lost: 1, ..Default::default() });
+        assert_eq!(did_b.changed, Reconciled { lost: 1, ..Default::default() });
+        let undone = balance(&ours, &alice).unwrap();
+        assert_eq!((undone.confirmed, undone.locked, undone.lost), (0, reward as u128, a.confirmed));
+        assert_eq!(balance(&ours, &bob).unwrap(), Balance { lost: 100 * COIN as u128, ..Default::default() });
+        // The payment is there to be mined again, at where what it
+        // spends is now.
+        let again = {
+            let state = ours.state();
+            let unconfirmed = alice.unconfirmed(&state.snapshot().unwrap()).unwrap();
+            assert_eq!(unconfirmed.len(), 1);
+            alice.resend(&unconfirmed[0].txid).unwrap()
+        };
+        assert!(again.verify_signatures() && again.txid() == signed.tx.txid());
+
+        // Their branch has it, further on: all is as it was, each
+        // output where it now is.
+        give(&ours, &[carrying(&theirs, &again, 2)]);
+        let (did_a, did_b) = both(&mut alice, &mut bob);
+        assert_eq!((did_a.changed.returned, did_b.changed.returned), (1, 1));
+        assert_eq!((balance(&ours, &alice).unwrap(), balance(&ours, &bob).unwrap()), (a, b));
+        // And bob spends what he was paid, from where it is.
+        let state = ours.state();
+        let back = bob.send(50 * COIN, None, &state.snapshot().unwrap(), NOW).unwrap();
+        assert_eq!(back.inputs.len(), 1);
+        drop(state);
+        // Deep enough, the payment is done with.
+        assert_eq!(alice.sent().len(), 1);
+        give(&ours, &grow(&theirs, 64, 9));
+        assert_eq!(follow(&ours, &mut alice, NOW).unwrap().changed, Reconciled { settled: 1, ..Default::default() });
+        assert!(alice.sent().is_empty());
     }
 }

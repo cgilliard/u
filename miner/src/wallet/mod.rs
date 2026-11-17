@@ -76,6 +76,8 @@ const T_SLATES: usize = 2;
 const T_SENT: usize = 3;
 const T_REWARDS: usize = 4;
 const T_ANSWERED: usize = 5;
+const T_LANDED: usize = 6;
+const T_LOST: usize = 7;
 
 /// A slate of this wallet's making: the reference's, less its sender and
 /// its receipt.
@@ -546,6 +548,27 @@ pub struct Balance {
     pub reserved: u128,
     /// Signed away by a payment that has not confirmed: about to leave.
     pub locked: u128,
+    /// Unspent, once in the chain and no longer: the block that made
+    /// them was undone. They are not counted as coming; they are found
+    /// again if a block makes them again.
+    pub lost: u128,
+}
+
+/// What looking at the chain again changed in what the wallet keeps
+/// ([`Wallet::reconcile`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Reconciled {
+    /// Payments sent that were in a block and are not any more: what
+    /// they spend is unspent again.
+    pub undone: usize,
+    /// Payments sent whose block is deep enough to rely on: done with.
+    pub settled: usize,
+    /// Outputs that were in the chain and are not any more.
+    pub lost: usize,
+    /// Outputs lost that are in the chain again.
+    pub returned: usize,
+    /// Outputs lost for so long that they are forgotten.
+    pub forgotten: usize,
 }
 
 /// A signed transaction and, for every input whose last signature it was,
@@ -719,6 +742,12 @@ struct Tables {
     rewards: BTreeMap<Id, (u32, [u8; 32])>,
     /// Outputs this wallet added to others' slates, until they land.
     answered: BTreeSet<Id>,
+    /// Payments sent whose inputs the chain no longer holds: by
+    /// transaction id, the chain's height when that was first seen.
+    landed: BTreeMap<Id, u32>,
+    /// Outputs that were in the chain and are not: by commitment, the
+    /// chain's height when that was first seen.
+    lost: BTreeMap<Id, u32>,
 }
 
 /// A table of records each named by 32 bytes.
@@ -764,6 +793,8 @@ impl Tables {
                 (id, b)
             })),
             T_ANSWERED => put_entries(self.answered.iter().map(|id| (id, Vec::new()))),
+            T_LANDED => put_entries(self.landed.iter().map(|(id, height)| (id, height.to_le_bytes().to_vec()))),
+            T_LOST => put_entries(self.lost.iter().map(|(id, height)| (id, height.to_le_bytes().to_vec()))),
             _ => unreachable!("no such table"),
         }
     }
@@ -801,6 +832,13 @@ impl Tables {
         }
         for (id, _) in get_entries(&table(T_ANSWERED)?).ok_or(WalletError::Corrupt("answered"))? {
             t.answered.insert(id);
+        }
+        let height = |b: &[u8]| Some(u32::from_le_bytes(b.try_into().ok()?));
+        for (id, b) in get_entries(&table(T_LANDED)?).ok_or(WalletError::Corrupt("landed"))? {
+            t.landed.insert(id, height(b).ok_or(WalletError::Corrupt("landed payment"))?);
+        }
+        for (id, b) in get_entries(&table(T_LOST)?).ok_or(WalletError::Corrupt("lost"))? {
+            t.lost.insert(id, height(b).ok_or(WalletError::Corrupt("lost output"))?);
         }
         Ok(t)
     }
@@ -1041,6 +1079,9 @@ impl<B: Backend> Wallet<B> {
             let held = self.held(&o, chain)?;
             match (o.state, held) {
                 (State::Unspent, true) => b.confirmed += o.amount as u128,
+                (State::Unspent, false) if self.t.lost.contains_key(&digest_to_bytes(&o.commitment)) => {
+                    b.lost += o.amount as u128
+                }
                 (State::Unspent, false) if self.t.answered.contains(&digest_to_bytes(&o.commitment)) => {
                     b.unverified += o.amount as u128
                 }
@@ -1580,6 +1621,9 @@ impl<B: Backend> Wallet<B> {
         in_flight.extend(t.slates.values().filter_map(|p| p.change.as_ref().map(digest_to_bytes)));
         in_flight.extend(t.rewards.keys().copied());
         let mut gone = 0;
+        // (What a reorganization undid goes when it has been gone long
+        // enough: the chain may yet go back, [`Wallet::reconcile`].)
+        in_flight.extend(t.lost.keys().copied());
         for o in self.outputs() {
             let id = digest_to_bytes(&o.commitment);
             let held = self.held(&o, chain)?;
@@ -1633,29 +1677,96 @@ impl<B: Backend> Wallet<B> {
         out
     }
 
-    /// Forgets the payments sent whose inputs the chain no longer holds:
-    /// they, or another spend of the same, have landed. Returns how many.
-    pub fn settle_sent(&mut self, chain: &impl Unspent) -> Result<usize> {
-        let mut t = self.t.clone();
-        let mut gone = Vec::new();
-        for (id, sent) in &t.sent {
+    /// Whether the output of this commitment was in the chain and is not
+    /// any more ([`Wallet::reconcile`]).
+    pub fn is_lost(&self, c: &Commitment) -> bool {
+        self.t.lost.contains_key(&digest_to_bytes(c))
+    }
+
+    /// The payments sent that no block has: those of which the chain
+    /// still holds something they spend. Oldest first.
+    pub fn unconfirmed(&self, chain: &impl Unspent) -> Result<Vec<Sent>> {
+        let mut out = Vec::new();
+        for sent in self.sent() {
             let mut held = false;
             for c in &sent.inputs {
-                held |= match t.outputs.get(&digest_to_bytes(c)) {
-                    Some(o) => self.held(o, chain)?,
-                    None => false,
-                };
+                if let Some(o) = self.owned(c) {
+                    held |= self.held(&o, chain)?;
+                }
             }
-            if !held {
-                gone.push(*id);
+            if held {
+                out.push(sent);
             }
         }
-        if gone.is_empty() {
-            return Ok(0);
+        Ok(out)
+    }
+
+    /// Holds what the wallet keeps against the chain as it is, of
+    /// `height` blocks: after every change of its last block, and above
+    /// all after it has gone over to another branch.
+    ///
+    /// A payment sent is kept until the block that has it is `depth`
+    /// blocks deep, deep enough that the chain will not go back on it:
+    /// until then, if what it spends is unspent again, it is a payment
+    /// to be mined again, and its record is what it is sent again from.
+    ///
+    /// An output that was in the chain and is not any more is lost:
+    /// kept apart from what is coming, found again if a block makes it
+    /// again, and forgotten once it has been gone for `depth` blocks.
+    pub fn reconcile(&mut self, chain: &impl Unspent, height: u32, depth: u32) -> Result<Reconciled> {
+        let mut t = self.t.clone();
+        let mut did = Reconciled::default();
+        let mut changed = false;
+        for (id, sent) in &self.t.sent {
+            let mut held = false;
+            for c in &sent.inputs {
+                if let Some(o) = self.owned(c) {
+                    held |= self.held(&o, chain)?;
+                }
+            }
+            match (held, t.landed.get(id).copied()) {
+                (false, None) => drop(t.landed.insert(*id, height)),
+                (false, Some(at)) if height >= at.saturating_add(depth) => {
+                    t.sent.remove(id);
+                    t.landed.remove(id);
+                    did.settled += 1;
+                }
+                (true, Some(_)) => {
+                    t.landed.remove(id);
+                    did.undone += 1;
+                }
+                _ => continue,
+            }
+            changed = true;
         }
-        gone.iter().for_each(|id| drop(t.sent.remove(id)));
-        self.commit(t, &[T_SENT])?;
-        Ok(gone.len())
+        for o in self.outputs() {
+            if o.state != State::Unspent || o.position.is_none() {
+                continue;
+            }
+            let id = digest_to_bytes(&o.commitment);
+            match (self.held(&o, chain)?, t.lost.get(&id).copied()) {
+                (false, None) => {
+                    t.lost.insert(id, height);
+                    did.lost += 1;
+                }
+                (false, Some(at)) if height >= at.saturating_add(depth) => {
+                    t.outputs.remove(&id);
+                    t.lost.remove(&id);
+                    t.answered.remove(&id);
+                    did.forgotten += 1;
+                }
+                (true, Some(_)) => {
+                    t.lost.remove(&id);
+                    did.returned += 1;
+                }
+                _ => continue,
+            }
+            changed = true;
+        }
+        if changed {
+            self.commit(t, &[T_OUTPUTS, T_SENT, T_ANSWERED, T_LANDED, T_LOST])?;
+        }
+        Ok(did)
     }
 }
 

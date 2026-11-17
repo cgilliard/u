@@ -552,6 +552,7 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
         let (hold, wallet, main) = (hold.clone(), Arc::clone(wallet), Arc::clone(&main));
         let following = move || {
             let mut failed = false;
+            let mut refused: Vec<tabminer::hash::Digest> = Vec::new();
             loop {
                 let seen = hold.moves();
                 let followed =
@@ -562,6 +563,54 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
                     _ => {}
                 }
                 failed = followed.is_err();
+                // What a reorganization took from the wallet, and gave
+                // back, is said.
+                if let Ok(did) = &followed {
+                    let c = did.changed;
+                    for (n, what) in [
+                        (c.undone, "payments sent are in no block any more: they are to be mined again"),
+                        (c.lost, "outputs are in no block any more: lost, unless a block makes them again"),
+                        (c.returned, "outputs that were lost are in the chain again"),
+                        (c.forgotten, "outputs lost for too long are forgotten"),
+                    ] {
+                        if n > 0 {
+                            main.log(&format!("The wallet: {n} {what}"));
+                        }
+                    }
+                }
+                // A payment sent that no block has is kept in the pool:
+                // put back if a reorganization, a restart or a full
+                // pool took it out. (Said once for each, if the pool
+                // will not have it.)
+                let waiting = {
+                    let wallet = wallet.lock().unwrap_or_else(|e| e.into_inner());
+                    let unconfirmed = hold.chain().whole().ok().and_then(|state| {
+                        let snap = state.snapshot().ok()?;
+                        wallet.unconfirmed(&snap).ok()
+                    });
+                    let again =
+                        |sent: &tabminer::wallet::Sent| Some((sent.txid, wallet.resend(&sent.txid).ok()?.to_bytes()));
+                    unconfirmed.unwrap_or_default().iter().filter_map(again).collect::<Vec<_>>()
+                };
+                refused.retain(|id| waiting.iter().any(|(txid, _)| txid == id));
+                for (txid, bytes) in waiting {
+                    if hold.pooled(&txid) {
+                        continue;
+                    }
+                    let id = short(&txid);
+                    match hold.submit(&bytes, socket::unix()) {
+                        Ok(_) => main.log(&format!(
+                            "The wallet: payment sent {id} was in no block and not pooled: pooled again"
+                        )),
+                        Err(why) if !refused.contains(&txid) => {
+                            refused.push(txid);
+                            main.log(&format!(
+                                "The wallet: payment sent {id} is in no block, and the pool does not take it: {why}"
+                            ));
+                        }
+                        Err(_) => {}
+                    }
+                }
                 // Pooled spends of its outputs: a leaf signed from
                 // elsewhere (a copy of this wallet, or its file as it
                 // was before) is never signed from again.

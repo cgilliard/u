@@ -214,7 +214,11 @@ fn a_payment_is_agreed_by_slate() {
     let (a, b) = (alice.balance(&chain).unwrap(), bob.balance(&chain).unwrap());
     assert_eq!(a, Balance { confirmed: (70 * COIN - fee) as u128, ..Default::default() });
     assert_eq!(b, Balance { confirmed: 30 * COIN as u128, ..Default::default() });
-    assert_eq!((alice.settle_sent(&chain).unwrap(), alice.sent().len()), (1, 0));
+    // (Once its block is deep enough to rely on.)
+    assert_eq!((alice.reconcile(&chain, 10, 5).unwrap(), alice.sent().len()), (Reconciled::default(), 1));
+    assert!(alice.unconfirmed(&chain).unwrap().is_empty());
+    assert_eq!(alice.reconcile(&chain, 15, 5).unwrap(), Reconciled { settled: 1, ..Default::default() });
+    assert!(alice.sent().is_empty());
     // And all of it is there when the files are opened again.
     assert_eq!(reopened(&alice, "").unwrap().balance(&chain).unwrap(), a);
     assert_eq!(reopened(&bob, "").unwrap().balance(&chain).unwrap(), b);
@@ -375,7 +379,8 @@ fn a_payment_sent_is_cancelled_or_sped_up() {
     // In a block: the wallet has it all but the fee, once what was
     // never made is forgotten; and the recipient has nothing.
     chain.take(&back.tx, &mut [&mut alice, &mut bob]);
-    assert_eq!(alice.settle_sent(&chain).unwrap(), 1);
+    alice.reconcile(&chain, 1, 0).unwrap();
+    assert_eq!(alice.reconcile(&chain, 1, 0).unwrap().settled, 1);
     assert!(alice.balance(&chain).unwrap().pending > 0);
     assert_eq!(alice.prune_pending(&chain, &[]).unwrap(), 2);
     assert_eq!(alice.balance(&chain).unwrap(), Balance { confirmed: (100 * COIN - min) as u128, ..Default::default() });
@@ -390,6 +395,58 @@ fn a_payment_sent_is_cancelled_or_sped_up() {
     let third = pay(&mut alice, &mut bob, &chain);
     let keep: Vec<Commitment> = third.tx.outputs.iter().map(|o| o.commitment).collect();
     assert_eq!((alice.prune_pending(&chain, &keep).unwrap(), bob.prune_pending(&chain, &keep).unwrap()), (0, 0));
+}
+
+/// The chain goes back on a block, and the wallet with it: a payment
+/// that block had is one to be mined again, with its record to send it
+/// from; an output it made is lost, kept apart from what is coming, and
+/// found again or, in time, forgotten.
+#[test]
+fn what_a_block_undone_took_with_it_is_put_right() {
+    let mut chain = Outputs::default();
+    let mut alice = funded(&mut chain, 100 * COIN);
+    let mut bob = new();
+    let mut slate = alice.send(30 * COIN, None, &chain, NOW).unwrap();
+    bob.receive_slate(&mut slate, NOW).unwrap();
+    let signed = alice.finalize(&slate, NOW).unwrap();
+    let before = chain.0.clone();
+    chain.take(&signed.tx, &mut [&mut alice, &mut bob]);
+    assert_eq!(alice.reconcile(&chain, 5, 10).unwrap(), Reconciled::default());
+    assert_eq!(bob.balance(&chain).unwrap().confirmed, 30 * COIN as u128);
+    let (paid, kept) = (bob.balance(&chain).unwrap(), alice.balance(&chain).unwrap());
+
+    // The block is undone: the payment is unconfirmed again, and what
+    // it made is in no block.
+    let after = std::mem::replace(&mut chain.0, before);
+    assert_eq!(alice.reconcile(&chain, 5, 10).unwrap(), Reconciled { undone: 1, lost: 1, ..Default::default() });
+    assert_eq!(bob.reconcile(&chain, 5, 10).unwrap(), Reconciled { lost: 1, ..Default::default() });
+    assert_eq!(alice.reconcile(&chain, 5, 10).unwrap(), Reconciled::default());
+    let a = alice.balance(&chain).unwrap();
+    assert_eq!((a.confirmed, a.locked, a.pending, a.lost), (0, 100 * COIN as u128, 0, kept.confirmed));
+    assert_eq!(bob.balance(&chain).unwrap(), Balance { lost: 30 * COIN as u128, ..Default::default() });
+    // What is lost is not spent from, and not pruned away.
+    assert!(matches!(bob.send(COIN, None, &chain, NOW), Err(WalletError::Insufficient { .. })));
+    assert_eq!((alice.prune_pending(&chain, &[]).unwrap(), bob.prune_pending(&chain, &[]).unwrap()), (0, 0));
+    // The payment is there to be sent again, as it was signed.
+    let again = alice.unconfirmed(&chain).unwrap();
+    assert_eq!((again.len(), alice.resend(&again[0].txid).unwrap()), (1, signed.tx.clone()));
+
+    // Mined again: everything is as it was.
+    chain.0 = after;
+    assert_eq!(alice.reconcile(&chain, 6, 10).unwrap(), Reconciled { returned: 1, ..Default::default() });
+    assert_eq!(bob.reconcile(&chain, 6, 10).unwrap(), Reconciled { returned: 1, ..Default::default() });
+    assert_eq!((bob.balance(&chain).unwrap(), alice.balance(&chain).unwrap()), (paid, kept));
+    assert_eq!(alice.reconcile(&chain, 16, 10).unwrap(), Reconciled { settled: 1, ..Default::default() });
+
+    // Undone and never mined again: forgotten, when it has been gone
+    // long enough; and it is all there when the file is opened again.
+    chain.0.truncate(1);
+    chain.0[0].3 = false;
+    assert_eq!(bob.reconcile(&chain, 20, 10).unwrap().lost, 1);
+    assert!(bob.is_lost(&slate.outputs[1].commitment) && reopened(&bob, "").unwrap().balance(&chain).unwrap().lost > 0);
+    assert_eq!(bob.reconcile(&chain, 29, 10).unwrap(), Reconciled::default());
+    assert_eq!(bob.reconcile(&chain, 30, 10).unwrap(), Reconciled { forgotten: 1, ..Default::default() });
+    assert!(bob.outputs().is_empty() && bob.balance(&chain).unwrap() == Balance::default());
 }
 
 /// A leaf seen signed from elsewhere (a copy of the wallet, or its file
