@@ -422,21 +422,18 @@ begun again whenever that changes, and not while the node is catching
 up with a chain ahead of its own. A block made is given to the node,
 which applies it and tells its peers.
 
-A block carries its reward and nothing else, so far: there is no pool
-of transactions yet.
+A block's reward is paid to the node's wallet (section 5), to an
+output made for that block: so a node that makes blocks has a wallet,
+and `--no-wallet` goes with `--no-mine`.
 
-- **Mainnet** (`tabminer --reward-key HEX`): a block's proof builds on
-  the proof of the block before, which is taken from the chain (the
-  proof from that block's body, and what it speaks to made again from
-  the body and the header before it). `--reward-key` is the hash of the
-  key the rewards are paid to, as 64 hex digits; it must be given,
-  since there is no wallet yet to make one.
+- **Mainnet**: a block's proof builds on the proof of the block
+  before, which is taken from the chain (the proof from that block's
+  body, and what it speaks to made again from the body and the header
+  before it).
 - `--network dev-recursive` (a build with `--features dev`): the same,
   at the smallest parameters; a block about every ten seconds.
 - `--network dev` (the same build): a block about every second, its
   proof checked directly.
-- On the dev networks, without `--reward-key`, rewards are paid to a
-  key nobody has.
 
 **What a block carries.** A block made here carries transactions of
 the node's pool: the longest waiting first, a tenth of it, and then
@@ -540,10 +537,77 @@ chain, and those it made (`Mined`).
 
 ---
 
-## 5. Still to do
+## 5. The wallet and the prompt
 
-1. **A wallet**, so that rewards need no key given by hand; and
-   **transactions in blocks**.
+A node has a wallet unless it is given `--no-wallet`: the file
+`wallet.tab` in its data directory, made the first time the node
+starts.
+
+**Its twelve words.** A wallet is made of a phrase of twelve words
+(BIP39). When a wallet is made the node says them on the terminal,
+once, and nowhere else: not in any log. They are all of the wallet:
+whoever has them has what it holds, and a wallet lost is made again
+from them.
+
+**Its password.** A new wallet asks for one (none, for no password),
+and a wallet that has one asks for it each time the node starts. What
+is typed is shown as it is typed. `--password-file FILE` gives it as
+the first line of a file and nothing is asked. With `--no-prompt`
+nothing can be asked: a new wallet has no password, and one that has
+a password needs `--password-file`.
+
+**The prompt.** Once the node is ready it takes commands on the
+terminal, at `> `, and answers each there; nothing else is said on the
+terminal (the logs are where the node says what happens). `quit`, or
+the end of what it reads, stops the node. `--no-prompt` is for a node
+run by another program, or in the background: it reads nothing.
+
+```
+commands:
+  status                    the chain's last block, peers, the pool, the wallet's total
+  peers                     how many peers are known, and how many are live
+  mempool                   the transactions waiting to be mined
+  balance                   confirmed, pending, unverified, reserved and locked funds
+  outputs                   the wallet's outputs
+  send-file AMOUNT [FEE] FILE
+  receive FILE [OUT]
+  finalize FILE
+  slates                    the payments begun and not yet finalized
+  cancel ID
+  scan                      find this wallet's outputs on the chain (after a restore)
+  help
+  quit
+```
+
+**A payment** is agreed between the two wallets in a slate, which is
+text in a file, passed between them however files are:
+
+1. The sender: `send-file 12.5 payment.slate`. What it is to spend is
+   reserved (`cancel` frees it).
+2. The recipient: `receive payment.slate`, which writes
+   `payment.slate.received` with its output added.
+3. The sender: `finalize payment.slate.received`. The transaction is
+   signed, pooled and told to the node's peers; a block carries it.
+
+Amounts are in coins, with up to ten decimals. A fee is coins in all,
+or `N/byte`; not given, it is the least the pool takes.
+
+**What a balance says.** Confirmed: unspent, and in the chain.
+Pending: the wallet's own, not yet in the chain (change, the reward of
+a block being made). Unverified: an output added to another's slate,
+which is nothing until its sender finalizes and a block carries it.
+Reserved: picked for a payment begun. Locked: signed away by a payment
+not yet in a block.
+
+Not yet: paying an address or a name with no file passed (that needs
+the message layer), names, restoring a wallet from its words by a
+command of the program (the library can), replacing a payment sent.
+
+---
+
+## 6. Still to do
+
+1. **The rest of the wallet** (above).
 2. **What is left of `THREADS.md`** (its 8.3).
 3. **The peers file and the built-in seeds.** `--peer` and `--seed` are
    what a node begins from today.

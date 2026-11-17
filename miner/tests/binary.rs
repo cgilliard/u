@@ -48,15 +48,13 @@ fn help_is_no_failure_and_an_unknown_option_is() {
     assert!(unknown.stdout.is_empty());
     assert!(!dir.exists());
 
-    // On mainnet, making blocks needs a key for their rewards: without
-    // one a node says so in a line, and does not start.
-    let keyless = Command::new(TABMINER).args(["--data-dir", &data]).output().unwrap();
-    assert!(matches!(keyless.status.code(), Some(-1 | 255)));
-    let said = String::from_utf8(keyless.stderr).unwrap();
-    assert_eq!(
-        said,
-        "Error: making blocks on mainnet needs --reward-key (the key their rewards are paid to), or --no-mine\n"
-    );
+    // Making blocks needs a wallet for their rewards: a node told to
+    // have none and to make blocks says so, and does not start.
+    let purseless = Command::new(TABMINER).args(["--data-dir", &data, "--no-wallet"]).output().unwrap();
+    assert!(matches!(purseless.status.code(), Some(-1 | 255)));
+    let said = String::from_utf8(purseless.stderr).unwrap();
+    let why = "--no-wallet needs --no-mine: the rewards of blocks made here are paid to the wallet";
+    assert_eq!(said, format!("Error: {why}\n\n{text}"));
     assert!(!dir.exists());
 }
 
@@ -74,7 +72,8 @@ fn a_node_starts_says_it_is_ready_and_ends_when_told() {
     let port = 20_000 + std::process::id() % 20_000;
     let listen = format!("127.0.0.1:{port}");
     let node = Command::new(TABMINER)
-        .args(["--no-mine", "--data-dir", &data, "--listen", &listen, "--max-peers", "2000"])
+        .args(["--no-mine", "--no-wallet", "--no-prompt"])
+        .args(["--data-dir", &data, "--listen", &listen, "--max-peers", "2000"])
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
@@ -131,7 +130,7 @@ fn a_node_starts_says_it_is_ready_and_ends_when_told() {
     // A second node on the same port cannot start: it says why, and
     // never that it is ready.
     let first = Command::new(TABMINER)
-        .args(["--no-mine", "--data-dir", &data, "--listen", &listen])
+        .args(["--no-mine", "--no-prompt", "--data-dir", &data, "--listen", &listen])
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
@@ -140,7 +139,7 @@ fn a_node_starts_says_it_is_ready_and_ends_when_told() {
     let mut lines = BufReader::new(first.0.stderr.take().unwrap()).lines();
     assert!(lines.by_ref().any(|l| l.unwrap().ends_with("Server is ready!")));
     let second = Command::new(TABMINER)
-        .args(["--no-mine", "--data-dir", &other.display().to_string(), "--listen", &listen])
+        .args(["--no-mine", "--no-prompt", "--data-dir", &other.display().to_string(), "--listen", &listen])
         .output()
         .unwrap();
     let said = String::from_utf8(second.stderr).unwrap();
@@ -171,7 +170,7 @@ fn two_nodes_make_blocks_and_take_each_others() {
         let node = Command::new(TABMINER)
             .args(["--network", "dev", "--threads", "2", "--stat-interval-seconds", "1", "--stat-summary-seconds", "2"])
             .args(["--data-dir", &dirs[i].display().to_string(), "--listen", &at(i as u32)])
-            .args(["--peer", &at(1 - i as u32)])
+            .args(["--peer", &at(1 - i as u32), "--no-prompt"])
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
@@ -219,4 +218,103 @@ fn two_nodes_make_blocks_and_take_each_others() {
         }
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+/// Two nodes of the dev network, each with a wallet and a prompt: one
+/// makes blocks, whose rewards are its wallet's, and pays the other by
+/// a slate passed between them as a file. The payment is mined, and the
+/// other's wallet has it.
+#[cfg(all(unix, feature = "dev"))]
+#[cfg_attr(debug_assertions, ignore = "proves blocks; run with --release")]
+#[test]
+fn a_payment_is_made_at_the_prompt_and_mined() {
+    use std::io::{Read, Write};
+    use std::process::{ChildStdin, ChildStdout};
+    use std::time::{Duration, Instant};
+    let dirs = [scratch("pay-a"), scratch("pay-b")];
+    let port = 43_000 + std::process::id() % 20_000;
+    let at = |i: u32| format!("127.0.0.1:{}", port + i);
+    // What a node says up to its next prompt.
+    fn until_prompt(out: &mut ChildStdout) -> String {
+        let (mut said, mut byte) = (Vec::new(), [0u8; 1]);
+        while !(said.ends_with(b"> ") && (said.len() == 2 || said[said.len() - 3] == b'\n')) {
+            assert_eq!(out.read(&mut byte).unwrap(), 1, "the node stopped: {}", String::from_utf8_lossy(&said));
+            said.push(byte[0]);
+        }
+        String::from_utf8(said[..said.len() - 2].to_vec()).unwrap()
+    }
+    fn ask(node: &mut (Running, ChildStdin, ChildStdout), command: &str) -> String {
+        writeln!(node.1, "{command}").unwrap();
+        until_prompt(&mut node.2)
+    }
+    let start = |i: usize, mines: bool| {
+        let mut command = Command::new(TABMINER);
+        command
+            .args(["--network", "dev", "--threads", "2"])
+            .args(["--data-dir", &dirs[i].display().to_string(), "--listen", &at(i as u32)])
+            .args(["--peer", &at(1 - i as u32)]);
+        if !mines {
+            command.arg("--no-mine");
+        }
+        let node = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let mut node = Running(node);
+        let (mut stdin, mut stdout) = (node.0.stdin.take().unwrap(), node.0.stdout.take().unwrap());
+        // A new wallet: no password. Its words are said, once, and then
+        // the node is ready.
+        writeln!(stdin).unwrap();
+        let mut lines = BufReader::new(node.0.stderr.take().unwrap()).lines();
+        let said: Vec<String> =
+            lines.by_ref().map(|l| l.unwrap()).take_while(|l| !l.ends_with("Server is ready!")).collect();
+        let words = said.iter().find(|l| l.starts_with("    ")).expect("the wallet's words");
+        assert_eq!(words.split_whitespace().count(), 12, "{said:#?}");
+        assert!(dirs[i].join("wallet.tab").exists());
+        // (What it says on that side from here on is not waited for.)
+        std::thread::spawn(move || lines.for_each(drop));
+        assert_eq!(until_prompt(&mut stdout), "");
+        (node, stdin, stdout)
+    };
+    let mut maker = start(0, true);
+    let mut other = start(1, false);
+    let confirmed = |node: &mut (Running, ChildStdin, ChildStdout)| {
+        let said = ask(node, "balance");
+        said.lines().next().unwrap().trim_start_matches("confirmed").trim().to_string()
+    };
+    let wait = |what: &str, done: &mut dyn FnMut() -> bool| {
+        let began = Instant::now();
+        while !done() {
+            assert!(began.elapsed() < Duration::from_secs(240), "{what}");
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    };
+    assert!(ask(&mut maker, "help").starts_with("commands:"));
+    assert_eq!(ask(&mut maker, "nonsense"), "error: nonsense: no such command (see help)\n");
+    assert_eq!(confirmed(&mut other), "0");
+    // Rewards come to the maker's wallet as its blocks join the chain.
+    wait("the maker has no rewards", &mut || confirmed(&mut maker) != "0");
+    assert!(ask(&mut maker, "outputs").contains("confirmed"));
+    // The payment: begun by the maker, answered by the other, signed by
+    // the maker.
+    let slate = dirs[0].join("payment.slate").display().to_string();
+    let begun = ask(&mut maker, &format!("send-file 12.5 {slate}"));
+    assert!(begun.contains("begun: 12.5 and a fee of"), "{begun}");
+    assert!(ask(&mut maker, "slates").contains("12.5"));
+    let answered = ask(&mut other, &format!("receive {slate}"));
+    assert!(answered.contains("answered: 12.5 to this wallet"), "{answered}");
+    assert!(ask(&mut other, "balance").contains("unverified  12.5"));
+    let signed = ask(&mut maker, &format!("finalize {slate}.received"));
+    assert!(signed.contains("signed and pooled"), "{signed}");
+    assert_eq!(ask(&mut maker, "slates"), "no payments begun\n");
+    // Mined: the other has it, confirmed, and the maker's log says a
+    // block carried it.
+    wait("the payment is not confirmed", &mut || confirmed(&mut other) == "12.5");
+    let log = std::fs::read_to_string(dirs[0].join("tabernacle.log")).unwrap();
+    assert!(log.contains("carries 1 transactions of the pool (1 signatures)"), "{log}");
+    let status = ask(&mut other, "status");
+    assert!(status.contains("wallet: 12.5 confirmed") && status.contains("pool: 0 transactions"), "{status}");
+    // Told to stop, each does, without failure.
+    for mut node in [maker, other] {
+        writeln!(node.1, "quit").unwrap();
+        assert_eq!(node.0.0.wait().unwrap().code(), Some(0));
+    }
+    dirs.iter().for_each(|d| drop(std::fs::remove_dir_all(d)));
 }

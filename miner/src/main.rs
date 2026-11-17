@@ -7,15 +7,17 @@
 //! until it is ended: nothing is done about being told to stop, since
 //! nothing has to be put in order first (`docs/RUNNING.md`).
 
+use std::io::{BufRead, Write};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use tabminer::aggregate::{AggregateVerifier, AggregatorParams, Genesis};
 use tabminer::chain::Chain;
 use tabminer::chain::params::ChainParams;
 use tabminer::configuration::{Configuration, Network, hex};
+use tabminer::console::{Console, Reply};
 use tabminer::logger::Logger;
 use tabminer::logger::fmt::{bytes, commas, seconds, short_seconds};
 use tabminer::logger::queued::Queued;
@@ -25,6 +27,11 @@ use tabminer::net::node::{Behind, Event, Handle, Node};
 use tabminer::net::socket::{self, Watch};
 use tabminer::pow::{Dataset, ItemSource, LazyDataset, SeedText};
 use tabminer::store::backend::FileBackend;
+use tabminer::wallet::follow::follow;
+use tabminer::wallet::{Ask, Wallet, WalletError};
+
+/// The node's wallet, as its threads share it.
+type Purse = Arc<Mutex<Wallet<FileBackend>>>;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -61,10 +68,6 @@ fn main() {
     }
     std::process::exit(-1);
 }
-
-/// Where the dev network's rewards go when no key is given: to a key
-/// nobody has. They are for trying the network, not for keeping.
-const DEV_REWARD: tabminer::hash::Digest = [tabminer::poseidon2::Fp::ZERO; 8];
 
 /// What the main log says of something that happened to the node, if
 /// anything.
@@ -134,7 +137,7 @@ fn make_blocks(
     kept: &Path,
     prebuild: bool,
     max_signatures: usize,
-    reward: &tabminer::hash::Digest,
+    wallet: &Purse,
     main: &Arc<Logger>,
     stats: &Arc<Stats>,
 ) {
@@ -229,10 +232,10 @@ fn make_blocks(
         let (done, ended) = std::sync::mpsc::channel::<bool>();
         let attempt = {
             let (hold, table, main, stats) = (hold.clone(), Arc::clone(&table), Arc::clone(main), Arc::clone(stats));
-            let (reward, watch) = (*reward, ahead.is_none());
+            let (wallet, watch) = (Arc::clone(wallet), ahead.is_none());
             std::thread::Builder::new().name("block".into()).spawn(move || {
                 let finished =
-                    make_block(&hold, &table, &reward, &main, &stats, max_signatures, seen, watch, start, on);
+                    make_block(&hold, &table, &wallet, &main, &stats, max_signatures, seen, watch, start, on);
                 let _ = done.send(finished);
             })
         };
@@ -273,7 +276,7 @@ fn make_blocks(
 fn make_block(
     hold: &Handle<FileBackend, AggregateVerifier>,
     table: &RwLock<LazyDataset<'static>>,
-    reward: &tabminer::hash::Digest,
+    wallet: &Purse,
     main: &Logger,
     stats: &Stats,
     max_signatures: usize,
@@ -326,9 +329,37 @@ fn make_block(
             commas(signatures as u64)
         ));
     }
-    let dataset = table.read().unwrap_or_else(|e| e.into_inner());
+    // What it pays is paid to the wallet: an output made for this
+    // block, and forgotten if the block comes to nothing.
     let unix = socket::unix();
-    match miner::mine_with(hold.chain(), &*dataset, reward, unix, start, &pooled, &sweeps, &proved, &cancel) {
+    let purse = || wallet.lock().unwrap_or_else(|e| e.into_inner());
+    let paid = match miner::reward_due(hold.chain(), &pooled) {
+        Ok(Some((height, due))) => purse().reward(due, height, unix).map_err(|e| e.to_string()),
+        Ok(None) => return true,
+        Err(e) => Err(e.to_string()),
+    };
+    let paid = match paid {
+        Ok(paid) => paid,
+        Err(e) => {
+            main.log(&format!("Error: making a block: its reward: {e}"));
+            hold.wait_moved(seen, Duration::from_secs(1));
+            return false;
+        }
+    };
+    let dataset = table.read().unwrap_or_else(|e| e.into_inner());
+    let made = miner::mine_with(hold.chain(), &*dataset, &paid, unix, start, &pooled, &sweeps, &proved, &cancel);
+    // Kept, with its block's id, before the block is handed over; and
+    // forgotten at once if there is no block.
+    let kept = match &made {
+        Ok(Mined::Block { header, .. }) => {
+            purse().reward_found(&paid.commitment, &tabminer::poseidon2::digest_to_bytes(&header.hash()))
+        }
+        _ => purse().forget(&paid.commitment).map(|_| ()),
+    };
+    if let Err(e) = kept {
+        main.log(&format!("Error: the wallet's record of a block's reward: {e}"));
+    }
+    match made {
         Ok(Mined::Block { block, header, hashes, solved, .. }) => {
             main.log(&format!(
                 "Won block {} ({}): {} hashes in {}",
@@ -421,13 +452,6 @@ fn fill_table(table: &Arc<RwLock<LazyDataset<'static>>>, kept: &Path, main: &Arc
 /// could not go on. Told to stop, the program is ended by the
 /// operating system, where it stands.
 fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::convert::Infallible, String> {
-    // On mainnet the rewards of blocks made here need somewhere to go:
-    // there is no wallet yet to make a key for them.
-    if c.mine && c.network == Network::Mainnet && c.reward.is_none() {
-        return Err(
-            "making blocks on mainnet needs --reward-key (the key their rewards are paid to), or --no-mine".into()
-        );
-    }
     if c.network != Network::Mainnet && !cfg!(feature = "dev") {
         return Err(format!("this build has no {} network: it is built with --features dev", c.network.name()));
     }
@@ -473,7 +497,7 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     }
     // Blocks are made with a table of their own, which fills as it is
     // read and is kept in the data directory from one run to the next.
-    let mining = c.mine.then(|| (seed, c.data_dir.join("pow.table"), c.reward.unwrap_or(DEV_REWARD)));
+    let mining = c.mine.then(|| (seed, c.data_dir.join("pow.table")));
 
     // The port.
     let socket = UdpSocket::bind(c.listen).map_err(|e| format!("cannot listen on {}: {e}", c.listen))?;
@@ -501,6 +525,12 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
         Arc::new(socket::stats().refreshed_by(Box::new(move |stats| socket::set_levels(stats, &hold))))
     };
 
+    // The wallet: opened, or made, before the node says it is ready.
+    let wallet = match c.wallet {
+        true => Some(open_wallet(c, &hold, &main)?),
+        false => None,
+    };
+
     // Everything is open: from here the node can do what it is for.
     let _stats_log = StatsLog::start(stat_log, Arc::clone(&stats), c.stats).map_err(threads)?;
     c.announce(&main);
@@ -516,13 +546,40 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
             }
         }));
     }
-    if let Some((seed, table, reward)) = mining {
-        let (main, stats, prebuild) = (Arc::clone(&main), Arc::clone(&stats), c.prebuild_table);
-        let most = c.max_block_signatures;
+    // The wallet follows the chain on a thread of its own: woken when
+    // the chain has another last block, and once in a while besides.
+    if let Some(wallet) = &wallet {
+        let (hold, wallet, main) = (hold.clone(), Arc::clone(wallet), Arc::clone(&main));
+        let following = move || {
+            let mut failed = false;
+            loop {
+                let seen = hold.moves();
+                let followed =
+                    follow(hold.chain(), &mut wallet.lock().unwrap_or_else(|e| e.into_inner()), socket::unix());
+                // (Said once, not at every block, while it goes on.)
+                match &followed {
+                    Err(e) if !failed => main.log(&format!("Error: the wallet cannot follow the chain: {e}")),
+                    _ => {}
+                }
+                failed = followed.is_err();
+                hold.wait_moved(seen, Duration::from_secs(60));
+            }
+        };
+        std::thread::Builder::new().name("wallet".into()).spawn(following).map_err(threads)?;
+    }
+    if let (Some((seed, table)), Some(wallet)) = (mining, &wallet) {
+        let (hold, main, stats, prebuild) = (hold.clone(), Arc::clone(&main), Arc::clone(&stats), c.prebuild_table);
+        let (most, wallet) = (c.max_block_signatures, Arc::clone(wallet));
         std::thread::Builder::new()
             .name("miner".into())
-            .spawn(move || make_blocks(&hold, seed, &table, prebuild, most, &reward, &main, &stats))
+            .spawn(move || make_blocks(&hold, seed, &table, prebuild, most, &wallet, &main, &stats))
             .map_err(threads)?;
+    }
+    // Commands are taken from the terminal on a thread of their own.
+    if c.prompt {
+        let console = Console { hold: hold.clone(), wallet: wallet.clone(), unix: socket::unix };
+        let main = Arc::clone(&main);
+        std::thread::Builder::new().name("prompt".into()).spawn(move || prompt(&console, &main)).map_err(threads)?;
     }
 
     let watch = Watch { requests: Some(&requests), stats: Some(&stats), main: Some(&main) };
@@ -530,4 +587,96 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
         Ok(()) => Err("the node stopped of itself".into()),
         Err(e) => Err(format!("the port can no longer be listened on: {e}")),
     }
+}
+
+/// Opens the wallet in the data directory, or makes one if there is
+/// none: its password asked for at the terminal, or read from the file
+/// given for it; a new wallet's phrase said on the terminal, once, and
+/// nowhere else. Then it is brought up to the chain.
+fn open_wallet(
+    c: &Configuration,
+    hold: &Handle<FileBackend, AggregateVerifier>,
+    main: &Logger,
+) -> Result<Purse, String> {
+    let path = c.data_dir.join("wallet.tab");
+    let is_new = !path.exists();
+    let whose = |e: WalletError| format!("the wallet {}: {e}", path.display());
+    let backend = FileBackend::open(&path).map_err(|e| format!("cannot open the wallet {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    let typed = |asking: &str| -> Result<String, WalletError> {
+        eprint!("{asking}");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line)?;
+        Ok(line.trim_end_matches(['\n', '\r']).to_string())
+    };
+    let mut ask = |ask: Ask| -> Result<String, WalletError> {
+        // From the file, if one is given: its first line.
+        if let Some(file) = &c.password_file {
+            let text = std::fs::read_to_string(file)?;
+            return Ok(text.lines().next().unwrap_or("").to_string());
+        }
+        match (ask, c.prompt) {
+            (Ask::Unlock, true) => typed("Wallet password: "),
+            (Ask::New, true) => loop {
+                let first = typed("A password for the new wallet (none, for no password): ")?;
+                if first.is_empty() || typed("The same again: ")? == first {
+                    break Ok(first);
+                }
+                eprintln!("They are not the same.");
+            },
+            // Nobody to ask: a new wallet has no password, and a locked
+            // one cannot be opened.
+            (Ask::New, false) => Ok(String::new()),
+            (Ask::Unlock, false) => Err(WalletError::WrongPassword),
+        }
+    };
+    let (mut wallet, phrase) = Wallet::open_with(backend, &mut ask).map_err(|e| match e {
+        WalletError::WrongPassword if c.password_file.is_none() && !c.prompt => {
+            format!("the wallet {} has a password: give --password-file", path.display())
+        }
+        e => whose(e),
+    })?;
+    if let Some(phrase) = phrase.filter(|_| is_new) {
+        eprintln!("\nA wallet has been made. Its twelve words, which are all of it: write them down, and keep them");
+        eprintln!("where nobody else can read them. Whoever has them has what the wallet holds.\n\n    {phrase}\n");
+        main.log(&format!("A wallet was made in '{}'", path.display()));
+    }
+    // Rewards of blocks that were being made when the node last stopped
+    // are of no block.
+    for (c, _, block) in wallet.rewards() {
+        if block == [0; 32] {
+            wallet.forget(&c).map_err(whose)?;
+        }
+    }
+    follow(hold.chain(), &mut wallet, socket::unix()).map_err(whose)?;
+    Ok(Arc::new(Mutex::new(wallet)))
+}
+
+/// Takes commands from the terminal, one a line, and says what comes of
+/// each; until told to stop, or there is no more to read, when the node
+/// ends.
+fn prompt(console: &Console<FileBackend, FileBackend>, main: &Logger) {
+    let mut line = String::new();
+    loop {
+        print!("> ");
+        let _ = std::io::stdout().flush();
+        line.clear();
+        match std::io::stdin().lock().read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        match console.run(&line) {
+            Reply::Said(text) => println!("{text}"),
+            Reply::Wrong(text) => println!("error: {text}"),
+            Reply::Nothing => {}
+            Reply::Quit => break,
+        }
+    }
+    main.log("Told to stop at the prompt, halting!");
+    std::process::exit(0);
 }

@@ -83,10 +83,25 @@ const OPTIONS: &[(&str, &[Opt])] = &[
                 takes: Takes::Value("N"),
                 help: "signatures a block made here checks at the most: one for\neach input of the transactions it carries (default 256)",
             },
+        ],
+    ),
+    (
+        "Wallet",
+        &[
             Opt {
-                name: "reward-key",
-                takes: Takes::Value("HEX"),
-                help: "the key the rewards of blocks made here are paid to:\nits hash, as 64 hex digits",
+                name: "no-wallet",
+                takes: Takes::Nothing,
+                help: "run without a wallet: with --no-mine, a block's reward\nbeing paid to the wallet",
+            },
+            Opt {
+                name: "password-file",
+                takes: Takes::Value("FILE"),
+                help: "the wallet's password is the first line of FILE, and is not\nasked for",
+            },
+            Opt {
+                name: "no-prompt",
+                takes: Takes::Nothing,
+                help: "take no commands from the terminal, and ask it nothing:\nfor a node run by another program",
             },
         ],
     ),
@@ -378,8 +393,13 @@ pub struct Configuration {
     /// Signatures a block made here checks at the most: what bounds the
     /// transactions it carries.
     pub max_block_signatures: usize,
-    /// The hash of the key rewards are paid to, if one was given.
-    pub reward: Option<crate::hash::Digest>,
+    /// Whether the node has a wallet: where the rewards of the blocks
+    /// it makes are paid.
+    pub wallet: bool,
+    /// Where the wallet's password is read from, if not asked for.
+    pub password_file: Option<PathBuf>,
+    /// Whether commands are taken from the terminal.
+    pub prompt: bool,
     pub listen: SocketAddrV4,
     /// Peers given by hand.
     pub peers: Vec<SocketAddrV4>,
@@ -691,17 +711,11 @@ impl Configuration {
             return Err(wrong(e.to_string()));
         }
 
-        let reward = match given.one("reward-key") {
-            None => None,
-            Some(hex) => {
-                let not = || wrong(format!("--reward-key: '{hex}' is not the hash of a key (64 hex digits)"));
-                let bytes: Vec<u8> = match hex.len() == 64 && hex.is_ascii() {
-                    true => (0..32).filter_map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()).collect(),
-                    false => Vec::new(),
-                };
-                Some(crate::poseidon2::digest_from_bytes(&bytes).filter(|_| bytes.len() == 32).ok_or_else(not)?)
-            }
-        };
+        let (mine, wallet) = (!given.flag("no-mine"), !given.flag("no-wallet"));
+        if mine && !wallet {
+            return clash("--no-wallet needs --no-mine: the rewards of blocks made here are paid to the wallet".into());
+        }
+        let password_file = path("password-file")?;
         let keep = count("max-undo-blocks", 1)?.unwrap_or(1008);
         if s.sync_point as usize >= keep {
             return clash(format!("--sync-point ({}) is not under --max-undo-blocks ({keep})", s.sync_point));
@@ -729,10 +743,12 @@ impl Configuration {
             network,
             data_dir,
             threads: count("threads", 0)?.unwrap_or(0),
-            mine: !given.flag("no-mine"),
+            mine,
             prebuild_table: given.flag("prebuild-table"),
             max_block_signatures: count("max-block-signatures", 0)?.unwrap_or(crate::miner::MAX_SIGNATURES),
-            reward,
+            wallet,
+            password_file,
+            prompt: !given.flag("no-prompt"),
             listen,
             peers,
             seeds,
@@ -765,7 +781,7 @@ impl Configuration {
             ("Prebuild Table", yes(self.prebuild_table)),
             ("Max Block Signatures", commas(self.max_block_signatures as u64)),
         ]);
-        lines.extend(self.reward.iter().map(|key| ("Reward Key", hex(&crate::poseidon2::digest_to_bytes(key)))));
+        lines.push(("Wallet", yes(self.wallet)));
         lines.extend([
             ("Threads", if self.threads == 0 { "one a core".to_string() } else { commas(self.threads as u64) }),
             ("Request Queue Size", commas(self.net.request_queue as u64)),
@@ -1107,21 +1123,19 @@ mod tests {
         );
     }
 
-    /// The key rewards are paid to is given by its hash, in hex.
+    /// A node has a wallet unless told not to, and one that makes
+    /// blocks must: their rewards are paid to it.
     #[test]
-    fn the_reward_key_is_a_hash_in_hex() {
-        assert_eq!(read(&[]).unwrap().reward, None);
-        let key: crate::hash::Digest = core::array::from_fn(|i| crate::poseidon2::Fp::new(1000 + i as u32));
-        let text = hex(&crate::poseidon2::digest_to_bytes(&key));
-        let c = read(&["--reward-key", &text]).unwrap();
-        assert_eq!(c.reward, Some(key));
-        assert!(c.lines().contains(&("Reward Key".to_string(), text.clone())));
-        for bad in ["abc", &text[1..], &format!("{}zz", &text[2..]), &"ff".repeat(32), &format!("{text}00")] {
-            assert_eq!(
-                wrong(&["--reward-key", bad]),
-                format!("--reward-key: '{bad}' is not the hash of a key (64 hex digits)")
-            );
-        }
+    fn a_node_that_makes_blocks_has_a_wallet() {
+        let c = read(&[]).unwrap();
+        assert!(c.wallet && c.prompt && c.password_file.is_none());
+        assert!(c.lines().contains(&("Wallet".to_string(), "yes".to_string())));
+        let c = read(&["--no-mine", "--no-wallet", "--no-prompt", "--password-file", "secret"]).unwrap();
+        assert!(!c.wallet && !c.prompt && c.password_file.as_deref() == Some(Path::new("/work/here/secret")));
+        assert_eq!(
+            wrong(&["--no-wallet"]),
+            "--no-wallet needs --no-mine: the rewards of blocks made here are paid to the wallet"
+        );
     }
 
     /// A time may be said in minutes, hours or days, and a size in
@@ -1228,7 +1242,7 @@ mod tests {
     fn the_help_and_the_options_are_one_list() {
         let help = help();
         assert!(help.starts_with("tabminer: a node of the Tabernacle network."));
-        for section in ["General", "Mining", "Network", "Peers", "Sync", "Serving", "Logging"] {
+        for section in ["General", "Mining", "Wallet", "Network", "Peers", "Sync", "Serving", "Logging"] {
             assert!(help.contains(&format!("\n{section}\n")), "{section}");
         }
         let mut named = 0;
@@ -1255,7 +1269,8 @@ mod tests {
             match read(&args) {
                 Ok(_) => {}
                 Err(Refused::Wrong(what)) => {
-                    assert!(what.contains(" is over ") || what.contains(" under "), "{option}: {what}")
+                    let clash = what.contains(" is over ") || what.contains(" under ") || what.contains(" needs --");
+                    assert!(clash, "{option}: {what}")
                 }
                 Err(Refused::Help) => panic!("{option}"),
             }

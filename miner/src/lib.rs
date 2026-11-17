@@ -11,6 +11,7 @@ pub mod challenger;
 pub mod codec;
 pub mod configuration;
 pub mod consensus;
+pub mod console;
 pub mod difficulty;
 pub mod error;
 pub mod expr;
