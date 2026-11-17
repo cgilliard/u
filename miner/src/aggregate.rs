@@ -1626,8 +1626,16 @@ fn prove_node(
         Output::Record => node_output(&record, &shape.tree),
         Output::Statement(s, _, _, _) => s.output(&params.work_shape(), &shape.tree),
     };
+    // (Asked between the steps before the proof as well: each is a
+    // second or more of a large node's, and none asks of itself.)
     let c = compile_node(params, &children, output);
+    if cancel() {
+        return None;
+    }
     let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).expect("node program rejects its own witness");
+    if cancel() {
+        return None;
+    }
     let pre = committed_program(&c.prog, &params.outer, &shape.digest);
     let public = VmAir::public_values(&pre.root(), &out_digest);
     let tables = VmAir::tables(&trace, &hashes, &pre);
@@ -1791,7 +1799,13 @@ pub fn prove_wrap(
     let wrap = shape.wrap.expect("shape is a planned root");
     let t = std::time::Instant::now();
     let c = compile_wrap(params, &root, statement, Some((wrap.log_n, wrap.hash_log_n)));
+    if cancel() {
+        return None;
+    }
     let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).expect("wrap program rejects its own witness");
+    if cancel() {
+        return None;
+    }
     let pre = committed_program(&c.prog, &params.wrap, &wrap.digest);
     let public = VmAir::public_values(&pre.root(), &statement.output(&params.work_shape(), &wrap.tree));
     let tables = VmAir::tables(&trace, &hashes, &pre);
@@ -2312,7 +2326,13 @@ pub fn prove_chain(
 ) -> Option<stark::Proof> {
     let pad = Some((setup.log_n, setup.hash_log_n));
     let c = compile_chain(params, emission, &setup.genesis, &setup.plan_root, &setup.base, &setup.step, w, pad);
+    if cancel() {
+        return None;
+    }
     let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).expect("chain program rejects its own witness");
+    if cancel() {
+        return None;
+    }
     let digest = if w.prev.is_none() { setup.base } else { setup.step };
     let pre = committed_program(&c.prog, &params.wrap, &digest);
     let public = VmAir::public_values(
