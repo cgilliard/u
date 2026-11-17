@@ -200,8 +200,12 @@ fn make_blocks(
         // few times a second, not at every hash).
         let watch = ahead.is_none();
         let looked = std::sync::Mutex::new(Instant::now());
+        // (When it was first seen to have another: for how long the
+        // giving up then took, which `TABMINER_TIMING` has said.)
+        let noticed = std::sync::Mutex::new(None::<Instant>);
         let cancel = || {
             if hold.moves() != seen {
+                noticed.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Instant::now);
                 return true;
             }
             let mut looked = looked.lock().unwrap_or_else(|e| e.into_inner());
@@ -252,7 +256,14 @@ fn make_blocks(
                 hold.mined(block, socket::unix());
                 hold.wait_settled(settled, Duration::from_secs(10));
             }
-            Ok(Mined::Cancelled) => {}
+            Ok(Mined::Cancelled) => {
+                let noticed = *noticed.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(at) = noticed
+                    && std::env::var_os("TABMINER_TIMING").is_some()
+                {
+                    main.log(&format!("Gave up {} ms after the chain was seen to move", at.elapsed().as_millis()));
+                }
+            }
             Ok(Mined::Finished) => return,
             Err(e) => {
                 main.log(&format!("Error: making a block: {e}"));
