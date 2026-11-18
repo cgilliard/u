@@ -34,6 +34,7 @@ pub mod merkle;
 pub mod miner;
 pub mod mldsa;
 pub mod mlkem;
+pub mod msg;
 pub mod name;
 pub mod name_air;
 pub mod net;
