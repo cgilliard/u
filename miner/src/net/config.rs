@@ -39,6 +39,8 @@ pub struct Config {
     pub relay: bool,
     /// How the sessions it holds are bounded.
     pub sessions: super::sessions::Limits,
+    /// And how the ways through it are ([`super::circuits`]).
+    pub circuits: super::circuits::Limits,
     /// How often a wallet says, to a node it is reached at, that it is
     /// there.
     pub keepalive: Micros,
@@ -218,6 +220,7 @@ impl Default for Config {
             pool: crate::mempool::DEFAULT_CAPACITY,
             relay: false,
             sessions: super::sessions::Limits::default(),
+            circuits: super::circuits::Limits::default(),
             keepalive: 30 * SECOND,
             peers: Peers::default(),
             sync: Sync::default(),

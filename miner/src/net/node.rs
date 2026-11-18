@@ -312,6 +312,12 @@ fn apply<B: Backend + 'static, V: ProofVerifier + Sync>(chain: &Chain<B, V>, job
 /// Tokens of those that are no peers kept at the most
 /// ([`Worker::fetch_granted`]).
 const GRANTS: usize = 256;
+/// The most that is kept on its way to neighbours on ways, that is
+/// being asked of them at once by one worker, and that a worker
+/// remembers having taken.
+const LEAVING: usize = 4096;
+const CARRIED: usize = 1024;
+const TAKEN: usize = 1024;
 
 /// Blocks whose leaves are asked for at one looking.
 const LEAVES_AT_ONCE: usize = 16;
@@ -564,6 +570,13 @@ pub(crate) struct Shared {
     /// said: for whoever keeps them from one run to the next
     /// ([`Handle::answered`]).
     answered: Vec<Mutex<Vec<SocketAddrV4>>>,
+    /// The ways through relays that pass through this node, if it is
+    /// one they do ([`Config::relay`]); those it opened itself; and
+    /// what is on its way to a neighbour on either
+    /// ([`super::circuits`]).
+    relayed: Mutex<super::circuits::Relayed>,
+    ways: Mutex<super::circuits::Ways>,
+    leaving: Mutex<Vec<super::circuits::Leaving>>,
     /// What a host's address is mixed with to find its worker: so that
     /// nobody outside can choose addresses that are all one worker's.
     key: u64,
@@ -898,6 +911,13 @@ pub struct Worker<B: Backend + 'static, V> {
     /// Sealed messages offered to this node to pass on, being asked
     /// for: the message, whom it is for, and who offered it.
     offered: Vec<(Digest, Digest, SocketAddrV4)>,
+    /// What a neighbour on a way said it has for this node, being
+    /// asked for: its name, the neighbour, and the way, kind and count
+    /// it was said to be of.
+    carried: Vec<(u64, SocketAddrV4, u64, u8, u64)>,
+    /// And what has come of those lately: what is said to be there
+    /// again is not asked for again.
+    taken: VecDeque<(SocketAddrV4, u64)>,
     /// The leaves asked for and not yet here: of which block, of whom.
     leaves_asked: Vec<(Digest, SocketAddrV4)>,
     /// When the votes were last looked to ([`Worker::follow_votes`]),
@@ -977,6 +997,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             now,
             to_say: Vec::new(),
             offered: Vec::new(),
+            carried: Vec::new(),
+            taken: VecDeque::new(),
             leaves_asked: Vec::new(),
             votes_looked: 0,
             votes_turn: 0,
@@ -1208,6 +1230,147 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         }
         if self.cfg.relay {
             self.shared.sessions.lock().unwrap_or_else(|e| e.into_inner()).prune(now);
+        }
+    }
+
+    /// Puts `step` on its way to the neighbour it is for: kept until
+    /// that neighbour asks for it, which it is told to.
+    fn carry(&mut self, now: Micros, mut step: super::circuits::Step) {
+        let mut leaving = self.shared.leaving.lock().unwrap_or_else(|e| e.into_inner());
+        if leaving.len() >= LEAVING {
+            return;
+        }
+        let name = Self::number(&self.secret, &mut self.numbers);
+        let bytes = Arc::new(std::mem::take(&mut step.bytes));
+        self.to_say.push((step.to, self.carrying(name, &step, bytes.len())));
+        leaving.push(super::circuits::Leaving { name, step, bytes, told: Some(now), asked: false, since: now });
+    }
+
+    /// What a neighbour is told of something that is there for it.
+    fn carrying(&self, name: u64, step: &super::circuits::Step, len: usize) -> Message<'static> {
+        let grant = self.tokens.issue(&SocketAddr::V4(step.to));
+        Message::Carry { grant, name, circuit: step.circuit, kind: step.kind, count: step.count, len: len as u32 }
+    }
+
+    /// Looks to the ways of this node: begins those asked for, sends
+    /// what is to be said along them, and tells again the neighbours
+    /// that have not asked for what is there for them.
+    fn drive_ways(&mut self, now: Micros) {
+        use super::circuits::{KEPT, TELL_AGAIN, Way};
+        let mut steps = Vec::new();
+        let mut ways = self.shared.ways.lock().unwrap_or_else(|e| e.into_inner());
+        for (circuit, path) in std::mem::take(&mut ways.wanted) {
+            let mut chance = [0u8; 96];
+            if crate::random::fill(&mut chance).is_ok() {
+                let (way, step) = Way::begin(circuit, path, &chance, now);
+                ways.open.push(way);
+                steps.push(step);
+            }
+        }
+        for (circuit, said) in std::mem::take(&mut ways.to_say) {
+            let way = ways.open.iter_mut().find(|w| w.circuit() == circuit);
+            steps.extend(way.and_then(|way| way.say(&said)));
+        }
+        drop(ways);
+        for step in steps {
+            self.carry(now, step);
+        }
+        let mut leaving = self.shared.leaving.lock().unwrap_or_else(|e| e.into_inner());
+        leaving.retain(|l| now.saturating_sub(l.since) < KEPT);
+        let mut again = Vec::new();
+        for l in leaving.iter_mut().filter(|l| !l.asked) {
+            let due = l.told.is_none_or(|told| now.saturating_sub(told) >= TELL_AGAIN);
+            if due && self.shared.owner(&l.step.to) == self.me {
+                l.told = Some(now);
+                again.push((l.step.to, self.carrying(l.name, &l.step, l.bytes.len())));
+            }
+        }
+        drop(leaving);
+        self.to_say.extend(again);
+    }
+
+    /// Something carried along a way has come from the neighbour at
+    /// `from`. Of a way through this node: passed on, as the way has
+    /// it. Of a way this node opened: taken as what came back.
+    fn step_arrived(&mut self, now: Micros, from: SocketAddrV4, name: u64, bytes: &[u8]) {
+        use super::circuits::{BACK, FORWARD, OPEN, OPENED, Out, PING, PONG};
+        let Some(at) = self.carried.iter().position(|c| c.0 == name && c.1 == from) else { return };
+        let (_, _, circuit, kind, count) = self.carried.swap_remove(at);
+        self.taken.push_back((from, name));
+        if self.taken.len() > TAKEN {
+            self.taken.pop_front();
+        }
+        let mut chance = [0u8; 96];
+        if crate::random::fill(&mut chance).is_err() {
+            return;
+        }
+        let fresh = Self::number(&self.secret, &mut self.numbers);
+        let link = (from, circuit);
+        let mut relayed = self.shared.relayed.lock().unwrap_or_else(|e| e.into_inner());
+        let step = match kind {
+            OPEN => {
+                let wallet = self.shared.participant.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(own) = wallet.as_ref() else { return };
+                let chance: &[u8; 32] = chance[..32].try_into().expect("32 bytes");
+                relayed.open(own.identity(), from, circuit, bytes, chance, now)
+            }
+            FORWARD => match relayed.forward(from, circuit, count, bytes.to_vec(), fresh, now) {
+                Out::Step(step) => Some(step),
+                // Said to this node, the last of the way.
+                Out::Said { way, said } => match said.split_first() {
+                    Some((&PING, rest)) => {
+                        let mut pong = Vec::with_capacity(1 + rest.len());
+                        pong.push(PONG);
+                        pong.extend_from_slice(rest);
+                        relayed.say(way, &pong, now)
+                    }
+                    _ => None,
+                },
+                Out::Nothing => None,
+            },
+            OPENED if relayed.goes_on_to(&link) => relayed.opened(from, circuit, bytes, now),
+            BACK if relayed.goes_on_to(&link) => relayed.back(from, circuit, count, bytes.to_vec(), now),
+            _ => {
+                drop(relayed);
+                return self.came_back(now, link, kind, count, bytes, &chance);
+            }
+        };
+        drop(relayed);
+        if let Some(step) = step {
+            self.carry(now, step);
+        }
+    }
+
+    /// Something has come back along a way this node opened, known to
+    /// its first relay as `link`.
+    fn came_back(
+        &mut self,
+        now: Micros,
+        link: (SocketAddrV4, u64),
+        kind: u8,
+        count: u64,
+        bytes: &[u8],
+        chance: &[u8; 96],
+    ) {
+        use super::circuits::{Came, OPENED};
+        let mut ways = self.shared.ways.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(at) = ways.open.iter().position(|w| (w.first(), w.circuit()) == link) else { return };
+        let came = match kind {
+            OPENED => ways.open[at].opened(bytes, chance, now),
+            _ => ways.open[at].back(count, bytes, chance, now),
+        };
+        match came {
+            Came::Step(step) => {
+                drop(ways);
+                self.carry(now, step);
+            }
+            Came::Said(said) => ways.said.push((link.1, said)),
+            Came::Ready => {}
+            // (A way being opened that is answered wrongly is no way.
+            // One that is open stays so: what does not open on it is
+            // nothing.)
+            Came::Bad if !ways.open[at].ready() => drop(ways.open.swap_remove(at)),
+            Came::Bad => {}
         }
     }
 
@@ -1467,6 +1630,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         // woken, not only when time is: a payment does not wait for
         // the second to turn.)
         self.send_posts(now, out);
+        self.drive_ways(now);
         if now >= self.due {
             self.due = now + self.cfg.tick;
             self.periodic(now, out);
@@ -1495,6 +1659,13 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         self.budget = self.cfg.peers.unproven_pings;
         self.follow_votes(now, out);
         self.keep_sessions(now, out);
+        if self.cfg.relay {
+            self.shared.relayed.lock().unwrap_or_else(|e| e.into_inner()).prune(now);
+        }
+        // (A way that does not open is given up.)
+        let mut ways = self.shared.ways.lock().unwrap_or_else(|e| e.into_inner());
+        ways.open.retain(|w| w.ready() || now.saturating_sub(w.began) < super::circuits::OPENING);
+        drop(ways);
         let mut due = Vec::new();
         let (secret, numbers) = (&self.secret, &mut self.numbers);
         self.peers.pings_due(now, || Self::number(secret, numbers), |addr, number| due.push((addr, number)));
@@ -1586,6 +1757,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             Message::Session { .. } => ("session", About::Nothing, "session-state"),
             Message::SessionState { .. } => ("session-state", About::Nothing, "answered"),
             Message::Offer { .. } => ("offer", About::Nothing, "answered"),
+            Message::Carry { .. } => ("carry", About::Nothing, "answered"),
             Message::Notice { .. } => ("notice", About::Nothing, "answered"),
         };
         // What was done is read off what it left behind: what was sent,
@@ -1739,6 +1911,36 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                         }
                     }
                 } else {
+                    self.counts.unheard += 1;
+                }
+            }
+            // A neighbour on a way has something for this node: asked
+            // for, if it is of a way that is here, or opens one through
+            // a node that ways go through.
+            Message::Carry { grant, name, circuit, kind, count, len } => {
+                use super::circuits::{BACK, FORWARD, MAX_STEP, OPEN, OPENED};
+                let link = (from, circuit);
+                let known =
+                    self.taken.contains(&(from, name)) || self.carried.iter().any(|c| (c.0, c.1) == (name, from));
+                let relayed = self.shared.relayed.lock().unwrap_or_else(|e| e.into_inner());
+                let wanted = match kind {
+                    _ if known || len as usize > MAX_STEP || self.carried.len() >= CARRIED => false,
+                    OPEN => self.cfg.relay && len as usize == crate::circuit::HELLO_LEN && !relayed.holds(&link),
+                    FORWARD => relayed.holds(&link),
+                    OPENED | BACK => {
+                        let own = || {
+                            let ways = self.shared.ways.lock().unwrap_or_else(|e| e.into_inner());
+                            ways.open.iter().any(|w| (w.first(), w.circuit()) == link)
+                        };
+                        relayed.goes_on_to(&link) || own()
+                    }
+                    _ => false,
+                };
+                drop(relayed);
+                if wanted {
+                    self.carried.push((name, from, circuit, kind, count));
+                    self.fetch_granted(now, Object::Step(name), from, len, grant);
+                } else if !known {
                     self.counts.unheard += 1;
                 }
             }
@@ -3005,6 +3207,14 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 let mail = self.shared.letters.lock().unwrap_or_else(|e| e.into_inner());
                 mail.sealed(&id).map(|s| s.to_vec())
             }
+            // Something on its way to a neighbour on a way, which now
+            // asks for it.
+            Object::Step(name) => {
+                let mut leaving = self.shared.leaving.lock().unwrap_or_else(|e| e.into_inner());
+                let leaving = leaving.iter_mut().find(|l| l.name == name)?;
+                leaving.asked = true;
+                Some(leaving.bytes.to_vec())
+            }
             // The state as of a block of the chain that can still be
             // gone back to, in its pieces (`super::snapshot`).
             Object::Manifest(block) => self.past(&block, |past| Some(Manifest::of(past).encode())),
@@ -3192,6 +3402,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             // at: the messages waiting for it are sealed to it.
             Object::Announce { id, .. } => self.announce_arrived(now, from, id, bytes),
             Object::Sealed(id) => self.sealed_arrived(now, from, id, bytes),
+            Object::Step(name) => self.step_arrived(now, from, name, bytes),
             // Asked for by whoever drives this node.
             _ => self.inbox.push((object, from, Some(bytes.to_vec()))),
         }
@@ -3227,6 +3438,10 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             while let Some(at) = mail.posts.iter().position(|p| p.to == id && p.sealed.is_none() && p.missed >= nodes) {
                 mail.settle(at, super::sessions::Posted::Offline);
             }
+            return;
+        }
+        if let Object::Step(name) = object {
+            self.carried.retain(|c| (c.0, c.1) != (name, from));
             return;
         }
         if matches!(object, Object::Headers { .. } | Object::Block(_)) {
@@ -3275,6 +3490,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             seeds: Mutex::new(BTreeSet::new()),
             consensus: Mutex::new(None),
             answered: (0..n).map(|_| Mutex::new(Vec::new())).collect(),
+            relayed: Mutex::new(super::circuits::Relayed::new(cfg.circuits)),
+            ways: Mutex::default(),
+            leaving: Mutex::default(),
             key: u64::from_le_bytes(derive(&secret, b'h', 0)[..8].try_into().unwrap()),
             token_secret: derive(&secret, b'T', 0),
             totals: Arc::new(Totals::new()),
@@ -3668,6 +3886,38 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
     pub fn post(&self, to: Digest, kind: u8, tag: [u8; 32], body: Vec<u8>, known: Option<Vec<u8>>) {
         self.shared.letters.lock().unwrap_or_else(|e| e.into_inner()).post(to, kind, tag, body, known);
         (0..self.shared.mail.len()).for_each(|w| self.shared.wake(w));
+    }
+
+    /// Opens a way through the relays of `path`, nearest first: each
+    /// by its id and where it is. The number the way is known by here,
+    /// to ask after it by ([`Handle::way`]).
+    pub fn open_way(&self, path: Vec<(Digest, SocketAddrV4)>) -> Option<u64> {
+        let mut number = [0u8; 8];
+        crate::random::fill(&mut number).ok().filter(|_| !path.is_empty())?;
+        let circuit = u64::from_le_bytes(number);
+        self.shared.ways.lock().unwrap_or_else(|e| e.into_inner()).wanted.push((circuit, path));
+        (0..self.shared.mail.len()).for_each(|w| self.shared.wake(w));
+        Some(circuit)
+    }
+
+    /// How the way of this number stands: open to its end, or not yet;
+    /// none if there is none, or it was given up.
+    pub fn way(&self, circuit: u64) -> Option<bool> {
+        let ways = self.shared.ways.lock().unwrap_or_else(|e| e.into_inner());
+        let open = ways.open.iter().find(|w| w.circuit() == circuit).map(|w| w.ready());
+        open.or_else(|| ways.wanted.iter().any(|w| w.0 == circuit).then_some(false))
+    }
+
+    /// Says `said` to the last relay of a way that is open.
+    pub fn say_along(&self, circuit: u64, said: Vec<u8>) {
+        self.shared.ways.lock().unwrap_or_else(|e| e.into_inner()).to_say.push((circuit, said));
+        (0..self.shared.mail.len()).for_each(|w| self.shared.wake(w));
+    }
+
+    /// What the last relays of this node's ways have said since this
+    /// was last asked: the way, and what.
+    pub fn take_said(&self) -> Vec<(u64, Vec<u8>)> {
+        std::mem::take(&mut self.shared.ways.lock().unwrap_or_else(|e| e.into_inner()).said)
     }
 
     /// The messages that have come for this node's wallet since this

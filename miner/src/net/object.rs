@@ -56,6 +56,10 @@ pub enum Object {
     Announce { id: Digest, seq: u64 },
     /// The sealed message of this id ([`crate::msg::sealed_id`]).
     Sealed(Digest),
+    /// Something carried along a way through relays
+    /// ([`super::circuits`]), by the number its holder said it has it
+    /// under.
+    Step(u64),
 }
 
 const BLOCK: u8 = 1;
@@ -70,6 +74,7 @@ const TX: u8 = 9;
 const ROOTS: u8 = 10;
 const ANNOUNCE: u8 = 11;
 const SEALED: u8 = 12;
+const STEP: u8 = 13;
 
 impl Object {
     /// What kind of object it is, in a word: for the logs.
@@ -87,6 +92,7 @@ impl Object {
             Object::Tx(_) => "tx",
             Object::Announce { .. } => "announce",
             Object::Sealed(_) => "sealed",
+            Object::Step(_) => "step",
         }
     }
 
@@ -153,6 +159,10 @@ impl Object {
                 put(&[SEALED]);
                 put(&digest_to_bytes(id));
             }
+            Object::Step(name) => {
+                put(&[STEP]);
+                put(&name.to_le_bytes());
+            }
         }
         at
     }
@@ -177,6 +187,7 @@ impl Object {
             FILE => Object::File(with(0)?.0),
             TX => Object::Tx(with(0)?.0),
             SEALED => Object::Sealed(with(0)?.0),
+            STEP => Object::Step(u64::from_le_bytes(rest.try_into().map_err(|_| BAD)?)),
             ANNOUNCE => {
                 let (id, tail) = with(8)?;
                 Object::Announce { id, seq: u64::from_le_bytes(tail.try_into().unwrap()) }
@@ -240,6 +251,7 @@ mod tests {
             Object::Tx(d),
             Object::Announce { id: d, seq: rng.next_u64() },
             Object::Sealed(d),
+            Object::Step(rng.next_u64()),
         ]
     }
 

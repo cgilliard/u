@@ -57,6 +57,7 @@ pub const NOTICE_REFUSED: u8 = 3;
 const GET: u8 = 16;
 const CHUNK: u8 = 17;
 const GONE: u8 = 18;
+const CARRY: u8 = 19;
 // 32 to 47: kept for the messages of private messaging.
 
 /// What a node says of itself, in every ping and pong.
@@ -226,6 +227,18 @@ pub enum Message<'a> {
         id: Digest,
         what: u8,
     },
+    /// "Here is something for the way we both know as `circuit`"
+    /// ([`super::circuits`]): of this kind and count and length, to be
+    /// asked for by `name` with `grant`, the sender's token for
+    /// whoever it is said to.
+    Carry {
+        grant: u64,
+        name: u64,
+        circuit: u64,
+        kind: u8,
+        count: u64,
+        len: u32,
+    },
     /// "I am going": the sender is not to be asked anything more.
     Goodbye {
         token: u64,
@@ -330,6 +343,15 @@ impl<'a> Message<'a> {
                 w.put(&[*what]);
                 NOTICE
             }
+            Message::Carry { grant, name, circuit, kind, count, len } => {
+                w.put(&grant.to_le_bytes());
+                w.put(&name.to_le_bytes());
+                w.put(&circuit.to_le_bytes());
+                w.put(&[*kind]);
+                w.put(&count.to_le_bytes());
+                w.put(&len.to_le_bytes());
+                CARRY
+            }
             Message::Get(g) => {
                 w.1 += g.encode(&mut w.0[HEAD..]);
                 GET
@@ -421,6 +443,14 @@ impl<'a> Message<'a> {
                 len: r.u32().ok_or(BAD)?,
             },
             NOTICE => Message::Notice { id: r.digest().ok_or(BAD)?, what: r.take(1).ok_or(BAD)?[0] },
+            CARRY => Message::Carry {
+                grant: r.u64().ok_or(BAD)?,
+                name: r.u64().ok_or(BAD)?,
+                circuit: r.u64().ok_or(BAD)?,
+                kind: r.take(1).ok_or(BAD)?[0],
+                count: r.u64().ok_or(BAD)?,
+                len: r.u32().ok_or(BAD)?,
+            },
             // The transport's own, which take the whole body or refuse it.
             GET => return Ok(Message::Get(Get::decode(body)?)),
             CHUNK => return Ok(Message::Chunk(Chunk::decode(body)?)),
@@ -570,6 +600,14 @@ mod tests {
                 len: rng.next_u64() as u32,
             },
             Message::Notice { id: digest(rng), what: NOTICE_OFFLINE },
+            Message::Carry {
+                grant: rng.next_u64(),
+                name: rng.next_u64(),
+                circuit: rng.next_u64(),
+                kind: 3,
+                count: rng.next_u64(),
+                len: rng.next_u64() as u32,
+            },
             Message::Leaves {
                 id: digest(rng),
                 leaves: core::array::from_fn(|_| core::array::from_fn(|_| rng.next_u64() as u8)),

@@ -1894,3 +1894,71 @@ fn a_transaction_crosses_the_network() {
     forged.set_positions(&[position]);
     assert_eq!(w.nodes[1].hold().submit(&forged.to_bytes(), NOW), Err(Reject::BadSignature));
 }
+
+/// A node with the wallet of this seed: a relay is known by its key.
+fn relay_of(w: &World, i: usize) -> (Digest, SocketAddrV4) {
+    let key = crate::mldsa::keygen(&[i as u8; 32]);
+    let id = crate::address::id_of(key.public_key());
+    w.nodes[i].hold().participate(crate::net::sessions::Participant::new(key, &[i as u8; 64], 0));
+    (id, at(i))
+}
+
+/// A way is opened from one node through three others, which are
+/// nothing to it but addresses and keys; what is said to the last
+/// comes back from it; and a relay knows only its neighbours.
+fn a_way_through(loss: u64) {
+    let mut w = World::new(5, &Config { relay: true, ..Config::default() });
+    w.loss = loss;
+    let path: Vec<_> = (1..=3).map(|i| relay_of(&w, i)).collect();
+    let me = w.nodes[0].hold();
+    let way = me.open_way(path.clone()).unwrap();
+    assert_eq!(me.way(way), Some(false));
+    let began = w.now;
+    while me.way(way) != Some(true) {
+        assert!(w.now - began < 60 * SECOND, "the way does not open: {:?}", me.way(way));
+        w.run(10 * MILLI);
+    }
+    println!("a way of three relays opened in {} ms, of every thousand datagrams {loss} lost", (w.now - began) / MILLI);
+    use crate::net::circuits::{PING, PONG};
+    let began = w.now;
+    me.say_along(way, vec![PING, 7, 8, 9]);
+    let mut said = Vec::new();
+    while said.is_empty() {
+        assert!(w.now - began < 60 * SECOND, "nothing comes back");
+        w.run(10 * MILLI);
+        said = me.take_said();
+    }
+    println!("and what was said along it was answered in {} ms", (w.now - began) / MILLI);
+    assert_eq!(said, [(way, vec![PONG, 7, 8, 9])]);
+    // Nobody talked to anybody but a neighbour: no datagram went
+    // between the opener and the second or third, or the first and the
+    // third. (None is a node's peer: there were no others to send.)
+    assert!(w.strays.is_empty());
+    assert!((0..5).all(|i| w.live(i).is_empty()));
+    // A way through a relay that is another than was named does not
+    // open, and is given up.
+    let mut wrong = path;
+    wrong[1].0 = wrong[2].0;
+    let way = me.open_way(wrong).unwrap();
+    w.run(40 * SECOND);
+    assert_eq!(me.way(way), None);
+    // And one through a node that ways do not go through: nor that.
+    let way = me.open_way(vec![relay_of(&w, 4), (Digest::default(), at(9))]).unwrap();
+    w.run(40 * SECOND);
+    assert_eq!(me.way(way), None);
+}
+
+#[test]
+fn a_way_is_opened_through_relays() {
+    a_way_through(0);
+}
+
+#[test]
+fn a_way_is_opened_through_relays_that_lose_datagrams() {
+    a_way_through(100);
+}
+
+#[test]
+fn several_workers_open_a_way_through_relays() {
+    several(|| a_way_through(0));
+}

@@ -42,8 +42,22 @@ pub const SAID_EXTENDED: u8 = 1;
 /// for whoever uses the way, not for the way itself.
 pub const SAID: u8 = 0x80;
 
-/// The longest thing said along a way.
-pub const MAX_SAID: usize = crate::msg::MAX_SEALED + 64;
+/// What whoever opened a way says to its last relay to know that the
+/// way still goes there, as the first byte of what is said; and what
+/// the relay says back, with whatever followed it.
+pub const PING: u8 = 1;
+pub const PONG: u8 = 2;
+
+/// The longest thing carried along a way.
+pub const MAX_STEP: usize = crate::msg::MAX_SEALED + 256;
+
+/// Where a relay's count of what it says back begins: a number of the
+/// hello it answered, so that no two relays of a way count alike, and
+/// none knows by its count how far along the way it is.
+fn base(hello: &[u8]) -> u64 {
+    let at = crate::mlkem::EK_LEN;
+    (u32::from_le_bytes(hello[at..at + 4].try_into().expect("four bytes")) as u64) << 32
+}
 
 /// Something to send to a neighbour on a way.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,9 +75,11 @@ struct Through {
     before: (SocketAddrV4, u64),
     after: Option<(SocketAddrV4, u64)>,
     hop: Hop,
-    /// The highest count of anything that has gone out through here:
-    /// what does not come after it has been here before.
+    /// The highest count of anything that has gone out through here,
+    /// and which of the 64 up to it have: what has been here before
+    /// does not pass again, and what overtook another on the way does.
     out: u64,
+    window: u64,
     /// How many things this relay itself has said back.
     said: u64,
     seen: Micros,
@@ -73,13 +89,15 @@ struct Through {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     pub most: usize,
+    /// Ways that may come to this relay from one host.
+    pub each_host: usize,
     /// How long nothing may pass along a way before it is forgotten.
     pub idle: Micros,
 }
 
 impl Default for Limits {
     fn default() -> Limits {
-        Limits { most: 50_000, idle: 1800 * SECOND }
+        Limits { most: 50_000, each_host: 64, idle: 1800 * SECOND }
     }
 }
 
@@ -93,6 +111,25 @@ pub enum Out {
     Said { way: (SocketAddrV4, u64), said: Vec<u8> },
     /// Not of a way through here, or not in its turn: nothing.
     Nothing,
+}
+
+impl Through {
+    /// Whether nothing of this count has gone out through here before;
+    /// after which something has.
+    fn fresh(&mut self, count: u64) -> bool {
+        if count > self.out {
+            let ahead = count - self.out;
+            self.window = if ahead >= 64 { 1 } else { self.window << ahead | 1 };
+            self.out = count;
+            return true;
+        }
+        let behind = self.out - count;
+        if behind >= 64 || self.window >> behind & 1 == 1 {
+            return false;
+        }
+        self.window |= 1 << behind;
+        true
+    }
 }
 
 /// The ways through a relay.
@@ -133,11 +170,14 @@ impl Relayed {
         now: Micros,
     ) -> Option<Step> {
         self.prune(now);
-        if self.through.len() >= self.limits.most || self.of_before(from, circuit).is_some() {
+        let of_host = self.through.iter().filter(|t| t.before.0.ip() == from.ip()).count();
+        let room = self.through.len() < self.limits.most && of_host < self.limits.each_host;
+        if !room || self.of_before(from, circuit).is_some() {
             return None;
         }
         let (hop, answer) = circuit::answer(identity, hello, chance)?;
-        self.through.push(Through { before: (from, circuit), after: None, hop, out: 0, said: 0, seen: now });
+        let (before, said) = ((from, circuit), base(hello));
+        self.through.push(Through { before, after: None, hop, out: 0, window: 1, said, seen: now });
         Some(Step { to: from, circuit, kind: OPENED, count: 0, bytes: answer })
     }
 
@@ -157,10 +197,10 @@ impl Relayed {
         now: Micros,
     ) -> Out {
         let Some(way) = self.of_before(from, circuit) else { return Out::Nothing };
-        if count <= way.out {
+        if !way.fresh(count) {
             return Out::Nothing;
         }
-        (way.out, way.seen) = (count, now);
+        way.seen = now;
         if let Some((to, circuit)) = way.after {
             way.hop.peel(count, &mut bytes);
             return Out::Step(Step { to, circuit, kind: FORWARD, count, bytes });
@@ -230,6 +270,12 @@ impl Relayed {
         self.through.iter().any(|t| t.before == *way)
     }
 
+    /// Whether a way through here goes on to `after`, known between the
+    /// two by that number.
+    pub fn goes_on_to(&self, after: &(SocketAddrV4, u64)) -> bool {
+        self.through.iter().any(|t| t.after == Some(*after))
+    }
+
     /// Forgets the ways nothing has passed along for too long.
     pub fn prune(&mut self, now: Micros) {
         let idle = self.limits.idle;
@@ -248,6 +294,38 @@ pub enum Came {
     Said(Vec<u8>),
     /// Not what this way was waiting for: the way is to be given up.
     Bad,
+}
+
+/// Something on its way to a neighbour, until that neighbour has asked
+/// for it: it is told that it is there, again if it does not ask.
+pub struct Leaving {
+    /// What the neighbour asks for it by.
+    pub name: u64,
+    pub step: Step,
+    pub bytes: std::sync::Arc<Vec<u8>>,
+    pub told: Option<Micros>,
+    pub asked: bool,
+    pub since: Micros,
+}
+
+/// How often a neighbour that does not ask is told again, and how long
+/// a thing is kept for it.
+pub const TELL_AGAIN: Micros = SECOND;
+pub const KEPT: Micros = 30 * SECOND;
+/// How long a way may take to open.
+pub const OPENING: Micros = 30 * SECOND;
+
+/// The ways this node opened, and what has come back along them.
+#[derive(Default)]
+pub struct Ways {
+    pub open: Vec<Way>,
+    /// What the last relay of a way said: the way, and what.
+    pub said: Vec<(u64, Vec<u8>)>,
+    /// Ways asked for and not yet begun: the number each is to be
+    /// known by, and its relays.
+    pub wanted: Vec<(u64, Vec<(Digest, SocketAddrV4)>)>,
+    /// What is to be said along a way, and has not yet been sent.
+    pub to_say: Vec<(u64, Vec<u8>)>,
 }
 
 /// A way, as whoever opened it has it.
@@ -492,6 +570,12 @@ mod tests {
         assert!(world.carry(at(ME), step.clone()).1.is_some());
         // The same again: the first relay has seen that count.
         assert_eq!(world.carry(at(ME), step.clone()), (None, None));
+        // One that overtook another: both pass, each once.
+        let (first, second) = (way.say(b"a").unwrap(), way.say(b"b").unwrap());
+        assert_eq!(world.carry(at(ME), second.clone()).1.unwrap().1, b"b");
+        assert_eq!(world.carry(at(ME), first.clone()).1.unwrap().1, b"a");
+        assert_eq!(world.carry(at(ME), first), (None, None));
+        assert_eq!(world.carry(at(ME), second), (None, None));
         // From another address, or on another number.
         let later = way.say(b"twice").unwrap();
         assert_eq!(world.carry(at(99), later.clone()), (None, None));
