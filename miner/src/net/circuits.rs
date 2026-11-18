@@ -47,6 +47,41 @@ pub const SAID: u8 = 0x80;
 /// the relay says back, with whatever followed it.
 pub const PING: u8 = 1;
 pub const PONG: u8 = 2;
+/// What a wallet says to the node it is reached at, at the end of a
+/// way: "here I am, and this is what I announce" (the announcement,
+/// made for this way: [`Way::bind`]); or "still here" (its id, and the
+/// number of what it announced). And what that node says back: the id,
+/// and the number of the announcement it holds for it, or none (zero).
+pub const HERE: u8 = 3;
+pub const STILL: u8 = 4;
+pub const HELD: u8 = 5;
+/// What whoever sends to a wallet says to a node that wallet is
+/// reached at: "what does the wallet of this id announce?", answered
+/// with the announcement, or with the id if the wallet is not there;
+/// and "pass this on" (a sealed message), answered with the message's
+/// id and what became of it ([`super::message::NOTICE_PASSED`] and the
+/// rest).
+pub const ASK: u8 = 6;
+pub const ANNOUNCED: u8 = 7;
+pub const ABSENT: u8 = 8;
+pub const GIVE: u8 = 9;
+pub const NOTICE: u8 = 10;
+/// And what that node says to the wallet, along the wallet's way:
+/// a sealed message for it.
+pub const TAKE: u8 = 11;
+
+/// What this node opened a way for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Purpose {
+    /// Whoever drives the node asked for it.
+    #[default]
+    Asked,
+    /// Its wallet is reached at the end of it.
+    Session,
+    /// Its wallet sends to another by it. (Never the way it is itself
+    /// reached by: the node at the end would know who sends to whom.)
+    Send,
+}
 
 /// The longest thing carried along a way.
 pub const MAX_STEP: usize = crate::msg::MAX_SEALED + 256;
@@ -167,11 +202,14 @@ impl Relayed {
         circuit: u64,
         hello: &[u8],
         chance: &[u8; 32],
+        listed: bool,
         now: Micros,
     ) -> Option<Step> {
         self.prune(now);
+        // (So many of one host, unless it is a relay of the list: the
+        // ways of everybody come through those.)
         let of_host = self.through.iter().filter(|t| t.before.0.ip() == from.ip()).count();
-        let room = self.through.len() < self.limits.most && of_host < self.limits.each_host;
+        let room = self.through.len() < self.limits.most && (listed || of_host < self.limits.each_host);
         if !room || self.of_before(from, circuit).is_some() {
             return None;
         }
@@ -270,6 +308,12 @@ impl Relayed {
         self.through.iter().any(|t| t.before == *way)
     }
 
+    /// The number the way known by who is before this relay on it is
+    /// bound by ([`Hop::bind`]).
+    pub fn bind_of(&self, way: &(SocketAddrV4, u64)) -> Option<u64> {
+        self.through.iter().find(|t| t.before == *way).map(|t| t.hop.bind())
+    }
+
     /// Whether a way through here goes on to `after`, known between the
     /// two by that number.
     pub fn goes_on_to(&self, after: &(SocketAddrV4, u64)) -> bool {
@@ -338,7 +382,9 @@ pub struct Way {
     opening: Option<Opening>,
     /// How many things have been sent out along it.
     sent: u64,
+    pub purpose: Purpose,
     pub began: Micros,
+    /// When something last came back along it.
     pub seen: Micros,
 }
 
@@ -350,7 +396,8 @@ impl Way {
         let opening = Opening::new(chance);
         let step = Step { to: path[0].1, circuit, kind: OPEN, count: 0, bytes: opening.hello().to_vec() };
         let hops = Vec::with_capacity(path.len());
-        (Way { circuit, path, hops, opening: Some(opening), sent: 0, began: now, seen: now }, step)
+        let purpose = Purpose::Asked;
+        (Way { circuit, path, hops, opening: Some(opening), sent: 0, purpose, began: now, seen: now }, step)
     }
 
     pub fn circuit(&self) -> u64 {
@@ -370,6 +417,12 @@ impl Way {
     /// Whether it is open to its end.
     pub fn ready(&self) -> bool {
         self.hops.len() == self.path.len()
+    }
+
+    /// The number this way and its last relay know, and nobody else:
+    /// none (zero) until it is open.
+    pub fn bind(&self) -> u64 {
+        self.hops.last().filter(|_| self.ready()).map_or(0, Hop::bind)
     }
 
     /// The relay being added has answered with `answer`: the way is a
@@ -482,7 +535,7 @@ mod tests {
                 self.fresh += 1;
                 let (here, relay) = (step.to, &mut self.relays[i]);
                 let next = match step.kind {
-                    OPEN => relay.open(&self.keys[i], from, step.circuit, &step.bytes, &[i as u8; 32], 0),
+                    OPEN => relay.open(&self.keys[i], from, step.circuit, &step.bytes, &[i as u8; 32], false, 0),
                     OPENED => relay.opened(from, step.circuit, &step.bytes, 0),
                     BACK => relay.back(from, step.circuit, step.count, step.bytes, 0),
                     FORWARD => match relay.forward(from, step.circuit, step.count, step.bytes, self.fresh, 0) {

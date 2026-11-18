@@ -385,8 +385,22 @@ impl Prompted {
         new: bool,
         restore: Option<&str>,
     ) -> (Prompted, Option<String>) {
+        Prompted::start_with(dir, listen, peers, mines, new, restore, &[])
+    }
+
+    /// The same, with these options more.
+    fn start_with(
+        dir: &std::path::Path,
+        listen: &str,
+        peers: &[String],
+        mines: bool,
+        new: bool,
+        restore: Option<&str>,
+        more: &[&str],
+    ) -> (Prompted, Option<String>) {
         use std::io::Write;
         let mut command = Command::new(TABMINER);
+        command.args(more);
         if restore.is_some() {
             command.arg("--restore");
         }
@@ -848,4 +862,89 @@ fn a_payment_is_sent_to_an_address() {
     for dir in &dirs {
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+/// While relays are in force a payment goes by them: four nodes that
+/// ways go through, a wallet that pays and one that is paid, each
+/// reached at the end of a way through relays and sending by another.
+/// The payment is answered, signed and mined; and neither wallet's
+/// node is told where the other is by anything of the message layer.
+#[cfg(all(unix, feature = "dev"))]
+#[cfg_attr(debug_assertions, ignore = "proves blocks; run with --release")]
+#[test]
+fn a_payment_goes_by_ways_through_relays() {
+    use std::time::{Duration, Instant};
+    let dirs: Vec<_> = (0..6).map(|i| scratch(&format!("ways-{i}"))).collect();
+    let port = 34_000 + std::process::id() % 10_000;
+    let at = |i: usize| format!("127.0.0.1:{}", port + i as u32);
+    // (All of one chain: each knows the first, as a node of the chain.)
+    let mut relays: Vec<Prompted> = (0..4)
+        .map(|i| {
+            let peers = if i == 0 { vec![] } else { vec![at(0)] };
+            Prompted::start_with(&dirs[i], &at(i), &peers, false, true, None, &["--relay"]).0
+        })
+        .collect();
+    let mut payer = Prompted::start(&dirs[4], &at(4), &[at(0)], true, true);
+    let mut paid = Prompted::start(&dirs[5], &at(5), &[at(0)], false, true);
+    // The relays, by the addresses of their wallets: a file nobody
+    // voted for, put in force at each node.
+    let mut file = String::from("mode onion\n");
+    for (i, relay) in relays.iter_mut().enumerate() {
+        file.push_str(&format!("relay {} {}\n", relay.ask("address").trim(), at(i)));
+    }
+    let path = dirs[0].join("forced.txt");
+    std::fs::write(&path, file).unwrap();
+    let force = format!("debug-consensus {}", path.display());
+    for node in relays.iter_mut().chain([&mut payer, &mut paid]) {
+        let said = node.ask(&force);
+        assert!(said.contains("onion mode, of 4 relays"), "{said}");
+    }
+    let to = paid.ask("address").trim().to_string();
+    let began = Instant::now();
+    loop {
+        let reached = |status: String| status.contains("reached at: 3 of 3 nodes");
+        if payer.confirmed() != "0" && reached(payer.ask("status")) && reached(paid.ask("status")) {
+            break;
+        }
+        assert!(began.elapsed() < Duration::from_secs(180), "{}\n{}", payer.ask("status"), paid.ask("status"));
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let sent = Instant::now();
+    let begun = payer.ask(&format!("send 5 {to}"));
+    assert!(begun.contains("begun: 5 and a fee of") && begun.contains(&to), "{begun}");
+    let pooled = loop {
+        let log = std::fs::read_to_string(dirs[4].join("tabernacle.log")).unwrap();
+        if log.contains(" signed and pooled: transaction ") {
+            break sent.elapsed();
+        }
+        assert!(sent.elapsed() < Duration::from_secs(60), "the answer has not come: {log}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    println!("a payment by ways through relays was answered, signed and pooled in {:.2}s", pooled.as_secs_f64());
+    let began = Instant::now();
+    while paid.confirmed() != "5" {
+        assert!(began.elapsed() < Duration::from_secs(120), "{}", paid.ask("balance"));
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // To a wallet that is nowhere: an error, and nothing spent.
+    let nobody = tabminer::address::encode(&[tabminer::poseidon2::Fp::new(78); 8]);
+    assert!(payer.ask(&format!("send 1 {nobody}")).contains("begun: 1 and a fee of"));
+    let began = Instant::now();
+    loop {
+        let log = std::fs::read_to_string(dirs[4].join("tabernacle.log")).unwrap();
+        if log.contains(&format!(" to {nobody} was not delivered (that wallet is not there): given up")) {
+            break;
+        }
+        assert!(began.elapsed() < Duration::from_secs(90), "{log}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // The relays held ways, and the nodes wallets are reached at held
+    // their sessions.
+    let held: Vec<String> = relays.iter_mut().map(|r| r.ask("status")).collect();
+    // (Each of the six wallets at three of the four.)
+    let here = |s: &String| -> u32 {
+        let line = s.lines().find(|l| l.starts_with("sessions: ")).unwrap_or("sessions: 0");
+        line.split(' ').nth(1).unwrap().parse().unwrap()
+    };
+    assert_eq!(held.iter().map(here).sum::<u32>(), 18, "{held:#?}");
 }

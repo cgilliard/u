@@ -42,10 +42,26 @@ impl Default for Limits {
     }
 }
 
+/// Where a wallet a session is held for is: at an address, which it
+/// says so from; or at the far end of a way through relays that ends
+/// at this node, known by who is before this node on it
+/// ([`super::circuits`]), and then this node does not know where.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Where {
+    Addr(SocketAddrV4),
+    Way(SocketAddrV4, u64),
+}
+
+impl From<SocketAddrV4> for Where {
+    fn from(addr: SocketAddrV4) -> Where {
+        Where::Addr(addr)
+    }
+}
+
 /// A wallet a node holds a session for.
 #[derive(Clone, Debug)]
 pub struct Session {
-    pub addr: SocketAddrV4,
+    pub at: Where,
     pub seq: u64,
     /// What it announced, as it said it.
     pub announce: Arc<Vec<u8>>,
@@ -89,9 +105,10 @@ impl Sessions {
     /// what it last announced has the number `seq`. True if that is the
     /// announcement held, from that address: the session goes on. If
     /// not, the announcement is to be asked for.
-    pub fn seen(&mut self, id: &Digest, addr: SocketAddrV4, seq: u64, now: Micros) -> bool {
+    pub fn seen(&mut self, id: &Digest, at: impl Into<Where>, seq: u64, now: Micros) -> bool {
+        let at = at.into();
         match self.held.get_mut(&digest_to_bytes(id)) {
-            Some(session) if session.addr == addr && session.seq == seq => {
+            Some(session) if session.at == at && session.seq == seq => {
                 session.seen = now;
                 true
             }
@@ -106,11 +123,12 @@ impl Sessions {
     pub fn admit(
         &mut self,
         announce: Vec<u8>,
-        addr: SocketAddrV4,
+        at: impl Into<Where>,
         bound: impl FnOnce(u64) -> bool,
         unix: u64,
         now: Micros,
     ) -> Result<Digest, Refused> {
+        let at = at.into();
         let said = Announced::read(&announce, unix).ok_or(Refused::Unsound)?;
         if !bound(said.bind()) {
             return Err(Refused::NotBound);
@@ -122,13 +140,23 @@ impl Sessions {
             Some(held) if held.seq >= seq => return Err(Refused::Stale),
             Some(_) => {}
             None => {
-                let of_host = self.held.values().filter(|s| s.addr.ip() == addr.ip()).count();
+                // (Of one host: of those that say so from an address.
+                // Who is at the end of a way is of no host this node
+                // knows, and the ways are bounded where they are made.)
+                let host = |at: &Where| match at {
+                    Where::Addr(addr) => Some(*addr.ip()),
+                    Where::Way(..) => None,
+                };
+                let of_host = match host(&at) {
+                    Some(ip) => self.held.values().filter(|s| host(&s.at) == Some(ip)).count(),
+                    None => 0,
+                };
                 if self.held.len() >= self.limits.most || of_host >= self.limits.each_host {
                     return Err(Refused::Full);
                 }
             }
         }
-        self.held.insert(key, Session { addr, seq, announce: Arc::new(announce), seen: now });
+        self.held.insert(key, Session { at, seq, announce: Arc::new(announce), seen: now });
         Ok(id)
     }
 
@@ -290,6 +318,11 @@ impl Participant {
             (said.bind, said.seq, said.held) = (token, 0, u64::MAX);
         }
         other
+    }
+
+    /// Whether the node at `node` holds what was last announced to it.
+    pub fn is_held(&self, node: &SocketAddrV4) -> bool {
+        self.said.get(node).is_some_and(|s| s.seq != 0 && s.held == s.seq)
     }
 
     /// The nodes this wallet is reached at now: those that hold what it
@@ -468,7 +501,7 @@ mod tests {
         assert!(!sessions.seen(&alice.id(), home, seq, 0));
         assert_eq!(sessions.admit(said.to_vec(), home, |bind| bind == 77, 1000, 0), Ok(alice.id()));
         assert!(sessions.seen(&alice.id(), home, seq, 10 * SECOND));
-        assert_eq!(sessions.get(&alice.id(), 20 * SECOND).unwrap().addr, home);
+        assert_eq!(sessions.get(&alice.id(), 20 * SECOND).unwrap().at, Where::Addr(home));
         assert_eq!(sessions.get(&alice.id(), 20 * SECOND).unwrap().announce, said);
         // From another address, or of another number: not that session.
         assert!(!sessions.seen(&alice.id(), at(2, 4000), seq, 20 * SECOND));

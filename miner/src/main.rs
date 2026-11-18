@@ -963,7 +963,8 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     if c.prompt {
         let said = Arc::clone(&main);
         let log = Arc::new(move |line: &str| said.log(line));
-        let console = Console { hold: hold.clone(), wallet: wallet.clone(), unix: socket::unix, log };
+        let debug = cfg!(feature = "dev") && c.network != Network::Mainnet;
+        let console = Console { hold: hold.clone(), wallet: wallet.clone(), unix: socket::unix, log, debug };
         let main = Arc::clone(&main);
         std::thread::Builder::new().name("prompt".into()).spawn(move || prompt(&console, &main)).map_err(threads)?;
     }
@@ -974,7 +975,8 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     if let Some(wallet) = &wallet {
         let said = Arc::clone(&main);
         let log = Arc::new(move |line: &str| said.log(line));
-        let console = Console { hold: hold.clone(), wallet: Some(Arc::clone(wallet)), unix: socket::unix, log };
+        let (wallet, debug) = (Some(Arc::clone(wallet)), false);
+        let console = Console { hold: hold.clone(), wallet, unix: socket::unix, log, debug };
         let (hold, main) = (hold.clone(), Arc::clone(&main));
         let taking = move || loop {
             std::thread::sleep(Duration::from_millis(50));

@@ -131,6 +131,15 @@ impl Hop {
         Hop { out: key(0), out_seal: key(1), back: key(2), back_seal: key(3) }
     }
 
+    /// A number both ends of these keys know and nobody else does:
+    /// what is said along the way to this relay can be made for it
+    /// alone by carrying it ([`crate::msg::announce`]).
+    pub fn bind(&self) -> u64 {
+        let mut h = Sponge::shake256();
+        h.absorb(b"bind").absorb(&self.out_seal).absorb(&self.back_seal);
+        u64::from_le_bytes(h.squeezed())
+    }
+
     /// The relay takes its wrapping off what goes out: the `count`-th
     /// thing sent this way. What is left is the next relay's to peel,
     /// or, of the last, what was sent.

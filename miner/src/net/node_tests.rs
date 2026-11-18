@@ -1962,3 +1962,83 @@ fn a_way_is_opened_through_relays_that_lose_datagrams() {
 fn several_workers_open_a_way_through_relays() {
     several(|| a_way_through(0));
 }
+
+/// While relays are in force a wallet is reached at the end of a way
+/// through them, and sends by another: a message goes from one wallet
+/// to another and is answered, between nodes that never say a word to
+/// each other, by way of relays none of which knows both ends.
+fn wallets_by_ways(loss: u64) {
+    use crate::net::sessions::Posted;
+    let mut w = World::new(7, &Config { relay: true, ..Config::default() });
+    w.loss = loss;
+    // Five relays, and two wallets that are no relays.
+    let ids: Vec<(Digest, SocketAddrV4)> = (0..7).map(|i| relay_of(&w, i)).collect();
+    let relays = ids[2..].iter().map(|(id, at)| crate::consensus::Relay { id: *id, addr: at.to_string() }).collect();
+    let file = crate::consensus::File { mode: crate::consensus::Mode::Onion, relays };
+    let hold: Vec<_> = w.nodes.iter().map(|n| n.hold()).collect();
+    hold.iter().for_each(|h| h.force_consensus(&file));
+    let began = w.now;
+    while !(hold[0].reached() && hold[1].reached()) {
+        assert!(w.now - began < 120 * SECOND, "the wallets are not reached: {:?}", hold[0].sessions());
+        w.run(50 * MILLI);
+    }
+    println!(
+        "two wallets were reached by ways in {} ms, of every thousand datagrams {loss} lost",
+        (w.now - began) / MILLI
+    );
+    // From the first to the second.
+    let began = w.now;
+    hold[0].post(ids[1].0, crate::msg::KIND_SLATE, [7; 32], b"a slate".to_vec(), None);
+    let mut came = Vec::new();
+    while came.is_empty() {
+        assert!(w.now - began < 120 * SECOND, "nothing comes");
+        w.run(20 * MILLI);
+        came = hold[1].take_messages();
+    }
+    println!("a message crossed in {} ms", (w.now - began) / MILLI);
+    assert_eq!((came.len(), came[0].from, &came[0].body[..]), (1, ids[0].0, &b"a slate"[..]));
+    // And its answer, sealed to what it carried.
+    hold[1].post(ids[0].0, crate::msg::KIND_SLATE, [8; 32], b"its answer".to_vec(), Some(came[0].reply.clone()));
+    let mut back = Vec::new();
+    while back.is_empty() {
+        assert!(w.now - began < 240 * SECOND, "no answer comes");
+        w.run(20 * MILLI);
+        back = hold[0].take_messages();
+    }
+    println!("and its answer was back in {} ms from the first", (w.now - began) / MILLI);
+    assert_eq!((back[0].from, &back[0].body[..]), (ids[1].0, &b"its answer"[..]));
+    w.run(5 * SECOND);
+    assert_eq!(hold[0].take_posted(), [(ids[1].0, crate::msg::KIND_SLATE, [7; 32], Posted::Passed)]);
+    assert_eq!(hold[1].take_posted(), [(ids[0].0, crate::msg::KIND_SLATE, [8; 32], Posted::Passed)]);
+    // Each came once.
+    assert!(hold[0].take_messages().is_empty() && hold[1].take_messages().is_empty());
+    // The two wallets' nodes never said anything to each other.
+    let said = |a: usize, b: usize| w.strays.iter().any(|s| (s.0, s.1) == (at(a), at(b)));
+    assert!(!said(0, 1) && !said(1, 0));
+    // To a wallet that is nowhere: said to be so.
+    let nobody = crate::address::id_of(crate::mldsa::keygen(&[99; 32]).public_key());
+    hold[0].post(nobody, crate::msg::KIND_SLATE, [9; 32], b"x".to_vec(), None);
+    let began = w.now;
+    let mut posted = Vec::new();
+    while posted.is_empty() {
+        assert!(w.now - began < 120 * SECOND, "nothing is said of it");
+        w.run(100 * MILLI);
+        posted = hold[0].take_posted();
+    }
+    assert_eq!(posted, [(nobody, crate::msg::KIND_SLATE, [9; 32], Posted::Offline)]);
+}
+
+#[test]
+fn wallets_are_reached_and_send_by_ways_through_relays() {
+    wallets_by_ways(0);
+}
+
+#[test]
+fn wallets_are_reached_by_ways_that_lose_datagrams() {
+    wallets_by_ways(50);
+}
+
+#[test]
+fn several_workers_reach_wallets_by_ways() {
+    several(|| wallets_by_ways(0));
+}

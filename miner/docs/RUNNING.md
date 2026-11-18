@@ -621,9 +621,29 @@ how long it is, not who sent it or what it says. The other wallet
 answers of itself, this one signs the answer and pools the
 transaction, and the main log of each says its part. Both must be
 reached: there is nowhere a message waits for a wallet that is not
-there, and one that cannot be passed on is said so within a minute
-(the payment is then to be taken back with `cancel`). `send-file`,
-`receive` and `finalize` do the same by hand, through files.
+there, and one that cannot be passed on is an error, said within a
+minute and mostly at once: the payment is given up and what it would
+have spent is free again. An answer is taken only from the wallet the
+slate was sent to. `send-file`, `receive` and `finalize` do the same
+by hand, through files.
+
+**While relays are in force** (a file of onion mode) a wallet is
+reached at three of the relays, chosen as above, and its node talks to
+none of them: to each it opens a way through two other relays drawn by
+chance, a relay at a time, agreeing a key with each through those
+before it, and says along that way that the wallet is there. The first
+relay knows the node's address and not where the way ends; the last
+knows which wallet is reached there and not where it is; the one
+between knows neither. Whoever pays opens a way of its own to a relay
+the other wallet is reached at, never the way it is itself reached by,
+and gives the sealed slate there. A relay is a node started with
+`--relay` whose wallet's address is the one the file lists it by: it
+answers with that wallet's key, which whoever opens a way through it
+checks. It holds 50,000 ways at the most, 64 of one host that is not
+itself a relay of the list, and forgets one nothing has passed along
+for half an hour. In a build with the dev networks, on one of them,
+the command `debug-consensus FILE` puts a file in force at that node
+alone, whatever the chain has decided.
 
 **A wallet made again.** `--restore` makes the wallet from its twelve
 words, which it asks for, where the data directory has no wallet (it

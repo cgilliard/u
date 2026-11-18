@@ -140,6 +140,9 @@ pub struct Console<B: Backend + 'static, W: Backend> {
     /// answered, signed, given up): a line for the main log. Nothing of
     /// anybody else's transactions is said there.
     pub log: Arc<dyn Fn(&str) + Send + Sync>,
+    /// Whether what is only for trying things may be done here: on a
+    /// network for that, in a build for that.
+    pub debug: bool,
 }
 
 /// An amount of coins as it is written: its whole part with commas, and
@@ -209,6 +212,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             ("set-leaf", [index, file]) => self.set_leaf(index, Some(file), None),
             ("set-leaf-value", [index, value]) => self.set_leaf(index, None, Some(value)),
             ("consensus", []) => self.consensus(),
+            ("debug-consensus", [file]) if self.debug => self.debug_consensus(file),
             ("balance", []) => self.balance(),
             ("address", []) => self.wallet().map(|wallet| wallet.address()),
             ("outputs", []) => self.outputs(),
@@ -410,6 +414,20 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
 
     /// The consensus file in force, how it was voted for, and what it
     /// says.
+    /// Puts a consensus file in force at this node alone, whatever the
+    /// chain has decided: to try what relays do without a day of
+    /// blocks voting for them.
+    fn debug_consensus(&self, path: &str) -> Said {
+        let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        let file = crate::consensus::File::parse(&bytes).map_err(|e| format!("{path}: {e}"))?;
+        self.hold.force_consensus(&file);
+        Ok(format!(
+            "here the message layer is in {} mode, of {} relays, whatever the chain decides",
+            file.mode,
+            file.relays.len()
+        ))
+    }
+
     fn consensus(&self) -> Said {
         use crate::consensus::{WINDOW, boundary};
         let chain = self.hold.chain();
