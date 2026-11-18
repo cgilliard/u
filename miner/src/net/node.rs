@@ -306,6 +306,36 @@ fn apply<B: Backend + 'static, V: ProofVerifier + Sync>(chain: &Chain<B, V>, job
     })
 }
 
+/// Parts of a state put together at the most.
+const PARTS_AT_ONCE: usize = 64;
+
+/// Puts parts of a state that arrived together (`jobs`, each a
+/// [`Job::Piece`] of a part) in one step, and says of each what became
+/// of it. If they are not put so, one of them not being its part, each
+/// is put by itself: so that the one at fault is known.
+fn apply_parts<B: Backend + 'static, V: ProofVerifier + Sync>(chain: &Chain<B, V>, jobs: Vec<Job>) -> Vec<Outcome> {
+    let mut decoded = Vec::with_capacity(jobs.len());
+    for job in &jobs {
+        if let Job::Piece { object: Object::Part { index, .. }, bytes, .. } = job
+            && let Ok((outputs, commits)) = snapshot::decode_part(bytes, *index)
+        {
+            decoded.push((*index, outputs, commits));
+        }
+    }
+    decoded.sort_unstable_by_key(|d| d.0);
+    let distinct = decoded.windows(2).all(|w| w[0].0 < w[1].0);
+    let together: Vec<(u64, &[(u64, crate::store::outputs::Record)], &[(u64, Digest)])> =
+        decoded.iter().map(|(index, outputs, commits)| (*index, &outputs[..], &commits[..])).collect();
+    if decoded.len() == jobs.len() && distinct && chain.put_parts(&together).is_ok() {
+        let put = |job| match job {
+            Job::Piece { object, from, .. } => Outcome::Piece { object, from, result: Ok(()) },
+            _ => Outcome::Nothing,
+        };
+        return jobs.into_iter().map(put).collect();
+    }
+    jobs.into_iter().map(|job| apply(chain, job).unwrap_or(Outcome::Nothing)).collect()
+}
+
 /// Where work on the chain is done. Applying a block takes as long as
 /// checking its proof does; a run of headers, their proofs of work; a
 /// part of a state, a write to the store. A node that did any of it
@@ -2116,10 +2146,11 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             Some(_) => {}
         }
         if join.begun
-            && let Ok((parts, names)) = self.chain.missing_parts()
+            && let Ok((parts, lacking, names)) =
+                self.chain.missing_parts_first(self.cfg.sync.parts + join.putting.len() + l.fetching.len())
         {
             // How far it has come is said every half minute.
-            let missing = (parts.len() + names.len()) as u64;
+            let missing = (lacking + names.len()) as u64;
             join.parts = join.parts.max(missing);
             if join.told == 0 {
                 join.told = now;
@@ -2321,7 +2352,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         if join.begun
             && !join.finishing
             && join.putting.is_empty()
-            && self.chain.missing_parts().is_ok_and(|(parts, names)| parts.is_empty() && names.is_empty())
+            && self.chain.missing_parts_first(1).is_ok_and(|(_, lacking, names)| lacking == 0 && names.is_empty())
             && let Some((block, _)) = &join.block
         {
             join.finishing = true;
@@ -2721,15 +2752,37 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             .name("applier".into())
             .spawn(move || {
                 // Until the node is dropped, and its end of either with it.
-                for job in todo {
-                    // (Something is always said of a job, so that the
-                    // node knows it is done with.)
-                    let outcome = apply(&chain, job).unwrap_or(Outcome::Nothing);
-                    // (Said to be ready before it is, never after: so
-                    // that it is not there and nobody looks.)
-                    shared.ready.fetch_add(1, Ordering::Relaxed);
-                    if done.send(outcome).is_err() {
-                        break;
+                let mut next: Option<Job> = None;
+                'jobs: while let Some(job) = next.take().or_else(|| todo.recv().ok()) {
+                    // Parts of a state that have come in while the last
+                    // was put are put together: many take little longer
+                    // than one ([`Chain::put_parts`]).
+                    let mut jobs = vec![job];
+                    while jobs.len() < PARTS_AT_ONCE
+                        && matches!(jobs[0], Job::Piece { object: Object::Part { .. }, .. })
+                    {
+                        match todo.try_recv() {
+                            Ok(job @ Job::Piece { object: Object::Part { .. }, .. }) => jobs.push(job),
+                            Ok(other) => {
+                                next = Some(other);
+                                break;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let outcomes = match jobs.len() {
+                        1 => vec![apply(&chain, jobs.pop().expect("one")).unwrap_or(Outcome::Nothing)],
+                        _ => apply_parts(&chain, jobs),
+                    };
+                    for outcome in outcomes {
+                        // (Something is always said of a job, so that
+                        // the node knows it is done with. Said to be
+                        // ready before it is, never after: so that it
+                        // is not there and nobody looks.)
+                        shared.ready.fetch_add(1, Ordering::Relaxed);
+                        if done.send(outcome).is_err() {
+                            break 'jobs;
+                        }
                     }
                     // One worker hears of it, each in turn.
                     shared.wake(shared.turn.fetch_add(1, Ordering::Relaxed) % shared.mail.len());

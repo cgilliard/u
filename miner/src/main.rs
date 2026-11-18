@@ -618,6 +618,9 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
         });
         filling.map_err(|e| format!("debug: filling the state: {e}"))?;
         main.log(&format!("debug: a state of {} outputs ready in {:.1}s", commas(n), began.elapsed().as_secs_f64()));
+        // (What making it held is not what a node holds: the most it
+        // holds is counted from here.)
+        tabminer::heap::reset_peak();
     }
     // A chain made under other rules than this build's is not gone on
     // with: nothing made here could build on it, and nothing of it

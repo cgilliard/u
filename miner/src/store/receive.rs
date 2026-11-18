@@ -95,6 +95,10 @@ pub struct Receiving<B: Backend + 'static> {
     /// part held now.
     want: BTreeMap<u64, Digest>,
     have: BTreeMap<u64, Digest>,
+    /// The parts of the outputs still to be put, once asked for and
+    /// kept up from then on: a state has a hundred thousand parts, and
+    /// which are missing is asked at every one that arrives.
+    lacking: std::sync::Mutex<Option<std::collections::BTreeSet<u64>>>,
     /// The same of the names.
     want_names: BTreeMap<u32, Part>,
     have_names: BTreeMap<u32, Part>,
@@ -202,6 +206,7 @@ impl<B: Backend + 'static> Receiving<B> {
             commits: Commits::EMPTY,
             level,
             name_level,
+            lacking: Default::default(),
             want: BTreeMap::new(),
             have: BTreeMap::new(),
             want_names: BTreeMap::new(),
@@ -210,6 +215,7 @@ impl<B: Backend + 'static> Receiving<B> {
         };
         txn.commit(&this.record())?;
         this.want = parts.iter().copied().collect();
+        this.lacking = Default::default();
         this.want_names = name_parts.iter().copied().collect();
         Ok(this)
     }
@@ -250,6 +256,7 @@ impl<B: Backend + 'static> Receiving<B> {
                     commits,
                     level,
                     name_level,
+                    lacking: Default::default(),
                     want: BTreeMap::new(),
                     have: BTreeMap::new(),
                     want_names: BTreeMap::new(),
@@ -297,6 +304,7 @@ impl<B: Backend + 'static> Receiving<B> {
         commits: Commits,
     ) -> Result<Receiving<B>, Error> {
         let mut this = Receiving {
+            lacking: Default::default(),
             have: outputs.parts(&*file, level)?.into_iter().collect(),
             have_names: names.parts(&*file, name_level)?.into_iter().collect(),
             want: parts.iter().copied().collect(),
@@ -363,6 +371,23 @@ impl<B: Backend + 'static> Receiving<B> {
         self.want.iter().filter(|(i, root)| self.have.get(i) != Some(root)).map(|(i, _)| *i).collect()
     }
 
+    /// The first `most` of the parts of the outputs still to be put,
+    /// ascending, and how many there are in all: what
+    /// [`Receiving::missing`] says, without going through every part
+    /// each time it is asked.
+    pub fn missing_first(&self, most: usize) -> (Vec<u64>, usize) {
+        let mut lacking = self.lacking.lock().unwrap_or_else(|e| e.into_inner());
+        let set = lacking.get_or_insert_with(|| self.missing().into_iter().collect());
+        (set.iter().take(most).copied().collect(), set.len())
+    }
+
+    /// The part of index `index` is kept, as it is wanted.
+    fn put_done(&self, index: u64) {
+        if let Some(set) = &mut *self.lacking.lock().unwrap_or_else(|e| e.into_inner()) {
+            set.remove(&index);
+        }
+    }
+
     /// The parts of the names still to be put, ascending.
     pub fn missing_names(&self) -> Vec<u32> {
         self.want_names.iter().filter(|(i, part)| self.have_names.get(i) != Some(part)).map(|(i, _)| *i).collect()
@@ -384,6 +409,68 @@ impl<B: Backend + 'static> Receiving<B> {
     /// that none is left out cannot be known, and need not be
     /// ([`super::commits`]).
     pub fn put_with(&mut self, index: u64, outputs: &[(u64, Record)], commits: &[(u64, Digest)]) -> Result<(), Error> {
+        self.checked(index, outputs, commits)?;
+        if self.have.get(&index) == self.want.get(&index) {
+            return Ok(());
+        }
+        self.exchange(index, outputs, commits)
+    }
+
+    /// Several parts put at once ([`Receiving::put_with`] of each, in
+    /// one step): all of them durable when this returns, or, if any is
+    /// not its part, none ([`Error::PartRoot`]). They are checked, and
+    /// put, on as many threads as there are: many parts so take little
+    /// longer than one. `parts` ascend by index.
+    #[allow(clippy::type_complexity)]
+    pub fn put_many(&mut self, parts: &[(u64, &[(u64, Record)], &[(u64, Digest)])]) -> Result<(), Error> {
+        if !parts.windows(2).all(|w| w[0].0 < w[1].0) {
+            return Err(Error::PartRoot);
+        }
+        let checks = crate::parallel::par_map_min(parts.len(), 1, |i| self.checked(parts[i].0, parts[i].1, parts[i].2));
+        checks.into_iter().collect::<Result<(), Error>>()?;
+        // One that is held already, as another, is put by itself: what
+        // it held is to be taken out.
+        if parts.iter().any(|p| self.have.contains_key(&p.0)) {
+            for (index, outputs, commits) in parts {
+                if self.have.get(index) != self.want.get(index) {
+                    self.exchange(*index, outputs, commits)?;
+                }
+            }
+            return Ok(());
+        }
+        let puts: Vec<(u64, Record, bool)> = parts.iter().flat_map(|p| p.1.iter().map(|o| (o.0, o.1, false))).collect();
+        let mut txn = self.file.begin()?;
+        let (outputs_before, commits_before) = (self.outputs, self.commits);
+        let done = (|| {
+            self.outputs = self.outputs.exchange(&mut txn, &[], &puts, self.target.next)?;
+            for (_, outputs, commits) in parts {
+                for (position, hash) in *commits {
+                    let height = outputs[outputs.binary_search_by_key(position, |o| o.0).unwrap()].1.height;
+                    self.commits.add(&txn, *position, Commit { hash: *hash, height })?;
+                }
+            }
+            Ok::<(), Error>(())
+        })();
+        if let Err(e) = done {
+            (self.outputs, self.commits) = (outputs_before, commits_before);
+            return Err(e);
+        }
+        if let Err(e) = txn.commit(&self.record()) {
+            (self.outputs, self.commits) = (outputs_before, commits_before);
+            return Err(e.into());
+        }
+        for (index, outputs, _) in parts {
+            if let Some(root) = self.want.get(index).filter(|_| !outputs.is_empty()) {
+                self.have.insert(*index, *root);
+                self.put_done(*index);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `outputs`, with `commits`, are the part of index `index`
+    /// that is wanted: [`Error::PartRoot`] if not.
+    fn checked(&self, index: u64, outputs: &[(u64, Record)], commits: &[(u64, Digest)]) -> Result<(), Error> {
         if !self.known {
             return Err(Error::PartsMissing);
         }
@@ -405,10 +492,7 @@ impl<B: Backend + 'static> Receiving<B> {
         if !sound || outputs::part_root(self.level, outputs) != *want {
             return Err(Error::PartRoot);
         }
-        if self.have.get(&index) == Some(want) {
-            return Ok(());
-        }
-        self.exchange(index, outputs, commits)
+        Ok(())
     }
 
     /// Puts the part of the names of index `index`: its names' records
@@ -506,6 +590,11 @@ impl<B: Backend + 'static> Receiving<B> {
             Some(root) => self.have.insert(index, *root),
             None => self.have.remove(&index),
         };
+        // (Whatever it was: which are missing is reckoned anew.)
+        match self.have.get(&index) == self.want.get(&index) {
+            true => self.put_done(index),
+            false => *self.lacking.lock().unwrap_or_else(|e| e.into_inner()) = None,
+        }
         Ok(())
     }
 
@@ -573,6 +662,7 @@ pub fn open<B: Backend + 'static>(backend: B, keep: usize) -> Result<Opened<B>, 
     Ok(Opened::Receiving(Receiving {
         have: outputs.parts(&file, PART_LEVEL)?.into_iter().collect(),
         have_names: names.parts(&file, NAME_PART_LEVEL)?.into_iter().collect(),
+        lacking: Default::default(),
         want: BTreeMap::new(),
         want_names: BTreeMap::new(),
         known: false,

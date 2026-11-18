@@ -250,6 +250,11 @@ pub struct State<B: Backend + 'static> {
     /// The thread that rebuilds the file's map of free space, until it
     /// has been waited for.
     marking: Mutex<Option<JoinHandle<Result<(), io::ErrorKind>>>>,
+    /// The state as of an earlier block that was last asked for
+    /// ([`State::past`]), and the root of the file it was made at: it
+    /// is the same for as long as that is the file's root, and making
+    /// it reads the root of every part there is.
+    past: Mutex<Option<(u64, Arc<PastThen>)>>,
     /// Tests: how long each step of the last block applied took (the
     /// outputs, the names and the window, the sweep, the commit).
     #[cfg(test)]
@@ -313,6 +318,7 @@ impl<B: Backend + 'static> State<B> {
             part_level: PART_LEVEL,
             name_level: NAME_PART_LEVEL,
             marking: Mutex::new(None),
+            past: Mutex::new(None),
             #[cfg(test)]
             times: Mutex::new([std::time::Duration::ZERO; 4]),
         }
@@ -387,6 +393,17 @@ impl<B: Backend + 'static> State<B> {
         // The state now, and everything read from the root record that
         // is held: a block applied meanwhile changes neither.
         let pin = self.file.pin();
+        // The one made last, if it is of this block and nothing has
+        // been written since: a node that hands a state over is asked
+        // for the same one thousands of times.
+        let kept = self.past.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((seq, then)) = &*kept
+            && *seq == pin.root().seq
+            && then.height == height
+        {
+            return Ok(Past { pin, then: Arc::clone(then) });
+        }
+        drop(kept);
         let meta = Meta::read(&pin, pin.root())?;
         let oldest = meta.window.oldest().unwrap_or(meta.height + 1);
         if height > meta.height || height + 1 < oldest {
@@ -436,8 +453,7 @@ impl<B: Backend + 'static> State<B> {
             offsets.retain(|o| (index << level | *o as u64) < next);
             offsets.sort_unstable();
         }
-        Ok(Past {
-            pin,
+        let then = Arc::new(PastThen {
             outputs: meta.outputs,
             level,
             height,
@@ -452,7 +468,9 @@ impl<B: Backend + 'static> State<B> {
             names_then,
             commits: meta.commits,
             commits_then,
-        })
+        });
+        *self.past.lock().unwrap_or_else(|e| e.into_inner()) = Some((pin.root().seq, Arc::clone(&then)));
+        Ok(Past { pin, then })
     }
 
     /// Changes the blocks known of ([`Blocks`]) and nothing of the
@@ -737,6 +755,21 @@ impl<'a, B: Backend + 'static> Session<'a, B> {
 /// reused.
 pub struct Past<'a, B: Backend + 'static> {
     pin: Pin<'a, B>,
+    then: Arc<PastThen>,
+}
+
+impl<B: Backend + 'static> std::ops::Deref for Past<'_, B> {
+    type Target = PastThen;
+
+    fn deref(&self) -> &PastThen {
+        &self.then
+    }
+}
+
+/// What a [`Past`] is made of besides the pages it reads: how the state
+/// then differs from the state now. Kept from one asking to the next
+/// ([`State::past`]).
+pub struct PastThen {
     /// The outputs as they are now.
     outputs: Outputs,
     level: u32,

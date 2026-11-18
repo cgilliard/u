@@ -105,11 +105,16 @@ pub fn fill<B: Backend + 'static, V: crate::chain::verify::ProofVerifier + Sync>
         }
     }
     chain.begin_receiving(&genesis, next(n, spacing), roots, &[])?;
-    for (done, (index, _)) in roots.iter().enumerate() {
-        chain.put_part(*index, &part(*index, n, spacing), &[])?;
-        if done % 256 == 255 {
-            progress((((index + 1) << PART_LEVEL).min(next(n, spacing))).div_ceil(spacing.max(1)));
-        }
+    // (A run of parts at a time: made, checked and put on every
+    // thread there is, and durable together.)
+    const RUN: usize = 64;
+    for run in roots.chunks(RUN) {
+        let made = crate::parallel::par_map_min(run.len(), 1, |k| part(run[k].0, n, spacing));
+        let parts: Vec<(u64, &[(u64, Record)], &[(u64, Digest)])> =
+            run.iter().zip(&made).map(|(r, outputs)| (r.0, &outputs[..], &[][..])).collect();
+        chain.put_parts(&parts)?;
+        let index = run[run.len() - 1].0;
+        progress((((index + 1) << PART_LEVEL).min(next(n, spacing))).div_ceil(spacing.max(1)));
     }
     chain.finish_receiving(&Body::default().to_bytes())?;
     progress(n);

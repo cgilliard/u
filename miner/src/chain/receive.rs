@@ -157,6 +157,21 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Chain<B, V> {
         }
     }
 
+    /// The first `most` parts of the outputs still to be put, how many
+    /// there are in all, and the parts of the names still to be put:
+    /// [`Chain::missing_parts`], at a cost that does not grow with the
+    /// state.
+    pub fn missing_parts_first(&self, most: usize) -> Result<(Vec<u64>, usize, Vec<u32>), Error> {
+        match &*self.store() {
+            Store::Receiving(r) if !r.roots_known() => Err(Error::PartsMissing),
+            Store::Receiving(r) => {
+                let (first, all) = r.missing_first(most);
+                Ok((first, all, r.missing_names()))
+            }
+            _ => Err(Error::Receiving),
+        }
+    }
+
     /// The parts of the outputs, and of the names, still to be put.
     pub fn missing_parts(&self) -> Result<(Vec<u64>, Vec<u32>), Error> {
         match &*self.store() {
@@ -175,6 +190,17 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Chain<B, V> {
     pub fn put_part(&self, index: u64, outputs: &[(u64, Record)], commits: &[(u64, Digest)]) -> Result<(), Error> {
         match &mut *self.store_mut() {
             Store::Receiving(r) => r.put_with(index, outputs, commits),
+            _ => Err(Error::Receiving),
+        }
+    }
+
+    /// Several parts of the outputs put at once, ascending by index:
+    /// all of them, or, if any is not its part, none
+    /// ([`crate::store::receive::Receiving::put_many`]).
+    #[allow(clippy::type_complexity)]
+    pub fn put_parts(&self, parts: &[(u64, &[(u64, Record)], &[(u64, Digest)])]) -> Result<(), Error> {
+        match &mut *self.store_mut() {
+            Store::Receiving(r) => r.put_many(parts),
             _ => Err(Error::Receiving),
         }
     }

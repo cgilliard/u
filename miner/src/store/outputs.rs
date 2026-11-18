@@ -209,7 +209,19 @@ pub fn parts_root(level: u32, parts: &[(u64, Digest)]) -> Digest {
 /// `outputs` (ascending by position): what a part received is checked
 /// against, among the roots of the parts.
 pub fn part_root(level: u32, outputs: &[(u64, Record)]) -> Digest {
-    let mut leaves: Vec<(u64, Digest)> = outputs.iter().map(|(p, r)| (*p, r.leaf())).collect();
+    // (A leaf is two compressions: those of eight outputs together.)
+    let mut leaves: Vec<(u64, Digest)> = Vec::with_capacity(outputs.len());
+    for group in outputs.chunks(LANES) {
+        if group.len() < LANES {
+            leaves.extend(group.iter().map(|(p, r)| (*p, r.leaf())));
+            continue;
+        }
+        let slot: [_; LANES] = core::array::from_fn(|i| memo_slot(&group[i].1.memo, group[i].1.amount));
+        let height: [_; LANES] = core::array::from_fn(|i| height_digest(group[i].1.height));
+        let inner = compress_batch(core::array::from_fn(|i| (&group[i].1.commitment, &slot[i])));
+        let leaf = compress_batch(core::array::from_fn(|i| (&inner[i], &height[i])));
+        leaves.extend(group.iter().zip(leaf).map(|(o, hash)| (o.0, hash)));
+    }
     root(0, level as usize, &mut leaves)
 }
 
