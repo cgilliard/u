@@ -330,11 +330,15 @@ fn a_fresh_node_fast_syncs_a_large_state() {
     assert_eq!(new.lines(&format!("Received block {blocks} {id}")).len(), 1, "the two are on one block");
     assert_eq!(new.lines("applied in ").len(), SYNC_POINT.parse::<usize>().unwrap());
 
+    // The first is what only a node of these tests does, before it is
+    // ready: making the first block of a chain begun with a state. The
+    // rest are counted from when it was ready, as a node of a network
+    // would be: they are how long joining takes.
     report(T, "first_block_secs", format!("{:.1}", ready.as_secs_f64()));
-    report(T, "headers_secs", format!("{:.1}", headers.as_secs_f64()));
-    report(T, "state_taken_secs", format!("{:.1}", taken.as_secs_f64()));
+    report(T, "headers_secs", format!("{:.1}", (headers - ready).as_secs_f64()));
+    report(T, "state_taken_secs", format!("{:.1}", (taken - ready).as_secs_f64()));
     report(T, "state_fetch_secs", format!("{:.1}", (taken - headers).as_secs_f64()));
-    report(T, "synced_secs", format!("{:.1}", synced.as_secs_f64()));
+    report(T, "synced_secs", format!("{:.1}", (synced - ready).as_secs_f64()));
     server.show();
     new.show();
     server.report(T, "server");
