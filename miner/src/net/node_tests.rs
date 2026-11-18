@@ -161,6 +161,12 @@ impl World {
         }
     }
 
+    /// Whoever drives a node has given it something to do: it is
+    /// woken, as a node that waits on a thread of its own is.
+    fn woken(&mut self) {
+        self.wake.iter_mut().for_each(|wake| *wake = self.now);
+    }
+
     fn live(&self, i: usize) -> Vec<SocketAddrV4> {
         self.nodes[i].tables().flat_map(|t| t.live(self.now)).map(|p| p.addr).collect()
     }
@@ -1922,6 +1928,7 @@ fn a_way_through(loss: u64) {
     use crate::net::circuits::{PING, PONG};
     let began = w.now;
     me.say_along(way, vec![PING, 7, 8, 9]);
+    w.woken();
     let mut said = Vec::new();
     while said.is_empty() {
         assert!(w.now - began < 60 * SECOND, "nothing comes back");
@@ -1989,6 +1996,7 @@ fn wallets_by_ways(loss: u64) {
     // From the first to the second.
     let began = w.now;
     hold[0].post(ids[1].0, crate::msg::KIND_SLATE, [7; 32], b"a slate".to_vec(), None);
+    w.woken();
     let mut came = Vec::new();
     while came.is_empty() {
         assert!(w.now - began < 120 * SECOND, "nothing comes");
@@ -1999,6 +2007,7 @@ fn wallets_by_ways(loss: u64) {
     assert_eq!((came.len(), came[0].from, &came[0].body[..]), (1, ids[0].0, &b"a slate"[..]));
     // And its answer, sealed to what it carried.
     hold[1].post(ids[0].0, crate::msg::KIND_SLATE, [8; 32], b"its answer".to_vec(), Some(came[0].reply.clone()));
+    w.woken();
     let mut back = Vec::new();
     while back.is_empty() {
         assert!(w.now - began < 240 * SECOND, "no answer comes");

@@ -941,10 +941,11 @@ fn a_payment_goes_by_ways_through_relays() {
     // The relays held ways, and the nodes wallets are reached at held
     // their sessions.
     let held: Vec<String> = relays.iter_mut().map(|r| r.ask("status")).collect();
-    // (Each of the six wallets at three of the four.)
+    // (Each of the six wallets at three of the four; and for a
+    // minute more, whichever the first still holds of before.)
     let here = |s: &String| -> u32 {
         let line = s.lines().find(|l| l.starts_with("sessions: ")).unwrap_or("sessions: 0");
         line.split(' ').nth(1).unwrap().parse().unwrap()
     };
-    assert_eq!(held.iter().map(here).sum::<u32>(), 18, "{held:#?}");
+    assert!((18..=24).contains(&held.iter().map(here).sum::<u32>()), "{held:#?}");
 }

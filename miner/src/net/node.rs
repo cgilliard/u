@@ -335,6 +335,9 @@ fn relays_of(file: Option<&crate::consensus::File>) -> Relays {
 const SEND_WAY_IDLE: Micros = 120 * crate::transport::SECOND;
 /// How long a way to a node a message is to go by may take to open
 /// before another of the wallet's nodes is tried.
+/// How long a way kept to go on from is kept before another is made.
+const SPARE_WAY_LIFE: Micros = 600 * crate::transport::SECOND;
+const SPARE_WAYS: usize = 2;
 const SEND_WAY_SLOW: Micros = 5 * crate::transport::SECOND;
 /// The most that is kept on its way to neighbours on ways, that is
 /// being asked of them at once by one worker, and that a worker
@@ -950,6 +953,11 @@ pub struct Worker<B: Backend + 'static, V> {
     /// And what has come of those lately: what is said to be there
     /// again is not asked for again.
     taken: VecDeque<(SocketAddrV4, u64)>,
+    /// What is to be said to a neighbour on a way with what it is:
+    /// whom, its name, way, kind and count, and the bytes.
+    stepping: Vec<(SocketAddrV4, u64, u64, u8, u64, Arc<Vec<u8>>)>,
+    /// When a neighbour that has not taken something is next told.
+    tell_due: Micros,
     /// The leaves asked for and not yet here: of which block, of whom.
     leaves_asked: Vec<(Digest, SocketAddrV4)>,
     /// When the votes were last looked to ([`Worker::follow_votes`]),
@@ -1031,6 +1039,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             offered: Vec::new(),
             carried: Vec::new(),
             taken: VecDeque::new(),
+            stepping: Vec::new(),
+            tell_due: Micros::MAX,
             leaves_asked: Vec::new(),
             votes_looked: 0,
             votes_turn: 0,
@@ -1282,8 +1292,21 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         }
         let name = Self::number(&self.secret, &mut self.numbers);
         let bytes = Arc::new(std::mem::take(&mut step.bytes));
-        self.to_say.push((step.to, self.carrying(name, &step, bytes.len())));
+        match Self::said_whole(&step, bytes.len()) {
+            true => self.stepping.push((step.to, name, step.circuit, step.kind, step.count, Arc::clone(&bytes))),
+            false => self.to_say.push((step.to, self.carrying(name, &step, bytes.len()))),
+        }
+        self.tell_due = self.tell_due.min(now + super::circuits::TELL_AGAIN);
         leaving.push(super::circuits::Leaving { name, step, bytes, told: Some(now), asked: false, since: now });
+    }
+
+    /// Whether a thing is said to the neighbour with what it is, and
+    /// not left to be asked for: what is small, of a way the two know
+    /// already. (What opens a way is asked for: whoever asks is where
+    /// it says it is, and a way is not made for whoever is not.)
+    fn said_whole(step: &super::circuits::Step, len: usize) -> bool {
+        use super::circuits::{BACK, FORWARD};
+        matches!(step.kind, FORWARD | BACK) && len <= super::message::MAX_STEPPED
     }
 
     /// What a neighbour is told of something that is there for it.
@@ -1318,12 +1341,29 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         let mut leaving = self.shared.leaving.lock().unwrap_or_else(|e| e.into_inner());
         leaving.retain(|l| now.saturating_sub(l.since) < KEPT);
         let mut again = Vec::new();
+        self.tell_due = Micros::MAX;
         for l in leaving.iter_mut().filter(|l| !l.asked) {
-            let due = l.told.is_none_or(|told| now.saturating_sub(told) >= TELL_AGAIN);
-            if due && self.shared.owner(&l.step.to) == self.me {
-                l.told = Some(now);
-                again.push((l.step.to, self.carrying(l.name, &l.step, l.bytes.len())));
+            if self.shared.owner(&l.step.to) != self.me {
+                continue;
             }
+            if l.told.is_none_or(|told| now.saturating_sub(told) >= TELL_AGAIN) {
+                l.told = Some(now);
+                match Self::said_whole(&l.step, l.bytes.len()) {
+                    true => {
+                        let step = &l.step;
+                        self.stepping.push((
+                            step.to,
+                            l.name,
+                            step.circuit,
+                            step.kind,
+                            step.count,
+                            Arc::clone(&l.bytes),
+                        ));
+                    }
+                    false => again.push((l.step.to, self.carrying(l.name, &l.step, l.bytes.len()))),
+                }
+            }
+            self.tell_due = self.tell_due.min(l.told.unwrap_or(now) + TELL_AGAIN);
         }
         drop(leaving);
         self.to_say.extend(again);
@@ -1333,13 +1373,18 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     /// `from`. Of a way through this node: passed on, as the way has
     /// it. Of a way this node opened: taken as what came back.
     fn step_arrived(&mut self, now: Micros, from: SocketAddrV4, name: u64, bytes: &[u8]) {
-        use super::circuits::{BACK, FORWARD, OPEN, OPENED, Out};
         let Some(at) = self.carried.iter().position(|c| c.0 == name && c.1 == from) else { return };
         let (_, _, circuit, kind, count) = self.carried.swap_remove(at);
         self.taken.push_back((from, name));
         if self.taken.len() > TAKEN {
             self.taken.pop_front();
         }
+        self.step_taken(now, from, circuit, kind, count, bytes);
+    }
+
+    /// The same, of whatever way it came by: asked for, or said whole.
+    fn step_taken(&mut self, now: Micros, from: SocketAddrV4, circuit: u64, kind: u8, count: u64, bytes: &[u8]) {
+        use super::circuits::{BACK, FORWARD, OPEN, OPENED, Out};
         let mut chance = [0u8; 96];
         if crate::random::fill(&mut chance).is_err() {
             return;
@@ -1442,20 +1487,24 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         ways: &mut super::circuits::Ways,
         purpose: super::circuits::Purpose,
         relays: &Relays,
-        point: (Digest, SocketAddrV4),
+        point: Option<(Digest, SocketAddrV4)>,
         own: &Digest,
         now: Micros,
     ) -> Option<super::circuits::Step> {
         let mut chance = [0u8; 96 + 16];
         crate::random::fill(&mut chance).ok()?;
+        let not_it = |id: &Digest| point.is_none_or(|p| p.0 != *id) && id != own;
         let mut others: Vec<(Digest, SocketAddrV4)> =
-            relays.iter().filter(|r| r.0 != point.0 && r.0 != *own).filter_map(|r| Some((r.0, r.1?))).collect();
+            relays.iter().filter(|r| not_it(&r.0)).filter_map(|r| Some((r.0, r.1?))).collect();
         let mut path = Vec::with_capacity(3);
         for draw in chance[96..].chunks(8).take(others.len().min(2)) {
             let at = u64::from_le_bytes(draw.try_into().expect("eight bytes")) as usize % others.len();
             path.push(others.swap_remove(at));
         }
-        path.push(point);
+        path.extend(point);
+        if path.is_empty() {
+            return None;
+        }
         let circuit = Self::number(&self.secret, &mut self.numbers);
         let (mut way, step) = super::circuits::Way::begin(circuit, path, chance[..96].try_into().expect("96"), now);
         way.purpose = purpose;
@@ -1487,12 +1536,21 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         ways.open.retain(|w| match w.purpose {
             Purpose::Session => at.contains(&w.end().1) && (!w.ready() || now.saturating_sub(w.seen) < silent),
             Purpose::Send => now.saturating_sub(w.seen) < SEND_WAY_IDLE,
+            // (One kept to go on from: a fresh one now and then, so
+            // that what is sent this hour does not all go by the
+            // relays of the last.)
+            Purpose::Spare => now.saturating_sub(w.began) < SPARE_WAY_LIFE,
             Purpose::Asked => true,
         });
         let mut steps = Vec::new();
+        // (Two: one of them mostly does not pass the relay a message
+        // is next to go to.)
+        for _ in ways.open.iter().filter(|w| w.purpose == Purpose::Spare).count()..SPARE_WAYS {
+            steps.extend(self.begin_way(&mut ways, Purpose::Spare, relays, None, &id, now));
+        }
         for point in points {
             match ways.open.iter_mut().find(|w| w.purpose == Purpose::Session && w.end().1 == point.1) {
-                None => steps.extend(self.begin_way(&mut ways, Purpose::Session, relays, point, &id, now)),
+                None => steps.extend(self.begin_way(&mut ways, Purpose::Session, relays, Some(point), &id, now)),
                 Some(way) if way.ready() && own.due(&point.1, now, self.cfg.keepalive) => {
                     let seq = own.say(point.1, way.bind(), self.unix, now);
                     let mut said = Vec::new();
@@ -1550,7 +1608,23 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             }
             let point = points[post.turn % points.len()];
             match ways.open.iter_mut().find(|w| w.purpose == Purpose::Send && w.end().1 == point.1) {
-                None => steps.extend(self.begin_way(&mut ways, Purpose::Send, relays, point, &own.id(), now)),
+                // No way there: the one kept to go on from goes on to
+                // it, if it is open and does not pass that relay
+                // already; or one is opened.
+                None => {
+                    let spare =
+                        ways.open.iter_mut().find(|w| w.purpose == Purpose::Spare && w.ready() && !w.passes(&point.0));
+                    let mut chance = [0u8; 96];
+                    match spare.filter(|_| crate::random::fill(&mut chance).is_ok()) {
+                        Some(way) => {
+                            way.purpose = Purpose::Send;
+                            steps.extend(way.extend(point, &chance, now));
+                        }
+                        None => {
+                            steps.extend(self.begin_way(&mut ways, Purpose::Send, relays, Some(point), &own.id(), now))
+                        }
+                    }
+                }
                 Some(way) if way.ready() => {
                     if post.sealed.is_none()
                         && let Some(known) = post.known.clone()
@@ -2059,7 +2133,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             self.due = now + self.cfg.tick;
             self.periodic(now, out);
         }
-        self.pump(now, out).min(self.due)
+        self.pump(now, out).min(self.due).min(self.tell_due)
     }
 
     fn periodic(&mut self, now: Micros, out: Out<'_>) {
@@ -2182,6 +2256,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             Message::SessionState { .. } => ("session-state", About::Nothing, "answered"),
             Message::Offer { .. } => ("offer", About::Nothing, "answered"),
             Message::Carry { .. } => ("carry", About::Nothing, "answered"),
+            Message::Stepped { .. } => ("stepped", About::Nothing, "carried"),
+            Message::Carried { .. } => ("carried", About::Nothing, "answered"),
             Message::Notice { .. } => ("notice", About::Nothing, "answered"),
         };
         // What was done is read off what it left behind: what was sent,
@@ -2365,6 +2441,44 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     self.carried.push((name, from, circuit, kind, count));
                     self.fetch_granted(now, Object::Step(name), from, len, grant);
                 } else if !known {
+                    self.counts.unheard += 1;
+                }
+            }
+            // The same, said whole: of a way that is here, taken, once;
+            // and said to have come, each time it is said.
+            Message::Stepped { name, circuit, kind, count, bytes } => {
+                use super::circuits::{BACK, FORWARD};
+                let link = (from, circuit);
+                let known = self.taken.contains(&(from, name));
+                let of_a_way = || {
+                    let relayed = self.shared.relayed.lock().unwrap_or_else(|e| e.into_inner());
+                    match kind {
+                        FORWARD => relayed.holds(&link),
+                        BACK => {
+                            let ways = self.shared.ways.lock().unwrap_or_else(|e| e.into_inner());
+                            relayed.goes_on_to(&link) || ways.open.iter().any(|w| (w.first(), w.circuit()) == link)
+                        }
+                        _ => false,
+                    }
+                };
+                if !known && !of_a_way() {
+                    self.counts.unheard += 1;
+                    return;
+                }
+                self.send(from, &Message::Carried { name }, out);
+                if !known {
+                    self.taken.push_back((from, name));
+                    if self.taken.len() > TAKEN {
+                        self.taken.pop_front();
+                    }
+                    self.step_taken(now, from, circuit, kind, count, bytes);
+                }
+            }
+            Message::Carried { name } => {
+                let mut leaving = self.shared.leaving.lock().unwrap_or_else(|e| e.into_inner());
+                let before = leaving.len();
+                leaving.retain(|l| (l.name, l.step.to) != (name, from));
+                if leaving.len() == before {
                     self.counts.unheard += 1;
                 }
             }
@@ -3690,6 +3804,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         let mut wake = self.fetch(now, out);
         for (to, message) in std::mem::take(&mut self.to_say) {
             self.send(to, &message, out);
+        }
+        for (to, name, circuit, kind, count, bytes) in std::mem::take(&mut self.stepping) {
+            self.send(to, &Message::Stepped { name, circuit, kind, count, bytes: &bytes }, out);
         }
         // A body that arrived may have been applied in place, and what
         // came of that may want more fetched: until nothing does.

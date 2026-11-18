@@ -76,6 +76,10 @@ pub enum Purpose {
     /// Whoever drives the node asked for it.
     #[default]
     Asked,
+    /// Kept open through relays drawn by chance, to go on from to
+    /// wherever a message is next to go: one relay more is sooner
+    /// added than a whole way opened.
+    Spare,
     /// Its wallet is reached at the end of it.
     Session,
     /// Its wallet sends to another by it. (Never the way it is itself
@@ -354,7 +358,7 @@ pub struct Leaving {
 
 /// How often a neighbour that does not ask is told again, and how long
 /// a thing is kept for it.
-pub const TELL_AGAIN: Micros = SECOND;
+pub const TELL_AGAIN: Micros = SECOND * 2 / 5;
 pub const KEPT: Micros = 30 * SECOND;
 /// How long a way may take to open.
 pub const OPENING: Micros = 30 * SECOND;
@@ -434,6 +438,11 @@ impl Way {
         if self.ready() {
             return Came::Ready;
         }
+        Came::Step(self.reach(chance))
+    }
+
+    /// Tells the last relay there is to go on to the next of the path.
+    fn reach(&mut self, chance: &[u8; 96]) -> Step {
         let opening = Opening::new(chance);
         let next = self.path[self.hops.len()].1;
         let mut tell = Vec::with_capacity(7 + circuit::HELLO_LEN);
@@ -442,7 +451,23 @@ impl Way {
         tell.extend_from_slice(&next.port().to_le_bytes());
         tell.extend_from_slice(opening.hello());
         self.opening = Some(opening);
-        Came::Step(self.wrapped(&tell))
+        self.wrapped(&tell)
+    }
+
+    /// Whether the relay of id `id` is one of the way's.
+    pub fn passes(&self, id: &Digest) -> bool {
+        self.path.iter().any(|relay| relay.0 == *id)
+    }
+
+    /// Goes on from a way that is open to one relay more: what is to
+    /// be sent. The way is open again when that relay has answered.
+    pub fn extend(&mut self, to: (Digest, SocketAddrV4), chance: &[u8; 96], now: Micros) -> Option<Step> {
+        if !self.ready() || self.passes(&to.0) {
+            return None;
+        }
+        self.path.push(to);
+        self.began = now;
+        Some(self.reach(chance))
     }
 
     fn wrapped(&mut self, whole: &[u8]) -> Step {
@@ -655,6 +680,34 @@ mod tests {
         let mut way = world.open_other(11);
         assert_eq!(way.back(1, b"nothing", &[0; 96], 0), Came::Bad);
         assert_eq!(way.say(b"x").map(|s| s.kind), Some(FORWARD));
+        // A way that is open goes on to one relay more, and what is
+        // said along it then is said to that one.
+        let fourth = (id_of(world.keys[0].public_key()), at(1));
+        assert_eq!(way.extend(fourth, &[80; 96], 0), None, "not to a relay it passes already");
+        let mut two = {
+            let (mut way, mut step) = Way::begin(21, world.path()[..2].to_vec(), &[81; 96], 0);
+            loop {
+                let came = world.carry(at(ME), step).0.unwrap();
+                let next = match came.kind {
+                    OPENED => way.opened(&came.bytes, &[82; 96], 0),
+                    _ => way.back(came.count, &came.bytes, &[83; 96], 0),
+                };
+                match next {
+                    Came::Step(next) => step = next,
+                    Came::Ready => break way,
+                    other => panic!("{other:?}"),
+                }
+            }
+        };
+        let third = world.path()[2];
+        let step = two.extend(third, &[84; 96], 5).unwrap();
+        assert!(!two.ready() && two.say(b"x").is_none());
+        let came = world.carry(at(ME), step).0.unwrap();
+        assert_eq!(two.back(came.count, &came.bytes, &[85; 96], 0), Came::Ready);
+        assert_eq!(two.end().1, at(3));
+        let step = two.say(b"to the third").unwrap();
+        let (known_by, said) = world.carry(at(ME), step).1.unwrap();
+        assert_eq!((known_by.0, &said[..]), (at(2), &b"to the third"[..]));
         // A relay forgets a way nothing passes along.
         world.relays[0].prune(Limits::default().idle);
         assert!(world.relays[0].is_empty());

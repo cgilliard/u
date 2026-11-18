@@ -58,6 +58,11 @@ const GET: u8 = 16;
 const CHUNK: u8 = 17;
 const GONE: u8 = 18;
 const CARRY: u8 = 19;
+const STEPPED: u8 = 20;
+const CARRIED: u8 = 21;
+
+/// The most a [`Message::Stepped`] carries.
+pub const MAX_STEPPED: usize = MAX_DATAGRAM - HEAD - 27;
 // 32 to 47: kept for the messages of private messaging.
 
 /// What a node says of itself, in every ping and pong.
@@ -239,6 +244,20 @@ pub enum Message<'a> {
         count: u64,
         len: u32,
     },
+    /// The same, of something small enough to be said with it: here it
+    /// is. Answered with [`Message::Carried`], and said again until it
+    /// is.
+    Stepped {
+        name: u64,
+        circuit: u64,
+        kind: u8,
+        count: u64,
+        bytes: &'a [u8],
+    },
+    /// "What you said under this name has come."
+    Carried {
+        name: u64,
+    },
     /// "I am going": the sender is not to be asked anything more.
     Goodbye {
         token: u64,
@@ -352,6 +371,20 @@ impl<'a> Message<'a> {
                 w.put(&len.to_le_bytes());
                 CARRY
             }
+            Message::Stepped { name, circuit, kind, count, bytes } => {
+                w.put(&name.to_le_bytes());
+                w.put(&circuit.to_le_bytes());
+                w.put(&[*kind]);
+                w.put(&count.to_le_bytes());
+                let bytes = &bytes[..bytes.len().min(MAX_STEPPED)];
+                w.put(&(bytes.len() as u16).to_le_bytes());
+                w.put(bytes);
+                STEPPED
+            }
+            Message::Carried { name } => {
+                w.put(&name.to_le_bytes());
+                CARRIED
+            }
             Message::Get(g) => {
                 w.1 += g.encode(&mut w.0[HEAD..]);
                 GET
@@ -443,6 +476,14 @@ impl<'a> Message<'a> {
                 len: r.u32().ok_or(BAD)?,
             },
             NOTICE => Message::Notice { id: r.digest().ok_or(BAD)?, what: r.take(1).ok_or(BAD)?[0] },
+            STEPPED => {
+                let (name, circuit) = (r.u64().ok_or(BAD)?, r.u64().ok_or(BAD)?);
+                let (kind, count) = (r.take(1).ok_or(BAD)?[0], r.u64().ok_or(BAD)?);
+                let len = u16::from_le_bytes(r.array().ok_or(BAD)?) as usize;
+                let bytes = r.take(len).ok_or(BAD)?;
+                Message::Stepped { name, circuit, kind, count, bytes }
+            }
+            CARRIED => Message::Carried { name: r.u64().ok_or(BAD)? },
             CARRY => Message::Carry {
                 grant: r.u64().ok_or(BAD)?,
                 name: r.u64().ok_or(BAD)?,
@@ -600,6 +641,9 @@ mod tests {
                 len: rng.next_u64() as u32,
             },
             Message::Notice { id: digest(rng), what: NOTICE_OFFLINE },
+            Message::Stepped { name: rng.next_u64(), circuit: rng.next_u64(), kind: 4, count: 9, bytes: &[1, 2, 3] },
+            Message::Stepped { name: 1, circuit: 2, kind: 3, count: 4, bytes: &[7; MAX_STEPPED] },
+            Message::Carried { name: rng.next_u64() },
             Message::Carry {
                 grant: rng.next_u64(),
                 name: rng.next_u64(),
