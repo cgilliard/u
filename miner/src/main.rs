@@ -151,6 +151,9 @@ fn said(event: &Event) -> Option<String> {
             format!("Taking the state as of a later block, {} ({})", n(*height), short(id))
         }
         Event::StateTaken { height } => format!("State taken as of block {}", n(*height)),
+        Event::StateProgress { parts, of } => {
+            format!("Taking the state: {} of {} parts ({}%)", commas(*parts), commas(*of), parts * 100 / (*of).max(1))
+        }
     })
 }
 
@@ -683,7 +686,9 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     // the node says as it starts, where whoever is at the terminal
     // sees them; once, and in no log.
     if let Some(phrase) = phrase {
-        eprintln!("\n{}\n", tabminer::console::made(&phrase));
+        // (To nobody, if nobody is there to read it: that is no
+        // reason for the node to stop.)
+        let _ = writeln!(std::io::stderr(), "\n{}\n", tabminer::console::made(&phrase));
     }
 
     // Blocks are made on a thread of their own, for as long as the

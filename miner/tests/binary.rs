@@ -259,14 +259,15 @@ fn a_payment_is_made_at_the_prompt_and_mined() {
         let node = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
         let mut node = Running(node);
         let (mut stdin, mut stdout) = (node.0.stdin.take().unwrap(), node.0.stdout.take().unwrap());
-        // A new wallet: no password. Its words are said, once, and then
-        // the node is ready.
+        // A new wallet: no password. The node is ready, and then its
+        // words are said, once: the last thing before the prompt.
         writeln!(stdin).unwrap();
         let mut lines = BufReader::new(node.0.stderr.take().unwrap()).lines();
-        let said: Vec<String> =
+        let before: Vec<String> =
             lines.by_ref().map(|l| l.unwrap()).take_while(|l| !l.ends_with("Server is ready!")).collect();
-        let words = said.iter().find(|l| l.starts_with("    ")).expect("the wallet's words");
-        assert_eq!(words.split_whitespace().count(), 12, "{said:#?}");
+        assert!(!before.iter().any(|l| l.starts_with("    ")), "{before:#?}");
+        let words = lines.by_ref().map(|l| l.unwrap()).find(|l| l.starts_with("    ")).expect("the wallet's words");
+        assert_eq!(words.split_whitespace().count(), 12, "{words}");
         assert!(dirs[i].join("wallet.tab").exists());
         // (What it says on that side from here on is not waited for.)
         std::thread::spawn(move || lines.for_each(drop));
@@ -388,7 +389,13 @@ impl Prompted {
         let mut lines = BufReader::new(node.0.stderr.take().unwrap()).lines();
         let before: Vec<String> =
             lines.by_ref().map(|l| l.unwrap()).take_while(|l| !l.ends_with("Server is ready!")).collect();
-        assert_eq!(before.iter().any(|l| l.starts_with("    ")), new, "{before:#?}");
+        // (A new wallet's words are said after that, and nowhere
+        // before.)
+        assert!(!before.iter().any(|l| l.starts_with("    ")), "{before:#?}");
+        if new {
+            let words = lines.by_ref().map(|l| l.unwrap()).find(|l| l.starts_with("    ")).expect("the wallet's words");
+            assert_eq!(words.split_whitespace().count(), 12, "{words}");
+        }
         std::thread::spawn(move || lines.for_each(drop));
         let mut node = Prompted { node, typed, said };
         assert_eq!(node.until_prompt(), "");

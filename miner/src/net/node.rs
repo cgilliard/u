@@ -348,6 +348,10 @@ pub(crate) struct Join {
     unserved: Vec<SocketAddrV4>,
     /// Which peer is asked next.
     turn: usize,
+    /// How many parts the state is of, once known; and when it was
+    /// last said how many are kept.
+    parts: u64,
+    told: Micros,
     /// Manifests that the block's proof refused.
     refused: u32,
     /// Since when no peer has been able to serve it.
@@ -567,6 +571,9 @@ pub enum Event {
     /// The state is being taken whole, as of this block; `again` if in
     /// place of an earlier one that nobody can serve any more.
     StateWanted { height: u32, id: Digest, again: bool },
+    /// How far the taking of the state has come: said now and then,
+    /// of a state that takes long. `parts` of its `of` parts are kept.
+    StateProgress { parts: u64, of: u64 },
     /// The state has been taken, as of the block of this height.
     StateTaken { height: u32 },
 }
@@ -2107,6 +2114,15 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         if join.begun
             && let Ok((parts, names)) = self.chain.missing_parts()
         {
+            // How far it has come is said every half minute.
+            let missing = (parts.len() + names.len()) as u64;
+            join.parts = join.parts.max(missing);
+            if join.told == 0 {
+                join.told = now;
+            } else if now.saturating_sub(join.told) >= 30 * crate::transport::SECOND && missing > 0 {
+                join.told = now;
+                self.shared.say(Event::StateProgress { parts: join.parts - missing, of: join.parts });
+            }
             wanted.extend(parts.iter().map(|i| (Object::Part { block: id, index: *i }, snapshot::MAX_PART as u32)));
             wanted.extend(names.iter().map(|i| (Object::Names { block: id, index: *i }, snapshot::MAX_NAMES as u32)));
             // (But for those that are here, and being kept.)
@@ -2205,6 +2221,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             finishing: false,
             unserved: Vec::new(),
             turn: 0,
+            parts: 0,
+            told: 0,
             refused: 0,
             orphaned: None,
         });
