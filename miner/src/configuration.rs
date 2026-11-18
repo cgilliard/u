@@ -84,6 +84,11 @@ const OPTIONS: &[(&str, &[Opt])] = &[
                 help: "where the table of the proof of work is kept (default\npow.table in the data directory): somewhere of its own, it\noutlasts the data directory and is not made again",
             },
             Opt {
+                name: "delay-blocks",
+                takes: Takes::Value("N"),
+                help: "wait N seconds after each block made here before the next\nis begun: slower blocks, for a network of a few nodes far\napart (what blocks ask for in work follows)",
+            },
+            Opt {
                 name: "max-block-signatures",
                 takes: Takes::Value("N"),
                 help: "signatures a block made here checks at the most: one for\neach input of the transactions it carries (default 256)",
@@ -475,6 +480,8 @@ pub struct Configuration {
     pub debug_blocks: Option<u32>,
     /// The height above which no block is made here.
     pub blocks: Option<u64>,
+    /// Seconds waited after a block made here before the next is begun.
+    pub delay_blocks: u64,
     pub listen: SocketAddrV4,
     /// Peers given by hand.
     pub peers: Vec<SocketAddrV4>,
@@ -875,6 +882,7 @@ impl Configuration {
             debug_outputs,
             debug_blocks: given.number("debug-blocks", 1)?.map(|n| n.min(u32::MAX as u64) as u32),
             blocks: given.number("blocks", 0)?,
+            delay_blocks: given.number("delay-blocks", 0)?.unwrap_or(0),
             listen,
             peers,
             seeds,

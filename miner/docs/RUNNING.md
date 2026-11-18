@@ -582,6 +582,12 @@ and for the new one twice. With `--no-prompt`
 nothing can be asked: a new wallet has no password, and one that has
 a password needs `--password-file`.
 
+**Its peers.** The peers that have answered the node are written to
+`peers.txt` in the data directory, one address to a line, as they
+change; a node that starts again asks them first, besides its seeds
+and those it is given, and keeps those that answer. The file may be
+edited, or removed.
+
 **The pool.** Transactions waiting for a block are kept in memory, to
 `--mempool-size` bytes (64 MB if not said), and written to `pool.tab`
 in the data directory as they change: a node that starts again has

@@ -538,6 +538,10 @@ pub(crate) struct Shared {
     /// The pace the workers serve at, all together
     /// ([`Serve::sharing`]).
     pace: Arc<AtomicU64>,
+    /// The peers of each worker that have answered it, as it last
+    /// said: for whoever keeps them from one run to the next
+    /// ([`Handle::answered`]).
+    answered: Vec<Mutex<Vec<SocketAddrV4>>>,
     /// What a host's address is mixed with to find its worker: so that
     /// nobody outside can choose addresses that are all one worker's.
     key: u64,
@@ -1118,6 +1122,14 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             self.rotated = now;
         }
         self.peers.prune(now, |_| {});
+        // Which have answered, for whoever keeps them: said when it is
+        // other than it was. (In the order of their addresses.)
+        let answered: Vec<SocketAddrV4> = self.peers.all().filter(|p| p.proven).map(|p| p.addr).collect();
+        let mut said = self.shared.answered[self.me].lock().unwrap_or_else(|e| e.into_inner());
+        if *said != answered {
+            *said = answered;
+        }
+        drop(said);
         self.budget = self.cfg.peers.unproven_pings;
         let mut due = Vec::new();
         let (secret, numbers) = (&self.secret, &mut self.numbers);
@@ -2716,6 +2728,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         let shared = Arc::new(Shared {
             mail: (0..n).map(|_| Mutex::new(Vec::new())).collect(),
             pace: Arc::default(),
+            answered: (0..n).map(|_| Mutex::new(Vec::new())).collect(),
             key: u64::from_le_bytes(derive(&secret, b'h', 0)[..8].try_into().unwrap()),
             totals: Arc::new(Totals::new()),
             live: (0..n).map(|_| AtomicUsize::new(0)).collect(),
@@ -3076,6 +3089,18 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
             (Ok(n), Ok(best)) if n > 1 => Behind::Blocks { best: best.header.hash(), height: best.header.height },
             _ => Behind::No,
         }
+    }
+
+    /// The peers that have answered the node: those it knows to be
+    /// where they say, as its workers last said. In the order of their
+    /// addresses.
+    pub fn answered(&self) -> Vec<SocketAddrV4> {
+        let mut all: Vec<SocketAddrV4> = Vec::new();
+        for worker in &self.shared.answered {
+            all.extend(worker.lock().unwrap_or_else(|e| e.into_inner()).iter());
+        }
+        all.sort_unstable();
+        all
     }
 
     /// Whether a chain ahead of ours is being caught up with: from when

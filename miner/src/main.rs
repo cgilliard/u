@@ -43,6 +43,9 @@ struct Making {
     max_signatures: usize,
     /// The height above which no block is made.
     blocks: Option<u64>,
+    /// How long is waited after a block made here before the next is
+    /// begun.
+    delay: Duration,
     /// Debugging: the outputs every block makes, and how many of the
     /// outputs the chain began with it spends.
     fill: Option<(usize, usize)>,
@@ -436,6 +439,8 @@ fn make_block(
             let settled = hold.settled();
             hold.mined(block, socket::unix());
             hold.wait_settled(settled, Duration::from_secs(600));
+            // (And then for as long as it was told to, before the next.)
+            std::thread::sleep(making.delay);
         }
         Ok(Mined::Cancelled) => {
             let noticed = *noticed.lock().unwrap_or_else(|e| e.into_inner());
@@ -692,6 +697,16 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     for peer in &c.peers {
         node.add_peer(*peer, true, now());
     }
+    // The peers that answered when the node last ran: asked again, as
+    // any peer it is told of is, and kept only if they answer.
+    let peers_kept = c.data_dir.join("peers.txt");
+    if let Ok(kept) = std::fs::read_to_string(&peers_kept) {
+        let known = kept.lines().filter_map(|line| line.trim().parse::<std::net::SocketAddrV4>().ok());
+        let taken = known.filter(|peer| node.add_peer(*peer, false, now())).count();
+        if taken > 0 {
+            main.log(&format!("{} peers are known from the last run", commas(taken as u64)));
+        }
+    }
     // A seed that cannot be found now is one fewer to begin from.
     for seed in &c.seeds {
         for found in seed.to_socket_addrs().into_iter().flatten() {
@@ -763,6 +778,7 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
             // (What the pool was when last kept: how many, their
             // bytes, and the last it took.)
             let mut was = (0, 0, 0);
+            let mut peers_were: Vec<std::net::SocketAddrV4> = Vec::new();
             loop {
                 std::thread::sleep(Duration::from_secs(30));
                 let (mut now, mut saved) = (was, None);
@@ -772,15 +788,30 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
                         saved = Some(pool.saved());
                     }
                 });
-                let Some(saved) = saved else { continue };
-                let tmp = kept.with_extension("tmp");
-                match std::fs::write(&tmp, &saved).and_then(|()| std::fs::rename(&tmp, &kept)) {
-                    Ok(()) => was = now,
-                    Err(e) => main.log(&format!("Error: the pool cannot be kept in {}: {e}", kept.display())),
+                if let Some(saved) = saved {
+                    let tmp = kept.with_extension("tmp");
+                    match std::fs::write(&tmp, &saved).and_then(|()| std::fs::rename(&tmp, &kept)) {
+                        Ok(()) => was = now,
+                        Err(e) => main.log(&format!("Error: the pool cannot be kept in {}: {e}", kept.display())),
+                    }
+                }
+                // And the peers that have answered, one to a line. (Not
+                // none: a node with nobody to talk to for a while does
+                // not forget everybody it knew.)
+                let answered = hold.answered();
+                if answered != peers_were && !answered.is_empty() {
+                    let text: String = answered.iter().map(|peer| format!("{peer}\n")).collect();
+                    let tmp = peers_kept.with_extension("tmp");
+                    match std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &peers_kept)) {
+                        Ok(()) => peers_were = answered,
+                        Err(e) => {
+                            main.log(&format!("Error: the peers cannot be kept in {}: {e}", peers_kept.display()))
+                        }
+                    }
                 }
             }
         };
-        std::thread::Builder::new().name("pool".into()).spawn(keeping).map_err(threads)?;
+        std::thread::Builder::new().name("keeper".into()).spawn(keeping).map_err(threads)?;
     }
     // The wallet follows the chain on a thread of its own: woken when
     // the chain has another last block, and once in a while besides.
@@ -892,6 +923,7 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
         let most = Making {
             max_signatures: c.max_block_signatures,
             blocks: c.blocks,
+            delay: Duration::from_secs(c.delay_blocks),
             fill: c.debug_fill,
             filled: c.debug_outputs.map(|(n, spacing, _)| (n, spacing)),
         };
