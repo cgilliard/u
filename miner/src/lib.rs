@@ -9,6 +9,7 @@ pub mod chacha20poly1305;
 pub mod chain;
 pub mod chain_verifier;
 pub mod challenger;
+pub mod circuit;
 pub mod codec;
 pub mod configuration;
 pub mod consensus;
