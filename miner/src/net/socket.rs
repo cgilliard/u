@@ -53,6 +53,8 @@ pub const STATS: &[(&str, Kind)] = &[
     ("Fetching", Kind::Level),
     ("Mined", Kind::Count),
     ("Requests", Kind::Count),
+    ("HeapMB", Kind::Level),
+    ("PeakHeapMB", Kind::Level),
 ];
 /// The node's stats. The log shows these of them, each in a column
 /// this wide; the rest are counted all the same.
@@ -65,6 +67,8 @@ pub fn stats() -> Stats {
         (REQUESTS, 11),
         (PACKETS, 11),
         (LATENCY, 15),
+        (HEAP, 7),
+        (HEAP_PEAK, 11),
         (PEERS, 6),
         (PEERS_LIVE, 10),
         (HEIGHT, 7),
@@ -82,6 +86,10 @@ pub fn set_levels<B: Backend + 'static, V>(stats: &Stats, hold: &Handle<B, V>) {
     stats.set(HEIGHT, now.height as u64);
     stats.set(BLOCKS, now.blocks);
     stats.set(FETCHING, now.fetching as u64);
+    // (In megabytes, of a million bytes: nothing, where the program
+    // does not count what it holds.)
+    stats.set(HEAP, crate::heap::now() as u64 / 1_000_000);
+    stats.set(HEAP_PEAK, crate::heap::peak() as u64 / 1_000_000);
 }
 
 /// Datagrams taken, of whatever kind: the requests, and the chunks of
@@ -107,6 +115,10 @@ pub const MINED: usize = 10;
 /// Requests taken: what the request log has a line for, each one line
 /// there and one here. (Not the chunks of what the node is fetching.)
 pub const REQUESTS: usize = 11;
+/// The memory the program holds, and the most it has held, in
+/// megabytes ([`crate::heap`]).
+pub const HEAP: usize = 12;
+pub const HEAP_PEAK: usize = 13;
 
 /// What the main log says when datagrams are dropped.
 pub const DROPPING: &str = "dropped requests: a worker's queue is full";

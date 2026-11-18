@@ -30,6 +30,11 @@ use tabminer::store::backend::FileBackend;
 use tabminer::wallet::follow::follow;
 use tabminer::wallet::{Ask, Wallet, WalletError};
 
+/// Every allocation of the node is counted: so that it can say how
+/// much memory it holds, and the most it has held.
+#[global_allocator]
+static HEAP: tabminer::heap::Counting = tabminer::heap::Counting;
+
 /// The node's wallet, as its threads share it.
 type Purse = Arc<Mutex<Wallet<FileBackend>>>;
 

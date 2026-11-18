@@ -22,6 +22,7 @@ pub mod genesis;
 pub mod hash;
 pub mod hash_machine;
 pub mod hash_table;
+pub mod heap;
 #[cfg(test)]
 #[path = "tests/inflate.rs"]
 pub mod inflate;

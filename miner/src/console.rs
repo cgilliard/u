@@ -237,6 +237,8 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             commas(pooled as u64),
             commas(bytes as u64)
         );
+        let (held, most) = (crate::heap::now() / 1_000_000, crate::heap::peak() / 1_000_000);
+        out.push_str(&format!("\nmemory: {} MB held, {} MB at the most", commas(held as u64), commas(most as u64)));
         if let Ok(wallet) = self.wallet() {
             let balance = follow::balance(self.hold.chain(), &wallet).map_err(|e| e.to_string())?;
             out.push_str(&format!("\nwallet: {} confirmed", coins(balance.confirmed)));
