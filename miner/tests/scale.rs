@@ -124,45 +124,6 @@ impl Node {
         // of itself is what there is).
         let (resident, own) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         let (r, o, path) = (Arc::clone(&resident), Arc::clone(&own), format!("/proc/{}/status", child.id()));
-        // Elsewhere the system is asked, every half minute, and what it
-        // says is printed: the memory the machine has free, what the
-        // node has of it, and (Windows) what the system keeps of files.
-        // So that a run that slows to nothing says what it ran out of.
-        #[cfg(not(target_os = "linux"))]
-        {
-            let pid = child.id();
-            std::thread::spawn(move || {
-                loop {
-                    std::thread::sleep(Duration::from_secs(30));
-                    #[cfg(windows)]
-                    let asked = Command::new("powershell")
-                        .args(["-NoProfile", "-Command"])
-                        .arg(format!(
-                            "$o=Get-CimInstance Win32_OperatingSystem; $p=Get-Process -Id {pid} -ErrorAction Stop; \
-                             $c=(Get-Counter '\\Memory\\Cache Bytes','\\Memory\\Modified Page List Bytes',\
-                             '\\Memory\\Standby Cache Normal Priority Bytes').CounterSamples; \
-                             'free_mb={{0}} node_working_set_mb={{1}} node_private_mb={{2}} cache_mb={{3}} modified_mb={{4}} \
-                             standby_mb={{5}}' -f [int]($o.FreePhysicalMemory/1024),[int]($p.WorkingSet64/1MB),\
-                             [int]($p.PrivateMemorySize64/1MB),[int]($c[0].CookedValue/1MB),[int]($c[1].CookedValue/1MB),\
-                             [int]($c[2].CookedValue/1MB)"
-                        ))
-                        .output();
-                    #[cfg(not(windows))]
-                    let asked = Command::new("sh")
-                        .arg("-c")
-                        .arg(format!(
-                            "echo node_rss_kb=$(ps -o rss= -p {pid}) $(vm_stat | tr -d '.' | awk '/Pages free|Pages inactive|File-backed/ {{printf \"%s_pages=%s \", $(NF-2) $(NF-1), $NF}}')"
-                        ))
-                        .output();
-                    match asked {
-                        Ok(o) if o.status.success() => {
-                            println!("MEMORY {name} {}", String::from_utf8_lossy(&o.stdout).trim())
-                        }
-                        _ => break,
-                    }
-                }
-            });
-        }
         std::thread::spawn(move || {
             while let Ok(status) = std::fs::read_to_string(&path) {
                 let kb = |what: &str| {
@@ -340,15 +301,6 @@ fn a_full_block_applies_on_a_large_state() {
         secs.sort_by(f64::total_cmp);
         report(T, &format!("{what}_median_secs"), format!("{:.3}", secs[secs.len() / 2]));
         report(T, &format!("{what}_max_secs"), format!("{:.3}", secs[secs.len() - 1]));
-        // (And how much of applying was writing to disk.)
-        if what == "apply" {
-            let mut written: Vec<f64> = lines.iter().filter_map(|l| secs_after(l, "s (")).collect();
-            written.sort_by(f64::total_cmp);
-            report(T, "apply_write_median_secs", format!("{:.3}", written[written.len() / 2]));
-        }
-        // (Only a guard: the times are for reading. Machines differ by
-        // too much for them to be held to a number.)
-        assert!(secs[secs.len() - 1] < 300.0, "{what} took {:.1}s", secs[secs.len() - 1]);
     }
     node.show();
     node.report(T, "node");

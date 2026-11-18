@@ -583,9 +583,7 @@ impl<B: Backend + 'static> State<B> {
         #[cfg(test)]
         let (clock, mut times) = (session.clock, session.times);
         let Session { txn, meta, .. } = session;
-        let began = std::time::Instant::now();
         txn.commit(&meta.to_bytes())?;
-        LAST_COMMIT.store(began.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         #[cfg(test)]
         {
             times[3] = clock.elapsed();
@@ -594,17 +592,6 @@ impl<B: Backend + 'static> State<B> {
         *self.meta() = meta;
         Ok(done)
     }
-}
-
-/// How long the last step of a state took to write to its file and
-/// make durable, in microseconds: for whoever measures a node. (Of any
-/// state in the program: there is one.)
-static LAST_COMMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// How long the last step of a state ([`State::session`]) took to
-/// write to its file and make durable.
-pub fn last_commit() -> std::time::Duration {
-    std::time::Duration::from_micros(LAST_COMMIT.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Changes to the state being made as one step ([`State::session`]).
