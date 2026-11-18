@@ -339,6 +339,13 @@ fn a_fresh_node_fast_syncs_a_large_state() {
     report(T, "state_taken_secs", format!("{:.1}", (taken - ready).as_secs_f64()));
     report(T, "state_fetch_secs", format!("{:.1}", (taken - headers).as_secs_f64()));
     report(T, "synced_secs", format!("{:.1}", (synced - ready).as_secs_f64()));
+    // How long the new node took to apply each of the full blocks it
+    // was sent: a node that did not make them, and had read none of
+    // what they spend.
+    let mut secs: Vec<f64> = new.lines("applied in ").iter().map(|l| secs_after(l, "applied in ").unwrap()).collect();
+    secs.sort_by(f64::total_cmp);
+    report(T, "apply_median_secs", format!("{:.3}", secs[secs.len() / 2]));
+    report(T, "apply_max_secs", format!("{:.3}", secs[secs.len() - 1]));
     server.show();
     new.show();
     server.report(T, "server");
