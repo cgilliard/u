@@ -2120,7 +2120,16 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             if l.fetching.iter().any(|f| f.0 == object) {
                 continue;
             }
-            join.turn = join.turn.wrapping_add(1);
+            // From the next of them that is not asked for as much as one
+            // peer is asked for at once: a peer answers only so many
+            // requests of one address at a time, and what it is asked
+            // beyond that is as good as lost.
+            let most_each = self.cfg.sync.blocks_per_peer;
+            let free = (1..=servers.len())
+                .map(|k| servers[join.turn.wrapping_add(k) % servers.len()])
+                .position(|peer| self.fetches.iter().filter(|f| f.from == peer).count() < most_each);
+            let Some(free) = free else { break };
+            join.turn = join.turn.wrapping_add(free + 1);
             let from = servers[join.turn % servers.len()];
             let path = self.peers.get(&from).map(|p| p.path).unwrap_or_default();
             let transfer = Self::number(&self.secret, &mut self.numbers);

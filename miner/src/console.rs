@@ -58,6 +58,8 @@ pub const HELP: &str = "commands:
                             spends)
   prune                     forget outputs expected that the chain does not hold and
                             the pool will not make: of payments taken back, say
+  seed                      this wallet's twelve words (its password is asked for,
+                            if it has one)
   names                     this wallet's names, and its commits not yet revealed
   name NAME                 look a name up on the chain
   name-commit NAME [VALUE [FEE]]
@@ -98,6 +100,17 @@ pub enum Reply {
     Quit,
     /// An empty line: nothing.
     Nothing,
+    /// The wallet's password is to be asked for, and given to
+    /// [`Console::seed`]: of a wallet that has one, asked for its words.
+    Password,
+}
+
+/// What is said of a wallet's twelve words when they are shown.
+pub fn made(phrase: &str) -> String {
+    format!(
+        "A wallet has been made. Its twelve words, which are all of it: write them down, and keep them\n\
+         where nobody else can read them. Whoever has them has what the wallet holds.\n\n    {phrase}"
+    )
 }
 
 /// What the commands are run on.
@@ -190,6 +203,12 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             ("bump", [id, fee]) => self.bump(id, Some(fee)),
             ("resend", [id]) => self.resend(id),
             ("prune", []) => self.prune(),
+            // (Its password asked for first, of a wallet that has one.)
+            ("seed", []) => match self.wallet().map(|w| w.locked()) {
+                Ok(true) => return Reply::Password,
+                Ok(false) => self.seed(""),
+                Err(e) => Err(e),
+            },
             ("names", []) => self.names(),
             ("name", [name]) => self.name(name),
             ("name-commit", [name]) => self.name_commit(name, "-", None),
@@ -207,8 +226,9 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             ("scan", []) => self.scan(),
             (
                 "status" | "peers" | "mempool" | "balance" | "outputs" | "send-file" | "receive" | "finalize"
-                | "slates" | "sent" | "cancel" | "bump" | "resend" | "prune" | "scan" | "help" | "quit" | "exit"
-                | "names" | "name" | "name-commit" | "name-reveal" | "name-update" | "name-offer" | "name-transfer",
+                | "slates" | "sent" | "cancel" | "bump" | "resend" | "prune" | "seed" | "scan" | "help" | "quit"
+                | "exit" | "names" | "name" | "name-commit" | "name-reveal" | "name-update" | "name-offer"
+                | "name-transfer",
                 _,
             ) => Err(format!("{command}: not what it takes (see help)")),
             _ => Err(format!("{command}: no such command (see help)")),
@@ -217,6 +237,16 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             Ok(text) => Reply::Said(text),
             Err(text) => Reply::Wrong(text),
         }
+    }
+
+    /// The wallet's twelve words, if `password` is its password (any,
+    /// of a wallet that has none).
+    pub fn seed(&self, password: &str) -> Result<String, String> {
+        let phrase = self.wallet()?.phrase(password).map_err(|e| e.to_string())?;
+        Ok(format!(
+            "The wallet's twelve words, which are all of it. Whoever has them has what the wallet holds:\n\
+             keep them where nobody else can read them.\n\n    {phrase}"
+        ))
     }
 
     fn wallet(&self) -> Result<MutexGuard<'_, Wallet<W>>, String> {

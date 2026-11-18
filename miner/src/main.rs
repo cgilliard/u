@@ -667,15 +667,24 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     };
 
     // The wallet: opened, or made, before the node says it is ready.
-    let wallet = match c.wallet {
-        true => Some(open_wallet(c, &hold, &main)?),
-        false => None,
+    let (wallet, phrase) = match c.wallet {
+        true => {
+            let (wallet, phrase) = open_wallet(c, &hold, &main)?;
+            (Some(wallet), phrase)
+        }
+        false => (None, None),
     };
 
     // Everything is open: from here the node can do what it is for.
     let _stats_log = StatsLog::start(stat_log, Arc::clone(&stats), c.stats).map_err(threads)?;
     c.announce(&main);
     Configuration::ready(&main);
+    // A wallet just made: its words, said here, after everything else
+    // the node says as it starts, where whoever is at the terminal
+    // sees them; once, and in no log.
+    if let Some(phrase) = phrase {
+        eprintln!("\n{}\n", tabminer::console::made(&phrase));
+    }
 
     // Blocks are made on a thread of their own, for as long as the
     // node runs.
@@ -810,7 +819,7 @@ fn open_wallet(
     c: &Configuration,
     hold: &Handle<FileBackend, AggregateVerifier>,
     main: &Logger,
-) -> Result<Purse, String> {
+) -> Result<(Purse, Option<String>), String> {
     let path = c.data_dir.join("wallet.tab");
     let is_new = !path.exists();
     let whose = |e: WalletError| format!("the wallet {}: {e}", path.display());
@@ -854,9 +863,8 @@ fn open_wallet(
         }
         e => whose(e),
     })?;
-    if let Some(phrase) = phrase.filter(|_| is_new) {
-        eprintln!("\nA wallet has been made. Its twelve words, which are all of it: write them down, and keep them");
-        eprintln!("where nobody else can read them. Whoever has them has what the wallet holds.\n\n    {phrase}\n");
+    let phrase = phrase.filter(|_| is_new);
+    if phrase.is_some() {
         main.log(&format!("A wallet was made in '{}'", path.display()));
     }
     // Rewards of blocks that were being made when the node last stopped
@@ -868,7 +876,7 @@ fn open_wallet(
     }
     wallet.set_min_confirmations(c.min_confirmations);
     follow(hold.chain(), &mut wallet, socket::unix()).map_err(whose)?;
-    Ok(Arc::new(Mutex::new(wallet)))
+    Ok((Arc::new(Mutex::new(wallet)), phrase))
 }
 
 /// Takes commands from the terminal, one a line, and says what comes of
@@ -888,6 +896,22 @@ fn prompt(console: &Console<FileBackend, FileBackend>, main: &Logger) {
             Reply::Said(text) => println!("{text}"),
             Reply::Wrong(text) => println!("error: {text}"),
             Reply::Nothing => {}
+            // The wallet's password, asked for and typed here: it is
+            // no part of a command, and is kept by nothing.
+            Reply::Password => {
+                print!("Wallet password: ");
+                let _ = std::io::stdout().flush();
+                line.clear();
+                match std::io::stdin().lock().read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                match console.seed(line.trim_end_matches(['\n', '\r'])) {
+                    Ok(text) => println!("{text}"),
+                    Err(text) => println!("error: {text}"),
+                }
+                line.clear();
+            }
             Reply::Quit => break,
         }
     }

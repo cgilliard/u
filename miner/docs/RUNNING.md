@@ -560,9 +560,10 @@ starts.
 
 **Its twelve words.** A wallet is made of a phrase of twelve words
 (BIP39). When a wallet is made the node says them on the terminal,
-once, and nowhere else: not in any log. They are all of the wallet:
-whoever has them has what it holds, and a wallet lost is made again
-from them.
+after `Server is ready!` and before the prompt, and in no log. They
+are all of the wallet: whoever has them has what it holds, and a
+wallet lost is made again from them. The command `seed` says them
+again, after asking for the wallet's password if it has one.
 
 **Its password.** A new wallet asks for one (none, for no password),
 and a wallet that has one asks for it each time the node starts. What

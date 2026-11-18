@@ -224,7 +224,7 @@ fn report_left(test: &str) {
         said.and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok()).map(|bytes| bytes / 1000)
     };
     if let Some(kb) = free {
-        report(test, "left_disk_mb", kb / 1000);
+        report(test, "machine_disk_available_mb", kb / 1000);
     }
     let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let kb = |what: &str| {
@@ -232,7 +232,7 @@ fn report_left(test: &str) {
     };
     if let (Some(total), Some(available)) = (kb("MemTotal:"), kb("MemAvailable:")) {
         report(test, "machine_memory_mb", total / 1000);
-        report(test, "left_memory_mb", available / 1000);
+        report(test, "machine_memory_available_mb", available / 1000);
     }
 }
 
