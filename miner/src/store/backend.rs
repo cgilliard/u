@@ -127,17 +127,40 @@ fn write_all_at(file: &File, mut offset: u64, mut data: &[u8]) -> io::Result<()>
     Ok(())
 }
 
+/// What the files of the program have been asked, in all: reads,
+/// writes and syncs, how many of each and the microseconds they took
+/// (of every thread, added up: more than passed, where several wait at
+/// once). For whoever measures a node: where a block's time went, on a
+/// disk that is slow.
+static ASKED: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Reads, writes and syncs so far: how many of each, and how long each
+/// kind took in all ([`ASKED`]).
+pub fn asked() -> [(u64, std::time::Duration); 3] {
+    let at = |i: usize| ASKED[i].load(std::sync::atomic::Ordering::Relaxed);
+    core::array::from_fn(|k| (at(2 * k), std::time::Duration::from_micros(at(2 * k + 1))))
+}
+
+fn counted<T>(kind: usize, ask: impl FnOnce() -> T) -> T {
+    use std::sync::atomic::Ordering::Relaxed;
+    let began = std::time::Instant::now();
+    let answer = ask();
+    ASKED[2 * kind].fetch_add(1, Relaxed);
+    ASKED[2 * kind + 1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+    answer
+}
+
 impl Backend for FileBackend {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        read_exact_at(&self.file, offset, buf)
+        counted(0, || read_exact_at(&self.file, offset, buf))
     }
 
     fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
-        write_all_at(&self.file, offset, data)
+        counted(1, || write_all_at(&self.file, offset, data))
     }
 
     fn sync(&self) -> io::Result<()> {
-        self.file.sync_data()
+        counted(2, || self.file.sync_data())
     }
 
     fn len(&self) -> io::Result<u64> {

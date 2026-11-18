@@ -485,6 +485,7 @@ pub fn mine_filled<B: Backend + 'static, S: ItemSource + Sync>(
     use crate::block::BlockOutput;
     use crate::poseidon2::{Fp, P};
     let began = Instant::now();
+    let reads_before = crate::store::backend::asked()[0];
     let params = *chain.params();
     let tip = chain.tip()?;
     let height = tip.height + 1;
@@ -547,10 +548,14 @@ pub fn mine_filled<B: Backend + 'static, S: ItemSource + Sync>(
         return Ok(Mined::Cancelled);
     }
     let took = began.elapsed();
+    let reads = crate::store::backend::asked()[0];
     said(&format!(
-        "debug fill: block {height}: {outputs} outputs, {spent} spends, {} bytes, built in {:.2}s",
+        "debug fill: block {height}: {outputs} outputs, {spent} spends, {} bytes, built in {:.2}s ({} reads of the \
+         disk in {:.1}s)",
         HEADER_SIZE + bytes.len(),
-        took.as_secs_f64()
+        took.as_secs_f64(),
+        reads.0 - reads_before.0,
+        (reads.1 - reads_before.1).as_secs_f64()
     ));
     let header = Header {
         prev_hash: tip.hash(),

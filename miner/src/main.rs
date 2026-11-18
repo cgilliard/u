@@ -734,6 +734,7 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     // node runs.
     {
         let (main, debug) = (Arc::clone(&main), c.debug_unchecked);
+        let asked = Mutex::new(tabminer::store::backend::asked());
         hold.on_event(Box::new(move |event| {
             if let Some(line) = said(event) {
                 main.log(&line);
@@ -748,6 +749,23 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
                         took.as_secs_f64(),
                         written.as_secs_f64()
                     ));
+                    // And what the disk was asked since the block
+                    // before: for all the node did meanwhile.
+                    let now = tabminer::store::backend::asked();
+                    let mut before = asked.lock().unwrap_or_else(|e| e.into_inner());
+                    let since = |k: usize| (now[k].0 - before[k].0, (now[k].1 - before[k].1).as_secs_f64());
+                    let (reads, writes, syncs) = (since(0), since(1), since(2));
+                    main.log(&format!(
+                        "debug: the disk since the block before: {} reads in {:.1}s, {} writes in {:.1}s, {} syncs in \
+                         {:.1}s (of every thread, added up)",
+                        commas(reads.0),
+                        reads.1,
+                        commas(writes.0),
+                        writes.1,
+                        commas(syncs.0),
+                        syncs.1
+                    ));
+                    *before = now;
                 }
             }
         }));
