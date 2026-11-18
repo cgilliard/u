@@ -85,6 +85,9 @@ const T_NAMES: usize = 10;
 /// The address counter ([`Wallet::identity_key`]): eight bytes, or
 /// nothing for the first address.
 const T_ADDRESS: usize = 11;
+/// Whom each pending slate was sent to, of those sent over the message
+/// layer: by the slate's id, the id of the wallet.
+const T_SENT_TO: usize = 12;
 
 /// Blocks looked at that the wallet remembers, at the most: as far back
 /// as it can find where the chain parted from what it knew.
@@ -766,6 +769,8 @@ struct Tables {
     secret: Vec<u8>,
     /// Whether a restore waits for its first scan.
     scan_pending: bool,
+    /// Whom each pending slate was sent to ([`Wallet::sent_to`]).
+    sent_to: BTreeMap<Id, Id>,
     /// Which of the wallet's addresses it is at: the first, for a new
     /// wallet; one drawn at random, for a wallet made again from its
     /// words, so that it is at an address never used before.
@@ -847,6 +852,7 @@ impl Tables {
             T_LOST => put_entries(self.lost.iter().map(|(id, height)| (id, height.to_le_bytes().to_vec()))),
             T_COMMITS => put_entries(self.commits.iter().map(|(id, c)| (id, c.to_bytes()))),
             T_NAMES => names::put_names(self.names.values()),
+            T_SENT_TO => put_entries(self.sent_to.iter().map(|(slate, whom)| (slate, whom.to_vec()))),
             T_ADDRESS => match self.address {
                 0 => Vec::new(),
                 at => at.to_le_bytes().to_vec(),
@@ -877,6 +883,9 @@ impl Tables {
             [] => 0,
             at => u64::from_le_bytes(at.try_into().map_err(|_| WalletError::Corrupt("address counter"))?),
         };
+        for (slate, whom) in get_entries(&table(T_SENT_TO)?).ok_or(WalletError::Corrupt("recipients"))? {
+            t.sent_to.insert(slate, whom.try_into().map_err(|_| WalletError::Corrupt("recipient"))?);
+        }
         let commitment = |id: &Id| digest_from_bytes(id);
         for (id, b) in get_entries(&table(T_OUTPUTS)?).ok_or(WalletError::Corrupt("outputs"))? {
             let o = commitment(&id).and_then(|c| Owned::from_bytes(c, b)).ok_or(WalletError::Corrupt("output"))?;
@@ -1838,6 +1847,28 @@ impl<B: Backend> Wallet<B> {
             self.commit(t, &[T_OUTPUTS])?;
         }
         Ok(behind)
+    }
+
+    /// Records that the pending slate of id `slate` was sent to the
+    /// wallet of id `whom`: so that its answer is taken from that
+    /// wallet and from no other ([`Wallet::sent_to`]). (Those of slates
+    /// no longer pending are let go.)
+    pub fn send_to(&mut self, slate: &[u8; 32], whom: &crate::hash::Digest) -> Result<()> {
+        let mut t = self.t.clone();
+        t.sent_to.retain(|id, _| t.slates.contains_key(id));
+        t.sent_to.insert(*slate, digest_to_bytes(whom));
+        self.commit(t, &[T_SENT_TO])
+    }
+
+    /// Whom the pending slate of id `slate` was sent to, if it was sent
+    /// to a wallet (and not written to a file, for anyone to answer).
+    pub fn sent_to(&self, slate: &[u8; 32]) -> Option<crate::hash::Digest> {
+        self.t
+            .slates
+            .contains_key(slate)
+            .then(|| self.t.sent_to.get(slate))
+            .flatten()
+            .and_then(|w| digest_from_bytes(w))
     }
 
     /// The pending slates: each one's id, and what it is to pay.

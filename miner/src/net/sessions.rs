@@ -345,6 +345,9 @@ pub struct Post {
     pub to: Digest,
     pub kind: u8,
     pub body: Vec<u8>,
+    /// What whoever posted it knows it by (a slate's id): given back
+    /// with what became of it.
+    pub tag: [u8; 32],
     /// The announcement of the wallet it is for, where that is known
     /// already (an answer is sealed to what the message answered
     /// carried); else it is asked for.
@@ -356,6 +359,9 @@ pub struct Post {
     /// When it was last tried, and of which of the wallet's nodes next.
     pub tried: Option<Micros>,
     pub turn: usize,
+    /// Of how many of the wallet's nodes it has been asked what the
+    /// wallet announced, and they had nothing.
+    pub missed: usize,
     pub state: Posted,
 }
 
@@ -373,20 +379,20 @@ pub struct Mail {
     /// taken once.
     seen: std::collections::VecDeque<Digest>,
     /// What became of the messages sent, for whoever sent them.
-    pub posted: Vec<(Digest, u8, Posted)>,
+    pub posted: Vec<(Digest, u8, [u8; 32], Posted)>,
 }
 
 impl Mail {
     /// A message to send.
-    pub fn post(&mut self, to: Digest, kind: u8, body: Vec<u8>, known: Option<Vec<u8>>) {
+    pub fn post(&mut self, to: Digest, kind: u8, tag: [u8; 32], body: Vec<u8>, known: Option<Vec<u8>>) {
         let (sealed, tried, turn, state) = (None, None, 0, Posted::Waiting);
-        self.posts.push(Post { to, kind, body, known, sealed, began: None, tried, turn, state });
+        self.posts.push(Post { to, kind, body, tag, known, sealed, began: None, tried, turn, missed: 0, state });
     }
 
     /// Says what became of the post at `at`, and lets it go.
     pub fn settle(&mut self, at: usize, state: Posted) {
         let post = self.posts.swap_remove(at);
-        self.posted.push((post.to, post.kind, state));
+        self.posted.push((post.to, post.kind, post.tag, state));
     }
 
     /// Gives up the messages that have been tried for long enough.

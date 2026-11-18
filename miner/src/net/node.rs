@@ -1456,6 +1456,10 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         self.unix = unix;
         self.now = now;
         self.mail(now, out);
+        // (What the wallet sends is looked to whenever the worker is
+        // woken, not only when time is: a payment does not wait for
+        // the second to turn.)
+        self.send_posts(now, out);
         if now >= self.due {
             self.due = now + self.cfg.tick;
             self.periodic(now, out);
@@ -1481,7 +1485,6 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         self.budget = self.cfg.peers.unproven_pings;
         self.follow_votes(now, out);
         self.keep_sessions(now, out);
-        self.send_posts(now, out);
         let mut due = Vec::new();
         let (secret, numbers) = (&self.secret, &mut self.numbers);
         self.peers.pings_due(now, || Self::number(secret, numbers), |addr, number| due.push((addr, number)));
@@ -1683,9 +1686,15 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                         self.grants.pop_front();
                     }
                 }
+                // (And what waited for it is tried again at once.)
+                if token != 0 {
+                    let mut mail = self.shared.letters.lock().unwrap_or_else(|e| e.into_inner());
+                    mail.posts.iter_mut().filter(|p| p.sealed.is_none()).for_each(|p| p.tried = None);
+                    drop(mail);
+                    self.send_posts(now, out);
+                }
                 let mut wallet = self.shared.participant.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(own) = wallet.as_mut().filter(|w| w.id() == id) else {
-                    self.counts.unheard += 1;
                     return;
                 };
                 if own.held(&from, seq, token) {
@@ -3195,6 +3204,21 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             // nobody.)
             return;
         }
+        // What a wallet announced, asked of a node it is reached at
+        // that has nothing of it: the wallet is not there, by that
+        // node's account. When each of its nodes has said so, what
+        // waits for it is given up as for a wallet that is not there.
+        if let Object::Announce { id, seq: 0 } = object {
+            let nodes = self.points_of(&id).len();
+            let mut mail = self.shared.letters.lock().unwrap_or_else(|e| e.into_inner());
+            for post in mail.posts.iter_mut().filter(|p| p.to == id && p.sealed.is_none()) {
+                (post.missed, post.tried) = (post.missed + 1, None);
+            }
+            while let Some(at) = mail.posts.iter().position(|p| p.to == id && p.sealed.is_none() && p.missed >= nodes) {
+                mail.settle(at, super::sessions::Posted::Offline);
+            }
+            return;
+        }
         if matches!(object, Object::Headers { .. } | Object::Block(_)) {
             self.peers.failed(&from, now);
         }
@@ -3630,8 +3654,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
     /// which is `known` where the message answers one that carried it,
     /// and is asked for otherwise. What becomes of it is said later
     /// ([`Handle::take_posted`]).
-    pub fn post(&self, to: Digest, kind: u8, body: Vec<u8>, known: Option<Vec<u8>>) {
-        self.shared.letters.lock().unwrap_or_else(|e| e.into_inner()).post(to, kind, body, known);
+    pub fn post(&self, to: Digest, kind: u8, tag: [u8; 32], body: Vec<u8>, known: Option<Vec<u8>>) {
+        self.shared.letters.lock().unwrap_or_else(|e| e.into_inner()).post(to, kind, tag, body, known);
         (0..self.shared.mail.len()).for_each(|w| self.shared.wake(w));
     }
 
@@ -3643,7 +3667,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
 
     /// What became of the messages sent, since this was last asked:
     /// whom each was for, its kind, and what became of it.
-    pub fn take_posted(&self) -> Vec<(Digest, u8, super::sessions::Posted)> {
+    pub fn take_posted(&self) -> Vec<(Digest, u8, [u8; 32], super::sessions::Posted)> {
         std::mem::take(&mut self.shared.letters.lock().unwrap_or_else(|e| e.into_inner()).posted)
     }
 

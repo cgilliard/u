@@ -977,23 +977,18 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
         let console = Console { hold: hold.clone(), wallet: Some(Arc::clone(wallet)), unix: socket::unix, log };
         let (hold, main) = (hold.clone(), Arc::clone(&main));
         let taking = move || loop {
-            std::thread::sleep(Duration::from_millis(250));
+            std::thread::sleep(Duration::from_millis(50));
             for message in hold.take_messages() {
                 if let Err(why) = console.take(&message) {
                     main.log(&format!("Error: a message for the wallet: {why}"));
                 }
             }
-            for (to, _, what) in hold.take_posted() {
+            for (to, _, tag, what) in hold.take_posted() {
                 use tabminer::net::sessions::Posted;
-                let to = tabminer::address::encode(&to);
                 match what {
                     Posted::Passed | Posted::Waiting => {}
-                    Posted::Offline => {
-                        main.log(&format!("A message to {to} was not passed on: that wallet is not there"))
-                    }
-                    Posted::Unsent => {
-                        main.log(&format!("A message to {to} was not sent: no node it is reached at took it"))
-                    }
+                    Posted::Offline => main.log(&console.undelivered(&to, &tag, "that wallet is not there")),
+                    Posted::Unsent => main.log(&console.undelivered(&to, &tag, "no node it is reached at took it")),
                 }
             }
         };

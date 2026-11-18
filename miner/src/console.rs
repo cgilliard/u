@@ -674,7 +674,10 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             crate::address::encode(&whom)
         );
         (self.log)(&format!("P{}", &done[1..]));
-        self.hold.post(whom, crate::msg::KIND_SLATE, slate.to_text().into_bytes(), None);
+        // Whom it is sent to is kept with it: its answer is taken from
+        // that wallet, and from no other.
+        wallet.send_to(&slate.id, &whom).map_err(|e| e.to_string())?;
+        self.hold.post(whom, crate::msg::KIND_SLATE, slate.id, slate.to_text().into_bytes(), None);
         Ok(format!("{done}; sent to its wallet, to be answered"))
     }
 
@@ -694,6 +697,26 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         // slate that was begun, answered: the wallet sees to that.)
         let ours = self.wallet()?.pending_slates().iter().any(|(id, _)| *id == slate.id);
         if ours {
+            // From the wallet it was sent to, or it is nobody's answer:
+            // whoever answers says where the payment goes. (One begun
+            // in a file was sent to nobody, and is finalized by hand.)
+            match self.wallet()?.sent_to(&slate.id) {
+                Some(whom) if whom == message.from => {}
+                Some(whom) => {
+                    let whom = crate::address::encode(&whom);
+                    return Err(format!(
+                        "payment {} was sent to {whom}, and {from} answers it: not signed",
+                        &slate.id_hex()[..8]
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "payment {} was begun in a file, and {from} answers it over the network: not signed (finalize \
+                         its answer from a file)",
+                        &slate.id_hex()[..8]
+                    ));
+                }
+            }
             self.observe()?;
             let signed = self.wallet()?.finalize(&slate, unix).map_err(|e| e.to_string())?;
             let id = short(&digest_to_bytes(&signed.tx.txid()));
@@ -724,8 +747,26 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             coins(slate.amount as u128)
         );
         (self.log)(&format!("P{}", &done[1..]));
-        self.hold.post(message.from, crate::msg::KIND_SLATE, slate.to_text().into_bytes(), Some(message.reply.clone()));
+        let (answer, known) = (slate.to_text().into_bytes(), Some(message.reply.clone()));
+        self.hold.post(message.from, crate::msg::KIND_SLATE, slate.id, answer, known);
         Ok(done)
+    }
+
+    /// A message this wallet sent was not passed on: `why`. If it was a
+    /// payment this wallet began, the payment is given up, and what it
+    /// would have spent is the wallet's to spend again. What is to be
+    /// said of it.
+    pub fn undelivered(&self, to: &crate::hash::Digest, slate: &[u8; 32], why: &str) -> String {
+        let to = crate::address::encode(to);
+        let given_up =
+            self.wallet().is_ok_and(|mut wallet| wallet.sent_to(slate).is_some() && wallet.cancel_slate(slate).is_ok());
+        match given_up {
+            true => format!(
+                "Error: payment {} to {to} was not delivered ({why}): given up, nothing was spent",
+                short(slate)
+            ),
+            false => format!("Error: a message to {to} was not delivered ({why})"),
+        }
     }
 
     fn receive(&self, file: &str, out: &str) -> Said {

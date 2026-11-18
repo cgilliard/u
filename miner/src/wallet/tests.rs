@@ -721,3 +721,30 @@ fn a_wallet_has_an_address_of_its_words() {
     let (other, _) = Wallet::open(MemBackend::new()).unwrap();
     assert_ne!(other.address(), address);
 }
+
+/// A slate sent to a wallet is kept with whom it was sent to, for as
+/// long as it is pending: its answer is to be taken from that wallet
+/// alone. One written to a file was sent to nobody.
+#[test]
+fn a_slate_is_kept_with_whom_it_was_sent_to() {
+    let mut chain = Outputs::default();
+    let mut wallet = funded(&mut chain, 10 * COIN);
+    let (bob, mallory) = ([Fp::new(7); 8], [Fp::new(9); 8]);
+    let to_bob = wallet.send(COIN, None, &chain, NOW).unwrap();
+    wallet.send_to(&to_bob.id, &bob).unwrap();
+    assert_eq!(wallet.sent_to(&to_bob.id), Some(bob));
+    assert_ne!(wallet.sent_to(&to_bob.id), Some(mallory));
+    // Opened again, it is still so.
+    assert_eq!(reopened(&wallet, "").unwrap().sent_to(&to_bob.id), Some(bob));
+    // Of a slate not sent to a wallet, and of one that is no slate of
+    // this wallet's: nobody.
+    assert_eq!(wallet.sent_to(&[1; 32]), None);
+    // Given up, it was sent to nobody any more; and what is kept of it
+    // goes when the next is sent.
+    wallet.cancel_slate(&to_bob.id).unwrap();
+    assert_eq!(wallet.sent_to(&to_bob.id), None);
+    let again = wallet.send(COIN, None, &chain, NOW).unwrap();
+    assert_eq!(wallet.sent_to(&again.id), None, "one written to a file was sent to nobody");
+    wallet.send_to(&again.id, &mallory).unwrap();
+    assert_eq!((wallet.sent_to(&again.id), wallet.sent_to(&to_bob.id)), (Some(mallory), None));
+}

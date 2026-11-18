@@ -799,13 +799,41 @@ fn a_payment_is_sent_to_an_address() {
     assert!(payer.ask("send 5 @nobody").starts_with("error: nobody is not registered"));
     let own = payer.ask("address").trim().to_string();
     assert!(payer.ask(&format!("send 5 {own}")).starts_with("error: that is this wallet's own address"));
+    let sent = Instant::now();
     let begun = payer.ask(&format!("send 5 {to}"));
     assert!(begun.contains("begun: 5 and a fee of") && begun.contains(&to), "{begun}");
+    // Answered, signed and pooled: how long that took is said, for
+    // whoever reads the run.
+    let pooled = loop {
+        let log = std::fs::read_to_string(dirs[1].join("tabernacle.log")).unwrap();
+        if log.contains(" signed and pooled: transaction ") {
+            break sent.elapsed();
+        }
+        assert!(sent.elapsed() < Duration::from_secs(60), "the answer has not come: {log}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    println!("a payment to an address was answered, signed and pooled in {:.2}s", pooled.as_secs_f64());
     let began = Instant::now();
     while paid.confirmed() != "5" {
         assert!(began.elapsed() < Duration::from_secs(180), "the payment has not come: {}", paid.ask("balance"));
         std::thread::sleep(Duration::from_millis(500));
     }
+    // A payment to a wallet that is not there is no payment: said to be
+    // so, given up, and nothing spent.
+    let nobody = tabminer::address::encode(&[tabminer::poseidon2::Fp::new(77); 8]);
+    let held = payer.confirmed();
+    assert!(payer.ask(&format!("send 1 {nobody}")).contains("begun: 1 and a fee of"));
+    let began = Instant::now();
+    loop {
+        let log = std::fs::read_to_string(dirs[1].join("tabernacle.log")).unwrap();
+        if log.contains(&format!(" to {nobody} was not delivered (that wallet is not there): given up")) {
+            break;
+        }
+        assert!(began.elapsed() < Duration::from_secs(90), "{log}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(payer.ask("slates").starts_with("no payments begun"), "{}", payer.ask("slates"));
+    assert!(payer.confirmed() >= held);
     // Each wallet's log says its part of it, and whom it was with.
     let logs: Vec<String> = dirs.iter().map(|d| std::fs::read_to_string(d.join("tabernacle.log")).unwrap()).collect();
     assert!(logs[1].contains(&format!(" answered by {to}, signed and pooled: transaction ")), "{}", logs[1]);
