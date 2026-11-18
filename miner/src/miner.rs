@@ -374,7 +374,13 @@ pub fn mine_with<B: Backend + 'static, S: ItemSource + Sync>(
     let mut body = body_from_segments(&segments, &names, vec![]);
     let unproven = body.to_bytes();
     let unproven = BodyRef::from_bytes(&unproven)?;
-    let state_root = chain.state_root_after(&unproven)?;
+    let state_root = match chain.state_root_after(&unproven) {
+        Ok(root) => root,
+        // The chain has gone on meanwhile: what this block was made of
+        // is no longer what the chain holds, and that is no fault.
+        Err(_) if chain.tip()?.hash() != tip.hash() => return Ok(Mined::Stale),
+        Err(e) => return Err(e),
+    };
     let statement = Statement::from_block(&BlockStatement {
         height,
         prev_state_root,
@@ -531,7 +537,12 @@ pub fn mine_filled<B: Backend + 'static, S: ItemSource + Sync>(
     let spent = picked.len();
     let body = Body { inputs: picked, outputs: made, proof: vec![0u8; PROOF_BYTES], ..Default::default() };
     let bytes = body.to_bytes();
-    let state_root = chain.state_root_after(&BodyRef::from_bytes(&bytes)?)?;
+    let state_root = match chain.state_root_after(&BodyRef::from_bytes(&bytes)?) {
+        Ok(root) => root,
+        // The chain has gone on meanwhile, and spent what was chosen.
+        Err(_) if chain.tip()?.hash() != tip.hash() => return Ok(Mined::Stale),
+        Err(e) => return Err(e),
+    };
     if cancel() {
         return Ok(Mined::Cancelled);
     }
