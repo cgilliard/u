@@ -700,8 +700,22 @@ fn sockets_sync(workers: usize) {
         })
         .collect();
     let start = Instant::now();
+    // (When its headers were all in, and when its first block was: said
+    // if it is too slow, so that it is known which of the two was.)
+    let (mut headers, mut first) = (None, None);
     while behind.tip().unwrap() != tip {
-        assert!(start.elapsed() < Duration::from_secs(60), "at {}", behind.tip().unwrap().height);
+        if headers.is_none() && behind.best_header().is_ok_and(|b| b.header.height == tip.height) {
+            headers = Some(start.elapsed());
+        }
+        if first.is_none() && behind.tip().unwrap().height > 0 {
+            first = Some(start.elapsed());
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "at {} of {}: its headers were in after {headers:?}, its first block after {first:?}",
+            behind.tip().unwrap().height,
+            tip.height
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     // (A moment for the node to hear of the last block from the thread
@@ -813,8 +827,22 @@ fn over_real_sockets_requests_are_logged_and_counted() {
         })
         .collect();
     let start = Instant::now();
+    // (When its headers were all in, and when its first block was: said
+    // if it is too slow, so that it is known which of the two was.)
+    let (mut headers, mut first) = (None, None);
     while behind.tip().unwrap() != tip {
-        assert!(start.elapsed() < Duration::from_secs(60), "at {}", behind.tip().unwrap().height);
+        if headers.is_none() && behind.best_header().is_ok_and(|b| b.header.height == tip.height) {
+            headers = Some(start.elapsed());
+        }
+        if first.is_none() && behind.tip().unwrap().height > 0 {
+            first = Some(start.elapsed());
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "at {} of {}: its headers were in after {headers:?}, its first block after {first:?}",
+            behind.tip().unwrap().height,
+            tip.height
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     // (Long enough for how the nodes stand to be told once more.)
@@ -1779,8 +1807,22 @@ fn over_real_sockets_blocks_come_from_several_peers_of_several_workers() {
         })
         .collect();
     let start = Instant::now();
+    // (When its headers were all in, and when its first block was: said
+    // if it is too slow, so that it is known which of the two was.)
+    let (mut headers, mut first) = (None, None);
     while behind.tip().unwrap() != tip {
-        assert!(start.elapsed() < Duration::from_secs(60), "at {}", behind.tip().unwrap().height);
+        if headers.is_none() && behind.best_header().is_ok_and(|b| b.header.height == tip.height) {
+            headers = Some(start.elapsed());
+        }
+        if first.is_none() && behind.tip().unwrap().height > 0 {
+            first = Some(start.elapsed());
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "at {} of {}: its headers were in after {headers:?}, its first block after {first:?}",
+            behind.tip().unwrap().height,
+            tip.height
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     std::thread::sleep(Duration::from_millis(300));
