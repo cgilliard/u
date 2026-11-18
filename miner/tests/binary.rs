@@ -367,8 +367,24 @@ impl Prompted {
     /// making blocks or not: `new` if it has no wallet yet, when its
     /// words are looked for.
     fn start(dir: &std::path::Path, listen: &str, peers: &[String], mines: bool, new: bool) -> Prompted {
+        Prompted::start_as(dir, listen, peers, mines, new, None).0
+    }
+
+    /// The same, and the words of its wallet if it is new; or, with
+    /// `restore`, a node whose wallet is made again from those words.
+    fn start_as(
+        dir: &std::path::Path,
+        listen: &str,
+        peers: &[String],
+        mines: bool,
+        new: bool,
+        restore: Option<&str>,
+    ) -> (Prompted, Option<String>) {
         use std::io::Write;
         let mut command = Command::new(TABMINER);
+        if restore.is_some() {
+            command.arg("--restore");
+        }
         command.args(["--network", "dev", "--threads", "2", "--data-dir", &dir.display().to_string()]);
         // (Its wallet spends what one block has: these chains are short.)
         command.args(["--min-confirmations", "1"]);
@@ -382,8 +398,12 @@ impl Prompted {
         let node = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
         let mut node = Running(node);
         let (mut typed, said) = (node.0.stdin.take().unwrap(), node.0.stdout.take().unwrap());
-        // (A new wallet: no password.)
-        if new {
+        // (Its words, of a wallet made again; and of that or a new
+        // one, no password.)
+        if let Some(words) = restore {
+            writeln!(typed, "{words}").unwrap();
+        }
+        if new || restore.is_some() {
             writeln!(typed).unwrap();
         }
         let mut lines = BufReader::new(node.0.stderr.take().unwrap()).lines();
@@ -392,14 +412,16 @@ impl Prompted {
         // (A new wallet's words are said after that, and nowhere
         // before.)
         assert!(!before.iter().any(|l| l.starts_with("    ")), "{before:#?}");
+        let mut words = None;
         if new {
-            let words = lines.by_ref().map(|l| l.unwrap()).find(|l| l.starts_with("    ")).expect("the wallet's words");
-            assert_eq!(words.split_whitespace().count(), 12, "{words}");
+            let said = lines.by_ref().map(|l| l.unwrap()).find(|l| l.starts_with("    ")).expect("the wallet's words");
+            assert_eq!(said.split_whitespace().count(), 12, "{said}");
+            words = Some(said.trim().to_string());
         }
         std::thread::spawn(move || lines.for_each(drop));
         let mut node = Prompted { node, typed, said };
         assert_eq!(node.until_prompt(), "");
-        node
+        (node, words)
     }
 
     /// What it says up to its next prompt.
@@ -596,4 +618,65 @@ fn a_name_is_registered_changed_and_given_at_the_prompt() {
     maker.stop();
     other.stop();
     dirs.iter().for_each(|d| drop(std::fs::remove_dir_all(d)));
+}
+
+/// A wallet is made again from its twelve words, on another node: it
+/// finds, once the chain is there, what the first holds; and says its
+/// words as the first does. And a wallet's password is set, asked for,
+/// and taken off, at the prompt.
+#[cfg(all(unix, feature = "dev"))]
+#[cfg_attr(debug_assertions, ignore = "proves blocks; run with --release")]
+#[test]
+fn a_wallet_is_made_again_from_its_words() {
+    use std::time::{Duration, Instant};
+    let dirs = [scratch("restore-a"), scratch("restore-b")];
+    let port = 35_000 + std::process::id() % 10_000;
+    let at = |i: u32| format!("127.0.0.1:{}", port + i);
+    // One makes blocks, and holds what they pay.
+    let (mut first, words) = Prompted::start_as(&dirs[0], &at(0), &[], true, true, None);
+    let words = words.unwrap();
+    let began = Instant::now();
+    while first.height() < 3 {
+        assert!(began.elapsed() < Duration::from_secs(120), "no blocks");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // Its password: none, then one, which its words are then kept
+    // behind, then none again.
+    use std::io::Write;
+    assert!(first.ask("seed").contains(&words));
+    writeln!(first.typed, "password\nsecret\nsecret").unwrap();
+    assert!(first.until_prompt().contains("password is set"));
+    writeln!(first.typed, "seed\nnot it").unwrap();
+    assert!(first.until_prompt().contains("wrong wallet password"));
+    writeln!(first.typed, "seed\nsecret").unwrap();
+    assert!(first.until_prompt().contains(&words));
+    writeln!(first.typed, "password\nsecret\n").unwrap();
+    assert!(first.until_prompt().contains("no password now"));
+    assert!(first.ask("seed").contains(&words));
+    // Another, of the same words, with nothing but the chain to go by:
+    // it comes to hold what the chain says those words hold.
+    let (mut second, _) = Prompted::start_as(&dirs[1], &at(1), &[at(0)], false, false, Some(&words));
+    assert!(second.ask("seed").contains(&words));
+    let began = Instant::now();
+    loop {
+        let (held, found) = (first.confirmed(), second.confirmed());
+        if found != "0" && found == held && first.height() == second.height() {
+            break;
+        }
+        assert!(began.elapsed() < Duration::from_secs(180), "the first holds {held}, the second has found {found}");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let log = std::fs::read_to_string(dirs[1].join("tabernacle.log")).unwrap();
+    assert!(log.contains("The wallet, made again from its words, has found "), "{log}");
+    // And it is not made again over a wallet that is there.
+    second.stop();
+    let again = Command::new(TABMINER)
+        .args(["--network", "dev", "--no-mine", "--restore", "--data-dir", &dirs[1].display().to_string()])
+        .output()
+        .unwrap();
+    assert!(!again.status.success() && String::from_utf8_lossy(&again.stderr).contains("there is a wallet already"));
+    first.stop();
+    for dir in &dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

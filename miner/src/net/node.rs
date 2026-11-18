@@ -3078,6 +3078,12 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
         }
     }
 
+    /// Whether a chain ahead of ours is being caught up with: from when
+    /// its headers are first asked for until its last block is here.
+    pub fn syncing(&self) -> bool {
+        self.list.read().unwrap_or_else(|e| e.into_inner()).syncing
+    }
+
     /// How many times the chain has had a new last block here.
     pub fn moves(&self) -> u64 {
         self.shared.blocks.load(Ordering::Relaxed)

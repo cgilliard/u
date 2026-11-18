@@ -27,7 +27,7 @@ use tabminer::net::node::{Behind, Event, Handle, Node};
 use tabminer::net::socket::{self, Watch};
 use tabminer::pow::{Dataset, ItemSource, LazyDataset, SeedText};
 use tabminer::store::backend::FileBackend;
-use tabminer::wallet::follow::follow;
+use tabminer::wallet::follow::follow_when;
 use tabminer::wallet::{Ask, Wallet, WalletError};
 
 /// Every allocation of the node is counted: so that it can say how
@@ -752,18 +752,42 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     if let Some(wallet) = &wallet {
         let (hold, wallet, main) = (hold.clone(), Arc::clone(wallet), Arc::clone(&main));
         let following = move || {
+            let began = Instant::now();
             let mut failed = false;
             let mut refused: Vec<tabminer::hash::Digest> = Vec::new();
             loop {
                 let seen = hold.moves();
-                let followed =
-                    follow(hold.chain(), &mut wallet.lock().unwrap_or_else(|e| e.into_inner()), socket::unix());
+                // (The chain is all here when nothing ahead of it is
+                // known of or coming in; and, of a node just started,
+                // not before its peers have had time to say how long
+                // theirs are.)
+                let caught_up = hold.behind() == tabminer::net::node::Behind::No
+                    && !hold.syncing()
+                    && began.elapsed() >= Duration::from_secs(20);
+                let followed = follow_when(
+                    hold.chain(),
+                    &mut wallet.lock().unwrap_or_else(|e| e.into_inner()),
+                    socket::unix(),
+                    caught_up,
+                );
                 // (Said once, not at every block, while it goes on.)
                 match &followed {
                     Err(e) if !failed => main.log(&format!("Error: the wallet cannot follow the chain: {e}")),
                     _ => {}
                 }
                 failed = followed.is_err();
+                // A wallet made again from its words has looked for
+                // what it holds, the chain being all here.
+                if let Ok(did) = &followed
+                    && did.restored
+                {
+                    main.log(&format!(
+                        "The wallet, made again from its words, has found {} outputs ({}) and {} names",
+                        commas(did.found.0 as u64),
+                        tabminer::console::coins(did.found.1),
+                        commas(did.names as u64)
+                    ));
+                }
                 // What a reorganization took from the wallet, and gave
                 // back, is said.
                 if let Ok(did) = &followed {
@@ -820,7 +844,10 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
                         "The wallet: {behind} outputs were signed from leaves it took for unused (its file is an earlier one?): passed over"
                     ));
                 }
-                hold.wait_moved(seen, Duration::from_secs(60));
+                // (Sooner, while a wallet made again waits to look for
+                // what it holds.)
+                let pending = wallet.lock().unwrap_or_else(|e| e.into_inner()).scan_pending();
+                hold.wait_moved(seen, Duration::from_secs(if pending { 5 } else { 60 }));
             }
         };
         std::thread::Builder::new().name("wallet".into()).spawn(following).map_err(threads)?;
@@ -867,6 +894,9 @@ fn open_wallet(
     let path = c.data_dir.join("wallet.tab");
     let is_new = !path.exists();
     let whose = |e: WalletError| format!("the wallet {}: {e}", path.display());
+    if c.restore && !is_new {
+        return Err(format!("--restore: there is a wallet already, {}: it is not made again over", path.display()));
+    }
     let backend = FileBackend::open(&path).map_err(|e| format!("cannot open the wallet {}: {e}", path.display()))?;
     #[cfg(unix)]
     {
@@ -901,16 +931,36 @@ fn open_wallet(
             (Ask::Unlock, false) => Err(WalletError::WrongPassword),
         }
     };
-    let (mut wallet, phrase) = Wallet::open_with(backend, &mut ask).map_err(|e| match e {
-        WalletError::WrongPassword if c.password_file.is_none() && !c.prompt => {
-            format!("the wallet {} has a password: give --password-file", path.display())
+    // Made again from its words, typed here: or opened, or made new.
+    let (mut wallet, phrase) = if c.restore {
+        let made = typed("The wallet's twelve words: ").and_then(|words| {
+            let words = words.split_whitespace().collect::<Vec<_>>().join(" ");
+            Wallet::restore(backend, &words, "", &ask(Ask::New)?)
+        });
+        match made {
+            Ok(wallet) => {
+                main.log(&format!("A wallet was made again from its words in '{}'", path.display()));
+                (wallet, None)
+            }
+            Err(e) => {
+                // (Nothing is left of a wallet that was not made.)
+                let _ = std::fs::remove_file(&path);
+                return Err(format!("--restore: {e}"));
+            }
         }
-        e => whose(e),
-    })?;
-    let phrase = phrase.filter(|_| is_new);
-    if phrase.is_some() {
-        main.log(&format!("A wallet was made in '{}'", path.display()));
-    }
+    } else {
+        let (wallet, phrase) = Wallet::open_with(backend, &mut ask).map_err(|e| match e {
+            WalletError::WrongPassword if c.password_file.is_none() && !c.prompt => {
+                format!("the wallet {} has a password: give --password-file", path.display())
+            }
+            e => whose(e),
+        })?;
+        let phrase = phrase.filter(|_| is_new);
+        if phrase.is_some() {
+            main.log(&format!("A wallet was made in '{}'", path.display()));
+        }
+        (wallet, phrase)
+    };
     // Rewards of blocks that were being made when the node last stopped
     // are of no block.
     for (c, _, block) in wallet.rewards() {
@@ -919,7 +969,10 @@ fn open_wallet(
         }
     }
     wallet.set_min_confirmations(c.min_confirmations);
-    follow(hold.chain(), &mut wallet, socket::unix()).map_err(whose)?;
+    // (What a wallet made again holds is looked for by the thread that
+    // follows the chain, once the chain is all here: not now, when the
+    // node has not yet heard how long the chain is.)
+    follow_when(hold.chain(), &mut wallet, socket::unix(), false).map_err(whose)?;
     Ok((Arc::new(Mutex::new(wallet)), phrase))
 }
 
@@ -955,6 +1008,33 @@ fn prompt(console: &Console<FileBackend, FileBackend>, main: &Logger) {
                     Err(text) => println!("error: {text}"),
                 }
                 line.clear();
+            }
+            // The wallet's password, changed: the one it has, and the
+            // new one twice.
+            Reply::NewPassword => {
+                let ask = |asking: &str| -> Option<String> {
+                    print!("{asking}");
+                    let _ = std::io::stdout().flush();
+                    let mut typed = String::new();
+                    match std::io::stdin().lock().read_line(&mut typed) {
+                        Ok(0) | Err(_) => None,
+                        Ok(_) => Some(typed.trim_end_matches(['\n', '\r']).to_string()),
+                    }
+                };
+                let old = match console.locked() {
+                    true => ask("Wallet password: "),
+                    false => Some(String::new()),
+                };
+                let Some(old) = old else { break };
+                let Some(new) = ask("A new password (none, for no password): ") else { break };
+                let Some(again) = (if new.is_empty() { Some(String::new()) } else { ask("The same again: ") }) else {
+                    break;
+                };
+                match (new == again).then(|| console.set_password(&old, &new)) {
+                    Some(Ok(text)) => println!("{text}"),
+                    Some(Err(text)) => println!("error: {text}"),
+                    None => println!("error: they are not the same"),
+                }
             }
             Reply::Quit => break,
         }

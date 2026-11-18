@@ -60,6 +60,7 @@ pub const HELP: &str = "commands:
                             the pool will not make: of payments taken back, say
   seed                      this wallet's twelve words (its password is asked for,
                             if it has one)
+  password                  give the wallet a password, another, or none: asked for
   names                     this wallet's names, and its commits not yet revealed
   name NAME                 look a name up on the chain
   name-commit NAME [VALUE [FEE]]
@@ -103,6 +104,10 @@ pub enum Reply {
     /// The wallet's password is to be asked for, and given to
     /// [`Console::seed`]: of a wallet that has one, asked for its words.
     Password,
+    /// The wallet's password is to be changed: the one it has is to be
+    /// asked for, if it has one ([`Console::locked`]), and the new one
+    /// twice, and both given to [`Console::set_password`].
+    NewPassword,
 }
 
 /// What is said of a wallet's twelve words when they are shown.
@@ -203,6 +208,10 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             ("bump", [id, fee]) => self.bump(id, Some(fee)),
             ("resend", [id]) => self.resend(id),
             ("prune", []) => self.prune(),
+            ("password", []) => match self.wallet() {
+                Ok(_) => return Reply::NewPassword,
+                Err(e) => Err(e),
+            },
             // (Its password asked for first, of a wallet that has one.)
             ("seed", []) => match self.wallet().map(|w| w.locked()) {
                 Ok(true) => return Reply::Password,
@@ -226,8 +235,8 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             ("scan", []) => self.scan(),
             (
                 "status" | "peers" | "mempool" | "balance" | "outputs" | "send-file" | "receive" | "finalize"
-                | "slates" | "sent" | "cancel" | "bump" | "resend" | "prune" | "seed" | "scan" | "help" | "quit"
-                | "exit" | "names" | "name" | "name-commit" | "name-reveal" | "name-update" | "name-offer"
+                | "slates" | "sent" | "cancel" | "bump" | "resend" | "prune" | "seed" | "password" | "scan" | "help"
+                | "quit" | "exit" | "names" | "name" | "name-commit" | "name-reveal" | "name-update" | "name-offer"
                 | "name-transfer",
                 _,
             ) => Err(format!("{command}: not what it takes (see help)")),
@@ -237,6 +246,26 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             Ok(text) => Reply::Said(text),
             Err(text) => Reply::Wrong(text),
         }
+    }
+
+    /// Whether the wallet has a password.
+    pub fn locked(&self) -> bool {
+        self.wallet().is_ok_and(|w| w.locked())
+    }
+
+    /// Gives the wallet the password `new` in place of `old`: either
+    /// may be none.
+    pub fn set_password(&self, old: &str, new: &str) -> Result<String, String> {
+        self.wallet()?.set_password(old, new).map_err(|e| e.to_string())?;
+        (self.log)(if new.is_empty() {
+            "The wallet's password was taken off"
+        } else {
+            "The wallet's password was set"
+        });
+        Ok(match new.is_empty() {
+            true => "The wallet has no password now: its file is all it takes to spend from it.".to_string(),
+            false => "The wallet's password is set: it is asked for when the node starts.".to_string(),
+        })
     }
 
     /// The wallet's twelve words, if `password` is its password (any,

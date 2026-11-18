@@ -32,8 +32,11 @@ pub struct Followed {
     pub blocks: u32,
     /// Whether the unspent outputs were looked through instead.
     pub looked_through: bool,
-    /// Outputs a restore's first scan found, and their total.
+    /// Outputs a restore's first scan found, and their total; the names
+    /// it found; and whether there was such a scan.
     pub found: (usize, u128),
+    pub names: usize,
+    pub restored: bool,
     /// What holding the wallet against the chain changed: payments
     /// undone, outputs lost and found again.
     pub changed: Reconciled,
@@ -45,6 +48,19 @@ pub fn follow<B: Backend + 'static, V, W: Backend>(
     chain: &Chain<B, V>,
     wallet: &mut Wallet<W>,
     now: u64,
+) -> Result<Followed, WalletError> {
+    follow_when(chain, wallet, now, true)
+}
+
+/// [`follow`], told whether the chain here is the network's, or still
+/// being caught up with (`whole`): a wallet made again from its words
+/// looks for what it holds only in a chain that is all here. Looked for
+/// in half a chain, what the rest of it holds would never be found.
+pub fn follow_when<B: Backend + 'static, V, W: Backend>(
+    chain: &Chain<B, V>,
+    wallet: &mut Wallet<W>,
+    now: u64,
+    caught_up: bool,
 ) -> Result<Followed, WalletError> {
     let mut done = Followed::default();
     let Ok(state) = chain.whole() else { return Ok(done) };
@@ -119,10 +135,11 @@ pub fn follow<B: Backend + 'static, V, W: Backend>(
         }
     }
     // A wallet restored from its phrase finds what is its own, once.
-    if wallet.scan_pending() {
+    if wallet.scan_pending() && caught_up {
         done.found = wallet.scan(&snap, now)?;
-        wallet.scan_names(&snap, now)?;
+        done.names = wallet.scan_names(&snap, now)?.0;
         wallet.clear_scan_pending()?;
+        done.restored = true;
     }
     done.changed = wallet.reconcile(&snap, height, chain.keep() as u32, undone_from)?;
     // Its names, as the chain's records now have them.

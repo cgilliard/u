@@ -565,10 +565,20 @@ are all of the wallet: whoever has them has what it holds, and a
 wallet lost is made again from them. The command `seed` says them
 again, after asking for the wallet's password if it has one.
 
+**A wallet made again.** `--restore` makes the wallet from its twelve
+words, which it asks for, where the data directory has no wallet (it
+is never made over one that is there). What the wallet holds is in the
+chain: the node looks for it once the chain is all here, and says in
+the main log what it found. Outputs of payments that no block has yet
+are not found: there is nothing of them but in the wallet that was
+lost.
+
 **Its password.** A new wallet asks for one (none, for no password),
 and a wallet that has one asks for it each time the node starts. What
 is typed is shown as it is typed. `--password-file FILE` gives it as
-the first line of a file and nothing is asked. With `--no-prompt`
+the first line of a file and nothing is asked. The command `password`
+sets one, changes it, or takes it off: it asks for the one there is,
+and for the new one twice. With `--no-prompt`
 nothing can be asked: a new wallet has no password, and one that has
 a password needs `--password-file`.
 

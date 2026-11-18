@@ -99,6 +99,11 @@ const OPTIONS: &[(&str, &[Opt])] = &[
                 help: "run without a wallet: with --no-mine, a block's reward\nbeing paid to the wallet",
             },
             Opt {
+                name: "restore",
+                takes: Takes::Nothing,
+                help: "make the wallet again from its twelve words, which are\nasked for: where the data directory has no wallet. What it\nholds is looked for once the chain is here",
+            },
+            Opt {
                 name: "password-file",
                 takes: Takes::Value("FILE"),
                 help: "the wallet's password is the first line of FILE, and is not\nasked for",
@@ -451,6 +456,8 @@ pub struct Configuration {
     pub min_confirmations: u32,
     /// Whether commands are taken from the terminal.
     pub prompt: bool,
+    /// Whether the wallet is to be made again from its words.
+    pub restore: bool,
     /// Debugging: whether blocks' proofs go unchecked, and unmade.
     pub debug_unchecked: bool,
     /// Debugging: the outputs every block made here makes, and how
@@ -816,6 +823,9 @@ impl Configuration {
         if mine && !wallet {
             return clash("--no-wallet needs --no-mine: the rewards of blocks made here are paid to the wallet".into());
         }
+        if given.flag("restore") && !wallet {
+            return clash("--restore needs a wallet: not with --no-wallet".into());
+        }
         let password_file = path("password-file")?;
         let keep = count("max-undo-blocks", 1)?.unwrap_or(1008);
         if s.sync_point as usize >= keep {
@@ -853,6 +863,7 @@ impl Configuration {
             min_confirmations: count("min-confirmations", 1)?
                 .map_or(crate::wallet::MIN_CONFIRMATIONS, |n| n.min(u32::MAX as usize) as u32),
             prompt: !given.flag("no-prompt"),
+            restore: given.flag("restore"),
             debug_unchecked,
             debug_fill,
             debug_outputs,
