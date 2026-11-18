@@ -112,7 +112,7 @@ fn said(event: &Event) -> Option<String> {
         Event::PeerLost { peer } => format!("Peer {peer} lost"),
         Event::Banned { peer } => format!("Banned {}: it sent what no honest peer sends, too often", peer.ip()),
         Event::HeadersWanted { from, to, peer } => {
-            format!("Syncing headers {} to {} from {peer}", n(*from), n(*to))
+            format!("Syncing headers {} to {} (announced by {peer})", n(*from), n(*to))
         }
         Event::HeadersKept { height } => format!("Headers synced to {}", n(*height)),
         Event::HeadersRefused { peer } => format!("Headers from {peer} refused"),

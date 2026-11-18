@@ -358,7 +358,7 @@ aside, and stopping.
 
 ```
 [2026-11-16 08:59:48:978] Peer 127.0.0.1:37411 connected (height 5)
-[2026-11-16 08:59:48:978] Syncing headers 1 to 5 from 127.0.0.1:37411
+[2026-11-16 08:59:48:978] Syncing headers 1 to 5 (announced by 127.0.0.1:37411)
 [2026-11-16 08:59:48:980] Headers synced to 5
 [2026-11-16 08:59:49:177] Received block 1 (39baef5c) from 127.0.0.1:37411
 ...
@@ -374,7 +374,7 @@ aside, and stopping.
 | `Peer A connected (height N)` | A peer answered and is live; its chain is that high |
 | `Peer A lost` | It is live no longer: silent too long, gone, or refused |
 | `Banned HOST: ...` | A host sent what no honest peer sends once too often, and is refused |
-| `Syncing headers N to M from A` | A chain ahead of ours is being caught up with |
+| `Syncing headers N to M (announced by A)` | A chain ahead of ours is being caught up with: A is the peer that told of it. The headers are asked of every peer whose chain reaches that far, a run from each at a time |
 | `Headers synced to M` | Its headers are kept |
 | `Headers from A refused` | They were not what they should be |
 | `Received block N (id) from A` | A block of a peer's became the chain's last |
