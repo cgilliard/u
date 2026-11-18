@@ -703,7 +703,12 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
             if debug && let Event::Block { header, .. } = event {
                 let (height, took) = tabminer::chain::apply::last_applied();
                 if height == header.height {
-                    main.log(&format!("debug: block {height} applied in {:.3}s", took.as_secs_f64()));
+                    let written = tabminer::store::state::last_commit();
+                    main.log(&format!(
+                        "debug: block {height} applied in {:.3}s ({:.3}s of it writing to disk)",
+                        took.as_secs_f64(),
+                        written.as_secs_f64()
+                    ));
                 }
             }
         }));

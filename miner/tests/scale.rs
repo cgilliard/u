@@ -243,7 +243,7 @@ fn report_left(test: &str) {
 fn filled(test: &'static str, port: u32, n: u64, blocks: u64) -> (Node, Duration) {
     let began = Instant::now();
     let (state, blocks) = (format!("{n},{}", spacing()), blocks.to_string());
-    let args = ["--debug-fill-outputs", &state, "--debug-fill", "100000,100000", "--blocks", &blocks, "--threads", "2"];
+    let args = ["--debug-fill-outputs", &state, "--debug-fill", "100000,100000", "--blocks", &blocks];
     let mut node = Node::start("server", test, port, &args);
     node.wait("Server is ready!", 1, scaled(n));
     (node, began.elapsed())
@@ -280,6 +280,12 @@ fn a_full_block_applies_on_a_large_state() {
         secs.sort_by(f64::total_cmp);
         report(T, &format!("{what}_median_secs"), format!("{:.3}", secs[secs.len() / 2]));
         report(T, &format!("{what}_max_secs"), format!("{:.3}", secs[secs.len() - 1]));
+        // (And how much of applying was writing to disk.)
+        if what == "apply" {
+            let mut written: Vec<f64> = lines.iter().filter_map(|l| secs_after(l, "s (")).collect();
+            written.sort_by(f64::total_cmp);
+            report(T, "apply_write_median_secs", format!("{:.3}", written[written.len() / 2]));
+        }
         // (Only a guard: the times are for reading. Machines differ by
         // too much for them to be held to a number.)
         assert!(secs[secs.len() - 1] < 300.0, "{what} took {:.1}s", secs[secs.len() - 1]);
