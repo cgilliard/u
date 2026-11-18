@@ -310,6 +310,15 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             commas(pooled as u64),
             commas(bytes as u64)
         );
+        // The message layer: where this node's wallet is reached, and
+        // the wallets this node is where others are reached.
+        let (sessions, reached, said) = self.hold.sessions();
+        if said > 0 {
+            out.push_str(&format!("\nreached at: {reached} of {said} nodes"));
+        }
+        if sessions > 0 {
+            out.push_str(&format!("\nsessions: {} wallets are reached here", commas(sessions as u64)));
+        }
         let (held, most) = (crate::heap::now() / 1_000_000, crate::heap::peak() / 1_000_000);
         out.push_str(&format!("\nmemory: {} MB held, {} MB at the most", commas(held as u64), commas(most as u64)));
         // (Of the store's file, what is in use and how long it is: the

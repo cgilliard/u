@@ -1,0 +1,406 @@
+//! Who is to be reached where: the sessions a node holds for wallets,
+//! and the sessions a wallet keeps at nodes.
+//!
+//! A wallet that is to be reached says so to the nodes it is reached at
+//! ([`crate::msg::points`]), now and then, for as long as it is to be:
+//! "I am the wallet of this id, and what I last announced has this
+//! number" ([`crate::net::message::Message::Session`]). A node that
+//! holds sessions ([`Sessions`]) asks for the announcement if it has
+//! not got it, checks it, and from then on knows where that wallet is:
+//! what is offered for it is passed on there, and whoever asks is
+//! given its announcement. A wallet that stops saying so is forgotten.
+//! Nothing is kept for a wallet that is not there.
+//!
+//! A node holds only so many sessions, and only so many of one host:
+//! ids cost nothing to make, and room for them is not given away to
+//! whoever asks for most.
+
+use std::collections::BTreeMap;
+use std::net::SocketAddrV4;
+use std::sync::Arc;
+
+use crate::hash::Digest;
+use crate::msg::{self, Announced};
+use crate::poseidon2::digest_to_bytes;
+use crate::transport::{Micros, SECOND};
+use crate::{mldsa, mlkem};
+
+/// How a node that holds sessions is bounded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// Sessions held in all.
+    pub most: usize,
+    /// Sessions of one host.
+    pub each_host: usize,
+    /// How long a wallet may say nothing before it is forgotten.
+    pub idle: Micros,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits { most: 10_000, each_host: 16, idle: 90 * SECOND }
+    }
+}
+
+/// A wallet a node holds a session for.
+#[derive(Clone, Debug)]
+pub struct Session {
+    pub addr: SocketAddrV4,
+    pub seq: u64,
+    /// What it announced, as it said it.
+    pub announce: Arc<Vec<u8>>,
+    /// When it last said it was there.
+    pub seen: Micros,
+}
+
+/// Why an announcement was not taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// Not an announcement, not signed by its key, or past its time.
+    Unsound,
+    /// Not made for this node to take from that address.
+    NotBound,
+    /// Older than the one held.
+    Stale,
+    /// No room: of that host, or at all.
+    Full,
+}
+
+/// The sessions a node holds.
+pub struct Sessions {
+    limits: Limits,
+    held: BTreeMap<[u8; 32], Session>,
+}
+
+impl Sessions {
+    pub fn new(limits: Limits) -> Sessions {
+        Sessions { limits, held: BTreeMap::new() }
+    }
+
+    pub fn len(&self) -> usize {
+        self.held.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+
+    /// The wallet of id `id` says, from `addr`, that it is there and
+    /// what it last announced has the number `seq`. True if that is the
+    /// announcement held, from that address: the session goes on. If
+    /// not, the announcement is to be asked for.
+    pub fn seen(&mut self, id: &Digest, addr: SocketAddrV4, seq: u64, now: Micros) -> bool {
+        match self.held.get_mut(&digest_to_bytes(id)) {
+            Some(session) if session.addr == addr && session.seq == seq => {
+                session.seen = now;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Takes an announcement that came from `addr`: at `unix` by the
+    /// calendar, `now` by the clock. `bound` says whether a token is
+    /// this node's for that address. The id of the wallet whose session
+    /// it opens, or goes on with.
+    pub fn admit(
+        &mut self,
+        announce: Vec<u8>,
+        addr: SocketAddrV4,
+        bound: impl FnOnce(u64) -> bool,
+        unix: u64,
+        now: Micros,
+    ) -> Result<Digest, Refused> {
+        let said = Announced::read(&announce, unix).ok_or(Refused::Unsound)?;
+        if !bound(said.bind()) {
+            return Err(Refused::NotBound);
+        }
+        let (id, seq) = (said.id(), said.seq());
+        let key = digest_to_bytes(&id);
+        self.prune(now);
+        match self.held.get(&key) {
+            Some(held) if held.seq >= seq => return Err(Refused::Stale),
+            Some(_) => {}
+            None => {
+                let of_host = self.held.values().filter(|s| s.addr.ip() == addr.ip()).count();
+                if self.held.len() >= self.limits.most || of_host >= self.limits.each_host {
+                    return Err(Refused::Full);
+                }
+            }
+        }
+        self.held.insert(key, Session { addr, seq, announce: Arc::new(announce), seen: now });
+        Ok(id)
+    }
+
+    /// The session held for the wallet of id `id`, if it has said it
+    /// was there lately enough.
+    pub fn get(&self, id: &Digest, now: Micros) -> Option<&Session> {
+        self.held.get(&digest_to_bytes(id)).filter(|s| now.saturating_sub(s.seen) < self.limits.idle)
+    }
+
+    /// Forgets the wallets that have said nothing for too long.
+    pub fn prune(&mut self, now: Micros) {
+        let idle = self.limits.idle;
+        self.held.retain(|_, s| now.saturating_sub(s.seen) < idle);
+    }
+}
+
+/// How long a wallet's Kyber key is announced for before another is
+/// made, and how long the one before it still opens what was sealed to
+/// it.
+const KEY_LIFE: Micros = 3600 * SECOND;
+const KEY_GRACE: Micros = 600 * SECOND;
+/// How long an announcement holds, in seconds: past a key's life, so
+/// that what was sealed just before another was made is still answered.
+const ANNOUNCE_HOLDS: u64 = 2 * 3600;
+/// Between sayings to a node that does not yet hold the announcement.
+const UNHELD_RETRY: Micros = 2 * SECOND;
+
+/// A wallet's side: its keys, and what it has announced to each node it
+/// is reached at.
+pub struct Participant {
+    identity: mldsa::SecretKey,
+    id: Digest,
+    kyber: mlkem::SecretKey,
+    made: Micros,
+    /// The key before, and until when it still opens.
+    before: Option<(mlkem::SecretKey, Micros)>,
+    /// To each node: the announcement made for it, the token it was
+    /// bound to, its number, and the number that node last said it
+    /// holds.
+    said: BTreeMap<SocketAddrV4, Said>,
+    /// The number of the last announcement made: the next is higher.
+    last: u64,
+}
+
+struct Said {
+    bind: u64,
+    seq: u64,
+    announce: Arc<Vec<u8>>,
+    held: u64,
+    asked: Micros,
+}
+
+impl Participant {
+    /// The wallet whose Dilithium key is `identity`, at `now`. `chance`
+    /// is 64 random bytes, for its first Kyber key.
+    pub fn new(identity: mldsa::SecretKey, chance: &[u8; 64], now: Micros) -> Participant {
+        let id = crate::address::id_of(identity.public_key());
+        let kyber = mlkem::keygen(chance);
+        Participant { identity, id, kyber, made: now, before: None, said: BTreeMap::new(), last: 0 }
+    }
+
+    pub fn id(&self) -> Digest {
+        self.id
+    }
+
+    pub fn identity(&self) -> &mldsa::SecretKey {
+        &self.identity
+    }
+
+    /// Makes another Kyber key if the one there is has been announced
+    /// long enough: every announcement is then to be made again.
+    /// `chance` is 64 random bytes.
+    pub fn rotate(&mut self, chance: &[u8; 64], now: Micros) -> bool {
+        if now.saturating_sub(self.made) < KEY_LIFE {
+            return false;
+        }
+        let old = std::mem::replace(&mut self.kyber, mlkem::keygen(chance));
+        self.before = Some((old, now + KEY_GRACE));
+        self.made = now;
+        self.said.clear();
+        true
+    }
+
+    /// Whether it is time to say again to the node at `node` that this
+    /// wallet is there: every `keepalive` while the node holds what was
+    /// announced to it, and sooner until it does.
+    pub fn due(&self, node: &SocketAddrV4, now: Micros, keepalive: Micros) -> bool {
+        match self.said.get(node) {
+            Some(said) if said.held == said.seq => now.saturating_sub(said.asked) >= keepalive,
+            Some(said) => now.saturating_sub(said.asked) >= UNHELD_RETRY,
+            None => true,
+        }
+    }
+
+    /// What is to be said to the node at `node`, whose token for this
+    /// wallet is `token`: the number of the announcement made for it,
+    /// which is made now if there is none, or if the token is another
+    /// than it was bound to. `unix` is the time by the calendar, in
+    /// seconds: a number that only rises is made of it (so that it
+    /// rises from one run of the node to the next, too).
+    pub fn say(&mut self, node: SocketAddrV4, token: u64, unix: u64, now: Micros) -> u64 {
+        let fresh = self.said.get(&node).is_none_or(|s| s.bind != token);
+        if fresh {
+            let stamp = (unix << 20).max(self.last + 1);
+            self.last = stamp;
+            let ek: [u8; mlkem::EK_LEN] = self.kyber.public_key().try_into().expect("a key's length");
+            let announce = msg::announce(&self.identity, &ek, stamp, unix + ANNOUNCE_HOLDS, token);
+            let said = Said { bind: token, seq: stamp, announce: Arc::new(announce), held: 0, asked: now };
+            self.said.insert(node, said);
+        }
+        let said = self.said.get_mut(&node).expect("it was put there");
+        said.asked = now;
+        said.seq
+    }
+
+    /// The announcement of the number `seq`, for whoever asks: one made
+    /// for some node, and still the one for it.
+    pub fn announced(&self, seq: u64) -> Option<Arc<Vec<u8>>> {
+        self.said.values().find(|s| s.seq == seq).map(|s| Arc::clone(&s.announce))
+    }
+
+    /// The announcement made for the node at `node`, if one was.
+    pub fn announced_to(&self, node: &SocketAddrV4) -> Option<Arc<Vec<u8>>> {
+        self.said.get(node).map(|s| Arc::clone(&s.announce))
+    }
+
+    /// The node at `node` says it holds the announcement of number
+    /// `seq` for this wallet.
+    pub fn held(&mut self, node: &SocketAddrV4, seq: u64) {
+        if let Some(said) = self.said.get_mut(node) {
+            said.held = seq;
+        }
+    }
+
+    /// The nodes this wallet is reached at now: those that hold what it
+    /// last announced to them.
+    pub fn reached_at(&self) -> impl Iterator<Item = SocketAddrV4> + '_ {
+        self.said.iter().filter(|(_, s)| s.held == s.seq).map(|(node, _)| *node)
+    }
+
+    /// The nodes it has said it is there to, whether or not they hold
+    /// its announcement.
+    pub fn said_to(&self) -> usize {
+        self.said.len()
+    }
+
+    /// No longer says anything to the nodes that are not of `points`.
+    pub fn keep(&mut self, points: &[SocketAddrV4]) {
+        self.said.retain(|node, _| points.contains(node));
+    }
+
+    /// Opens a message sealed to this wallet, at `unix` by the calendar
+    /// and `now` by the clock: with the key it announces, or the one
+    /// before while that still opens.
+    pub fn open(&self, sealed: &[u8], unix: u64, now: Micros) -> Option<msg::Opened> {
+        let before = self.before.as_ref().filter(|(_, until)| now < *until).map(|(key, _)| key);
+        [Some(&self.kyber), before].into_iter().flatten().find_map(|key| msg::open(key, &self.id, sealed, unix))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(host: u8, port: u16) -> SocketAddrV4 {
+        SocketAddrV4::new([10, 0, 0, host].into(), port)
+    }
+
+    fn wallet(seed: u8) -> Participant {
+        Participant::new(mldsa::keygen(&[seed; 32]), &[seed; 64], 0)
+    }
+
+    /// A node holds a session for a wallet once it has its announcement,
+    /// made for that node and come from where the wallet is; goes on
+    /// with it while the wallet says it is there; takes a newer
+    /// announcement, never an older; and forgets a wallet that has
+    /// said nothing for too long.
+    #[test]
+    fn a_session_is_opened_gone_on_with_and_forgotten() {
+        let mut sessions = Sessions::new(Limits { most: 3, each_host: 2, idle: 90 * SECOND });
+        let mut alice = wallet(1);
+        let (node, home) = (at(9, 3737), at(1, 4000));
+        let seq = alice.say(node, 77, 1000, 0);
+        assert_eq!(alice.say(node, 77, 1001, SECOND), seq, "the same token: the same announcement");
+        assert!(!alice.due(&node, 2 * SECOND, 30 * SECOND) && alice.due(&node, 3 * SECOND, 30 * SECOND));
+        let said = alice.announced(seq).unwrap();
+        // Not held yet: asked for, then taken.
+        assert!(!sessions.seen(&alice.id(), home, seq, 0));
+        assert_eq!(sessions.admit(said.to_vec(), home, |bind| bind == 77, 1000, 0), Ok(alice.id()));
+        assert!(sessions.seen(&alice.id(), home, seq, 10 * SECOND));
+        assert_eq!(sessions.get(&alice.id(), 20 * SECOND).unwrap().addr, home);
+        assert_eq!(sessions.get(&alice.id(), 20 * SECOND).unwrap().announce, said);
+        // From another address, or of another number: not that session.
+        assert!(!sessions.seen(&alice.id(), at(2, 4000), seq, 20 * SECOND));
+        assert!(!sessions.seen(&alice.id(), home, seq + 1, 20 * SECOND));
+        // Not made for this node; said again, the same; past its time;
+        // or changed: not taken.
+        let taken = |sessions: &mut Sessions, bytes: &[u8], bind: u64, unix: u64| {
+            sessions.admit(bytes.to_vec(), home, |b| b == bind, unix, 20 * SECOND)
+        };
+        assert_eq!(taken(&mut sessions, &said, 78, 1000), Err(Refused::NotBound));
+        assert_eq!(taken(&mut sessions, &said, 77, 1000), Err(Refused::Stale));
+        assert_eq!(taken(&mut sessions, &said, 77, 1000 + ANNOUNCE_HOLDS), Err(Refused::Unsound));
+        assert_eq!(taken(&mut sessions, &said[1..], 77, 1000), Err(Refused::Unsound));
+        // The node's token for it is another (the wallet moved, or the
+        // node's tokens did): announced again, with a higher number,
+        // and taken in place of the first.
+        let again = alice.say(node, 80, 1100, 30 * SECOND);
+        assert!(again > seq);
+        let newer = alice.announced(again).unwrap();
+        assert_eq!(taken(&mut sessions, &newer, 80, 1100), Ok(alice.id()));
+        assert!(sessions.seen(&alice.id(), home, again, 30 * SECOND) && sessions.len() == 1);
+        // Said nothing for too long: forgotten.
+        assert!(sessions.get(&alice.id(), 119 * SECOND).is_some());
+        assert!(sessions.get(&alice.id(), 120 * SECOND).is_none());
+        sessions.prune(120 * SECOND);
+        assert!(sessions.is_empty());
+    }
+
+    /// Room is not given away: so many sessions of one host, and so
+    /// many in all; a wallet already there is not turned out by it.
+    #[test]
+    fn sessions_are_bounded_by_host_and_in_all() {
+        let mut sessions = Sessions::new(Limits { most: 3, each_host: 2, idle: 90 * SECOND });
+        let node = at(9, 3737);
+        let open = |sessions: &mut Sessions, seed: u8, from: SocketAddrV4, unix: u64| {
+            let mut w = wallet(seed);
+            let seq = w.say(node, 1, unix, 0);
+            sessions.admit(w.announced(seq).unwrap().to_vec(), from, |_| true, unix, 0).map(|_| ())
+        };
+        assert_eq!(open(&mut sessions, 1, at(1, 1), 1000), Ok(()));
+        assert_eq!(open(&mut sessions, 2, at(1, 2), 1000), Ok(()));
+        assert_eq!(open(&mut sessions, 3, at(1, 3), 1000), Err(Refused::Full), "a third of one host");
+        assert_eq!(open(&mut sessions, 3, at(2, 3), 1000), Ok(()));
+        assert_eq!(open(&mut sessions, 4, at(3, 1), 1000), Err(Refused::Full), "a fourth in all");
+        // One that is there announces again: it has its place.
+        assert_eq!(open(&mut sessions, 1, at(1, 1), 1001), Ok(()));
+        assert_eq!(sessions.len(), 3);
+    }
+
+    /// A wallet opens what is sealed to the key it announces; makes
+    /// another key in time, and still opens, for a while, what was
+    /// sealed to the one before.
+    #[test]
+    fn a_wallet_opens_what_is_sealed_to_its_keys() {
+        let (mut alice, mut bob) = (wallet(1), wallet(2));
+        let node = at(9, 3737);
+        let said = bob.say(node, 1, 1000, 0);
+        let own = bob.announced(said).unwrap();
+        let seq = alice.say(node, 2, 1000, 0);
+        let to = alice.announced(seq).unwrap();
+        let sealed =
+            msg::seal(bob.identity(), &own, &Announced::read(&to, 1000).unwrap(), 1, b"hello", &[3; 32]).unwrap();
+        assert_eq!(alice.open(&sealed, 1000, 0).unwrap().body, b"hello");
+        assert_eq!(bob.open(&sealed, 1000, 0), None);
+        // Not yet time for another key; then it is, and everything is
+        // announced again.
+        assert!(!alice.rotate(&[9; 64], KEY_LIFE - 1));
+        assert!(alice.rotate(&[9; 64], KEY_LIFE));
+        assert_eq!((alice.said_to(), alice.announced(seq)), (0, None));
+        assert_ne!(alice.say(node, 2, 5000, KEY_LIFE), seq);
+        assert_eq!(alice.open(&sealed, 1000, KEY_LIFE + KEY_GRACE - 1).unwrap().body, b"hello");
+        assert_eq!(alice.open(&sealed, 1000, KEY_LIFE + KEY_GRACE), None);
+        // Which nodes hold what it last said; and one that does is told
+        // again only now and then.
+        assert_eq!(alice.reached_at().count(), 0);
+        let now = alice.say(node, 2, 5000, KEY_LIFE);
+        alice.held(&node, now);
+        assert_eq!(alice.reached_at().collect::<Vec<_>>(), [node]);
+        assert!(!alice.due(&node, KEY_LIFE + 29 * SECOND, 30 * SECOND));
+        assert!(alice.due(&node, KEY_LIFE + 30 * SECOND, 30 * SECOND));
+        alice.keep(&[]);
+        assert_eq!(alice.said_to(), 0);
+    }
+}

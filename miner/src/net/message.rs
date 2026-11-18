@@ -43,6 +43,17 @@ const TX: u8 = 8;
 const GET_LEAVES: u8 = 9;
 const LEAVES: u8 = 10;
 const GOODBYE: u8 = 11;
+const SESSION: u8 = 12;
+const SESSION_STATE: u8 = 13;
+const OFFER: u8 = 14;
+const NOTICE: u8 = 15;
+
+/// What a [`Message::Notice`] says of a message offered: passed on to
+/// the wallet it is for; that wallet is not here to take it; or not
+/// taken, by a node that passes nothing on or has no room.
+pub const NOTICE_PASSED: u8 = 1;
+pub const NOTICE_OFFLINE: u8 = 2;
+pub const NOTICE_REFUSED: u8 = 3;
 const GET: u8 = 16;
 const CHUNK: u8 = 17;
 const GONE: u8 = 18;
@@ -177,6 +188,40 @@ pub enum Message<'a> {
         id: Digest,
         leaves: Leaves,
     },
+    /// "I am the wallet of this id, and what I last announced has this
+    /// number": said to a node the wallet is to be reached at, now and
+    /// then, for as long as it is to be. `grant` is the sender's token
+    /// for the node, with which the node may ask it for the
+    /// announcement ([`crate::net::object::Object::Announce`]).
+    Session {
+        token: u64,
+        grant: u64,
+        id: Digest,
+        seq: u64,
+    },
+    /// The answer: the number of the announcement the node holds for
+    /// that wallet, zero while it holds none.
+    SessionState {
+        id: Digest,
+        seq: u64,
+    },
+    /// "Here is a sealed message for this wallet": its id and length,
+    /// to be asked for with `grant`, the sender's token for whoever it
+    /// is said to. `token` is theirs for the sender, where the sender
+    /// has one: a node takes an offer to pass on only with it.
+    Offer {
+        token: u64,
+        grant: u64,
+        to: Digest,
+        id: Digest,
+        len: u32,
+    },
+    /// What became of a message offered to a node to pass on
+    /// ([`NOTICE_PASSED`] and the rest).
+    Notice {
+        id: Digest,
+        what: u8,
+    },
     /// "I am going": the sender is not to be asked anything more.
     Goodbye {
         token: u64,
@@ -255,6 +300,31 @@ impl<'a> Message<'a> {
                 w.put(&token.to_le_bytes());
                 GOODBYE
             }
+            Message::Session { token, grant, id, seq } => {
+                w.put(&token.to_le_bytes());
+                w.put(&grant.to_le_bytes());
+                w.put(&digest_to_bytes(id));
+                w.put(&seq.to_le_bytes());
+                SESSION
+            }
+            Message::SessionState { id, seq } => {
+                w.put(&digest_to_bytes(id));
+                w.put(&seq.to_le_bytes());
+                SESSION_STATE
+            }
+            Message::Offer { token, grant, to, id, len } => {
+                w.put(&token.to_le_bytes());
+                w.put(&grant.to_le_bytes());
+                w.put(&digest_to_bytes(to));
+                w.put(&digest_to_bytes(id));
+                w.put(&len.to_le_bytes());
+                OFFER
+            }
+            Message::Notice { id, what } => {
+                w.put(&digest_to_bytes(id));
+                w.put(&[*what]);
+                NOTICE
+            }
             Message::Get(g) => {
                 w.1 += g.encode(&mut w.0[HEAD..]);
                 GET
@@ -327,6 +397,21 @@ impl<'a> Message<'a> {
                 Message::Leaves { id, leaves }
             }
             GOODBYE => Message::Goodbye { token: r.u64().ok_or(BAD)? },
+            SESSION => Message::Session {
+                token: r.u64().ok_or(BAD)?,
+                grant: r.u64().ok_or(BAD)?,
+                id: r.digest().ok_or(BAD)?,
+                seq: r.u64().ok_or(BAD)?,
+            },
+            SESSION_STATE => Message::SessionState { id: r.digest().ok_or(BAD)?, seq: r.u64().ok_or(BAD)? },
+            OFFER => Message::Offer {
+                token: r.u64().ok_or(BAD)?,
+                grant: r.u64().ok_or(BAD)?,
+                to: r.digest().ok_or(BAD)?,
+                id: r.digest().ok_or(BAD)?,
+                len: r.u32().ok_or(BAD)?,
+            },
+            NOTICE => Message::Notice { id: r.digest().ok_or(BAD)?, what: r.take(1).ok_or(BAD)?[0] },
             // The transport's own, which take the whole body or refuse it.
             GET => return Ok(Message::Get(Get::decode(body)?)),
             CHUNK => return Ok(Message::Chunk(Chunk::decode(body)?)),

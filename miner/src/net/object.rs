@@ -50,6 +50,12 @@ pub enum Object {
     File(Digest),
     /// The transaction of this id.
     Tx(Digest),
+    /// What the wallet of this id announced ([`crate::msg`]): the one
+    /// of this sequence number, asked of the wallet itself; or, with
+    /// none (zero), the newest a node that holds a session for it has.
+    Announce { id: Digest, seq: u64 },
+    /// The sealed message of this id ([`crate::msg::sealed_id`]).
+    Sealed(Digest),
 }
 
 const BLOCK: u8 = 1;
@@ -62,6 +68,8 @@ const PROOF: u8 = 7;
 const FILE: u8 = 8;
 const TX: u8 = 9;
 const ROOTS: u8 = 10;
+const ANNOUNCE: u8 = 11;
+const SEALED: u8 = 12;
 
 impl Object {
     /// What kind of object it is, in a word: for the logs.
@@ -77,6 +85,8 @@ impl Object {
             Object::Proof { .. } => "proof",
             Object::File(_) => "file",
             Object::Tx(_) => "tx",
+            Object::Announce { .. } => "announce",
+            Object::Sealed(_) => "sealed",
         }
     }
 
@@ -134,6 +144,15 @@ impl Object {
                 put(&[TX]);
                 put(&digest_to_bytes(id));
             }
+            Object::Announce { id, seq } => {
+                put(&[ANNOUNCE]);
+                put(&digest_to_bytes(id));
+                put(&seq.to_le_bytes());
+            }
+            Object::Sealed(id) => {
+                put(&[SEALED]);
+                put(&digest_to_bytes(id));
+            }
         }
         at
     }
@@ -157,6 +176,11 @@ impl Object {
             MANIFEST => Object::Manifest(with(0)?.0),
             FILE => Object::File(with(0)?.0),
             TX => Object::Tx(with(0)?.0),
+            SEALED => Object::Sealed(with(0)?.0),
+            ANNOUNCE => {
+                let (id, tail) = with(8)?;
+                Object::Announce { id, seq: u64::from_le_bytes(tail.try_into().unwrap()) }
+            }
             HEADERS => {
                 if rest.len() != 38 {
                     return Err(BAD);

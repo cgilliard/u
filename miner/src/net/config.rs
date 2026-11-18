@@ -33,6 +33,15 @@ pub struct Config {
     pub request_queue: usize,
     /// Bytes of transactions the pool holds at the most.
     pub pool: usize,
+    /// Whether the node stands between wallets on the message layer:
+    /// holds sessions for them, and passes on what is sealed to them
+    /// ([`super::sessions`]). Only a node told to does.
+    pub relay: bool,
+    /// How the sessions it holds are bounded.
+    pub sessions: super::sessions::Limits,
+    /// How often a wallet says, to a node it is reached at, that it is
+    /// there.
+    pub keepalive: Micros,
     pub peers: Peers,
     pub sync: Sync,
     pub serve: Serve,
@@ -207,6 +216,9 @@ impl Default for Config {
             workers: 1,
             request_queue: 4096,
             pool: crate::mempool::DEFAULT_CAPACITY,
+            relay: false,
+            sessions: super::sessions::Limits::default(),
+            keepalive: 30 * SECOND,
             peers: Peers::default(),
             sync: Sync::default(),
             serve: Serve::default(),

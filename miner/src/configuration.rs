@@ -145,6 +145,16 @@ const OPTIONS: &[(&str, &[Opt])] = &[
             },
             Opt { name: "no-seeds", takes: Takes::Nothing, help: "do not use the built-in seeds" },
             Opt {
+                name: "relay",
+                takes: Takes::Nothing,
+                help: "stand between wallets on the message layer: hold sessions\nfor those that are reached here, and pass on what is sealed\nto them. A node not told to does neither",
+            },
+            Opt {
+                name: "max-sessions",
+                takes: Takes::Value("N"),
+                help: "with --relay: wallets a session is held for at the most\n(default 10000)",
+            },
+            Opt {
                 name: "mempool-size",
                 takes: Takes::Value("SIZE"),
                 help: "bytes of transactions waiting for a block that are kept at\nthe most: what pays least gives way to what pays more\n(default 64m)",
@@ -752,6 +762,11 @@ impl Configuration {
         net.serve.waiting = count("serve-queue", 1)?.unwrap_or(net.serve.waiting);
         net.request_queue = count("request-queue-size", 1)?.unwrap_or(net.request_queue);
         net.pool = given.size("mempool-size", 1 << 20)?.map_or(net.pool, |bytes| bytes as usize);
+        net.relay = given.flag("relay");
+        net.sessions.most = count("max-sessions", 1)?.unwrap_or(net.sessions.most);
+        if given.one("max-sessions").is_some() && !net.relay {
+            return Err(Refused::Wrong("--max-sessions needs --relay".into()));
+        }
         net.serve.waiting_each = count("serve-queue-per-peer", 1)?.unwrap_or(net.serve.waiting_each);
         // What cannot both hold, said by the options' own names.
         let (p, s) = (&net.peers, &net.sync);
@@ -925,6 +940,14 @@ impl Configuration {
             ("Threads", if self.threads == 0 { "one a core".to_string() } else { commas(self.threads as u64) }),
             ("Request Queue Size", commas(self.net.request_queue as u64)),
             ("Mempool Size", format!("{} bytes", commas(self.net.pool as u64))),
+            (
+                "Relay",
+                if self.net.relay {
+                    format!("yes, {} sessions at the most", commas(self.net.sessions.most as u64))
+                } else {
+                    "no".to_string()
+                },
+            ),
             ("Data Directory", self.data_dir.display().to_string()),
             ("Main Log", self.main_log.display().to_string()),
             ("Request Log", self.request_log.display().to_string()),

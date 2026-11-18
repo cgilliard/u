@@ -748,6 +748,15 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
         false => (None, None),
     };
 
+    // The wallet is to be reached: the node says, to the nodes that
+    // stand between wallets, that it is there, for as long as it runs.
+    if let Some(wallet) = &wallet {
+        let identity = wallet.lock().unwrap_or_else(|e| e.into_inner()).identity_key();
+        let mut chance = [0u8; 64];
+        tabminer::random::fill(&mut chance).map_err(|e| format!("the system gave no random bytes: {e}"))?;
+        hold.participate(tabminer::net::sessions::Participant::new(identity, &chance, now()));
+    }
+
     // Everything is open: from here the node can do what it is for.
     let _stats_log = StatsLog::start(stat_log, Arc::clone(&stats), c.stats).map_err(threads)?;
     c.announce(&main);

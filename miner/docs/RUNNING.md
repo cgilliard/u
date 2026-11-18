@@ -597,6 +597,19 @@ or
 with three relays at the least. Until a file is in force, and whenever
 none is, the mode is init.
 
+**Being reached.** A wallet is reached through nodes that stand
+between wallets: while no consensus file names relays, the seeds and
+the peers the node was given, three of them at the most, chosen by the
+wallet's address and changed every 144 blocks. The node says to each,
+every half minute, that its wallet is there, and gives it what the
+wallet announces: a key to seal to, made anew every hour, under the
+wallet's signature. `status` says at how many of them the wallet is
+reached. A node stands between wallets only if it is started with
+`--relay`: it then holds a session for each wallet that says it is
+there (`--max-sessions`, 10,000 if not said, and sixteen of one host),
+and forgets one that has said nothing for a minute and a half. Nothing
+is sent through them yet.
+
 **A wallet made again.** `--restore` makes the wallet from its twelve
 words, which it asks for, where the data directory has no wallet (it
 is never made over one that is there). What the wallet holds is in the

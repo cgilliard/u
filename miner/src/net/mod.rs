@@ -21,6 +21,7 @@ pub mod message;
 pub mod node;
 pub mod object;
 pub mod peers;
+pub mod sessions;
 pub mod snapshot;
 pub mod socket;
 
