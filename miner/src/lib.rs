@@ -56,6 +56,7 @@ pub mod sig_air;
 pub mod signed;
 pub mod stark;
 pub mod store;
+pub mod subnames;
 #[cfg(test)]
 #[path = "tests/util.rs"]
 pub(crate) mod test_util;
