@@ -253,9 +253,76 @@ pub fn points(id: &Digest, epoch: u32, nodes: usize) -> Vec<usize> {
     chosen
 }
 
+/// The epochs a wallet is to be reached by the nodes of, when the
+/// chain is `height` blocks high: the one that height is of, and for a
+/// few blocks either side of where one epoch gives way to the next
+/// ([`crate::consensus::GRACE`]), the other too. Whoever sends looks
+/// where the epoch of its own chain says, and its chain may be a block
+/// ahead or behind: the wallet is there either way.
+pub fn reached_epochs(height: u32) -> Vec<u32> {
+    use crate::consensus::{EPOCH, GRACE};
+    let (epoch, into) = (height / EPOCH, height % EPOCH);
+    let mut epochs = vec![epoch];
+    if into < GRACE && epoch > 0 {
+        epochs.push(epoch - 1);
+    }
+    if into >= EPOCH - GRACE {
+        epochs.push(epoch + 1);
+    }
+    epochs
+}
+
+/// Which of `nodes` nodes a wallet of id `id` is to be reached at when
+/// the chain is `height` blocks high: those of each epoch it is to be
+/// reached by the nodes of, none twice, those of its own epoch first.
+pub fn reached_points(id: &Digest, height: u32, nodes: usize) -> Vec<usize> {
+    let mut all: Vec<usize> = Vec::new();
+    for epoch in reached_epochs(height) {
+        for point in points(id, epoch, nodes) {
+            if !all.contains(&point) {
+                all.push(point);
+            }
+        }
+    }
+    all
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Where one epoch gives way to the next a wallet is reached by the
+    /// nodes of both: whoever sends, a few blocks ahead of it or
+    /// behind, finds it at the nodes its own chain says.
+    #[test]
+    fn a_wallet_is_reached_by_the_nodes_of_both_epochs_where_they_meet() {
+        use crate::consensus::{EPOCH, GRACE};
+        assert_eq!(reached_epochs(0), [0]);
+        assert_eq!(reached_epochs(GRACE), [0]);
+        assert_eq!(reached_epochs(EPOCH - GRACE - 1), [0]);
+        assert_eq!(reached_epochs(EPOCH - GRACE), [0, 1]);
+        assert_eq!(reached_epochs(EPOCH - 1), [0, 1]);
+        assert_eq!(reached_epochs(EPOCH), [1, 0]);
+        assert_eq!(reached_epochs(EPOCH + GRACE - 1), [1, 0]);
+        assert_eq!(reached_epochs(EPOCH + GRACE), [1]);
+        assert_eq!(reached_epochs(7 * EPOCH + 70), [7]);
+        let id = crate::address::id_of(mldsa::keygen(&[5; 32]).public_key());
+        for height in 0..3 * EPOCH {
+            let reached = reached_points(&id, height, 50);
+            // Whoever sends, its chain up to GRACE blocks ahead or
+            // behind, looks at nodes the wallet is reached at.
+            for theirs in height.saturating_sub(GRACE)..=height + GRACE {
+                let looked = points(&id, theirs / EPOCH, 50);
+                assert!(looked.iter().all(|p| reached.contains(p)), "at {height}, a sender at {theirs}");
+            }
+            assert!(reached.len() <= 6 && reached[..3] == points(&id, height / EPOCH, 50)[..]);
+        }
+        // Mostly it is three nodes, and never one twice.
+        assert_eq!(reached_points(&id, 70, 50).len(), 3);
+        let mut of_two = reached_points(&id, EPOCH, 2);
+        of_two.sort_unstable();
+        assert_eq!(of_two, [0, 1]);
+    }
 
     fn wallet(seed: u8) -> (mldsa::SecretKey, mlkem::SecretKey) {
         (mldsa::keygen(&[seed; 32]), mlkem::keygen(&[seed.wrapping_add(100); 64]))

@@ -55,6 +55,9 @@ pub const PONG: u8 = 2;
 pub const HERE: u8 = 3;
 pub const STILL: u8 = 4;
 pub const HELD: u8 = 5;
+/// (The same as [`HELD`], said in answer to [`HERE`]: filled out as
+/// that is.)
+pub const HERE_HELD: u8 = 12;
 /// What whoever sends to a wallet says to a node that wallet is
 /// reached at: "what does the wallet of this id announce?", answered
 /// with the announcement, or with the id if the wallet is not there;
@@ -87,8 +90,51 @@ pub enum Purpose {
     Send,
 }
 
+/// The lengths of what is carried along a way, before it is sealed:
+/// whatever is said is filled out to the least of them that holds it,
+/// so that a relay that passes it on learns from its length only
+/// which of these few it is. The least is what one datagram holds;
+/// the next holds a key agreed or what a wallet announces; the rest,
+/// sealed messages by their length.
+pub const SIZES: [usize; 6] =
+    [super::message::MAX_STEPPED - circuit::SEAL, 8 << 10, 16 << 10, 32 << 10, 48 << 10, 80 << 10];
+/// The length what opens a way, what a wallet announces, and what is
+/// asked and answered of it are all filled out to, both ways: so that
+/// going on to another relay, saying a wallet is there and asking
+/// after one look alike to the relays between.
+const MIDDLE: usize = SIZES[1];
+const _: () = assert!(SIZES[5] >= crate::msg::MAX_SEALED + 8);
+
 /// The longest thing carried along a way.
-pub const MAX_STEP: usize = crate::msg::MAX_SEALED + 256;
+pub const MAX_STEP: usize = SIZES[5] + circuit::SEAL;
+
+/// `whole` filled out to the least of [`SIZES`] that holds it and is
+/// no less than `least`: its length, itself, and nothing.
+fn filled(whole: &[u8], least: usize) -> Vec<u8> {
+    let needs = (4 + whole.len()).max(least);
+    let size = SIZES.iter().copied().find(|size| *size >= needs).unwrap_or(needs);
+    let mut out = Vec::with_capacity(size + circuit::SEAL);
+    out.extend_from_slice(&(whole.len() as u32).to_le_bytes());
+    out.extend_from_slice(whole);
+    out.resize(size, 0);
+    out
+}
+
+/// What was filled out: none if it is not of one of the lengths, or
+/// does not hold what it says it does.
+fn emptied(filled: &[u8]) -> Option<&[u8]> {
+    let (len, rest) = filled.split_first_chunk::<4>().filter(|_| SIZES.contains(&filled.len()))?;
+    rest.get(..u32::from_le_bytes(*len) as usize)
+}
+
+/// The least length what is said along a way is filled out to, by
+/// what it is.
+fn least(said: &[u8]) -> usize {
+    match said.first() {
+        Some(&(HERE | HERE_HELD | ASK | ANNOUNCED | ABSENT)) => MIDDLE,
+        _ => 0,
+    }
+}
 
 /// Where a relay's count of what it says back begins: a number of the
 /// hello it answered, so that no two relays of a way count alike, and
@@ -248,6 +294,7 @@ impl Relayed {
             return Out::Step(Step { to, circuit, kind: FORWARD, count, bytes });
         }
         let Some(said) = circuit::open(&way.hop, count, &bytes) else { return Out::Nothing };
+        let Some(said) = emptied(&said) else { return Out::Nothing };
         match said.split_first() {
             Some((&TELL_EXTEND, rest)) if rest.len() == 6 + circuit::HELLO_LEN => {
                 let ip: [u8; 4] = rest[..4].try_into().expect("four bytes");
@@ -273,7 +320,7 @@ impl Relayed {
         said.extend_from_slice(answer);
         way.said += 1;
         way.seen = now;
-        let bytes = circuit::seal_back(&way.hop, way.said, &said);
+        let bytes = circuit::seal_back(&way.hop, way.said, &filled(&said, MIDDLE));
         Some(Step { to: way.before.0, circuit: way.before.1, kind: BACK, count: way.said, bytes })
     }
 
@@ -302,7 +349,7 @@ impl Relayed {
         whole.extend_from_slice(said);
         way.said += 1;
         way.seen = now;
-        let bytes = circuit::seal_back(&way.hop, way.said, &whole);
+        let bytes = circuit::seal_back(&way.hop, way.said, &filled(&whole, least(said)));
         Some(Step { to: way.before.0, circuit: way.before.1, kind: BACK, count: way.said, bytes })
     }
 
@@ -451,7 +498,7 @@ impl Way {
         tell.extend_from_slice(&next.port().to_le_bytes());
         tell.extend_from_slice(opening.hello());
         self.opening = Some(opening);
-        self.wrapped(&tell)
+        self.wrapped(&tell, MIDDLE)
     }
 
     /// Whether the relay of id `id` is one of the way's.
@@ -470,9 +517,9 @@ impl Way {
         Some(self.reach(chance))
     }
 
-    fn wrapped(&mut self, whole: &[u8]) -> Step {
+    fn wrapped(&mut self, whole: &[u8], least: usize) -> Step {
         self.sent += 1;
-        let bytes = circuit::wrap(&self.hops, self.sent, whole);
+        let bytes = circuit::wrap(&self.hops, self.sent, &filled(whole, least));
         Step { to: self.path[0].1, circuit: self.circuit, kind: FORWARD, count: self.sent, bytes }
     }
 
@@ -490,6 +537,7 @@ impl Way {
     pub fn back(&mut self, count: u64, bytes: &[u8], chance: &[u8; 96], now: Micros) -> Came {
         self.seen = now;
         let Some(said) = circuit::unwrap(&self.hops, count, bytes) else { return Came::Bad };
+        let Some(said) = emptied(&said) else { return Came::Bad };
         match said.split_first() {
             Some((&SAID_EXTENDED, answer)) if !self.ready() => self.grown(answer, chance),
             Some((&SAID, rest)) if self.ready() => Came::Said(rest.to_vec()),
@@ -506,7 +554,7 @@ impl Way {
         let mut whole = Vec::with_capacity(1 + said.len());
         whole.push(SAID);
         whole.extend_from_slice(said);
-        Some(self.wrapped(&whole))
+        Some(self.wrapped(&whole, least(said)))
     }
 }
 
@@ -634,6 +682,61 @@ mod tests {
             let came = world.carry(at(3), step).0.unwrap();
             assert_eq!(way.back(came.count, &came.bytes, &[0; 96], 0), Came::Said(vec![round; 9]));
         }
+    }
+
+    /// What goes along a way is of a few lengths, whatever it is: a
+    /// word is one datagram; and going on to another relay, saying a
+    /// wallet is there and asking after one are of one length, both
+    /// ways.
+    #[test]
+    fn what_goes_along_a_way_is_of_few_lengths() {
+        let mut world = World::new();
+        let mut way = world.open();
+        // Opening it: but for the first word of each relay, which is
+        // what it is, everything was of the middle length.
+        let seal = circuit::SEAL;
+        let opening: Vec<usize> = world.given.iter().flatten().map(Vec::len).collect();
+        let (hello, answer) = (circuit::HELLO_LEN, circuit::ANSWER_LEN);
+        assert!(opening.iter().all(|len| [hello, answer, MIDDLE + seal].contains(len)), "{opening:?}");
+        // What is said, each way, by what it is.
+        let mut lengths = |said: &[u8], answer: &[u8]| {
+            world.given.iter_mut().for_each(Vec::clear);
+            let step = way.say(said).unwrap();
+            let out = step.bytes.len();
+            let (known_by, got) = world.carry(at(ME), step).1.unwrap();
+            assert_eq!(got, said);
+            assert!(world.given.iter().all(|g| g.len() == 1 && g[0].len() == out), "the same at each relay");
+            let step = world.relays[2].say(known_by, answer, 0).unwrap();
+            let back = step.bytes.len();
+            let came = world.carry(at(3), step).0.unwrap();
+            assert_eq!(
+                (came.bytes.len(), way.back(came.count, &came.bytes, &[0; 96], 0)),
+                (back, Came::Said(answer.to_vec()))
+            );
+            (out - seal, back - seal)
+        };
+        let (id, announce) = ([1u8; 33], [2u8; 1 + crate::msg::ANNOUNCE_LEN]);
+        let with = |code: u8, bytes: &[u8]| [&[code][..], &bytes[1..]].concat();
+        // A word: one datagram each way.
+        assert_eq!(lengths(&with(PING, &[0; 9]), &with(PONG, &[0; 9])), (SIZES[0], SIZES[0]));
+        assert_eq!(lengths(&with(STILL, &[0; 41]), &with(HELD, &[0; 41])), (SIZES[0], SIZES[0]));
+        assert!(SIZES[0] + seal <= crate::net::message::MAX_STEPPED);
+        // A wallet says it is there; one is asked after, and is or is
+        // not there: as going on to another relay.
+        assert_eq!(lengths(&with(HERE, &announce), &with(HERE_HELD, &[0; 41])), (MIDDLE, MIDDLE));
+        assert_eq!(lengths(&with(ASK, &id), &with(ANNOUNCED, &announce)), (MIDDLE, MIDDLE));
+        assert_eq!(lengths(&with(ASK, &id), &with(ABSENT, &id)), (MIDDLE, MIDDLE));
+        // A sealed message, by its length: the least holds a slate of
+        // a few thousand bytes, the greatest the longest there is.
+        let sealed = |body: usize| vec![GIVE; 1 + crate::msg::OVERHEAD + body];
+        assert_eq!(lengths(&sealed(100), &with(NOTICE, &[0; 34])), (SIZES[2], SIZES[0]));
+        assert_eq!(lengths(&sealed(5_000), &with(NOTICE, &[0; 34])), (SIZES[2], SIZES[0]));
+        assert_eq!(lengths(&sealed(6_000), &with(NOTICE, &[0; 34])), (SIZES[3], SIZES[0]));
+        assert_eq!(lengths(&sealed(crate::msg::MAX_BODY), &with(NOTICE, &[0; 34])).0, SIZES[5]);
+        // What is not of one of the lengths says nothing.
+        assert_eq!(emptied(&filled(b"abc", 0)), Some(&b"abc"[..]));
+        assert_eq!(emptied(&filled(b"abc", 0)[1..]), None);
+        assert_eq!(emptied(&[0xff; SIZES[0]]), None);
     }
 
     /// What does not belong on a way does nothing: said again, it has

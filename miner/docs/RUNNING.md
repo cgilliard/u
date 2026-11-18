@@ -641,7 +641,14 @@ and gives the sealed slate there. A relay is a node started with
 answers with that wallet's key, which whoever opens a way through it
 checks. It holds 50,000 ways at the most, 64 of one host that is not
 itself a relay of the list, and forgets one nothing has passed along
-for half an hour. In a build with the dev networks, on one of them,
+for half an hour. What goes along a way is filled out to one of six
+lengths (a datagram; 8, 16, 32, 48 and 80 thousand bytes): going on to
+another relay, saying a wallet is there and asking after one are all
+of the second, both ways, and a relay that passes a thing on learns
+from its length only which of the six it is. For six blocks either
+side of where the relays a wallet is reached at change (every 144
+blocks) it is reached at those of both, so that whoever pays, a block
+ahead or behind, finds it. In a build with the dev networks, on one of them,
 the command `debug-consensus FILE` puts a file in force at that node
 alone, whatever the chain has decided.
 

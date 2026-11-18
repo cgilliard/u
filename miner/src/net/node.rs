@@ -1248,11 +1248,11 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         drop(ways);
         let seeds: Vec<SocketAddrV4> =
             self.shared.seeds.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
-        let epoch = self.chain.tip().map_or(0, |tip| tip.height / crate::consensus::EPOCH);
+        let height = self.chain.tip().map_or(0, |tip| tip.height);
         let mut wallet = self.shared.participant.lock().unwrap_or_else(|e| e.into_inner());
         let Some(own) = wallet.as_mut() else { return };
         let points: Vec<SocketAddrV4> =
-            crate::msg::points(&own.id(), epoch, seeds.len()).into_iter().map(|i| seeds[i]).collect();
+            crate::msg::reached_points(&own.id(), height, seeds.len()).into_iter().map(|i| seeds[i]).collect();
         own.keep(&points);
         let mut chance = [0u8; 64];
         if crate::random::fill(&mut chance).is_ok() {
@@ -1520,11 +1520,20 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     fn keep_sessions_by_ways(&mut self, now: Micros, relays: &Relays) {
         use super::circuits::{HERE, Purpose, STILL};
         let shared = Arc::clone(&self.shared);
-        let epoch = self.chain.tip().map_or(0, |tip| tip.height / crate::consensus::EPOCH);
+        let height = self.chain.tip().map_or(0, |tip| tip.height);
         let mut wallet = shared.participant.lock().unwrap_or_else(|e| e.into_inner());
         let Some(own) = wallet.as_mut() else { return };
         let id = own.id();
-        let points = Self::points_among(&id, epoch, relays);
+        // (Of the epoch the chain is in; and where one gives way to
+        // the next, of both.)
+        let mut points: Vec<(Digest, SocketAddrV4)> = Vec::new();
+        for epoch in crate::msg::reached_epochs(height) {
+            for point in Self::points_among(&id, epoch, relays) {
+                if !points.contains(&point) {
+                    points.push(point);
+                }
+            }
+        }
         let at: Vec<SocketAddrV4> = points.iter().map(|p| p.1).collect();
         own.keep(&at);
         let mut chance = [0u8; 64];
@@ -1665,7 +1674,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     /// known by `link`: by a wallet that is reached here, or by
     /// whoever sends to one that is.
     fn said_to_point(&mut self, now: Micros, link: (SocketAddrV4, u64), said: &[u8]) {
-        use super::circuits::{ABSENT, ANNOUNCED, ASK, GIVE, HELD, HERE, NOTICE, PING, PONG, STILL, TAKE};
+        use super::circuits::{ABSENT, ANNOUNCED, ASK, GIVE, HELD, HERE, HERE_HELD, NOTICE, PING, PONG, STILL, TAKE};
         use super::message::{NOTICE_OFFLINE, NOTICE_PASSED};
         use super::sessions::{Refused, Where};
         use crate::poseidon2::{digest_from_bytes, digest_to_bytes};
@@ -1693,7 +1702,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 if let Some(id) = id
                     && let Some(seq) = sessions.get(&id, now).filter(|s| s.at == here).map(|s| s.seq)
                 {
-                    back.push((link, made(HELD, &[&digest_to_bytes(&id), &seq.to_le_bytes()])));
+                    back.push((link, made(HERE_HELD, &[&digest_to_bytes(&id), &seq.to_le_bytes()])));
                 }
             }
             Some((&STILL, rest)) if rest.len() == 40 => {
@@ -1761,13 +1770,13 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         point: SocketAddrV4,
         said: Vec<u8>,
     ) {
-        use super::circuits::{ABSENT, ANNOUNCED, GIVE, HELD, NOTICE, Purpose, TAKE};
+        use super::circuits::{ABSENT, ANNOUNCED, GIVE, HELD, HERE_HELD, NOTICE, Purpose, TAKE};
         use crate::poseidon2::digest_from_bytes;
         let shared = Arc::clone(&self.shared);
         match (purpose, said.split_first()) {
             (Purpose::Asked, _) => shared.ways.lock().unwrap_or_else(|e| e.into_inner()).said.push((circuit, said)),
             // The node holds this of the wallet, or nothing.
-            (Purpose::Session, Some((&HELD, rest))) if rest.len() == 40 => {
+            (Purpose::Session, Some((&(HELD | HERE_HELD), rest))) if rest.len() == 40 => {
                 let seq = u64::from_le_bytes(rest[32..].try_into().expect("eight bytes"));
                 let mut wallet = shared.participant.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(own) = wallet.as_mut().filter(|w| Some(w.id()) == digest_from_bytes(&rest[..32])) {
