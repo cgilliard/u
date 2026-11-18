@@ -572,6 +572,31 @@ sent to an address yet: it is what the message layer, to come, reaches
 a wallet by. A wallet made again from its words is at another address
 of its own than the wallet that was lost.
 
+**The consensus file.** The message layer, to come, is run by a text
+file the miners agree on by voting for it. A header has 32 bytes of
+the miner's own, which are the root of sixteen leaves; leaf 0 is the
+SHA-256 of the file the miner favours. `set-leaf 0 FILE` votes for
+`FILE` in every block made here from then on (it must be a consensus
+file, and is kept to be handed to whoever asks); `leaves` shows the
+leaves, and `set-leaf` and `set-leaf-value` set the others, which mean
+nothing to the node. Every node asks its peers for the leaves of the
+blocks it has and for the files they vote for. At every 144th block
+the votes of the 144 blocks before are counted, and the file most of
+them voted for, if it is held and sound, is in force until the next:
+`consensus` says which, and how the votes stand. A file is
+
+    mode init
+
+or
+
+    mode onion
+    relay tab1… host:port
+    relay tab1… host:port
+    relay tab1… host:port
+
+with three relays at the least. Until a file is in force, and whenever
+none is, the mode is init.
+
 **A wallet made again.** `--restore` makes the wallet from its twelve
 words, which it asks for, where the data directory has no wallet (it
 is never made over one that is there). What the wallet holds is in the

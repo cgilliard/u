@@ -154,6 +154,13 @@ fn said(event: &Event) -> Option<String> {
             format!("Taking the state as of a later block, {} ({})", n(*height), short(id))
         }
         Event::StateTaken { height } => format!("State taken as of block {}", n(*height)),
+        Event::Consensus { mode, file: Some(hash) } => format!(
+            "The message layer is in {mode} mode: the consensus file {} is in force",
+            hash[..4].iter().map(|b| format!("{b:02x}")).collect::<String>()
+        ),
+        Event::Consensus { mode, file: None } => {
+            format!("The message layer is in {mode} mode: no consensus file is in force")
+        }
         Event::StateProgress { parts, of } => {
             format!("Taking the state: {} of {} parts ({}%)", commas(*parts), commas(*of), parts * 100 / (*of).max(1))
         }

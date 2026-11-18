@@ -691,3 +691,59 @@ fn a_wallet_is_made_again_from_its_words() {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+/// Miners vote for a consensus file, and the network comes to follow
+/// it: a node that makes blocks is told to vote for a file that names
+/// three relays; a node that makes none, and was told nothing, takes
+/// from it the leaves its blocks commit to and then the file itself;
+/// and when the votes of the first hundred and forty-four blocks are
+/// counted, both say the same file is in force, and the mode it names.
+#[cfg(all(unix, feature = "dev"))]
+#[cfg_attr(debug_assertions, ignore = "proves blocks; run with --release")]
+#[test]
+fn a_consensus_file_is_voted_for_and_followed() {
+    use std::time::{Duration, Instant};
+    use tabminer::poseidon2::Fp;
+    let dirs = [scratch("votes-a"), scratch("votes-b")];
+    let port = 37_000 + std::process::id() % 10_000;
+    let at = |i: u32| format!("127.0.0.1:{}", port + i);
+    let mut first = Prompted::start(&dirs[0], &at(0), &[], true, true);
+    let mut second = Prompted::start(&dirs[1], &at(1), &[at(0)], false, true);
+    assert!(first.ask("consensus").starts_with("mode init\nnothing is decided before block 144"));
+    assert!(first.ask("leaves").starts_with("no leaf is set"));
+    // A file that is none is not voted for; one that is, is.
+    let file = dirs[0].join("consensus.txt");
+    std::fs::write(&file, "mode onion\n").unwrap();
+    assert!(first.ask(&format!("set-leaf 0 {}", file.display())).contains("fewer than the 3 needed"));
+    let relays: Vec<String> = (1..=3u32).map(|i| tabminer::address::encode(&[Fp::new(i); 8])).collect();
+    let text: String = relays.iter().enumerate().map(|(i, id)| format!("relay {id} 10.0.0.{i}:3737\n")).collect();
+    std::fs::write(&file, format!("# three relays\nmode onion\n{text}")).unwrap();
+    let voted = first.ask(&format!("set-leaf 0 {}", file.display()));
+    assert!(voted.contains("vote for") && voted.contains("mode onion"), "{voted}");
+    assert!(first.ask("leaves").contains("(the vote for a consensus file)"));
+    // Until the first boundary nothing is in force; after it, the file
+    // is, on both: the second has it from the first.
+    let began = Instant::now();
+    loop {
+        let (a, b) = (first.ask("consensus"), second.ask("consensus"));
+        if a.starts_with("mode onion") && b.starts_with("mode onion") {
+            for said in [&a, &b] {
+                assert!(said.contains("decided at block 144, of the votes of blocks 1 to 144"), "{said}");
+                assert!(said.contains("in force: "), "{said}");
+                assert!(relays.iter().all(|id| said.contains(&format!("  relay {id} 10.0.0."))), "{said}");
+            }
+            break;
+        }
+        assert!(began.elapsed() < Duration::from_secs(900), "the first says:\n{a}\nthe second says:\n{b}");
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    for dir in &dirs {
+        let log = std::fs::read_to_string(dir.join("tabernacle.log")).unwrap();
+        assert!(log.contains("The message layer is in onion mode: the consensus file "), "{log}");
+    }
+    first.stop();
+    second.stop();
+    for dir in &dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

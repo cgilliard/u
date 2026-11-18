@@ -309,6 +309,9 @@ fn apply<B: Backend + 'static, V: ProofVerifier + Sync>(chain: &Chain<B, V>, job
     })
 }
 
+/// Blocks whose leaves are asked for at one looking.
+const LEAVES_AT_ONCE: usize = 16;
+
 /// Parts of a state put together at the most.
 const PARTS_AT_ONCE: usize = 64;
 
@@ -538,6 +541,9 @@ pub(crate) struct Shared {
     /// The pace the workers serve at, all together
     /// ([`Serve::sharing`]).
     pace: Arc<AtomicU64>,
+    /// The consensus file last said to be in force: its mode, and the
+    /// file's hash if there is one.
+    consensus: Mutex<Option<(crate::consensus::Mode, Option<crate::consensus::Hash>)>>,
     /// The peers of each worker that have answered it, as it last
     /// said: for whoever keeps them from one run to the next
     /// ([`Handle::answered`]).
@@ -611,6 +617,9 @@ pub enum Event {
     /// The state is being taken whole, as of this block; `again` if in
     /// place of an earlier one that nobody can serve any more.
     StateWanted { height: u32, id: Digest, again: bool },
+    /// Another consensus file is in force, or none: the mode the
+    /// message layer is in from here on.
+    Consensus { mode: crate::consensus::Mode, file: Option<crate::consensus::Hash> },
     /// How far the taking of the state has come: said now and then,
     /// of a state that takes long. `parts` of its `of` parts are kept.
     StateProgress { parts: u64, of: u64 },
@@ -854,6 +863,12 @@ pub struct Worker<B: Backend + 'static, V> {
     fetches: Vec<Fetching>,
     /// The peers that were live when that was last looked to.
     was_live: Vec<SocketAddrV4>,
+    /// The leaves asked for and not yet here: of which block, of whom.
+    leaves_asked: Vec<(Digest, SocketAddrV4)>,
+    /// When the votes were last looked to ([`Worker::follow_votes`]),
+    /// and which peer is asked next.
+    votes_looked: Micros,
+    votes_turn: usize,
     /// What is about no one peer.
     list: Arc<RwLock<List>>,
     /// Who announced which block, and how long its body is: the newest
@@ -921,6 +936,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             served: VecDeque::new(),
             fetches: Vec::new(),
             was_live: Vec::new(),
+            leaves_asked: Vec::new(),
+            votes_looked: 0,
+            votes_turn: 0,
             list,
             announced: VecDeque::new(),
             inbox: Vec::new(),
@@ -1088,6 +1106,89 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         out(to, &buf[..n]);
     }
 
+    /// Looks to what the chain's blocks vote for, now and then: asks
+    /// for the leaves of the blocks of the window that are not kept
+    /// (a block's leaves are not in the block), and for the files they
+    /// vote for that are not held; lets go of the files nobody votes
+    /// for any more; and says so when another file is in force.
+    ///
+    /// Each worker of its own peers. (What two of them ask for at once
+    /// is kept once; and what changed is said once, by whichever sees
+    /// it first.)
+    fn follow_votes(&mut self, now: Micros, out: Out<'_>) {
+        use crate::consensus::{MAX_CONSENSUS, WINDOW, file_id};
+        if now.saturating_sub(self.votes_looked) < self.cfg.sync.leaves_retry {
+            return;
+        }
+        self.votes_looked = now;
+        // (What was asked for and never came is asked for again, of
+        // another.)
+        self.leaves_asked.clear();
+        if self.chain.receiving() {
+            return;
+        }
+        let Ok((current, decided)) = self.chain.consensus() else { return };
+        let Ok(running) = self.chain.consensus_votes(WINDOW) else { return };
+        // What is in force, said when it is another than was last said.
+        let now_is = (current.mode, current.winner.map(|w| w.0));
+        let mut said = self.shared.consensus.lock().unwrap_or_else(|e| e.into_inner());
+        if *said != Some(now_is) {
+            // (Not of a node that has only just started, in init mode
+            // like every other: that is no news.)
+            if said.is_some() || now_is != (crate::consensus::Mode::Init, None) {
+                self.shared.say(Event::Consensus { mode: current.mode, file: now_is.1 });
+            }
+            *said = Some(now_is);
+        }
+        drop(said);
+        let peers: Vec<(SocketAddrV4, u64)> = self.peers.able(now).filter_map(|p| Some((p.addr, p.token()?))).collect();
+        if peers.is_empty() {
+            return;
+        }
+        // The leaves that are missing, the newest first: a few at a
+        // time, each of the next peer in turn.
+        for (id, _) in running.missing.iter().chain(&decided.missing).rev().take(LEAVES_AT_ONCE) {
+            self.votes_turn = self.votes_turn.wrapping_add(1);
+            let (peer, token) = peers[self.votes_turn % peers.len()];
+            self.leaves_asked.push((*id, peer));
+            self.send(peer, &Message::GetLeaves { token, id: *id }, out);
+        }
+        // The files voted for that are not held: one at a time.
+        let voted = || running.counts.iter().chain(&decided.counts).map(|c| c.0);
+        let wanted = voted().find(|hash| !matches!(self.chain.consensus_file(hash), Ok(Some(_))));
+        if let Some(hash) = wanted {
+            let object = Object::File(file_id(&hash));
+            if !self.fetches.iter().any(|f| f.object == object) {
+                self.votes_turn = self.votes_turn.wrapping_add(1);
+                let peer = peers[self.votes_turn % peers.len()].0;
+                self.fetch_object(now, object, peer, MAX_CONSENSUS as u32);
+            }
+        }
+        // And those held that nobody votes for any more go: but never
+        // the one this node itself votes for, which it is to hand over
+        // from the first block that says so.
+        if let Ok(own) = self.chain.aux_leaves() {
+            let keep: Vec<crate::consensus::Hash> = voted().chain([own[0]]).collect();
+            let _ = self.chain.keep_consensus_files(&keep);
+        }
+    }
+
+    /// A consensus file asked for has arrived: kept, if it is one that
+    /// is voted for. (Whether it is sound is for whoever counts the
+    /// votes: an unsound file is held, and counts for nothing.)
+    fn file_arrived(&mut self, now: Micros, from: SocketAddrV4, id: Digest, bytes: &[u8]) {
+        use crate::consensus::{WINDOW, file_id, file_matches};
+        let voted = self.chain.consensus_votes(2 * WINDOW).map(|v| v.counts).unwrap_or_default();
+        match voted.iter().find(|c| file_id(&c.0) == id) {
+            Some((hash, _, _)) if file_matches(hash, bytes) => {
+                let _ = self.chain.put_consensus_file(bytes);
+            }
+            // Not the file of its name: its sender's doing.
+            Some(_) => self.tell(now, from, Notice::Strike(from)),
+            None => {}
+        }
+    }
+
     /// Whether a request from `from` carries the token `from` was given.
     fn asked_rightly(&mut self, from: &SocketAddrV4, token: u64) -> bool {
         let ok = self.tokens.check(&SocketAddr::V4(*from), token);
@@ -1131,6 +1232,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         }
         drop(said);
         self.budget = self.cfg.peers.unproven_pings;
+        self.follow_votes(now, out);
         let mut due = Vec::new();
         let (secret, numbers) = (&self.secret, &mut self.numbers);
         self.peers.pings_due(now, || Self::number(secret, numbers), |addr, number| due.push((addr, number)));
@@ -1292,8 +1394,26 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 }
             }
             Message::Tx { id, len } => self.on_tx(now, from, id, len),
-            // Aux leaves are not here yet.
-            _ => self.counts.unheard += 1,
+            // A block's leaves, if they are kept here: to whoever asks
+            // with the token it was given.
+            Message::GetLeaves { token, id } => {
+                if self.asked_rightly(&from, token)
+                    && let Ok(Some(leaves)) = self.chain.aux_leaves_of(&id)
+                {
+                    self.send(from, &Message::Leaves { id, leaves }, out);
+                }
+            }
+            // And those asked for: kept if they are what the block's
+            // header commits to, and their sender struck if not.
+            Message::Leaves { id, leaves } => match self.leaves_asked.iter().position(|a| *a == (id, from)) {
+                Some(at) => {
+                    self.leaves_asked.swap_remove(at);
+                    if let Err(Error::AuxMismatch) = self.chain.put_aux_leaves(&id, &leaves) {
+                        self.tell(now, from, Notice::Strike(from));
+                    }
+                }
+                None => self.counts.unheard += 1,
+            },
         }
     }
 
@@ -2501,6 +2621,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             }
             Object::Block(id) => self.chain.body(&id).ok().flatten(),
             Object::Tx(id) => self.shared.pool().entry(&id).map(|e| e.bytes().to_vec()),
+            Object::File(id) => self.chain.consensus_file_by_id(&id).ok().flatten(),
             // The state as of a block of the chain that can still be
             // gone back to, in its pieces (`super::snapshot`).
             Object::Manifest(block) => self.past(&block, |past| Some(Manifest::of(past).encode())),
@@ -2666,6 +2787,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             Object::Headers { from: first, .. } => self.headers_arrived(l, now, from, first, bytes),
             Object::Block(id) => self.body_arrived(l, now, from, id, bytes),
             Object::Tx(id) => self.tx_arrived(now, from, id, bytes),
+            Object::File(id) => self.file_arrived(now, from, id, bytes),
             // Asked for by whoever drives this node.
             _ => self.inbox.push((object, from, Some(bytes.to_vec()))),
         }
@@ -2728,6 +2850,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         let shared = Arc::new(Shared {
             mail: (0..n).map(|_| Mutex::new(Vec::new())).collect(),
             pace: Arc::default(),
+            consensus: Mutex::new(None),
             answered: (0..n).map(|_| Mutex::new(Vec::new())).collect(),
             key: u64::from_le_bytes(derive(&secret, b'h', 0)[..8].try_into().unwrap()),
             totals: Arc::new(Totals::new()),
