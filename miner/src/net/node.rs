@@ -186,7 +186,10 @@ enum Job {
     /// was made here).
     Block { block: Vec<u8>, from: Option<SocketAddrV4>, unix: u64 },
     /// A run of headers to check and keep: from the height `first`.
-    Headers { first: u32, headers: Vec<Header>, from: SocketAddrV4, unix: u64 },
+    /// With `defer` their work is checked only by what each claims,
+    /// and in full later, or vouched for by a proof
+    /// ([`Chain::accept_headers`]).
+    Headers { first: u32, headers: Vec<Header>, from: SocketAddrV4, unix: u64, defer: bool },
     /// The block a state is to be taken as of, to check by its proof.
     Check { block: Vec<u8>, next: u64 },
     /// A state to begin to receive, as of the block of `target`.
@@ -269,8 +272,8 @@ fn apply<B: Backend + 'static, V: ProofVerifier + Sync>(chain: &Chain<B, V>, job
             let result = chain.apply_block(&view, unix);
             Outcome::Block { header: *view.header(), len: (block.len() - HEADER_SIZE) as u32, from, result }
         }
-        Job::Headers { first, headers, from, unix } => {
-            let (new, error) = chain.accept_headers(&headers, unix, false);
+        Job::Headers { first, headers, from, unix, defer } => {
+            let (new, error) = chain.accept_headers(&headers, unix, defer);
             Outcome::Headers { first, count: headers.len() as u32, last: headers.last()?.hash(), from, new, error }
         }
         Job::Check { block, next } => {
@@ -1531,7 +1534,16 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         if let Some((headers, from)) = aim.done.remove(&aim.next) {
             aim.keeping = true;
             let first = aim.next;
-            self.work(l, Job::Headers { first, headers, from, unix: self.unix });
+            // A chain being caught up with, by a node that takes its
+            // state whole where it can, and whose blocks' proofs vouch
+            // for the work of the blocks under them: the work of each
+            // header is left to the proof of the block the state is
+            // taken as of, and checked in full from that block up
+            // ([`Chain::confirm_work`]), or when its block is applied.
+            // From the seed text a header's work is tens of
+            // milliseconds, and a year of headers most of an hour.
+            let defer = self.cfg.sync.sync_point > 0 && self.chain.verifier().attests_work();
+            self.work(l, Job::Headers { first, headers, from, unix: self.unix, defer });
         }
     }
 

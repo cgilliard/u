@@ -782,6 +782,7 @@ again; nor is one whose blocks were checked opened with it.
 | `--debug-fill-outputs N[,K]` | The chain begins with N outputs nobody made, one every K positions (5 if not said). Its first block is another than the network's, and the same on every node told the same. |
 | `--debug-genesis-outputs N[,K]` | That first block, and none of the outputs: a new node of that chain, which takes the state from the others. |
 | `--debug-fill N[,S]` | Every block made here makes N outputs and spends S of those the chain began with: as many of both as fit a block. |
+| `--debug-blocks N` | Before the node starts, the chain is made N blocks long: empty blocks, spaced so that each takes next to no work. A chain as long as one that has run for years, in a couple of minutes. |
 | `--blocks N` | No block is made above height N. |
 
 The main log says how long each block took to apply

@@ -572,6 +572,65 @@ pub fn mine_filled<B: Backend + 'static, S: ItemSource + Sync>(
     Ok(Mined::Block { block: Block { header, body }.to_bytes(), header, proved: took, hashes, solved })
 }
 
+/// Debugging only: makes `chain`, whose blocks' proofs go unchecked,
+/// `blocks` blocks long, of blocks that are empty but for what each
+/// pays (to nobody) and carry no proof: a chain as long as one that has
+/// run for years, made in minutes, for trying how a node takes its
+/// headers. Their times are `spacing` seconds apart from the first
+/// block's, which on a dev network is far more than its blocks are
+/// meant to be: so each asks for the least work there is. `unix` is
+/// the time now, which no block's time may be ahead of; `progress` is
+/// told, now and then, how long the chain is.
+#[cfg(feature = "dev")]
+pub fn extend_empty<B: Backend + 'static, S: ItemSource + Sync>(
+    chain: &Chain<B, AggregateVerifier>,
+    dataset: &S,
+    blocks: u32,
+    spacing: u64,
+    unix: u64,
+    progress: &dyn Fn(u32),
+) -> Result<(), Error> {
+    use crate::block::BlockOutput;
+    use crate::poseidon2::Fp;
+    let params = *chain.params();
+    loop {
+        let tip = chain.tip()?;
+        let height = tip.height + 1;
+        if height > blocks || params.subsidy(height) == 0 {
+            return Ok(());
+        }
+        // (An output like no other: its commitment is its height.)
+        let paid = BlockOutput {
+            commitment: core::array::from_fn(|i| Fp::new(if i == 0 { height } else { 0x0e0e_0e0e })),
+            memo: [Fp::ZERO; 5],
+            amount: params.subsidy(height),
+        };
+        let body = Body { outputs: vec![paid], ..Default::default() };
+        let bytes = body.to_bytes();
+        let state_root = chain.state_root_after(&BodyRef::from_bytes(&bytes)?)?;
+        let timestamp = (params.genesis_timestamp + height as u64 * spacing).max(chain.earliest_timestamp(&tip)?);
+        let header = Header {
+            prev_hash: tip.hash(),
+            height,
+            timestamp: timestamp.min(unix),
+            body_commitment: body.commitment(),
+            state_root,
+            aux: [0; 32],
+            mix: tip.mix,
+            nonce: [0; 32],
+        };
+        let target = chain.expected_target(&tip)?;
+        let Some((nonce, mix, _)) = solve(dataset, &header.pow_hash(), &target, height as u64, &|| false) else {
+            return Ok(());
+        };
+        let block = Block { header: Header { nonce, mix, ..header }, body }.to_bytes();
+        chain.apply_block(&crate::block::BlockRef::from_bytes(&block)?, unix)?;
+        if height.is_multiple_of(5000) {
+            progress(height);
+        }
+    }
+}
+
 /// The proof in a body kept by the chain.
 fn proof_of(body: &[u8]) -> &[u8] {
     BodyRef::from_bytes(body).map_or(&[], |b| b.proof())

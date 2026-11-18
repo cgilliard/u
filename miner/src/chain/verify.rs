@@ -47,6 +47,15 @@ pub trait ProofVerifier {
     fn is_unchecked(&self) -> bool {
         false
     }
+
+    /// Whether a block's proof attests to the work of every block
+    /// before it: so that a node that takes its state as of a block
+    /// whose proof it checks need not check, from the seed text, the
+    /// work of each header under it ([`crate::chain::headers`]). Not so
+    /// unless said.
+    fn attests_work(&self) -> bool {
+        false
+    }
 }
 
 /// Accepts every proof. For development and tests only; a node using this

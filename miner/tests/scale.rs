@@ -11,6 +11,11 @@
 //! system's temporary directory (`TMPDIR`), which needs room for the
 //! state: twice, when it is taken by a second node.
 //!
+//! A third test is of a chain's length, not its state's size: a chain
+//! of a year's blocks (`TABMINER_SCALE_BLOCKS`, or 144 x 365 = 52,560)
+//! is made in a couple of minutes (`--debug-blocks`: empty blocks, of
+//! next to no work), and a new node takes its headers.
+//!
 //! Each test prints what it measured as `SCALE` lines, one fact a line,
 //! to be read and compared between runs: `SCALE <test> <what> <value>`.
 //! The last of them say what the machine had left, of disk and of
@@ -103,6 +108,45 @@ impl Node {
         // of itself is what there is).
         let (resident, own) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         let (r, o, path) = (Arc::clone(&resident), Arc::clone(&own), format!("/proc/{}/status", child.id()));
+        // Elsewhere the system is asked, every half minute, and what it
+        // says is printed: the memory the machine has free, what the
+        // node has of it, and (Windows) what the system keeps of files.
+        // So that a run that slows to nothing says what it ran out of.
+        #[cfg(not(target_os = "linux"))]
+        {
+            let pid = child.id();
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_secs(30));
+                    #[cfg(windows)]
+                    let asked = Command::new("powershell")
+                        .args(["-NoProfile", "-Command"])
+                        .arg(format!(
+                            "$o=Get-CimInstance Win32_OperatingSystem; $p=Get-Process -Id {pid} -ErrorAction Stop; \
+                             $c=(Get-Counter '\\Memory\\Cache Bytes','\\Memory\\Modified Page List Bytes',\
+                             '\\Memory\\Standby Cache Normal Priority Bytes').CounterSamples; \
+                             'free_mb={{0}} node_working_set_mb={{1}} node_private_mb={{2}} cache_mb={{3}} modified_mb={{4}} \
+                             standby_mb={{5}}' -f [int]($o.FreePhysicalMemory/1024),[int]($p.WorkingSet64/1MB),\
+                             [int]($p.PrivateMemorySize64/1MB),[int]($c[0].CookedValue/1MB),[int]($c[1].CookedValue/1MB),\
+                             [int]($c[2].CookedValue/1MB)"
+                        ))
+                        .output();
+                    #[cfg(not(windows))]
+                    let asked = Command::new("sh")
+                        .arg("-c")
+                        .arg(format!(
+                            "echo node_rss_kb=$(ps -o rss= -p {pid}) $(vm_stat | tr -d '.' | awk '/Pages free|Pages inactive|File-backed/ {{printf \"%s_pages=%s \", $(NF-2) $(NF-1), $NF}}')"
+                        ))
+                        .output();
+                    match asked {
+                        Ok(o) if o.status.success() => {
+                            println!("MEMORY {name} {}", String::from_utf8_lossy(&o.stdout).trim())
+                        }
+                        _ => break,
+                    }
+                }
+            });
+        }
         std::thread::spawn(move || {
             while let Ok(status) = std::fs::read_to_string(&path) {
                 let kb = |what: &str| {
@@ -352,6 +396,63 @@ fn a_fresh_node_fast_syncs_a_large_state() {
     secs.sort_by(f64::total_cmp);
     report(T, "apply_median_secs", format!("{:.3}", secs[secs.len() / 2]));
     report(T, "apply_max_secs", format!("{:.3}", secs[secs.len() - 1]));
+    server.show();
+    new.show();
+    server.report(T, "server");
+    new.report(T, "new");
+    report_left(T);
+}
+
+/// A new node takes the headers of a chain a year long (52,560 blocks,
+/// or `TABMINER_SCALE_BLOCKS`) from the one node that has it, and then
+/// joins it: how long the headers take, and what the node needed.
+///
+/// The work of each header is checked as a node of the main network
+/// checks it while it catches up: by what the header claims, the rest
+/// left to the proof of the block the state is taken as of, and checked
+/// in full only from that block up. (What that full check costs is the
+/// main network's own, and is not what this measures: there it is tens
+/// of milliseconds a header, of a handful of headers.)
+#[test]
+#[ignore = "slow: a job of its own in .github/workflows/test.yml, and nightly"]
+fn a_fresh_node_takes_a_years_headers() {
+    const T: &str = "headers";
+    let blocks = number("TABMINER_SCALE_BLOCKS", 144 * 365);
+    let said = |n: u64| {
+        // (As the log says a number: in threes.)
+        let digits = n.to_string();
+        let mut out = String::new();
+        for (i, c) in digits.chars().enumerate() {
+            if i > 0 && (digits.len() - i).is_multiple_of(3) {
+                out.push(',');
+            }
+            out.push(c);
+        }
+        out
+    };
+    let port = 46_000 + std::process::id() % 15_000;
+    let within = Duration::from_secs(3600);
+    let began = Instant::now();
+    let mut server = Node::start("server", T, port, &["--no-mine", "--debug-blocks", &blocks.to_string()]);
+    server.wait("Server is ready!", 1, within);
+    report(T, "blocks", blocks);
+    report(T, "chain_made_secs", format!("{:.1}", began.elapsed().as_secs_f64()));
+    report(T, "server_disk_mb", dir_size(&server.dir) / 1_000_000);
+
+    let mut new = Node::start("new", T, port + 1, &["--no-mine", "--peer", &server.listen]);
+    new.wait("Server is ready!", 1, within);
+    let began = Instant::now();
+    new.wait("Syncing headers 1 to ", 1, within);
+    let asked = began.elapsed();
+    new.wait(&format!("Headers synced to {}", said(blocks)), 1, within);
+    let headers = began.elapsed();
+    // And then the chain itself: its state, small as it is, and the
+    // blocks after it.
+    new.wait(&format!("Synced at block {}", said(blocks)), 1, within);
+    let synced = began.elapsed();
+    report(T, "headers_secs", format!("{:.1}", (headers - asked).as_secs_f64()));
+    report(T, "headers_a_second", format!("{:.0}", blocks as f64 / (headers - asked).as_secs_f64()));
+    report(T, "synced_secs", format!("{:.1}", synced.as_secs_f64()));
     server.show();
     new.show();
     server.report(T, "server");

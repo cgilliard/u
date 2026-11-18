@@ -2670,6 +2670,14 @@ impl ProofVerifier for AggregateVerifier {
     fn is_unchecked(&self) -> bool {
         self.unchecked
     }
+
+    /// A chain proof proves the work of the block before, and holds
+    /// only if that block's own proof did: every block's work, back to
+    /// the first. A direct proof says nothing of work. (Unchecked,
+    /// proofs are taken to say whatever a proof could.)
+    fn attests_work(&self) -> bool {
+        self.unchecked || !self.params.direct
+    }
 }
 
 #[cfg(test)]

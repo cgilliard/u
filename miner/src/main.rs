@@ -429,10 +429,13 @@ fn make_block(
             stats.add(socket::MINED, 1);
             // Until what came of it is heard: it is the chain's
             // last, or another got there first. Either way the next
-            // is begun at once, on whatever the last then is.
+            // is begun at once, on whatever the last then is. (However
+            // long applying it takes, which on a slow disk and a large
+            // state is minutes: a block begun meanwhile would be begun
+            // on the block before, and be for nothing.)
             let settled = hold.settled();
             hold.mined(block, socket::unix());
-            hold.wait_settled(settled, Duration::from_secs(10));
+            hold.wait_settled(settled, Duration::from_secs(600));
         }
         Ok(Mined::Cancelled) => {
             let noticed = *noticed.lock().unwrap_or_else(|e| e.into_inner());
@@ -621,6 +624,31 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
         // (What making it held is not what a node holds: the most it
         // holds is counted from here.)
         tabminer::heap::reset_peak();
+    }
+    // Debugging: a chain made long before the node starts, of empty
+    // blocks spaced as far apart as there is time for since its first.
+    #[cfg(feature = "dev")]
+    if let Some(blocks) = c.debug_blocks {
+        let began = Instant::now();
+        let dataset = Dataset::built_in(&seed).ok_or("debug: --debug-blocks needs the dev network's own table")?;
+        // (Checked against the table as they are applied, as they are
+        // from here on: from the seed's text a header is a hundred
+        // times the work.)
+        chain.set_dataset(Arc::new(Dataset::built_in(&seed).ok_or("debug: no table")?));
+        let unix = socket::unix();
+        let spacing = (unix.saturating_sub(params.genesis_timestamp) / (blocks as u64 + 1)).clamp(1, 500);
+        main.log(&format!("debug: making the chain {} blocks long", commas(blocks as u64)));
+        let said = |height: u32| {
+            main.log(&format!("debug: {} blocks made in {:.1}s", commas(height as u64), began.elapsed().as_secs_f64()))
+        };
+        miner::extend_empty(&chain, &dataset, blocks, spacing, unix, &said)
+            .map_err(|e| format!("debug: making the chain longer: {e}"))?;
+        let now = chain.tip().map_or(0, |tip| tip.height);
+        main.log(&format!(
+            "debug: a chain of {} blocks ready in {:.1}s",
+            commas(now as u64),
+            began.elapsed().as_secs_f64()
+        ));
     }
     // A chain made under other rules than this build's is not gone on
     // with: nothing made here could build on it, and nothing of it

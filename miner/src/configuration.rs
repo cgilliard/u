@@ -263,6 +263,11 @@ const OPTIONS: &[(&str, &[Opt])] = &[
                 takes: Takes::Value("N[,K]"),
                 help: "with the above: begin with the first block of a chain so\nfilled, and none of its outputs: a new node of that chain,\nto take its state from the others",
             },
+            Opt {
+                name: "debug-blocks",
+                takes: Takes::Value("N"),
+                help: "with the above: before anything else, make the chain N blocks\nlong, of empty blocks that take no work to speak of: a chain\nas long as one that has run for years",
+            },
             Opt { name: "blocks", takes: Takes::Value("N"), help: "make no block above height N" },
         ],
     ),
@@ -449,6 +454,8 @@ pub struct Configuration {
     /// Debugging: the outputs the chain begins with and how far apart
     /// they are, and whether this node has only their root.
     pub debug_outputs: Option<(u64, u64, bool)>,
+    /// Debugging: how long the chain is made before the node starts.
+    pub debug_blocks: Option<u32>,
     /// The height above which no block is made here.
     pub blocks: Option<u64>,
     pub listen: SocketAddrV4,
@@ -781,6 +788,7 @@ impl Configuration {
         }
         for (name, given) in [
             ("debug-fill", debug_fill.is_some()),
+            ("debug-blocks", given.one("debug-blocks").is_some()),
             ("debug-fill-outputs", filled.is_some()),
             ("debug-genesis-outputs", rooted.is_some()),
         ] {
@@ -842,6 +850,7 @@ impl Configuration {
             debug_unchecked,
             debug_fill,
             debug_outputs,
+            debug_blocks: given.number("debug-blocks", 1)?.map(|n| n.min(u32::MAX as u64) as u32),
             blocks: given.number("blocks", 0)?,
             listen,
             peers,
