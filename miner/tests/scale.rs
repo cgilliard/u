@@ -20,7 +20,7 @@
 //! what these say and, besides, the memory of a proof and of the table
 //! of the proof of work.
 
-#![cfg(all(feature = "dev", unix))]
+#![cfg(feature = "dev")]
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -97,7 +97,8 @@ impl Node {
             .spawn()
             .unwrap();
         // Its memory as the system sees it, looked at every second for
-        // as long as it runs (Linux only).
+        // as long as it runs (Linux only: elsewhere what the node says
+        // of itself is what there is).
         let (resident, own) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         let (r, o, path) = (Arc::clone(&resident), Arc::clone(&own), format!("/proc/{}/status", child.id()));
         std::thread::spawn(move || {
@@ -188,7 +189,10 @@ fn dir_size(dir: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
     let size = |e: std::fs::DirEntry| match e.metadata() {
         Ok(m) if m.is_dir() => dir_size(&e.path()),
+        #[cfg(unix)]
         Ok(m) => std::os::unix::fs::MetadataExt::blocks(&m) * 512,
+        #[cfg(not(unix))]
+        Ok(m) => m.len(),
         Err(_) => 0,
     };
     entries.flatten().map(size).sum()
@@ -197,11 +201,18 @@ fn dir_size(dir: &Path) -> u64 {
 /// Says what the machine has left, of disk where the data directories
 /// were and of memory: so that a run on a machine with little says so.
 fn report_left(test: &str) {
-    let df = Command::new("df").arg("-Pk").arg(std::env::temp_dir()).output().ok();
-    let free = df.and_then(|o| {
+    // (Kilobytes free: `df` says, or on Windows the drive itself.)
+    #[cfg(unix)]
+    let free = Command::new("df").arg("-Pk").arg(std::env::temp_dir()).output().ok().and_then(|o| {
         let text = String::from_utf8_lossy(&o.stdout).into_owned();
         text.lines().nth(1)?.split_whitespace().nth(3)?.parse::<u64>().ok()
     });
+    #[cfg(not(unix))]
+    let free = {
+        let ask = format!("(Get-Item '{}').PSDrive.Free", std::env::temp_dir().display());
+        let said = Command::new("powershell").args(["-NoProfile", "-Command", &ask]).output().ok();
+        said.and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok()).map(|bytes| bytes / 1000)
+    };
     if let Some(kb) = free {
         report(test, "left_disk_mb", kb / 1000);
     }

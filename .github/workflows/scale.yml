@@ -5,8 +5,8 @@ name: scale
 # more than Bitcoin's), full blocks applied on it, and a new node taking
 # it from the one that has it (miner/tests/scale.rs). Each job prints
 # what it measured as SCALE lines, the last of them what the machine had
-# left of disk and of memory. The same in small runs on every push
-# (test.yml).
+# left of disk and of memory: on each of the systems a node is run on.
+# The same in small runs on every push (test.yml).
 
 on:
   schedule:
@@ -25,12 +25,17 @@ env:
 
 jobs:
   scale:
-    name: ${{ matrix.test }}
-    runs-on: ubuntu-latest
+    name: ${{ matrix.test }} (${{ matrix.os.name }})
+    runs-on: ${{ matrix.os.runner }}
     timeout-minutes: 350
     strategy:
       fail-fast: false
       matrix:
+        os:
+          - { name: linux-x64, runner: ubuntu-latest }
+          - { name: linux-arm64, runner: ubuntu-24.04-arm }
+          - { name: windows-x64, runner: windows-latest }
+          - { name: macos-arm64, runner: macos-latest }
         test:
           - a_full_block_applies_on_a_large_state
           - a_fresh_node_fast_syncs_a_large_state
@@ -50,6 +55,7 @@ jobs:
 
       # The data directories go where the machine has the most room.
       - name: Choose where the state is kept
+        if: runner.os == 'Linux'
         run: |
           df -h / /mnt || true
           free -m
