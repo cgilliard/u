@@ -582,6 +582,13 @@ and for the new one twice. With `--no-prompt`
 nothing can be asked: a new wallet has no password, and one that has
 a password needs `--password-file`.
 
+**The pool.** Transactions waiting for a block are kept in memory, to
+`--mempool-size` bytes (64 MB if not said), and written to `pool.tab`
+in the data directory as they change: a node that starts again has
+those the chain still takes, with the ages they had. The command
+`fees` says what a payment is to pay a byte to be in a block soon, by
+the hour or within the day, as the pool reckons it.
+
 **The prompt.** Once the node is ready it takes commands on the
 terminal, at `> `, and answers each there; nothing else is said on the
 terminal (the logs are where the node says what happens). `quit`, or

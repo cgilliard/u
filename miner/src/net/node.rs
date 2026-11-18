@@ -86,7 +86,7 @@ use crate::chain::headers::LOCATOR;
 use crate::chain::verify::ProofVerifier;
 use crate::error::Error;
 use crate::hash::Digest;
-use crate::mempool::{DEFAULT_CAPACITY, MAX_TX_SIZE, Mempool, Reject};
+use crate::mempool::{MAX_TX_SIZE, Mempool, Reject};
 use crate::sha256::Sha256;
 use crate::store::backend::Backend;
 use crate::transport::fetch::{Fetch, Poll, Why};
@@ -2727,7 +2727,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             waker: RwLock::new(None),
             turn: AtomicUsize::new(0),
             moved: (Mutex::new(()), std::sync::Condvar::new()),
-            pool: Mutex::new(Mempool::new(DEFAULT_CAPACITY)),
+            pool: Mutex::new(Mempool::new(cfg.pool)),
             told: RwLock::new(None),
             #[cfg(test)]
             by_port: AtomicBool::new(false),
@@ -3127,6 +3127,17 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
     /// first.)
     pub fn pool(&self, f: &mut dyn FnMut(&Mempool)) {
         f(&self.shared.pool())
+    }
+
+    /// Takes into the pool what a run before this one kept of its own
+    /// ([`Mempool::saved`]): how many transactions were taken. They are
+    /// not told of to anyone: whoever has not got them is told when
+    /// they are next sent again, or has them of whoever sent them.
+    pub fn load_pool(&self, saved: &[u8], unix: u64) -> usize {
+        let Ok(state) = self.chain.whole() else { return 0 };
+        let Ok(snapshot) = state.snapshot() else { return 0 };
+        let height = snapshot.tip().0 + 1;
+        self.shared.pool().load(saved, &snapshot, height, unix)
     }
 
     /// Whether the transaction `id` is in the pool.

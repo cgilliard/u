@@ -31,6 +31,8 @@ pub struct Config {
     /// Datagrams that may wait for one worker: one that comes when so
     /// many do is dropped.
     pub request_queue: usize,
+    /// Bytes of transactions the pool holds at the most.
+    pub pool: usize,
     pub peers: Peers,
     pub sync: Sync,
     pub serve: Serve,
@@ -204,6 +206,7 @@ impl Default for Config {
             tick: SECOND,
             workers: 1,
             request_queue: 4096,
+            pool: crate::mempool::DEFAULT_CAPACITY,
             peers: Peers::default(),
             sync: Sync::default(),
             serve: Serve::default(),

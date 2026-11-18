@@ -747,6 +747,41 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
             }
         }));
     }
+    // The pool is what it was when the node last ran, as far as the
+    // chain still takes it; and is kept, as it changes, for the next
+    // run: a node that stops has no say in when.
+    {
+        let kept = c.data_dir.join("pool.tab");
+        if let Ok(saved) = std::fs::read(&kept) {
+            let taken = hold.load_pool(&saved, socket::unix());
+            if taken > 0 {
+                main.log(&format!("The pool has {} transactions kept from the last run", commas(taken as u64)));
+            }
+        }
+        let (hold, main) = (hold.clone(), Arc::clone(&main));
+        let keeping = move || {
+            // (What the pool was when last kept: how many, their
+            // bytes, and the last it took.)
+            let mut was = (0, 0, 0);
+            loop {
+                std::thread::sleep(Duration::from_secs(30));
+                let (mut now, mut saved) = (was, None);
+                hold.pool(&mut |pool| {
+                    now = (pool.len(), pool.bytes(), pool.entries().map(|e| e.order).max().unwrap_or(0));
+                    if now != was {
+                        saved = Some(pool.saved());
+                    }
+                });
+                let Some(saved) = saved else { continue };
+                let tmp = kept.with_extension("tmp");
+                match std::fs::write(&tmp, &saved).and_then(|()| std::fs::rename(&tmp, &kept)) {
+                    Ok(()) => was = now,
+                    Err(e) => main.log(&format!("Error: the pool cannot be kept in {}: {e}", kept.display())),
+                }
+            }
+        };
+        std::thread::Builder::new().name("pool".into()).spawn(keeping).map_err(threads)?;
+    }
     // The wallet follows the chain on a thread of its own: woken when
     // the chain has another last block, and once in a while besides.
     if let Some(wallet) = &wallet {

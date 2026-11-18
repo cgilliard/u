@@ -28,6 +28,8 @@ pub const OFFER_MARKER: &str = "TAB NAME OFFER";
 pub const HELP: &str = "commands:
   status                    the chain's last block, peers, the pool, the wallet's total
   peers                     how many peers are known, and how many are live
+  fees                      what a payment is to pay a byte, to be in a block soon, by
+                            the hour, or within the day
   mempool                   the transactions waiting to be mined
   balance                   what there is to spend; what is confirmed but too new to
                             spend; and pending, unverified, reserved, locked and lost
@@ -193,6 +195,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             ("status", []) => self.status(),
             ("peers", []) => self.peers(),
             ("mempool", []) => self.mempool(),
+            ("fees", []) => self.fees(),
             ("balance", []) => self.balance(),
             ("outputs", []) => self.outputs(),
             ("send-file", [amount, file]) => self.send_file(amount, None, file),
@@ -234,7 +237,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             ("name-transfer", [file, fee]) => self.name_transfer(file, Some(fee)),
             ("scan", []) => self.scan(),
             (
-                "status" | "peers" | "mempool" | "balance" | "outputs" | "send-file" | "receive" | "finalize"
+                "status" | "peers" | "mempool" | "fees" | "balance" | "outputs" | "send-file" | "receive" | "finalize"
                 | "slates" | "sent" | "cancel" | "bump" | "resend" | "prune" | "seed" | "password" | "scan" | "help"
                 | "quit" | "exit" | "names" | "name" | "name-commit" | "name-reveal" | "name-update" | "name-offer"
                 | "name-transfer",
@@ -315,6 +318,34 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
     fn peers(&self) -> Said {
         let standing = self.hold.read();
         Ok(format!("{} peers known, {} of them live", commas(standing.peers as u64), commas(standing.live as u64)))
+    }
+
+    /// What a payment is to pay to be in a block soon, by the hour, or
+    /// within the day: as the pool reckons it from what it holds and
+    /// what it has seen blocks take.
+    fn fees(&self) -> Said {
+        use crate::mempool::{TARGET_BLOCK, TARGET_DAY, TARGET_HOUR};
+        let unix = (self.unix)();
+        let size = Wallet::<W>::payment_size(1);
+        let mut lines = Vec::new();
+        self.hold.pool(&mut |pool| {
+            lines.push(format!(
+                "the least a byte is {}; the pool takes from {}",
+                commas(pool.policy().min_fee_per_byte),
+                commas(pool.admission_fee(unix))
+            ));
+            for (what, target) in [("next block", TARGET_BLOCK), ("an hour", TARGET_HOUR), ("a day", TARGET_DAY)] {
+                let seen = if pool.estimate(target, unix).is_some() { "" } else { " (too little seen yet: the least)" };
+                lines.push(format!("  within {what:<11} {} a byte{seen}", commas(pool.suggest(target, size, unix))));
+            }
+            lines.push(format!(
+                "  the least         {} a byte: about {} blocks at the most, by its age",
+                commas(pool.admission_fee(unix)),
+                commas(pool.reserve_wait(size))
+            ));
+        });
+        lines.push(format!("a simple payment is about {} bytes; fees are in base units", commas(size as u64)));
+        Ok(lines.join("\n"))
     }
 
     fn mempool(&self) -> Said {

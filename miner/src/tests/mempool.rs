@@ -154,6 +154,47 @@ fn transactions_expire_and_stay_refused() {
     assert_eq!(pool.expired().count(), 0);
 }
 
+/// A pool is kept from one run to the next: its transactions with
+/// their ages, what it remembers of those that waited too long, and
+/// what it has seen confirm. One whose output the chain no longer has
+/// is not taken again; and what is no saved pool is nothing.
+#[test]
+fn a_pool_is_kept_and_taken_again() {
+    let mut state = Fake::default();
+    state.fund(0, 1, 1000);
+    state.fund(1, 2, 2000);
+    state.fund(2, 3, 3000);
+    let policy = Policy { expiry_secs: 100, ..Policy::NONE };
+    let mut pool = Mempool::with_policy(1 << 20, policy);
+    let gone = pool.insert(&spend_at(3, &[2], 3000, 7, 9), &state, 1, 900).unwrap();
+    assert_eq!(pool.expire(1000), [gone]);
+    let first = pool.insert(&spend(1, 1000, 5), &state, 1, 1000).unwrap();
+    let second = pool.insert(&spend_at(2, &[1], 2000, 9, 9), &state, 1, 1010).unwrap();
+    pool.remember_confirmed(50, 600, 990);
+    let saved = pool.saved();
+    // Taken again, by a pool that has nothing: all of it.
+    let mut again = Mempool::with_policy(1 << 20, policy);
+    assert_eq!(again.load(&saved, &state, 1, 1020), 2);
+    assert_eq!((again.len(), again.bytes()), (pool.len(), pool.bytes()));
+    assert_eq!(again.entry(&first).unwrap().arrived, 1000);
+    assert_eq!(again.entry(&second).unwrap().arrived, 1010);
+    assert_eq!(again.expired().collect::<Vec<_>>(), pool.expired().collect::<Vec<_>>());
+    assert_eq!(again.confirmed().collect::<Vec<_>>(), [&(50, 600, 990)]);
+    assert_eq!(again.saved(), saved);
+    // By one whose chain has since spent what the first spends: the
+    // other only.
+    state.outputs.remove(&0);
+    let mut later = Mempool::with_policy(1 << 20, policy);
+    assert_eq!(later.load(&saved, &state, 1, 1020), 1);
+    assert!(later.contains(&second) && !later.contains(&first));
+    // Cut short, what is whole of it is taken; and anything else is
+    // no pool at all.
+    let mut short = Mempool::with_policy(1 << 20, policy);
+    assert_eq!(short.load(&saved[..saved.len() / 2], &state, 1, 1020), 0);
+    assert_eq!(short.load(b"not a pool", &state, 1, 1020), 0);
+    assert_eq!(short.load(&[], &state, 1, 1020), 0);
+}
+
 /// A full pool takes what pays more than its lowest and drops that; what
 /// it then asks rises past what it dropped, and falls back with time.
 /// The oldest are spared.

@@ -199,6 +199,9 @@ const MIN_SAMPLES: usize = 20;
 /// The share of those that must have confirmed in time.
 const SUCCESS: f64 = 0.85;
 /// The waits estimates are made for: about a block, an hour, a day.
+/// What a saved pool begins with ([`Mempool::saved`]).
+const SAVED_TAG: &[u8; 8] = b"tabpool1";
+
 pub const TARGET_BLOCK: u64 = BLOCK_TIME;
 pub const TARGET_HOUR: u64 = 3600;
 pub const TARGET_DAY: u64 = 86400;
@@ -753,6 +756,61 @@ impl Mempool {
 
     pub fn entries(&self) -> impl Iterator<Item = &Entry> {
         self.txs.values()
+    }
+
+    /// The pool as it is kept from one run of a node to the next: its
+    /// transactions, each with when it arrived; the ids of those that
+    /// waited too long, with until when each is remembered; and the
+    /// confirmations the fee estimates go by.
+    pub fn saved(&self) -> Vec<u8> {
+        let mut out = SAVED_TAG.to_vec();
+        out.extend_from_slice(&(self.len() as u32).to_le_bytes());
+        // (In the order they were taken: so they are taken again.)
+        let mut entries: Vec<&Entry> = self.entries().collect();
+        entries.sort_by_key(|e| (e.arrived, e.order));
+        for e in entries {
+            out.extend_from_slice(&e.arrived.to_le_bytes());
+            out.extend_from_slice(&(e.bytes().len() as u32).to_le_bytes());
+            out.extend_from_slice(e.bytes());
+        }
+        let expired: Vec<_> = self.expired().collect();
+        out.extend_from_slice(&(expired.len() as u32).to_le_bytes());
+        for (id, until) in expired {
+            out.extend_from_slice(&crate::poseidon2::digest_to_bytes(id));
+            out.extend_from_slice(&until.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.confirmed.len() as u32).to_le_bytes());
+        for (rate, waited, at) in &self.confirmed {
+            for v in [rate, waited, at] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// Takes what [`Mempool::saved`] kept: each transaction checked
+    /// again, as any is, against the chain as it now is, and keeping
+    /// its age. Returns how many were taken. What is of another form,
+    /// or cut short, is passed over from there on.
+    pub fn load(&mut self, saved: &[u8], ledger: &impl Ledger, height: u32, now: u64) -> usize {
+        let Some(rest) = saved.strip_prefix(SAVED_TAG) else { return 0 };
+        let mut r = crate::codec::Reader(rest);
+        let mut taken = 0;
+        for _ in 0..r.u32().unwrap_or(0) {
+            let (Some(arrived), Some(len)) = (r.u64(), r.u32()) else { return taken };
+            let Some(tx) = r.take(len as usize) else { return taken };
+            taken += self.insert_at(tx, ledger, height, arrived, now).is_ok() as usize;
+        }
+        for _ in 0..r.u32().unwrap_or(0) {
+            let (Some(id), Some(until)) = (r.take(32), r.u64()) else { return taken };
+            let Some(id) = crate::poseidon2::digest_from_bytes(id.try_into().expect("32 bytes")) else { return taken };
+            self.remember_expired(id, until);
+        }
+        for _ in 0..r.u32().unwrap_or(0) {
+            let (Some(rate), Some(waited), Some(at)) = (r.u64(), r.u64(), r.u64()) else { return taken };
+            self.remember_confirmed(rate, waited, at);
+        }
+        taken
     }
 
     /// Validates and adds the transaction `bytes` are, arrived at `now`
