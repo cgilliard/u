@@ -67,7 +67,18 @@ impl FileBackend {
     /// Opens the file at `path` for reading and writing, creating it
     /// empty if there is none.
     pub fn open(path: &Path) -> io::Result<FileBackend> {
-        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        // On Windows what is written goes to the disk as it is written
+        // (`FILE_FLAG_WRITE_THROUGH`), from several threads at once
+        // ([`Backend::write_many`]), and not when the file is next
+        // synced. A sync there writes what is waiting a page at a time,
+        // one after another: twenty thousand pages scattered through a
+        // large file, most of a minute on a disk that takes them
+        // sixteen at a time in seconds.
+        #[cfg(windows)]
+        std::os::windows::fs::OpenOptionsExt::custom_flags(&mut options, 0x8000_0000);
+        let file = options.open(path)?;
         Ok(FileBackend { file })
     }
 }
@@ -131,6 +142,25 @@ impl Backend for FileBackend {
 
     fn len(&self) -> io::Result<u64> {
         Ok(self.file.metadata()?.len())
+    }
+
+    /// On Windows, where each write waits on the disk
+    /// ([`FileBackend::open`]), a batch is split among threads as a
+    /// batch of reads is.
+    #[cfg(windows)]
+    fn write_many(&self, writes: &[WriteReq<'_>]) -> io::Result<()> {
+        let threads = IO_THREADS.min(writes.len() / (MIN_BATCH / 2));
+        if writes.len() < MIN_BATCH || threads < 2 {
+            return writes.iter().try_for_each(|w| self.write_at(w.offset, w.data));
+        }
+        let per = writes.len().div_ceil(threads);
+        std::thread::scope(|s| {
+            let handles: Vec<_> = writes
+                .chunks(per)
+                .map(|part| s.spawn(move || part.iter().try_for_each(|w| self.write_at(w.offset, w.data))))
+                .collect();
+            handles.into_iter().try_for_each(|h| h.join().expect("a writing thread does not panic"))
+        })
     }
 
     /// A batch is split among threads, each reading its share: the reads
