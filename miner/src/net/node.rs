@@ -567,6 +567,11 @@ pub(crate) struct Shared {
     /// What a host's address is mixed with to find its worker: so that
     /// nobody outside can choose addresses that are all one worker's.
     key: u64,
+    /// What the tokens of every worker are made under: one for the
+    /// node, so that a token one worker gives an address is one the
+    /// worker that address belongs to honours. (What passes between
+    /// wallets comes in at one worker and goes out by another.)
+    token_secret: [u8; 32],
     /// The node's peers in all.
     totals: Arc<Totals>,
     /// How many of each worker's peers are live, as it last counted;
@@ -943,6 +948,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     ) -> Worker<B, V> {
         let seed = u64::from_le_bytes(derive(&secret, b's', 0)[..8].try_into().unwrap());
         let pace = Arc::clone(&shared.pace);
+        let tokens = Tokens::new(derive(&shared.token_secret, b't', now / cfg.serve.token_life.max(1)));
+        let lives = now / cfg.serve.token_life.max(1);
         Worker {
             me,
             peers: Peers::sharing(&cfg, seed, Arc::clone(&shared.totals)),
@@ -953,9 +960,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             network,
             genesis: chain.params().genesis().header.hash(),
             chain,
-            tokens: Tokens::new(derive(&secret, b't', 0)),
+            tokens,
             secret,
-            secrets: 0,
+            secrets: lives,
             numbers: 0,
             rotated: now,
             asked: None,
@@ -1468,9 +1475,12 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     }
 
     fn periodic(&mut self, now: Micros, out: Out<'_>) {
-        if now.saturating_sub(self.rotated) >= self.cfg.serve.token_life {
-            self.secrets += 1;
-            self.tokens.rotate(derive(&self.secret, b't', self.secrets));
+        // (The same secret at the same time in every worker: by how
+        // many lives of a token have passed, not by when each began.)
+        let lives = now / self.cfg.serve.token_life.max(1);
+        if lives != self.secrets {
+            self.secrets = lives;
+            self.tokens.rotate(derive(&self.shared.token_secret, b't', lives));
             self.rotated = now;
         }
         self.peers.prune(now, |_| {});
@@ -3266,6 +3276,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             consensus: Mutex::new(None),
             answered: (0..n).map(|_| Mutex::new(Vec::new())).collect(),
             key: u64::from_le_bytes(derive(&secret, b'h', 0)[..8].try_into().unwrap()),
+            token_secret: derive(&secret, b'T', 0),
             totals: Arc::new(Totals::new()),
             live: (0..n).map(|_| AtomicUsize::new(0)).collect(),
             known: (0..n).map(|_| Mutex::new(Vec::new())).collect(),

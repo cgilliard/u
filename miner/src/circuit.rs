@@ -6,11 +6,13 @@
 //! second, and so on to the node it is reached at. With each of them it
 //! agrees a key of its own ([`Opening`], [`answer`]), the further ones
 //! through the nearer, which pass on what they cannot read. What it
-//! then sends it wraps once for each relay on the way, the last first
-//! ([`wrap`]); each takes one wrapping off ([`Hop::peel`]) and passes
-//! on what is left, which looks like nothing it was given. What comes
-//! back is wrapped once more at each relay ([`Hop::cover`]) and
-//! unwrapped by the wallet alone ([`unwrap`]). So a relay knows who
+//! then sends it seals for the last relay and wraps once for each on
+//! the way to it ([`wrap`]); each takes its wrapping off
+//! ([`Hop::peel`]) and passes on what is left, which looks like
+//! nothing it was given, and the last opens it ([`open`]). What comes
+//! back is sealed by the last ([`seal_back`]), wrapped once more at
+//! each relay nearer ([`Hop::cover`]) and unwrapped by the wallet
+//! alone ([`unwrap`]). So a relay knows who
 //! gave it a thing and whom it gives it to, and nothing else: not what
 //! it says, not where it began, not where it ends.
 //!
@@ -149,45 +151,45 @@ fn nonce(count: u64) -> [u8; aead::NONCE_LEN] {
     nonce
 }
 
-/// The bytes a thing sent out is longer by than what it says: so that
-/// the last relay knows it is what was sent, whole and unchanged.
+/// The bytes a thing sent is longer by than what it says: so that the
+/// relay it is for knows it is what was sent, whole and unchanged.
 pub const SEAL: usize = aead::TAG_LEN;
 
-/// Wraps `said` for the way through `hops`, nearest first, as the
-/// `count`-th thing sent out: sealed for the last of them, then
-/// wrapped for each from the last back to the first. Each peels its
-/// own; the last then [`open`]s it.
+/// Wraps `said` for the last of `hops` (nearest first), as the
+/// `count`-th thing sent out: sealed for it, then wrapped for each
+/// relay before it, the furthest first. Each of those peels its own
+/// wrapping; the last [`open`]s what is left.
 pub fn wrap(hops: &[Hop], count: u64, said: &[u8]) -> Vec<u8> {
-    let last = hops.last().expect("a way has a relay");
+    let (last, before) = hops.split_last().expect("a way has a relay");
     let mut bytes = aead::seal(&last.out_seal, &nonce(count), b"sent", said);
-    for hop in hops.iter().rev() {
+    for hop in before.iter().rev() {
         hop.peel(count, &mut bytes);
     }
     bytes
 }
 
-/// The last relay of a way opens what it has peeled: what was said, if
+/// The last relay of a way opens what has come to it: what was said, if
 /// it is whole and was sent this way as the `count`-th.
-pub fn open(hop: &Hop, count: u64, peeled: &[u8]) -> Option<Vec<u8>> {
-    aead::open(&hop.out_seal, &nonce(count), b"sent", peeled)
+pub fn open(hop: &Hop, count: u64, came: &[u8]) -> Option<Vec<u8>> {
+    aead::open(&hop.out_seal, &nonce(count), b"sent", came)
 }
 
 /// The last relay of a way seals what it sends back, as the `count`-th
-/// thing sent back; each relay nearer then [`Hop::cover`]s it.
+/// thing it sends back; each relay nearer then [`Hop::cover`]s it.
 pub fn seal_back(hop: &Hop, count: u64, said: &[u8]) -> Vec<u8> {
-    let mut bytes = aead::seal(&hop.back_seal, &nonce(count), b"back", said);
-    hop.cover(count, &mut bytes);
-    bytes
+    aead::seal(&hop.back_seal, &nonce(count), b"back", said)
 }
 
 /// Whoever opened the way takes every wrapping off what came back, the
-/// `count`-th, and opens it: what the last relay said, if it is whole.
+/// `count`-th of the last relay's, and opens it: what that relay said,
+/// if it is whole.
 pub fn unwrap(hops: &[Hop], count: u64, came: &[u8]) -> Option<Vec<u8>> {
+    let (last, before) = hops.split_last()?;
     let mut bytes = came.to_vec();
-    for hop in hops {
+    for hop in before {
         hop.cover(count, &mut bytes);
     }
-    aead::open(&hops.last()?.back_seal, &nonce(count), b"back", &bytes)
+    aead::open(&last.back_seal, &nonce(count), b"back", &bytes)
 }
 
 #[cfg(test)]
@@ -257,7 +259,7 @@ mod tests {
         assert_eq!(sent.len(), said.len() + SEAL);
         let mut bytes = sent.clone();
         let mut seen = vec![sent.clone()];
-        for hop in &theirs {
+        for hop in &theirs[..2] {
             hop.peel(5, &mut bytes);
             assert!(!seen.contains(&bytes), "each relay passes on something else");
             seen.push(bytes.clone());
@@ -273,7 +275,7 @@ mod tests {
         assert_eq!(open(&theirs[2], 6, &bytes), None);
         let mut changed = sent.clone();
         changed[3] ^= 1;
-        theirs.iter().for_each(|hop| hop.peel(5, &mut changed));
+        theirs[..2].iter().for_each(|hop| hop.peel(5, &mut changed));
         assert_eq!(open(&theirs[2], 5, &changed), None);
         // Back: sealed by the last, covered by the second and the first.
         let answer = b"its answer";
@@ -285,11 +287,24 @@ mod tests {
         assert_eq!(unwrap(&mine[..2], 9, &back), None);
         back[0] ^= 1;
         assert_eq!(unwrap(&mine, 9, &back), None);
-        // A way of one relay, too.
+        // A way of one relay, too; and a way that grows: what was for
+        // the second of two is not the third's of three to open.
         let (one, its) = way(&[4]);
-        let mut bytes = wrap(&one, 0, said);
-        its[0].peel(0, &mut bytes);
+        let bytes = wrap(&one, 0, said);
         assert_eq!(open(&its[0], 0, &bytes).as_deref(), Some(&said[..]));
+        let mut for_second = wrap(&mine[..2], 1, said);
+        theirs[0].peel(1, &mut for_second);
+        assert_eq!(open(&theirs[1], 1, &for_second).as_deref(), Some(&said[..]));
+        assert_eq!(open(&theirs[2], 1, &for_second), None);
+        assert_eq!(
+            unwrap(&mine[..2], 3, &{
+                let mut back = seal_back(&theirs[1], 3, answer);
+                theirs[0].cover(3, &mut back);
+                back
+            })
+            .as_deref(),
+            Some(&answer[..])
+        );
         assert_eq!(unwrap(&one, 0, &seal_back(&its[0], 0, answer)).as_deref(), Some(&answer[..]));
     }
 }

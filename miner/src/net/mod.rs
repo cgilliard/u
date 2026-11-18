@@ -16,6 +16,7 @@
 //! * How many peers, how many fetches at once, how long to wait: these
 //!   are settings ([`config`]), each with a default.
 
+pub mod circuits;
 pub mod config;
 pub mod message;
 pub mod node;
