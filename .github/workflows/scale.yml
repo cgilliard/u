@@ -67,5 +67,21 @@ jobs:
             echo "TMPDIR=/mnt/scale" >> "$GITHUB_ENV"
           fi
 
+      # (On Windows too: the drive with the most room, and what each
+      # drive has, said before the test and not only after.)
+      - name: Choose where the state is kept (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='FreeGB';e={[int]($_.Free/1GB)}}, @{n='UsedGB';e={[int]($_.Used/1GB)}}
+          $most = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Free -gt 0 } | Sort-Object Free -Descending | Select-Object -First 1
+          $temp = Get-Item $env:TEMP
+          if ($most.Name -ne $temp.PSDrive.Name) {
+            $dir = "$($most.Name):\scale"
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            "TMP=$dir" >> $env:GITHUB_ENV
+            "TEMP=$dir" >> $env:GITHUB_ENV
+          }
+
       - name: Test
         run: cargo test --locked --release --features dev --test scale -- --ignored --exact --nocapture ${{ matrix.test }}
