@@ -565,6 +565,13 @@ are all of the wallet: whoever has them has what it holds, and a
 wallet lost is made again from them. The command `seed` says them
 again, after asking for the wallet's password if it has one.
 
+**Its address.** A wallet is known by an address, `tab1…` and 62
+characters long: the hash of a key of its own (Dilithium), which is
+made of its twelve words. The command `address` says it. Nothing is
+sent to an address yet: it is what the message layer, to come, reaches
+a wallet by. A wallet made again from its words is at another address
+of its own than the wallet that was lost.
+
 **A wallet made again.** `--restore` makes the wallet from its twelve
 words, which it asks for, where the data directory has no wallet (it
 is never made over one that is there). What the wallet holds is in the

@@ -110,6 +110,32 @@ const _: () = {
 
 const MASK30: u64 = (1 << 30) - 1;
 
+/// [`hash_domain`] of the elements `input` gives, taken as they come:
+/// for what is too long to lay out first (a key of two thousand bytes,
+/// packed).
+pub(crate) fn hash_domain_of(domain: u32, input: impl ExactSizeIterator<Item = Fp>) -> Digest {
+    let len = input.len() as u64;
+    let mut state = [Fp::ZERO; WIDTH];
+    state[DIGEST] = Fp::new(domain);
+    state[DIGEST + 1] = Fp::new((len & MASK30) as u32);
+    state[DIGEST + 2] = Fp::new((len >> 30) as u32);
+    let mut at = 0;
+    for x in input {
+        state[at] = state[at].add(&x);
+        at += 1;
+        if at == DIGEST {
+            permute_in_place(&mut state);
+            at = 0;
+        }
+    }
+    // (A chunk not full is absorbed as it is; and nothing at all is one
+    // permutation all the same.)
+    if at > 0 || len == 0 {
+        permute_in_place(&mut state);
+    }
+    state[..DIGEST].try_into().unwrap()
+}
+
 /// Domain-separated sponge over the Poseidon2 permutation. The capacity holds
 /// the domain tag and the input length, so inputs of different lengths never
 /// collide through zero padding.
@@ -206,6 +232,14 @@ mod tests {
         });
         let long = std::panic::catch_unwind(|| DomainHasher::new(DOM_COVERED, 3).absorb(&[Fp::ONE; 4]));
         assert!(short.is_err() && long.is_err());
+    }
+
+    #[test]
+    fn a_hash_of_what_comes_is_the_hash_of_what_lies() {
+        for len in [0usize, 1, 7, 8, 9, 16, 651] {
+            let input: Vec<Fp> = (0..len as u32).map(|i| Fp::new(i * 7 + 1)).collect();
+            assert_eq!(hash_domain_of(18, input.iter().copied()), hash_domain(18, &input), "{len}");
+        }
     }
 
     #[test]

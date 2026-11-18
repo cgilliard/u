@@ -31,6 +31,7 @@ pub const HELP: &str = "commands:
   fees                      what a payment is to pay a byte, to be in a block soon, by
                             the hour, or within the day
   mempool                   the transactions waiting to be mined
+  address                   this wallet's address: what it is known by, as tab1…
   balance                   what there is to spend; what is confirmed but too new to
                             spend; and pending, unverified, reserved, locked and lost
                             funds
@@ -197,6 +198,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             ("mempool", []) => self.mempool(),
             ("fees", []) => self.fees(),
             ("balance", []) => self.balance(),
+            ("address", []) => self.wallet().map(|wallet| wallet.address()),
             ("outputs", []) => self.outputs(),
             ("send-file", [amount, file]) => self.send_file(amount, None, file),
             ("send-file", [amount, fee, file]) => self.send_file(amount, Some(fee), file),
@@ -237,10 +239,10 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             ("name-transfer", [file, fee]) => self.name_transfer(file, Some(fee)),
             ("scan", []) => self.scan(),
             (
-                "status" | "peers" | "mempool" | "fees" | "balance" | "outputs" | "send-file" | "receive" | "finalize"
-                | "slates" | "sent" | "cancel" | "bump" | "resend" | "prune" | "seed" | "password" | "scan" | "help"
-                | "quit" | "exit" | "names" | "name" | "name-commit" | "name-reveal" | "name-update" | "name-offer"
-                | "name-transfer",
+                "status" | "peers" | "mempool" | "fees" | "balance" | "address" | "outputs" | "send-file" | "receive"
+                | "finalize" | "slates" | "sent" | "cancel" | "bump" | "resend" | "prune" | "seed" | "password"
+                | "scan" | "help" | "quit" | "exit" | "names" | "name" | "name-commit" | "name-reveal" | "name-update"
+                | "name-offer" | "name-transfer",
                 _,
             ) => Err(format!("{command}: not what it takes (see help)")),
             _ => Err(format!("{command}: no such command (see help)")),

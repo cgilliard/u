@@ -82,6 +82,9 @@ const T_LOST: usize = 7;
 const T_RECENT: usize = 8;
 const T_COMMITS: usize = 9;
 const T_NAMES: usize = 10;
+/// The address counter ([`Wallet::identity_key`]): eight bytes, or
+/// nothing for the first address.
+const T_ADDRESS: usize = 11;
 
 /// Blocks looked at that the wallet remembers, at the most: as far back
 /// as it can find where the chain parted from what it knew.
@@ -96,6 +99,9 @@ pub const SLATE_MARKER: &str = "TAB SLATE";
 const DOM_MASTER: u32 = 0x30;
 const DOM_TAG: u32 = 0x31;
 const DOM_KEY: u32 = 0x32;
+/// The seed of the wallet's Dilithium key, its identity on the message
+/// layer: of the master key and the address counter.
+const DOM_IDENTITY: u32 = 0x36;
 
 /// Nonce elements in a memo.
 pub const NONCE: usize = 4;
@@ -760,6 +766,10 @@ struct Tables {
     secret: Vec<u8>,
     /// Whether a restore waits for its first scan.
     scan_pending: bool,
+    /// Which of the wallet's addresses it is at: the first, for a new
+    /// wallet; one drawn at random, for a wallet made again from its
+    /// words, so that it is at an address never used before.
+    address: u64,
     /// Height and id of the block up to which [`Wallet::locate`] has
     /// been given the outputs.
     synced: Option<(u32, [u8; 32])>,
@@ -837,6 +847,10 @@ impl Tables {
             T_LOST => put_entries(self.lost.iter().map(|(id, height)| (id, height.to_le_bytes().to_vec()))),
             T_COMMITS => put_entries(self.commits.iter().map(|(id, c)| (id, c.to_bytes()))),
             T_NAMES => names::put_names(self.names.values()),
+            T_ADDRESS => match self.address {
+                0 => Vec::new(),
+                at => at.to_le_bytes().to_vec(),
+            },
             T_RECENT => put_entries(self.recent.iter().map(|(height, id, next)| {
                 let mut b = height.to_le_bytes().to_vec();
                 b.extend_from_slice(&next.to_le_bytes());
@@ -859,6 +873,10 @@ impl Tables {
             t.secret = meta[39..].to_vec();
         }
         let table = |at: usize| records.read(at);
+        t.address = match &table(T_ADDRESS)?[..] {
+            [] => 0,
+            at => u64::from_le_bytes(at.try_into().map_err(|_| WalletError::Corrupt("address counter"))?),
+        };
         let commitment = |id: &Id| digest_from_bytes(id);
         for (id, b) in get_entries(&table(T_OUTPUTS)?).ok_or(WalletError::Corrupt("outputs"))? {
             let o = commitment(&id).and_then(|c| Owned::from_bytes(c, b)).ok_or(WalletError::Corrupt("output"))?;
@@ -955,7 +973,14 @@ impl<B: Backend> Wallet<B> {
         }
         t.secret = secret.seal(password)?;
         t.scan_pending = true;
-        records.write(&[(T_META, &t.encode(T_META))])?;
+        // An address of its own: what the wallet that was lost was
+        // reached at is not taken up again by this one, which cannot
+        // know what was sent there meanwhile or who else holds its
+        // words.
+        let mut drawn = [0u8; 8];
+        crate::random::fill(&mut drawn)?;
+        t.address = (u64::from_le_bytes(drawn) >> 4).max(1);
+        records.write(&[(T_META, &t.encode(T_META)), (T_ADDRESS, &t.encode(T_ADDRESS))])?;
         Ok(Wallet { records, master: master_of(&secret.seed), t, min_confirmations: MIN_CONFIRMATIONS })
     }
 
@@ -1019,6 +1044,35 @@ impl<B: Backend> Wallet<B> {
         let mut t = self.t.clone();
         t.secret = Secret::open(&self.t.secret, old)?.seal(new)?;
         self.commit(t, &[T_META])
+    }
+
+    /// The wallet's Dilithium (ML-DSA-65) key: what it is known by on
+    /// the message layer, and signs what it says there with. Of the
+    /// master key and the address counter, so the same words at the
+    /// same counter are the same key.
+    pub fn identity_key(&self) -> crate::mldsa::SecretKey {
+        const LOW: u64 = (1 << 30) - 1;
+        let mut input = [Fp::ZERO; DIGEST + 2];
+        input[..DIGEST].copy_from_slice(&self.master);
+        input[DIGEST] = Fp::new((self.t.address & LOW) as u32);
+        input[DIGEST + 1] = Fp::new((self.t.address >> 30 & LOW) as u32);
+        crate::mldsa::keygen(&digest_to_bytes(&hash_domain(DOM_IDENTITY, &input)))
+    }
+
+    /// The wallet's id: the hash of its Dilithium key
+    /// ([`crate::address::id_of`]).
+    pub fn id(&self) -> crate::hash::Digest {
+        crate::address::id_of(self.identity_key().public_key())
+    }
+
+    /// The wallet's address: its id as `tab1…`.
+    pub fn address(&self) -> String {
+        crate::address::encode(&self.id())
+    }
+
+    /// Which of its addresses the wallet is at.
+    pub fn address_index(&self) -> u64 {
+        self.t.address
     }
 
     fn with_master(&self, domain: u32, nonce: &[Fp; NONCE]) -> [Fp; DIGEST] {

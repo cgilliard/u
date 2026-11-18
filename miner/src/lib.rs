@@ -1,3 +1,4 @@
+pub mod address;
 pub mod aggregate;
 pub mod bip39;
 pub mod bits;
@@ -26,10 +27,13 @@ pub mod heap;
 #[cfg(test)]
 #[path = "tests/inflate.rs"]
 pub mod inflate;
+pub mod keccak;
 pub mod logger;
 pub mod mempool;
 pub mod merkle;
 pub mod miner;
+pub mod mldsa;
+pub mod mlkem;
 pub mod name;
 pub mod name_air;
 pub mod net;

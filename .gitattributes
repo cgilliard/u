@@ -1,1 +1,2 @@
 resources/bip39-english.txt text eol=lf
+miner/tests/vectors/*.kat text eol=lf

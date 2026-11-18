@@ -695,3 +695,29 @@ fn a_name_is_registered_changed_and_given() {
     assert_eq!(alice.prune_commits(&names, &[]).unwrap(), ["never"]);
     assert_eq!(alice.pending_commits().len(), 1);
 }
+
+/// A wallet has an address: of its words and of which of its addresses
+/// it is at. The same words opened again are at the same one; made
+/// again from its words, a wallet is at one of its own, never the first
+/// again; and another wallet's is another.
+#[test]
+fn a_wallet_has_an_address_of_its_words() {
+    let (wallet, phrase) = Wallet::open(MemBackend::new()).unwrap();
+    let address = wallet.address();
+    assert!(address.starts_with("tab1") && address.len() == crate::address::LEN);
+    assert_eq!(crate::address::decode(&address), Some(wallet.id()));
+    assert_eq!((wallet.address_index(), wallet.address()), (0, address.clone()));
+    assert_eq!(reopened(&wallet, "").unwrap().address(), address);
+    // What it signs is its key's, and its key is what its id is of.
+    let key = wallet.identity_key();
+    let signed = key.sign(b"said", b"tab");
+    assert!(crate::mldsa::verify(key.public_key(), b"said", b"tab", &signed));
+    assert_eq!(crate::address::id_of(key.public_key()), wallet.id());
+    // Made again: its own address, kept from then on.
+    let restored = Wallet::restore(MemBackend::new(), &phrase.unwrap(), "", "").unwrap();
+    assert!(restored.address_index() > 0);
+    assert_ne!(restored.address(), address);
+    assert_eq!(reopened(&restored, "").unwrap().address(), restored.address());
+    let (other, _) = Wallet::open(MemBackend::new()).unwrap();
+    assert_ne!(other.address(), address);
+}
