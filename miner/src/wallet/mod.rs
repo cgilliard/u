@@ -88,6 +88,62 @@ const T_ADDRESS: usize = 11;
 /// Whom each pending slate was sent to, of those sent over the message
 /// layer: by the slate's id, the id of the wallet.
 const T_SENT_TO: usize = 12;
+/// The names this wallet has given out under names it holds
+/// ([`crate::subnames`]): by the id each full name is reached by, the
+/// label, the name, the wallet it is, and the number and time of the
+/// certificate last signed for it.
+const T_NAMES_GIVEN: usize = 13;
+/// The full names this wallet is: by the id each is reached by, the
+/// number of its certificate and until when it holds (eight bytes
+/// each), and the certificate with what goes with it.
+const T_NAMES_HELD: usize = 14;
+
+/// A name this wallet has given out under a name it holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Given {
+    pub label: Vec<u8>,
+    pub name: Vec<u8>,
+    /// The wallet the full name is.
+    pub holder: crate::hash::Digest,
+    /// The number of the certificate last signed for it, and until
+    /// when that one holds (Unix seconds).
+    pub seq: u64,
+    pub expires: u64,
+}
+
+impl Given {
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = vec![self.label.len() as u8];
+        out.extend_from_slice(&self.label);
+        out.push(self.name.len() as u8);
+        out.extend_from_slice(&self.name);
+        out.extend_from_slice(&digest_to_bytes(&self.holder));
+        out.extend_from_slice(&self.seq.to_le_bytes());
+        out.extend_from_slice(&self.expires.to_le_bytes());
+        out
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Option<Given> {
+        let (n, rest) = bytes.split_first()?;
+        let (label, rest) = rest.split_at_checked(*n as usize)?;
+        let (n, rest) = rest.split_first()?;
+        let (name, rest) = rest.split_at_checked(*n as usize)?;
+        let (holder, rest) = rest.split_at_checked(32)?;
+        let (seq, expires) = rest.split_at_checked(8).filter(|(_, expires)| expires.len() == 8)?;
+        Some(Given {
+            label: label.to_vec(),
+            name: name.to_vec(),
+            holder: digest_from_bytes(holder)?,
+            seq: u64::from_le_bytes(seq.try_into().ok()?),
+            expires: u64::from_le_bytes(expires.try_into().ok()?),
+        })
+    }
+
+    /// The full name, as it is written.
+    pub fn full(&self) -> String {
+        format!("{}@{}", String::from_utf8_lossy(&self.label), String::from_utf8_lossy(&self.name))
+    }
+}
 
 /// Blocks looked at that the wallet remembers, at the most: as far back
 /// as it can find where the chain parted from what it knew.
@@ -771,6 +827,10 @@ struct Tables {
     scan_pending: bool,
     /// Whom each pending slate was sent to ([`Wallet::sent_to`]).
     sent_to: BTreeMap<Id, Id>,
+    /// The names given out under names this wallet holds, and the full
+    /// names it is ([`Wallet::give_name`], [`Wallet::hold_name`]).
+    names_given: BTreeMap<Id, Given>,
+    names_held: BTreeMap<Id, Vec<u8>>,
     /// Which of the wallet's addresses it is at: the first, for a new
     /// wallet; one drawn at random, for a wallet made again from its
     /// words, so that it is at an address never used before.
@@ -853,6 +913,8 @@ impl Tables {
             T_COMMITS => put_entries(self.commits.iter().map(|(id, c)| (id, c.to_bytes()))),
             T_NAMES => names::put_names(self.names.values()),
             T_SENT_TO => put_entries(self.sent_to.iter().map(|(slate, whom)| (slate, whom.to_vec()))),
+            T_NAMES_GIVEN => put_entries(self.names_given.iter().map(|(at, given)| (at, given.to_bytes()))),
+            T_NAMES_HELD => put_entries(self.names_held.iter().map(|(at, bundle)| (at, bundle.clone()))),
             T_ADDRESS => match self.address {
                 0 => Vec::new(),
                 at => at.to_le_bytes().to_vec(),
@@ -885,6 +947,15 @@ impl Tables {
         };
         for (slate, whom) in get_entries(&table(T_SENT_TO)?).ok_or(WalletError::Corrupt("recipients"))? {
             t.sent_to.insert(slate, whom.try_into().map_err(|_| WalletError::Corrupt("recipient"))?);
+        }
+        for (at, given) in get_entries(&table(T_NAMES_GIVEN)?).ok_or(WalletError::Corrupt("names given"))? {
+            t.names_given.insert(at, Given::from_bytes(given).ok_or(WalletError::Corrupt("name given"))?);
+        }
+        for (at, held) in get_entries(&table(T_NAMES_HELD)?).ok_or(WalletError::Corrupt("names held"))? {
+            if held.len() < 16 {
+                return Err(WalletError::Corrupt("name held"));
+            }
+            t.names_held.insert(at, held.to_vec());
         }
         let commitment = |id: &Id| digest_from_bytes(id);
         for (id, b) in get_entries(&table(T_OUTPUTS)?).ok_or(WalletError::Corrupt("outputs"))? {
@@ -1858,6 +1929,86 @@ impl<B: Backend> Wallet<B> {
         t.sent_to.retain(|id, _| t.slates.contains_key(id));
         t.sent_to.insert(*slate, digest_to_bytes(whom));
         self.commit(t, &[T_SENT_TO])
+    }
+
+    /// Gives `label@name` to the wallet of id `holder`, at `unix`: a
+    /// certificate of this wallet's key, with a number higher than any
+    /// it signed for that full name, holding for a week. (It is the
+    /// name's certificate if this wallet's address is what the name
+    /// says on the chain: whoever calls sees to that.) Kept, to be
+    /// signed again as its time runs out ([`Wallet::names_to_renew`]).
+    /// The certificate as it travels.
+    pub fn give_name(&mut self, label: &[u8], name: &[u8], holder: &crate::hash::Digest, unix: u64) -> Result<Vec<u8>> {
+        use crate::subnames::{HOLDS, bundle, certify, point};
+        let at = digest_to_bytes(&point(label, name));
+        let seq = self.t.names_given.get(&at).map_or(0, |given| given.seq + 1).max(unix);
+        let expires = unix + HOLDS;
+        let certificate = certify(&self.identity_key(), label, name, holder, seq, expires);
+        let mut t = self.t.clone();
+        t.names_given.insert(at, Given { label: label.to_vec(), name: name.to_vec(), holder: *holder, seq, expires });
+        self.commit(t, &[T_NAMES_GIVEN])?;
+        Ok(bundle(&certificate, None))
+    }
+
+    /// The names this wallet has given out, in the order of their ids.
+    pub fn names_given(&self) -> Vec<Given> {
+        self.t.names_given.values().cloned().collect()
+    }
+
+    /// Those of them whose certificate was signed long enough ago, at
+    /// `unix`, for another to be due.
+    pub fn names_to_renew(&self, unix: u64) -> Vec<Given> {
+        use crate::subnames::{HOLDS, RENEWED};
+        let due = |given: &&Given| given.expires < unix + HOLDS - RENEWED;
+        self.t.names_given.values().filter(due).cloned().collect()
+    }
+
+    /// Gives `label@name` out no longer: no certificate is signed for
+    /// it again, and the last one holds until its time is past. Whether
+    /// it was given.
+    pub fn take_name_back(&mut self, label: &[u8], name: &[u8]) -> Result<bool> {
+        let mut t = self.t.clone();
+        let was = t.names_given.remove(&digest_to_bytes(&crate::subnames::point(label, name))).is_some();
+        self.commit(t, &[T_NAMES_GIVEN])?;
+        Ok(was)
+    }
+
+    /// Keeps a certificate by which this wallet is a full name: one
+    /// that was read, and names this wallet. In place of an older one
+    /// for that name; or, of a name it was not yet, if it is fewer
+    /// than `most` names. Whether it was kept.
+    pub fn hold_name(&mut self, checked: &crate::subnames::Checked, bundle: &[u8], most: usize) -> Result<bool> {
+        let at = digest_to_bytes(&checked.point());
+        let number = |held: &Vec<u8>| u64::from_le_bytes(held[..8].try_into().expect("eight bytes"));
+        let takes = match self.t.names_held.get(&at) {
+            Some(held) => number(held) < checked.seq,
+            None => self.t.names_held.len() < most,
+        };
+        if !takes || checked.holder != self.id() {
+            return Ok(false);
+        }
+        let mut t = self.t.clone();
+        let kept = [&checked.seq.to_le_bytes()[..], &checked.expires.to_le_bytes(), bundle].concat();
+        t.names_held.insert(at, kept);
+        self.commit(t, &[T_NAMES_HELD])?;
+        Ok(true)
+    }
+
+    /// The certificates by which this wallet is a full name: the id
+    /// each name is reached by, the certificate's number, and the
+    /// certificate as it was given, with what goes with it.
+    pub fn names_held(&self) -> Vec<(crate::hash::Digest, u64, Vec<u8>)> {
+        let number = |held: &Vec<u8>| u64::from_le_bytes(held[..8].try_into().expect("eight bytes"));
+        let each = self.t.names_held.iter();
+        each.filter_map(|(at, held)| Some((digest_from_bytes(at)?, number(held), held[16..].to_vec()))).collect()
+    }
+
+    /// Is `label@name` no longer. Whether it was.
+    pub fn drop_name(&mut self, label: &[u8], name: &[u8]) -> Result<bool> {
+        let mut t = self.t.clone();
+        let was = t.names_held.remove(&digest_to_bytes(&crate::subnames::point(label, name))).is_some();
+        self.commit(t, &[T_NAMES_HELD])?;
+        Ok(was)
     }
 
     /// Whom the pending slate of id `slate` was sent to, if it was sent

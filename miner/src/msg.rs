@@ -45,6 +45,9 @@ pub const MAX_SEALED: usize = OVERHEAD + MAX_BODY;
 
 /// What a message says: a slate, of a payment being made.
 pub const KIND_SLATE: u8 = 1;
+/// A certificate that the wallet it is sent to is a name under a name,
+/// with what goes with it ([`crate::subnames`]).
+pub const KIND_NAME: u8 = 2;
 
 /// Domain tag of the id of a sealed message, by which it is fetched.
 const DOM_SEALED: u32 = 19;

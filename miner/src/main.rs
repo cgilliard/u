@@ -959,12 +959,14 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
             .spawn(move || make_blocks(&hold, seed, &table, prebuild, most, &wallet, &main, &stats))
             .map_err(threads)?;
     }
+    let names: Arc<Mutex<tabminer::console::Named>> = Arc::default();
     // Commands are taken from the terminal on a thread of their own.
     if c.prompt {
         let said = Arc::clone(&main);
         let log = Arc::new(move |line: &str| said.log(line));
         let debug = cfg!(feature = "dev") && c.network != Network::Mainnet;
-        let console = Console { hold: hold.clone(), wallet: wallet.clone(), unix: socket::unix, log, debug };
+        let (wallet, unix, names) = (wallet.clone(), socket::unix, Arc::clone(&names));
+        let console = Console { hold: hold.clone(), wallet, unix, log, debug, max_names: c.max_names, names };
         let main = Arc::clone(&main);
         std::thread::Builder::new().name("prompt".into()).spawn(move || prompt(&console, &main)).map_err(threads)?;
     }
@@ -975,11 +977,32 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     if let Some(wallet) = &wallet {
         let said = Arc::clone(&main);
         let log = Arc::new(move |line: &str| said.log(line));
-        let (wallet, debug) = (Some(Arc::clone(wallet)), false);
-        let console = Console { hold: hold.clone(), wallet, unix: socket::unix, log, debug };
+        let (wallet, debug, names) = (Some(Arc::clone(wallet)), false, Arc::clone(&names));
+        let (unix, max_names) = (socket::unix, c.max_names);
+        let console = Console { hold: hold.clone(), wallet, unix, log, debug, max_names, names };
+        // (The full names the wallet is: reached by them from the
+        // start, and looked to now and then while the node runs.)
+        if let Err(why) = console.renew_names() {
+            main.log(&format!("Error: the wallet's names: {why}"));
+        }
         let (hold, main) = (hold.clone(), Arc::clone(&main));
+        let mut looked = std::time::Instant::now();
         let taking = move || loop {
             std::thread::sleep(Duration::from_millis(50));
+            if looked.elapsed() >= Duration::from_secs(600) {
+                looked = std::time::Instant::now();
+                if let Err(why) = console.renew_names() {
+                    main.log(&format!("Error: the wallet's names: {why}"));
+                }
+            }
+            // (Whose a name is, is known before its wallet answers.)
+            for (slate, whom) in hold.take_resolved() {
+                match console.resolved(&slate, &whom) {
+                    Ok(said) if !said.is_empty() => main.log(&format!("P{}", &said[1..])),
+                    Ok(_) => {}
+                    Err(why) => main.log(&format!("Error: a payment to a name: {why}")),
+                }
+            }
             for message in hold.take_messages() {
                 if let Err(why) = console.take(&message) {
                     main.log(&format!("Error: a message for the wallet: {why}"));

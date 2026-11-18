@@ -949,3 +949,99 @@ fn a_payment_goes_by_ways_through_relays() {
     };
     assert!((18..=24).contains(&held.iter().map(here).sum::<u32>()), "{held:#?}");
 }
+
+/// A name under a name: the wallet that holds `mailhub` gives
+/// `alice@mailhub` to another wallet, which is then reached by it, and
+/// is paid by it; a name nobody was given is nobody's; and only the
+/// wallet a name says may give names under it.
+#[cfg(all(unix, feature = "dev"))]
+#[cfg_attr(debug_assertions, ignore = "proves blocks; run with --release")]
+#[test]
+fn a_wallet_is_paid_by_a_name_under_a_name() {
+    use std::time::{Duration, Instant};
+    let dirs = [scratch("sub-relay"), scratch("sub-hub"), scratch("sub-alice")];
+    let port = 36_000 + std::process::id() % 10_000;
+    let at = |i: u32| format!("127.0.0.1:{}", port + i);
+    let wait = |what: &str, done: &mut dyn FnMut() -> bool| {
+        let began = Instant::now();
+        while !done() {
+            assert!(began.elapsed() < Duration::from_secs(240), "{what}");
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    };
+    let relay = Command::new(TABMINER)
+        .args(["--network", "dev", "--threads", "2", "--no-mine", "--no-prompt", "--relay"])
+        .args(["--data-dir", &dirs[0].display().to_string(), "--listen", &at(0)])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let relay = Running(relay);
+    let mut hub = Prompted::start(&dirs[1], &at(1), &[at(0)], true, true);
+    let mut alice = Prompted::start(&dirs[2], &at(2), &[at(0)], false, true);
+    let (hub_is, alice_is) = (hub.ask("address").trim().to_string(), alice.ask("address").trim().to_string());
+    wait("the hub has no rewards", &mut || hub.confirmed() != "0");
+    // The hub's wallet registers `mailhub`, and has it say its address.
+    assert!(hub.ask("name-commit mailhub").starts_with("Name mailhub: committed to"));
+    wait("the name is not revealed", &mut || hub.ask("name-reveal mailhub").starts_with("Name mailhub: revealed"));
+    wait("the name is not registered", &mut || hub.ask("names").contains("  owned  "));
+    // (Until it says the hub's address, the hub gives no names under it.)
+    let early = hub.ask(&format!("subname set alice@mailhub {alice_is}"));
+    assert!(early.starts_with("error: mailhub is not this wallet's to give names under"), "{early}");
+    assert!(hub.ask(&format!("name-update mailhub {hub_is}")).starts_with("Name mailhub: changed"));
+    wait("the name does not say the address", &mut || {
+        let says = alice.ask("name mailhub");
+        !says.contains(&"0".repeat(64)) && says.starts_with("mailhub says ")
+    });
+    assert_eq!(hub.ask("subnames"), "no names under names: none given, and this wallet is none\n");
+    // What is no name under a name, or not the hub's to give.
+    assert!(
+        hub.ask(&format!("subname set Alice@mailhub {alice_is}"))
+            .starts_with("error: 'Alice@mailhub' is no label@name")
+    );
+    assert!(hub.ask(&format!("subname set alice@nothing {alice_is}")).starts_with("error: nothing is not registered"));
+    assert!(
+        alice.ask(&format!("subname set bob@mailhub {alice_is}")).starts_with("error: mailhub is not this wallet's")
+    );
+    // Given: the other wallet is the name, and is reached by it.
+    wait("the wallets are not reached", &mut || {
+        hub.ask("status").contains("reached at: 1 of 1") && alice.ask("status").contains("reached at: 1 of 1")
+    });
+    let given = hub.ask(&format!("subname set alice@mailhub {alice_is}"));
+    assert!(given.starts_with(&format!("alice@mailhub is {alice_is}, by a certificate that holds 7 days")), "{given}");
+    wait("the name is not reached", &mut || alice.ask("subnames").contains("reached by it at 1 nodes"));
+    assert!(alice.ask("subnames").starts_with("this wallet is alice@mailhub, for 7.0 days more"));
+    assert!(hub.ask("subnames").starts_with(&format!("given: alice@mailhub is {alice_is}, for 7.0 days more")));
+    // Paid by the name.
+    let sent = Instant::now();
+    let begun = hub.ask("send 5 alice@mailhub");
+    assert!(begun.contains("begun: 5 and a fee of") && begun.contains("to alice@mailhub"), "{begun}");
+    let pooled = loop {
+        let log = std::fs::read_to_string(dirs[1].join("tabernacle.log")).unwrap();
+        if log.contains(" signed and pooled: transaction ") {
+            assert!(log.contains(&format!(": alice@mailhub is {alice_is}")), "{log}");
+            break sent.elapsed();
+        }
+        assert!(sent.elapsed() < Duration::from_secs(60), "the answer has not come: {log}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    println!("a payment to a name under a name was answered, signed and pooled in {:.2}s", pooled.as_secs_f64());
+    wait("the payment is not confirmed", &mut || alice.confirmed() == "5");
+    // To a name nobody was given: an error that names it.
+    assert!(hub.ask("send 1 bob@mailhub").contains("to bob@mailhub"));
+    wait("nothing is said of the name that is nobody's", &mut || {
+        let log = std::fs::read_to_string(dirs[1].join("tabernacle.log")).unwrap();
+        log.contains(" to bob@mailhub was not delivered (that wallet is not there): given up")
+    });
+    assert!(hub.ask("send 1 bob@nothing").starts_with("error: nothing is not registered"));
+    // The wallet is the name no longer, if it says so: and is not
+    // paid by it.
+    assert_eq!(alice.ask("subname drop alice@mailhub"), "this wallet is alice@mailhub no longer\n");
+    assert!(alice.ask("subname drop alice@mailhub").starts_with("error: this wallet is not alice@mailhub"));
+    assert!(hub.ask("subname del alice@mailhub").starts_with("alice@mailhub is given out no longer"));
+    hub.stop();
+    alice.stop();
+    drop(relay);
+    dirs.iter().for_each(|d| drop(std::fs::remove_dir_all(d)));
+}

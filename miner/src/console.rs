@@ -41,9 +41,17 @@ pub const HELP: &str = "commands:
                             spend; and pending, unverified, reserved, locked and lost
                             funds
   outputs                   the wallet's outputs
-  send AMOUNT [FEE] TO      pay AMOUNT to the wallet at TO: its address (tab1…) or its
-                            name (@name). Its wallet answers and this one signs,
-                            with nothing more asked: both must be reached
+  send AMOUNT [FEE] TO      pay AMOUNT to the wallet at TO: its address (tab1…), its
+                            name (@name), or a name under a name (label@name). Its
+                            wallet answers and this one signs, with nothing more
+                            asked: both must be reached
+  subname set LABEL@NAME ADDRESS
+                            give a name under NAME, which this wallet holds, to the
+                            wallet at ADDRESS: it is sent a certificate, signed again
+                            daily while this node runs
+  subname del LABEL@NAME    give it out no longer
+  subname drop LABEL@NAME   be a name this wallet was given no longer
+  subnames                  the names given out, and the names this wallet is
   send-file AMOUNT [FEE] FILE
                             start a payment by file: write the slate to FILE for the
                             recipient to `receive`, then `finalize` its answer
@@ -143,6 +151,22 @@ pub struct Console<B: Backend + 'static, W: Backend> {
     /// Whether what is only for trying things may be done here: on a
     /// network for that, in a build for that.
     pub debug: bool,
+    /// Full names this wallet may be at the most ([`crate::subnames`]).
+    pub max_names: usize,
+    /// What is remembered between the prompt and what takes the
+    /// wallet's messages.
+    pub names: Arc<Mutex<Named>>,
+}
+
+/// What is remembered of full names while the node runs.
+#[derive(Default)]
+pub struct Named {
+    /// The full name each payment begun was sent to, by its slate's
+    /// id: to say it by, whatever becomes of it.
+    sent: std::collections::BTreeMap<[u8; 32], String>,
+    /// The names given out whose certificate did not reach the wallet
+    /// it is for: given again when names are next looked to.
+    again: std::collections::BTreeSet<[u8; 32]>,
 }
 
 /// An amount of coins as it is written: its whole part with commas, and
@@ -213,6 +237,10 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             ("set-leaf-value", [index, value]) => self.set_leaf(index, None, Some(value)),
             ("consensus", []) => self.consensus(),
             ("debug-consensus", [file]) if self.debug => self.debug_consensus(file),
+            ("subname", ["set", full, to]) => self.subname_set(full, to),
+            ("subname", ["del", full]) => self.subname_del(full),
+            ("subname", ["drop", full]) => self.subname_drop(full),
+            ("subnames", []) => self.subnames(),
             ("balance", []) => self.balance(),
             ("address", []) => self.wallet().map(|wallet| wallet.address()),
             ("outputs", []) => self.outputs(),
@@ -671,7 +699,21 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
     /// its wallet answers, and this one signs the answer and pools the
     /// transaction, with nothing more asked of either.
     fn send(&self, amount: &str, fee: Option<&&str>, to: &str) -> Said {
-        let whom = self.whom(to)?;
+        // A name under a name: whose it is, is asked of the nodes the
+        // full name is reached at when the payment is sent. Until one
+        // of them shows it, the payment is to the name.
+        let under = match to.split_once('@') {
+            Some((label, _)) if !label.is_empty() => {
+                let (label, name) = crate::subnames::split(to).ok_or_else(|| format!("'{to}' is no label@name"))?;
+                self.value_of(name)?;
+                Some(crate::subnames::point(label.as_bytes(), name.as_bytes()))
+            }
+            _ => None,
+        };
+        let whom = match under {
+            Some(n) => n,
+            None => self.whom(to)?,
+        };
         let amount = parse_coins(amount).ok_or_else(|| format!("'{amount}' is not an amount of coins"))?;
         let fee = Self::fee(fee)?;
         if !self.hold.reached() {
@@ -689,13 +731,21 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             &slate.id_hex()[..8],
             coins(slate.amount as u128),
             coins(slate.fee as u128),
-            crate::address::encode(&whom)
+            if under.is_some() { to.to_string() } else { crate::address::encode(&whom) }
         );
         (self.log)(&format!("P{}", &done[1..]));
         // Whom it is sent to is kept with it: its answer is taken from
-        // that wallet, and from no other.
+        // that wallet, and from no other. (Of a name under a name,
+        // from nobody until it is known whose the name is.)
         wallet.send_to(&slate.id, &whom).map_err(|e| e.to_string())?;
-        self.hold.post(whom, crate::msg::KIND_SLATE, slate.id, slate.to_text().into_bytes(), None);
+        let body = slate.to_text().into_bytes();
+        match under {
+            Some(n) => {
+                self.names.lock().unwrap_or_else(|e| e.into_inner()).sent.insert(slate.id, to.to_string());
+                self.hold.post_to_name(n, crate::msg::KIND_SLATE, slate.id, body);
+            }
+            None => self.hold.post(whom, crate::msg::KIND_SLATE, slate.id, body, None),
+        }
         Ok(format!("{done}; sent to its wallet, to be answered"))
     }
 
@@ -704,6 +754,9 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
     /// answer sent back; the answer to a slate this wallet began is
     /// signed, and the transaction pooled. What was done, to be said.
     pub fn take(&self, message: &crate::msg::Opened) -> Said {
+        if message.kind == crate::msg::KIND_NAME {
+            return self.given(&message.body);
+        }
         if message.kind != crate::msg::KIND_SLATE {
             return Err(format!("a message of a kind not known ({})", message.kind));
         }
@@ -775,7 +828,25 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
     /// would have spent is the wallet's to spend again. What is to be
     /// said of it.
     pub fn undelivered(&self, to: &crate::hash::Digest, slate: &[u8; 32], why: &str) -> String {
-        let to = crate::address::encode(to);
+        let mut names = self.names.lock().unwrap_or_else(|e| e.into_inner());
+        // (A certificate that did not reach the wallet it is for: its
+        // tag is the id of the name. Given again later.)
+        let given = self.wallet().ok().and_then(|wallet| {
+            wallet
+                .names_given()
+                .into_iter()
+                .find(|g| digest_to_bytes(&crate::subnames::point(&g.label, &g.name)) == *slate)
+        });
+        if let Some(given) = given {
+            names.again.insert(*slate);
+            let holder = crate::address::encode(&given.holder);
+            return format!(
+                "Error: the certificate of {} was not given to {holder} ({why}): it is tried again while this node runs",
+                given.full()
+            );
+        }
+        let to = names.sent.remove(slate).unwrap_or_else(|| crate::address::encode(to));
+        drop(names);
         let given_up =
             self.wallet().is_ok_and(|mut wallet| wallet.sent_to(slate).is_some() && wallet.cancel_slate(slate).is_ok());
         match given_up {
@@ -785,6 +856,183 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             ),
             false => format!("Error: a message to {to} was not delivered ({why})"),
         }
+    }
+
+    /// What `name` says on the chain: the id of whoever holds it.
+    fn value_of(&self, name: &str) -> Result<crate::hash::Digest, String> {
+        let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
+        let snap = state.snapshot().map_err(|e| e.to_string())?;
+        let record = Registry::record(&snap, name.as_bytes()).map_err(|e| e.to_string())?;
+        Ok(record.ok_or_else(|| format!("{name} is not registered"))?.value)
+    }
+
+    /// Whose the full name a payment was sent to turned out to be: its
+    /// answer is taken from that wallet, and from no other.
+    pub fn resolved(&self, slate: &[u8; 32], whom: &crate::hash::Digest) -> Said {
+        let mut wallet = self.wallet()?;
+        if wallet.sent_to(slate).is_none() {
+            return Ok(String::new());
+        }
+        let names = self.names.lock().unwrap_or_else(|e| e.into_inner());
+        let name = names.sent.get(slate).cloned().unwrap_or_default();
+        wallet.send_to(slate, whom).map_err(|e| e.to_string())?;
+        Ok(format!("payment {}: {name} is {}", short(slate), crate::address::encode(whom)))
+    }
+
+    /// Gives `label@name`, a name under a name this wallet holds, to
+    /// the wallet at `to`: a certificate, sent to that wallet.
+    fn subname_set(&self, full: &str, to: &str) -> Said {
+        let (label, name) = crate::subnames::split(full).ok_or_else(|| format!("'{full}' is no label@name"))?;
+        let holder = crate::address::decode(to).ok_or_else(|| format!("'{to}' is no address (tab1…)"))?;
+        let says = self.value_of(name)?;
+        let mut wallet = self.wallet()?;
+        if says != wallet.id() {
+            return Err(format!(
+                "{name} is not this wallet's to give names under: it says {}, and this wallet is {}",
+                crate::address::encode(&says),
+                wallet.address()
+            ));
+        }
+        let unix = (self.unix)();
+        let bundle = wallet.give_name(label.as_bytes(), name.as_bytes(), &holder, unix).map_err(|e| e.to_string())?;
+        let own = holder == wallet.id();
+        drop(wallet);
+        let days = crate::subnames::HOLDS / 86_400;
+        let done = format!("{full} is {to}, by a certificate that holds {days} days and is signed again daily");
+        (self.log)(&format!("Name given: {done}"));
+        match own {
+            true => drop(self.given(&bundle)?),
+            false => self.send_certificate(label.as_bytes(), name.as_bytes(), holder, bundle),
+        }
+        Ok(format!("{done}; sent to that wallet, which is the name once it has it"))
+    }
+
+    fn send_certificate(&self, label: &[u8], name: &[u8], holder: crate::hash::Digest, bundle: Vec<u8>) {
+        let tag = digest_to_bytes(&crate::subnames::point(label, name));
+        self.hold.post(holder, crate::msg::KIND_NAME, tag, bundle, None);
+    }
+
+    /// Gives a name out no longer.
+    fn subname_del(&self, full: &str) -> Said {
+        let (label, name) = crate::subnames::split(full).ok_or_else(|| format!("'{full}' is no label@name"))?;
+        match self.wallet()?.take_name_back(label.as_bytes(), name.as_bytes()).map_err(|e| e.to_string())? {
+            true => Ok(format!(
+                "{full} is given out no longer: its certificate is not signed again, and the last holds until its                  time is past (give the name to another wallet to end it at once)"
+            )),
+            false => Err(format!("{full} is not a name this wallet gave out")),
+        }
+    }
+
+    /// Is a full name no longer.
+    fn subname_drop(&self, full: &str) -> Said {
+        let (label, name) = crate::subnames::split(full).ok_or_else(|| format!("'{full}' is no label@name"))?;
+        let was = self.wallet()?.drop_name(label.as_bytes(), name.as_bytes()).map_err(|e| e.to_string())?;
+        self.reached_by_names()?;
+        match was {
+            true => Ok(format!("this wallet is {full} no longer")),
+            false => Err(format!("this wallet is not {full}")),
+        }
+    }
+
+    /// The names given out, and the full names this wallet is.
+    fn subnames(&self) -> Said {
+        let wallet = self.wallet()?;
+        let unix = (self.unix)();
+        let days = |until: u64| format!("{:.1} days", until.saturating_sub(unix) as f64 / 86_400.0);
+        let mut lines = Vec::new();
+        for (n, _, bundle) in wallet.names_held() {
+            match crate::subnames::read(&bundle, unix) {
+                Some(c) => lines.push(format!(
+                    "this wallet is {}, for {} more: reached by it at {} nodes",
+                    c.full(),
+                    days(c.expires),
+                    self.hold.name_reached(&n)
+                )),
+                None => lines.push("a certificate past its time (it is this wallet's name no longer)".to_string()),
+            }
+        }
+        for given in wallet.names_given() {
+            let to = crate::address::encode(&given.holder);
+            lines.push(format!("given: {} is {to}, for {} more", given.full(), days(given.expires)));
+        }
+        match lines.is_empty() {
+            true => Ok("no names under names: none given, and this wallet is none".to_string()),
+            false => Ok(lines.join("\n")),
+        }
+    }
+
+    /// A certificate has come that this wallet is a name under a name:
+    /// kept, if it is the name's by the chain and names this wallet,
+    /// and the wallet is not too many names already.
+    fn given(&self, bundle: &[u8]) -> Said {
+        let unix = (self.unix)();
+        let checked = crate::subnames::read(bundle, unix).ok_or("what came is no certificate of a name")?;
+        let full = checked.full();
+        let says = self.value_of(&String::from_utf8_lossy(&checked.name))?;
+        if says != checked.by {
+            return Err(format!("a certificate of {full} that is not signed for whoever holds its name: not kept"));
+        }
+        let mut wallet = self.wallet()?;
+        if checked.holder != wallet.id() {
+            return Err(format!("a certificate of {full} that names another wallet: not kept"));
+        }
+        if !wallet.hold_name(&checked, bundle, self.max_names).map_err(|e| e.to_string())? {
+            let held = wallet.names_held();
+            let known = held.iter().any(|(n, seq, _)| *n == checked.point() && *seq >= checked.seq);
+            return match known {
+                true => Ok(String::new()),
+                false => Err(format!(
+                    "a certificate of {full} is not kept: this wallet is {} names already (subname drop one, or                      --max-names)",
+                    held.len()
+                )),
+            };
+        }
+        drop(wallet);
+        self.reached_by_names()?;
+        let days = (checked.expires.saturating_sub(unix)) as f64 / 86_400.0;
+        let done = format!("This wallet is {full}, by a certificate that holds {days:.1} days more");
+        (self.log)(&done);
+        Ok(done)
+    }
+
+    /// Tells the node which full names its wallet is to be reached by:
+    /// those whose certificates hold now.
+    pub fn reached_by_names(&self) -> Result<(), String> {
+        let unix = (self.unix)();
+        let held = self.wallet()?.names_held();
+        let hold = held.into_iter().filter(|(_, _, bundle)| crate::subnames::read(bundle, unix).is_some());
+        self.hold.set_names(hold.collect());
+        Ok(())
+    }
+
+    /// Looks to the names given out: signs another certificate for
+    /// each whose last was signed a day ago, and for each whose last
+    /// did not reach its wallet, and sends it.
+    pub fn renew_names(&self) -> Result<(), String> {
+        let unix = (self.unix)();
+        let again = std::mem::take(&mut self.names.lock().unwrap_or_else(|e| e.into_inner()).again);
+        let mut wallet = self.wallet()?;
+        let at = |g: &crate::wallet::Given| digest_to_bytes(&crate::subnames::point(&g.label, &g.name));
+        let mut due = wallet.names_to_renew(unix);
+        due.extend(wallet.names_given().into_iter().filter(|g| again.contains(&at(g))));
+        for given in due {
+            // (Only of a name that is still this wallet's.)
+            let name = String::from_utf8_lossy(&given.name).to_string();
+            if self.value_of(&name).ok() != Some(wallet.id()) {
+                continue;
+            }
+            let bundle = wallet.give_name(&given.label, &given.name, &given.holder, unix).map_err(|e| e.to_string())?;
+            match given.holder == wallet.id() {
+                true => drop(wallet.hold_name(
+                    &crate::subnames::read(&bundle, unix).ok_or("no certificate")?,
+                    &bundle,
+                    usize::MAX,
+                )),
+                false => self.send_certificate(&given.label, &given.name, given.holder, bundle),
+            }
+        }
+        drop(wallet);
+        self.reached_by_names()
     }
 
     fn receive(&self, file: &str, out: &str) -> Said {
@@ -994,19 +1242,22 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         ))
     }
 
-    /// What a name says, as it is written: 64 hex digits; nothing, for
-    /// `-`.
+    /// What a name says, as it is written: an address (`tab1…`), or
+    /// 64 hex digits; nothing, for `-`.
     fn value(text: &str) -> Result<crate::hash::Digest, String> {
         if text == "-" {
             return Ok([crate::poseidon2::Fp::ZERO; 8]);
+        }
+        if let Some(id) = crate::address::decode(text) {
+            return Ok(id);
         }
         let bytes: Vec<u8> = match text.len() == 64 && text.is_ascii() {
             true => (0..32).filter_map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok()).collect(),
             false => Vec::new(),
         };
-        crate::poseidon2::digest_from_bytes(&bytes)
-            .filter(|_| bytes.len() == 32)
-            .ok_or_else(|| format!("'{text}' is not what a name says: 64 hex digits, or - for nothing"))
+        crate::poseidon2::digest_from_bytes(&bytes).filter(|_| bytes.len() == 32).ok_or_else(|| {
+            format!("'{text}' is not what a name says: an address (tab1…), 64 hex digits, or - for nothing")
+        })
     }
 
     fn hex(d: &crate::hash::Digest) -> String {

@@ -748,3 +748,43 @@ fn a_slate_is_kept_with_whom_it_was_sent_to() {
     wallet.send_to(&again.id, &mallory).unwrap();
     assert_eq!((wallet.sent_to(&again.id), wallet.sent_to(&to_bob.id)), (Some(mallory), None));
 }
+
+/// A wallet keeps the names it gives out under a name, signing for
+/// each a certificate of a higher number than the last; and the full
+/// names it is itself, so many of them, each by its newest
+/// certificate. Both as they were when its file is opened again.
+#[test]
+fn names_under_names_are_kept() {
+    use crate::subnames::{HOLDS, RENEWED, point, read};
+    let mut owner = new();
+    let mut alice = new();
+    let unix = 1_800_000_000;
+    let first = owner.give_name(b"alice", b"mailhub", &alice.id(), unix).unwrap();
+    let checked = read(&first, unix).unwrap();
+    assert_eq!((checked.full(), checked.holder, checked.by), ("alice@mailhub".to_string(), alice.id(), owner.id()));
+    assert_eq!((checked.seq, checked.expires, checked.delegated), (unix, unix + HOLDS, false));
+    // Again at once: a higher number. Not due again until a day on.
+    let again = read(&owner.give_name(b"alice", b"mailhub", &alice.id(), unix).unwrap(), unix).unwrap();
+    assert_eq!(again.seq, unix + 1);
+    assert!(owner.names_to_renew(unix + RENEWED).is_empty());
+    assert_eq!(owner.names_to_renew(unix + RENEWED + 1).len(), 1);
+    assert_eq!(reopened(&owner, "").unwrap().names_given(), owner.names_given());
+    assert_eq!(owner.names_given()[0].full(), "alice@mailhub");
+    // Held: by the wallet it names, the newest, and so many.
+    assert!(!owner.hold_name(&checked, &first, 5).unwrap(), "it names another wallet");
+    assert!(alice.hold_name(&checked, &first, 5).unwrap());
+    assert!(!alice.hold_name(&checked, &first, 5).unwrap(), "no newer than the one held");
+    let newer = owner.give_name(b"alice", b"mailhub", &alice.id(), unix).unwrap();
+    assert!(alice.hold_name(&read(&newer, unix).unwrap(), &newer, 5).unwrap());
+    let other = owner.give_name(b"al", b"mailhub", &alice.id(), unix).unwrap();
+    assert!(!alice.hold_name(&read(&other, unix).unwrap(), &other, 1).unwrap(), "one name is the most");
+    assert!(alice.hold_name(&read(&other, unix).unwrap(), &other, 2).unwrap());
+    let held = reopened(&alice, "").unwrap().names_held();
+    assert_eq!(held, alice.names_held());
+    assert_eq!(held.len(), 2);
+    assert!(held.contains(&(point(b"alice", b"mailhub"), unix + 2, newer)));
+    // Let go of, on either side.
+    assert!(alice.drop_name(b"alice", b"mailhub").unwrap() && !alice.drop_name(b"alice", b"mailhub").unwrap());
+    assert!(owner.take_name_back(b"al", b"mailhub").unwrap() && !owner.take_name_back(b"al", b"mailhub").unwrap());
+    assert_eq!((alice.names_held().len(), owner.names_given().len()), (1, 1));
+}

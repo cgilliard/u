@@ -652,6 +652,30 @@ ahead or behind, finds it. In a build with the dev networks, on one of them,
 the command `debug-consensus FILE` puts a file in force at that node
 alone, whatever the chain has decided.
 
+**Names under names.** The chain keeps a few names a block: not one
+for everybody. Whoever holds a name gives out names under it,
+`label@name`, as many as it likes, and the chain knows nothing of
+them. The wallet whose address `mailhub` says (`name-update mailhub
+tab1…`) gives one with `subname set alice@mailhub tab1…`: it signs a
+certificate that the name is that wallet, holding seven days and
+signed again daily while the node runs, and sends it to that wallet
+over the message layer. The wallet that is given a name is reached by
+it from then on (five names at the most, or `--max-names`; `subname
+drop alice@mailhub` to be one no longer): beside the nodes its address
+is reached at it is held at those the full name is reached at, and
+shows them the certificate, which they check against the chain.
+`send 5 alice@mailhub` asks those nodes, is shown the certificate with
+what the wallet announces, checks it against the chain too, and pays
+the wallet it names: one asking, as for an address, and the same at
+the seeds and by ways through relays. Nothing is kept anywhere for a
+wallet that is not there: a name resolves while its wallet is reached.
+`subnames` says the names given and the names the wallet is; `subname
+del alice@mailhub` signs for one no longer (its last certificate holds
+until its time is past; giving the name to another wallet ends it at
+once, the newer certificate taking its place). A name that says
+another address on the chain is given under by that wallet from then
+on, and every certificate of the wallet before it is nothing.
+
 **A wallet made again.** `--restore` makes the wallet from its twelve
 words, which it asks for, where the data directory has no wallet (it
 is never made over one that is there). What the wallet holds is in the

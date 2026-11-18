@@ -155,6 +155,12 @@ const OPTIONS: &[(&str, &[Opt])] = &[
                 help: "with --relay: wallets a session is held for at the most\n(default 10000)",
             },
             Opt {
+                name: "max-names",
+                takes: Takes::Value("N"),
+                help: "names under names the wallet takes at the most, of those it
+is given (default 5)",
+            },
+            Opt {
                 name: "mempool-size",
                 takes: Takes::Value("SIZE"),
                 help: "bytes of transactions waiting for a block that are kept at\nthe most: what pays least gives way to what pays more\n(default 64m)",
@@ -492,6 +498,8 @@ pub struct Configuration {
     pub blocks: Option<u64>,
     /// Seconds waited after a block made here before the next is begun.
     pub delay_blocks: u64,
+    /// Names under names the wallet takes at the most.
+    pub max_names: usize,
     pub listen: SocketAddrV4,
     /// Peers given by hand.
     pub peers: Vec<SocketAddrV4>,
@@ -898,6 +906,7 @@ impl Configuration {
             debug_blocks: given.number("debug-blocks", 1)?.map(|n| n.min(u32::MAX as u64) as u32),
             blocks: given.number("blocks", 0)?,
             delay_blocks: given.number("delay-blocks", 0)?.unwrap_or(0),
+            max_names: given.number("max-names", 0)?.unwrap_or(5) as usize,
             listen,
             peers,
             seeds,
