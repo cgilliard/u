@@ -28,7 +28,8 @@
 use crate::address::id_of;
 use crate::chacha20poly1305 as aead;
 use crate::codec::packed;
-use crate::hash::{Digest, hash_domain_of};
+use crate::hash::{Digest, hash_domain, hash_domain_of};
+use crate::poseidon2::Fp;
 use crate::poseidon2::{digest_from_bytes, digest_to_bytes};
 use crate::{mldsa, mlkem};
 
@@ -239,9 +240,10 @@ pub fn points(id: &Digest, epoch: u32, nodes: usize) -> Vec<usize> {
     let mut chosen: Vec<usize> = Vec::with_capacity(3);
     let mut k = 0u32;
     while chosen.len() < nodes.min(3) {
-        let input =
-            id.iter().copied().chain([crate::poseidon2::Fp::new(epoch & 0x3fff_ffff), crate::poseidon2::Fp::new(k)]);
-        let drawn = hash_domain_of(DOM_POINT, input.collect::<Vec<_>>().into_iter());
+        let mut input = [Fp::ZERO; 10];
+        input[..8].copy_from_slice(id);
+        (input[8], input[9]) = (Fp::new(epoch & 0x3fff_ffff), Fp::new(k));
+        let drawn = hash_domain(DOM_POINT, &input);
         let index = (drawn[0].to_canonical() as usize) % nodes;
         if !chosen.contains(&index) {
             chosen.push(index);
