@@ -451,6 +451,16 @@ says so:
 [2026-11-17 19:02:11:403] Block 7 carries 3 transactions of the pool (8 signatures)
 ```
 
+**A chain of other rules.** A block's proof builds on the proof of the
+block before, by the network's rules as the program has them. A data
+directory whose chain was made by a build of other rules (a
+development build, before a rule was changed) cannot be gone on with:
+the node says so when it starts, and stops.
+
+```
+Error: the chain in /home/chris/.tabernacle/tabminer/chain.store was made under other rules than this build's (the proof of its last block is not one this build takes): it cannot be gone on with. Give another --data-dir, or remove that one
+```
+
 **The table of the proof of work.** A miner hashes against a table: 1.1
 GB on mainnet (it doubles each year, to 32 GB), 64 KB and built in on
 the dev networks. Its memory is taken when the node starts making
@@ -459,6 +469,11 @@ blocks.
 - **It is made once, and kept.** When it is whole it is written to
   `pow.table` in the data directory, and every later run reads it from
   there and says so.
+- **`--pow-table FILE`** keeps it somewhere else: somewhere of its
+  own, it outlasts a data directory that is thrown away, and is not
+  made again for the next. The table is of the network and of the
+  chain's year, not of a node: nodes of one machine may be given the
+  one file, though only one of them is to be making it at a time.
 - **Unless told otherwise it is made while blocks are**: what is read
   of it is filled as it is read, so blocks are made from the first
   moment, and a thread fills the rest. Until it is whole, looking for a
@@ -685,8 +700,7 @@ blocks, the one that made an output counted, unless
 undone is no output, and a payment that spent it no payment; a
 miner's newest reward, the largest it has, is of the block most likely
 to be. The chain has no such rule (an output may be spent in the
-block after its own): this is the wallet's own care. `balance` says
-how much of what is confirmed is there to spend yet.
+block after its own): this is the wallet's own care.
 
 Amounts are in coins, with up to ten decimals. A fee is coins in all,
 or `N/byte`; not given, it is the least the pool takes.
@@ -721,7 +735,17 @@ it, and nothing has to be done:
 [2026-11-17 21:14:51:977] The wallet: 1 outputs that were lost are in the chain again
 ```
 
-**What a balance says.** Confirmed: unspent, and in the chain.
+**What a balance says.** Spendable: unspent, and in the chain for as
+many blocks as the wallet waits before it spends. Confirmed: in the
+chain, and for fewer blocks than that; it becomes spendable of itself.
+
+```
+> balance
+spendable   1,500
+confirmed   3,000  (in the chain for fewer than 6 blocks: not spent yet)
+pending     1,500
+```
+
 Pending: the wallet's own, not yet in the chain (change, the reward of
 a block being made). Unverified: an output added to another's slate,
 which is nothing until its sender finalizes and a block carries it.

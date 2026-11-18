@@ -277,7 +277,7 @@ fn a_payment_is_made_at_the_prompt_and_mined() {
     let mut other = start(1, false);
     let confirmed = |node: &mut (Running, ChildStdin, ChildStdout)| {
         let said = ask(node, "balance");
-        said.lines().next().unwrap().trim_start_matches("confirmed").trim().to_string()
+        said.lines().next().unwrap().trim_start_matches("spendable").trim().to_string()
     };
     let wait = |what: &str, done: &mut dyn FnMut() -> bool| {
         let began = Instant::now();
@@ -413,7 +413,7 @@ impl Prompted {
     }
 
     fn confirmed(&mut self) -> String {
-        self.ask("balance").lines().next().unwrap().trim_start_matches("confirmed").trim().to_string()
+        self.ask("balance").lines().next().unwrap().trim_start_matches("spendable").trim().to_string()
     }
 
     fn height(&mut self) -> u64 {
@@ -514,7 +514,7 @@ fn a_payment_survives_the_chain_going_over_to_another_branch() {
     assert_eq!(maker.ask("sent"), "no payments sent that are not in a block\n");
     assert!(other.ask("balance").contains("unverified  3"));
     assert!(other.ask("prune").starts_with("1 outputs expected"));
-    assert_eq!(other.ask("balance"), "confirmed   12.5\n");
+    assert_eq!(other.ask("balance"), "spendable   12.5\n");
     for node in [maker, other, third] {
         node.stop();
     }

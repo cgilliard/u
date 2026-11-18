@@ -29,7 +29,8 @@ pub const HELP: &str = "commands:
   status                    the chain's last block, peers, the pool, the wallet's total
   peers                     how many peers are known, and how many are live
   mempool                   the transactions waiting to be mined
-  balance                   confirmed, pending, unverified, reserved, locked and lost
+  balance                   what there is to spend; what is confirmed but too new to
+                            spend; and pending, unverified, reserved, locked and lost
                             funds
   outputs                   the wallet's outputs
   send-file AMOUNT [FEE] FILE
@@ -279,9 +280,15 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
     fn balance(&self) -> Said {
         let wallet = self.wallet()?;
         let b = follow::balance(self.hold.chain(), &wallet).map_err(|e| e.to_string())?;
-        let mut out = format!("confirmed   {}", coins(b.confirmed));
-        if b.spendable != b.confirmed {
-            out.push_str(&format!("\n  of which, in the chain long enough to spend: {}", coins(b.spendable)));
+        // What is there to spend, first; then what is confirmed and
+        // has not been in the chain long enough to be.
+        let mut out = format!("spendable   {}", coins(b.spendable));
+        if b.confirmed > b.spendable {
+            out.push_str(&format!(
+                "\nconfirmed   {}  (in the chain for fewer than {} blocks: not spent yet)",
+                coins(b.confirmed - b.spendable),
+                wallet.min_confirmations()
+            ));
         }
         let rest = [
             ("pending", b.pending),
@@ -341,6 +348,25 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         Slate::from_text(&text).ok_or_else(|| format!("{file} holds no slate"))
     }
 
+    /// What is said of a payment the wallet could not make: where it
+    /// has the funds and they have not been in the chain long enough to
+    /// spend, that, and not that it has none.
+    fn short_of(wallet: &Wallet<W>, chain: &impl crate::wallet::Unspent, e: crate::wallet::WalletError) -> String {
+        let crate::wallet::WalletError::Insufficient { have, need } = e else { return e.to_string() };
+        let waiting = wallet.balance(chain).map_or(0, |b| b.confirmed.saturating_sub(b.spendable));
+        let blocks = wallet.min_confirmations();
+        match waiting {
+            0 => format!("insufficient funds: {} to spend, {} needed", coins(have), coins(need)),
+            waiting => format!(
+                "nothing to spend it from yet: {} to spend, {} needed. {} more is confirmed, but the wallet spends \
+                 only what has been in the chain for {blocks} blocks (--min-confirmations)",
+                coins(have),
+                coins(need),
+                coins(waiting)
+            ),
+        }
+    }
+
     /// A fee as it is written: coins in all, or `N/byte`; the least
     /// that will do if none is.
     fn fee(text: Option<&&str>) -> Result<Fee, String> {
@@ -366,7 +392,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         let mut wallet = self.wallet()?;
         let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
         let snap = state.snapshot().map_err(|e| e.to_string())?;
-        let slate = wallet.send(amount, fee, &snap, (self.unix)()).map_err(|e| e.to_string())?;
+        let slate = wallet.send(amount, fee, &snap, (self.unix)()).map_err(|e| Self::short_of(&wallet, &snap, e))?;
         let done = format!(
             "payment {} begun: {} and a fee of {}, from {} outputs",
             &slate.id_hex()[..8],
@@ -647,13 +673,13 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         let signed = {
             let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
             let snap = state.snapshot().map_err(|e| e.to_string())?;
-            wallet.carry(vec![op.clone()], fee, &snap, unix)
+            wallet.carry(vec![op.clone()], fee, &snap, unix).map_err(|e| Self::short_of(wallet, &snap, e))
         };
         let signed = match signed {
             Ok(signed) => signed,
             Err(e) => {
                 wallet.undo_name_op(&op).map_err(|e| e.to_string())?;
-                return Err(e.to_string());
+                return Err(e);
             }
         };
         let id = short(&digest_to_bytes(&signed.tx.txid()));

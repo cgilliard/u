@@ -490,6 +490,16 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     let backend = FileBackend::open(&store).map_err(|e| format!("cannot open the store {}: {e}", store.display()))?;
     let chain = Chain::open(backend, c.keep, params, seed, verifier)
         .map_err(|e| format!("cannot open the store {}: {e}", store.display()))?;
+    // A chain made under other rules than this build's is not gone on
+    // with: nothing made here could build on it, and nothing of it
+    // would be taken from a peer.
+    if matches!(miner::last_proof_holds(&chain), Ok(false)) {
+        return Err(format!(
+            "the chain in {} was made under other rules than this build's (the proof of its last block is not one \
+             this build takes): it cannot be gone on with. Give another --data-dir, or remove that one",
+            store.display()
+        ));
+    }
     // The table of the proof of work, where the network's is built in:
     // headers are checked against it, and blocks made with it.
     if let Some(dataset) = Dataset::built_in(&seed) {
@@ -497,7 +507,12 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     }
     // Blocks are made with a table of their own, which fills as it is
     // read and is kept in the data directory from one run to the next.
-    let mining = c.mine.then(|| (seed, c.data_dir.join("pow.table")));
+    // (Where the table is kept may be somewhere of its own, which is
+    // made if it is not there.)
+    if let Some(dir) = c.pow_table.parent().filter(|_| c.mine) {
+        made(dir)?;
+    }
+    let mining = c.mine.then(|| (seed, c.pow_table.clone()));
 
     // The port.
     let socket = UdpSocket::bind(c.listen).map_err(|e| format!("cannot listen on {}: {e}", c.listen))?;

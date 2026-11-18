@@ -364,6 +364,13 @@ pub fn mine_with<B: Backend + 'static, S: ItemSource + Sync>(
         true => Some(before(chain, &tip, first_output_position)?),
         false => None,
     };
+    // (A proof before that this build does not take is not built on:
+    // the block's own could not be made, and is not tried.)
+    if let Some((statement, body)) = &before
+        && chain.verifier().verify_chain_proof(tip.height, statement, proof_of(body)).is_err()
+    {
+        return Err(Error::BadProof);
+    }
     let mut body = body_from_segments(&segments, &names, vec![]);
     let unproven = body.to_bytes();
     let unproven = BodyRef::from_bytes(&unproven)?;
@@ -412,6 +419,26 @@ pub fn mine_with<B: Backend + 'static, S: ItemSource + Sync>(
     let header = Header { nonce, mix, ..header };
     let solved = began.elapsed();
     Ok(Mined::Block { block: Block { header, body }.to_bytes(), header, proved: took, hashes, solved })
+}
+
+/// Whether the proof of `chain`'s last block is one this build takes:
+/// true where there is none to hold (the first block, a network whose
+/// proofs stand alone).
+///
+/// A block's proof builds on the proof of the block before, and says
+/// so in a program that is the network's rules: its circuits, and the
+/// numbers in them. A chain made by a build of other rules has proofs
+/// this build's blocks cannot build on, and it would not take that
+/// chain's blocks from a peer either. Such a chain is not to be gone on
+/// with: whoever starts a node on one is told, before anything is made.
+pub fn last_proof_holds<B: Backend + 'static>(chain: &Chain<B, AggregateVerifier>) -> Result<bool, Error> {
+    let tip = chain.tip()?;
+    if !chain.verifier().needs_plan() || tip.height == 0 {
+        return Ok(true);
+    }
+    let end = chain.whole()?.snapshot()?.outputs().next;
+    let (statement, body) = before(chain, &tip, end)?;
+    Ok(chain.verifier().verify_chain_proof(tip.height, &statement, proof_of(&body)).is_ok())
 }
 
 /// The proof in a body kept by the chain.
