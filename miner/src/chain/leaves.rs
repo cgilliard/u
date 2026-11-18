@@ -141,6 +141,34 @@ impl<B: Backend + 'static, V> Chain<B, V> {
         Ok(Votes::tally((first, end), all.into_iter()))
     }
 
+    /// The consensus file in force: what the votes of the window ending
+    /// at the last boundary at or under the chain's last block decided
+    /// ([`crate::consensus::boundary`]), of the files held. It changes
+    /// only at a boundary; until the first, or while nothing that
+    /// counts was voted for, the mode is init. With the votes it was
+    /// decided from.
+    pub fn consensus(&self) -> Result<(crate::consensus::Current, Votes), Error> {
+        let tip = self.store().view()?.tip().0;
+        let end = crate::consensus::boundary(tip);
+        let votes = match end {
+            // (Before the first boundary nothing has been decided.)
+            0 => Votes::default(),
+            _ => self.consensus_votes_at(end, crate::consensus::WINDOW)?,
+        };
+        let mut failed = None;
+        let current = crate::consensus::Current::decide(&votes, |hash| match self.consensus_file(hash) {
+            Ok(file) => file,
+            Err(e) => {
+                failed = Some(e);
+                None
+            }
+        });
+        match failed {
+            Some(e) => Err(e),
+            None => Ok((current, votes)),
+        }
+    }
+
     /// Holds a consensus file; returns its SHA-256, the value that votes
     /// for it. [`Error::TooLarge`] for one larger than a file may be.
     pub fn put_consensus_file(&self, bytes: &[u8]) -> Result<Hash, Error> {

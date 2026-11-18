@@ -30,6 +30,11 @@ pub const HELP: &str = "commands:
   peers                     how many peers are known, and how many are live
   fees                      what a payment is to pay a byte, to be in a block soon, by
                             the hour, or within the day
+  leaves                    the sixteen leaves the blocks made here commit to
+  set-leaf INDEX FILE       set leaf INDEX (0 to 15) to the SHA-256 of FILE; leaf 0 is
+                            the vote for a consensus file, which FILE must be
+  set-leaf-value INDEX HEX  set leaf INDEX to 32 bytes given in hex (all zero: none)
+  consensus                 the consensus file in force, and how it is voted on
   mempool                   the transactions waiting to be mined
   address                   this wallet's address: what it is known by, as tab1…
   balance                   what there is to spend; what is confirmed but too new to
@@ -197,6 +202,10 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             ("peers", []) => self.peers(),
             ("mempool", []) => self.mempool(),
             ("fees", []) => self.fees(),
+            ("leaves", []) => self.leaves(),
+            ("set-leaf", [index, file]) => self.set_leaf(index, Some(file), None),
+            ("set-leaf-value", [index, value]) => self.set_leaf(index, None, Some(value)),
+            ("consensus", []) => self.consensus(),
             ("balance", []) => self.balance(),
             ("address", []) => self.wallet().map(|wallet| wallet.address()),
             ("outputs", []) => self.outputs(),
@@ -239,10 +248,10 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             ("name-transfer", [file, fee]) => self.name_transfer(file, Some(fee)),
             ("scan", []) => self.scan(),
             (
-                "status" | "peers" | "mempool" | "fees" | "balance" | "address" | "outputs" | "send-file" | "receive"
-                | "finalize" | "slates" | "sent" | "cancel" | "bump" | "resend" | "prune" | "seed" | "password"
-                | "scan" | "help" | "quit" | "exit" | "names" | "name" | "name-commit" | "name-reveal" | "name-update"
-                | "name-offer" | "name-transfer",
+                "status" | "peers" | "mempool" | "fees" | "leaves" | "set-leaf" | "set-leaf-value" | "consensus"
+                | "balance" | "address" | "outputs" | "send-file" | "receive" | "finalize" | "slates" | "sent"
+                | "cancel" | "bump" | "resend" | "prune" | "seed" | "password" | "scan" | "help" | "quit" | "exit"
+                | "names" | "name" | "name-commit" | "name-reveal" | "name-update" | "name-offer" | "name-transfer",
                 _,
             ) => Err(format!("{command}: not what it takes (see help)")),
             _ => Err(format!("{command}: no such command (see help)")),
@@ -320,6 +329,108 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
     fn peers(&self) -> Said {
         let standing = self.hold.read();
         Ok(format!("{} peers known, {} of them live", commas(standing.peers as u64), commas(standing.live as u64)))
+    }
+
+    /// The sixteen leaves the blocks made here commit to, and their
+    /// root: what a header's auxiliary bytes are.
+    fn leaves(&self) -> Said {
+        let chain = self.hold.chain();
+        let leaves = chain.aux_leaves().map_err(|e| e.to_string())?;
+        let hex = |bytes: &[u8; 32]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let mut lines: Vec<String> = Vec::new();
+        for (i, leaf) in leaves.iter().enumerate().filter(|(_, leaf)| **leaf != [0u8; 32]) {
+            let what = if i == 0 { "  (the vote for a consensus file)" } else { "" };
+            lines.push(format!("  {i:>2}  {}{what}", hex(leaf)));
+        }
+        if lines.is_empty() {
+            return Ok("no leaf is set: the blocks made here commit to nothing".to_string());
+        }
+        lines.push(format!("root  {}", hex(&chain.aux_root().map_err(|e| e.to_string())?)));
+        Ok(lines.join("\n"))
+    }
+
+    /// Sets one of the leaves: to the SHA-256 of a file, or to 32 bytes
+    /// given in hex. Leaf 0 is the vote for a consensus file: the file
+    /// must be one, and is kept, to be served to whoever asks for what
+    /// was voted for.
+    fn set_leaf(&self, index: &str, file: Option<&str>, value: Option<&str>) -> Said {
+        use crate::chain::leaves::AUX_LEAVES;
+        let chain = self.hold.chain();
+        let index: usize = index.parse().ok().filter(|i| *i < AUX_LEAVES).ok_or("the leaves are 0 to 15")?;
+        let (leaf, said) = match (file, value) {
+            (Some(file), _) => {
+                let bytes = std::fs::read(file).map_err(|e| format!("{file}: {e}"))?;
+                match index {
+                    0 => {
+                        let parsed = crate::consensus::File::parse(&bytes).map_err(|e| format!("{file}: {e}"))?;
+                        let hash = chain.put_consensus_file(&bytes).map_err(|e| e.to_string())?;
+                        (hash, format!("the blocks made here vote for {file}: mode {}", parsed.mode))
+                    }
+                    _ => (crate::sha256::sha256(&bytes), format!("leaf {index} is the SHA-256 of {file}")),
+                }
+            }
+            (None, Some(value)) => {
+                let digits = value.as_bytes();
+                if digits.len() != 64 || !digits.iter().all(u8::is_ascii_hexdigit) {
+                    return Err("the value is 64 hex digits".to_string());
+                }
+                let leaf: [u8; 32] =
+                    core::array::from_fn(|i| u8::from_str_radix(&value[2 * i..2 * i + 2], 16).unwrap());
+                // (A vote is for a file this node can hand over: not
+                // for whatever a number happens to name. But none at
+                // all is a vote withdrawn.)
+                if index == 0 && leaf != [0u8; 32] && chain.consensus_file(&leaf).map_err(|e| e.to_string())?.is_none()
+                {
+                    return Err("leaf 0 is a vote for a consensus file: set it with set-leaf 0 FILE".to_string());
+                }
+                (leaf, format!("leaf {index} is set"))
+            }
+            (None, None) => return Err("nothing to set it to".to_string()),
+        };
+        let root = chain.set_aux_leaf(index, leaf).map_err(|e| e.to_string())?;
+        (self.log)(&format!("Leaf {index} of the blocks made here was set"));
+        let hex: String = root.iter().map(|b| format!("{b:02x}")).collect();
+        Ok(format!("{said}\nroot  {hex}"))
+    }
+
+    /// The consensus file in force, how it was voted for, and what it
+    /// says.
+    fn consensus(&self) -> Said {
+        use crate::consensus::{WINDOW, boundary};
+        let chain = self.hold.chain();
+        let (current, votes) = chain.consensus().map_err(|e| e.to_string())?;
+        let hex = |bytes: &[u8; 32]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let height = self.hold.read().height;
+        let mut lines = vec![format!("mode {}", current.mode)];
+        match boundary(height) {
+            0 => lines.push(format!("nothing is decided before block {WINDOW}: until then the mode is init")),
+            at => lines.push(format!(
+                "decided at block {}, of the votes of blocks {} to {}: {} of {} voted",
+                commas(at as u64),
+                commas(votes.range.0 as u64),
+                commas(votes.range.1 as u64),
+                commas(votes.cast() as u64),
+                commas(votes.blocks as u64)
+            )),
+        }
+        lines.push(format!("the next is decided at block {}", commas((boundary(height) + WINDOW) as u64)));
+        if let Some((hash, n)) = &current.winner {
+            lines.push(format!("in force: {} ({} votes)", hex(hash), commas(*n as u64)));
+        }
+        for (hash, n, why) in &current.skipped {
+            lines.push(format!("not counted: {} ({} votes): {why}", hex(hash), commas(*n as u64)));
+        }
+        if let Some(file) = &current.file {
+            for relay in &file.relays {
+                lines.push(format!("  relay {} {}", crate::address::encode(&relay.id), relay.addr));
+            }
+        }
+        // What is being voted for now, towards the next boundary.
+        let running = chain.consensus_votes(height + 1 - boundary(height)).map_err(|e| e.to_string())?;
+        for (hash, n, _) in &running.counts {
+            lines.push(format!("since then: {} has {} votes", hex(hash), commas(*n as u64)));
+        }
+        Ok(lines.join("\n"))
     }
 
     /// What a payment is to pay to be in a block soon, by the hour, or

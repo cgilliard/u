@@ -413,7 +413,7 @@ pub fn mine_with<B: Backend + 'static, S: ItemSource + Sync>(
         timestamp: unix.max(chain.earliest_timestamp(&tip)?),
         body_commitment: body.commitment(),
         state_root,
-        aux: [0; 32],
+        aux: chain.aux_root()?,
         mix: tip.mix,
         nonce: [0; 32],
     };
@@ -558,7 +558,7 @@ pub fn mine_filled<B: Backend + 'static, S: ItemSource + Sync>(
         timestamp: unix.max(chain.earliest_timestamp(&tip)?),
         body_commitment: body.commitment(),
         state_root,
-        aux: [0; 32],
+        aux: chain.aux_root()?,
         mix: tip.mix,
         nonce: [0; 32],
     };
@@ -631,7 +631,7 @@ pub fn extend_empty<B: Backend + 'static>(
             timestamp: timestamp.min(unix),
             body_commitment: body.commitment(),
             state_root,
-            aux: [0; 32],
+            aux: chain.aux_root()?,
             mix: tip.mix,
             nonce: [0; 32],
         };

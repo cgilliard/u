@@ -439,6 +439,15 @@ fn make_block(
             let settled = hold.settled();
             hold.mined(block, socket::unix());
             hold.wait_settled(settled, Duration::from_secs(600));
+            // Its leaves are the node's own, which nobody else has: kept
+            // with it, for whoever asks what its header commits to.
+            // (Unless they were set to something else meanwhile, or the
+            // block was not taken: then there is nothing to keep.)
+            if header.aux != [0u8; 32]
+                && let Ok(leaves) = hold.chain().aux_leaves()
+            {
+                let _ = hold.chain().put_aux_leaves(&header.hash(), &leaves);
+            }
             // (And then for as long as it was told to, before the next.)
             std::thread::sleep(making.delay);
         }
