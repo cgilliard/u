@@ -238,6 +238,8 @@ mod tests {
             Object::Proof { block: d, position: rng.next_u64() },
             Object::File(d),
             Object::Tx(d),
+            Object::Announce { id: d, seq: rng.next_u64() },
+            Object::Sealed(d),
         ]
     }
 

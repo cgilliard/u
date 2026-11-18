@@ -607,8 +607,23 @@ wallet's signature. `status` says at how many of them the wallet is
 reached. A node stands between wallets only if it is started with
 `--relay`: it then holds a session for each wallet that says it is
 there (`--max-sessions`, 10,000 if not said, and sixteen of one host),
-and forgets one that has said nothing for a minute and a half. Nothing
-is sent through them yet.
+and forgets one that has said nothing for a minute and a half. A
+wallet need be nothing else to the nodes it is reached at: they are
+addresses, not peers. (While they are the seeds they are in fact both:
+that is this mode, in which nothing is hidden from them but what is
+said.)
+
+**Paying an address.** `send AMOUNT TO` pays the wallet at `TO`, an
+address or a name (`@name`, whose value is an address). The slate is
+sealed to a key that wallet announced and handed to a node it is
+reached at, which passes it on: that node learns whom it is for and
+how long it is, not who sent it or what it says. The other wallet
+answers of itself, this one signs the answer and pools the
+transaction, and the main log of each says its part. Both must be
+reached: there is nowhere a message waits for a wallet that is not
+there, and one that cannot be passed on is said so within a minute
+(the payment is then to be taken back with `cancel`). `send-file`,
+`receive` and `finalize` do the same by hand, through files.
 
 **A wallet made again.** `--restore` makes the wallet from its twelve
 words, which it asks for, where the data directory has no wallet (it

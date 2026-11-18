@@ -551,6 +551,9 @@ pub(crate) struct Shared {
     /// The wallet this node is the node of, on the message layer: none
     /// unless it was given one ([`Handle::participate`]).
     participant: Mutex<Option<super::sessions::Participant>>,
+    /// The messages of the node: those its wallet sends, those it
+    /// passes on, those that have come for its wallet.
+    letters: Mutex<super::sessions::Mail>,
     /// The nodes wallets are reached at while no consensus file names
     /// others: the seeds, and the peers the node was given.
     seeds: Mutex<BTreeSet<SocketAddrV4>>,
@@ -630,6 +633,9 @@ pub enum Event {
     /// The state is being taken whole, as of this block; `again` if in
     /// place of an earlier one that nobody can serve any more.
     StateWanted { height: u32, id: Digest, again: bool },
+    /// A message has come for this node's wallet
+    /// ([`Handle::take_messages`]).
+    Mail,
     /// Another consensus file is in force, or none: the mode the
     /// message layer is in from here on.
     Consensus { mode: crate::consensus::Mode, file: Option<crate::consensus::Hash> },
@@ -881,6 +887,12 @@ pub struct Worker<B: Backend + 'static, V> {
     grants: VecDeque<(SocketAddrV4, u64)>,
     /// The time by the clock, as last told.
     now: Micros,
+    /// What is to be said to whom when there is next a way to say it:
+    /// of what was found where there was none.
+    to_say: Vec<(SocketAddrV4, Message<'static>)>,
+    /// Sealed messages offered to this node to pass on, being asked
+    /// for: the message, whom it is for, and who offered it.
+    offered: Vec<(Digest, Digest, SocketAddrV4)>,
     /// The leaves asked for and not yet here: of which block, of whom.
     leaves_asked: Vec<(Digest, SocketAddrV4)>,
     /// When the votes were last looked to ([`Worker::follow_votes`]),
@@ -956,6 +968,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             was_live: Vec::new(),
             grants: VecDeque::new(),
             now,
+            to_say: Vec::new(),
+            offered: Vec::new(),
             leaves_asked: Vec::new(),
             votes_looked: 0,
             votes_turn: 0,
@@ -1167,7 +1181,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         }
         let mut due = Vec::new();
         for node in points {
-            if !own.due(&node, now, self.cfg.keepalive) {
+            if self.shared.owner(&node) != self.me || !own.due(&node, now, self.cfg.keepalive) {
                 continue;
             }
             // (Before the node has said its token: asked for it.)
@@ -1188,6 +1202,154 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         if self.cfg.relay {
             self.shared.sessions.lock().unwrap_or_else(|e| e.into_inner()).prune(now);
         }
+    }
+
+    /// The token the node at `node` gave this one: as a peer, or when
+    /// it was last said to that a wallet is there.
+    fn token_of(&self, node: &SocketAddrV4) -> Option<u64> {
+        let granted = || self.grants.iter().rev().find(|g| g.0 == *node).map(|g| g.1);
+        self.peers.get(node).and_then(|p| p.token()).or_else(granted)
+    }
+
+    /// The nodes the wallet of id `id` is reached at now.
+    fn points_of(&self, id: &Digest) -> Vec<SocketAddrV4> {
+        let seeds: Vec<SocketAddrV4> =
+            self.shared.seeds.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
+        let epoch = self.chain.tip().map_or(0, |tip| tip.height / crate::consensus::EPOCH);
+        crate::msg::points(id, epoch, seeds.len()).into_iter().map(|i| seeds[i]).collect()
+    }
+
+    /// Sends on the messages this node's wallet is sending: each to a
+    /// node the wallet it is for is reached at, one after another until
+    /// one passes it on. A message not yet sealed is sealed first, to
+    /// what the wallet it is for announced, which is asked of such a
+    /// node if it is not known.
+    fn send_posts(&mut self, now: Micros, out: Out<'_>) {
+        use super::sessions::POST_RETRY;
+        let wallet = self.shared.participant.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(own) = wallet.as_ref() else { return };
+        let mut mail = self.shared.letters.lock().unwrap_or_else(|e| e.into_inner());
+        mail.expire(now);
+        let mut say: Vec<(SocketAddrV4, Message<'static>)> = Vec::new();
+        let mut ask: Vec<(Digest, SocketAddrV4, u64)> = Vec::new();
+        for at in 0..mail.posts.len() {
+            if mail.posts[at].tried.is_some_and(|tried| now.saturating_sub(tried) < POST_RETRY) {
+                continue;
+            }
+            let to = mail.posts[at].to;
+            let points = self.points_of(&to);
+            if points.is_empty() {
+                continue;
+            }
+            let node = points[mail.posts[at].turn % points.len()];
+            // (Of the worker that node's answers come to: what it says
+            // back is this worker's to hear.)
+            if self.shared.owner(&node) != self.me {
+                continue;
+            }
+            let grant = self.tokens.issue(&SocketAddr::V4(node));
+            // A node that has not yet said its token is asked for it.
+            let Some(token) = self.token_of(&node) else {
+                mail.posts[at].tried = Some(now);
+                say.push((node, Message::Session { token: 0, grant, id: own.id(), seq: 0 }));
+                continue;
+            };
+            // Sealed, if what the wallet announced is known.
+            if mail.posts[at].sealed.is_none()
+                && let Some(known) = mail.posts[at].known.clone()
+            {
+                let sealed = Self::seal_for(own, &known, &mail.posts[at], self.unix);
+                mail.posts[at].sealed = sealed;
+            }
+            mail.posts[at].tried = Some(now);
+            mail.posts[at].turn += 1;
+            match &mail.posts[at].sealed {
+                Some((id, bytes)) => {
+                    let len = bytes.len() as u32;
+                    say.push((node, Message::Offer { token, grant, to, id: *id, len }));
+                }
+                None => ask.push((to, node, token)),
+            }
+        }
+        drop(mail);
+        drop(wallet);
+        for (node, message) in say {
+            self.send(node, &message, out);
+        }
+        for (to, node, token) in ask {
+            let object = Object::Announce { id: to, seq: 0 };
+            if !self.fetches.iter().any(|f| f.object == object) {
+                self.fetch_granted(now, object, node, crate::msg::ANNOUNCE_LEN as u32, token);
+            }
+        }
+    }
+
+    /// Seals `post` to the wallet that announced `to`, from this node's
+    /// wallet: none if that is not an announcement of the wallet the
+    /// post is for, or this wallet has announced nothing to answer to.
+    fn seal_for(
+        own: &super::sessions::Participant,
+        to: &[u8],
+        post: &super::sessions::Post,
+        unix: u64,
+    ) -> Option<(Digest, Arc<Vec<u8>>)> {
+        let said = crate::msg::Announced::read(to, unix).filter(|said| said.id() == post.to)?;
+        let ours = own.announced_any()?;
+        let mut chance = [0u8; 32];
+        crate::random::fill(&mut chance).ok()?;
+        let sealed = crate::msg::seal(own.identity(), &ours, &said, post.kind, &post.body, &chance)?;
+        Some((crate::msg::sealed_id(&sealed), Arc::new(sealed)))
+    }
+
+    /// What a wallet announced has come, from a node it is reached at:
+    /// the messages waiting for it are sealed to it, and offered to
+    /// that node.
+    fn announce_arrived(&mut self, now: Micros, from: SocketAddrV4, id: Digest, bytes: &[u8]) {
+        let wallet = self.shared.participant.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(own) = wallet.as_ref() else { return };
+        let mut mail = self.shared.letters.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(token) = self.token_of(&from) else { return };
+        let grant = self.tokens.issue(&SocketAddr::V4(from));
+        for post in mail.posts.iter_mut().filter(|p| p.to == id && p.sealed.is_none()) {
+            let Some(sealed) = Self::seal_for(own, bytes, post, self.unix) else { continue };
+            let len = sealed.1.len() as u32;
+            self.to_say.push((from, Message::Offer { token, grant, to: id, id: sealed.0, len }));
+            (post.sealed, post.tried) = (Some(sealed), Some(now));
+        }
+    }
+
+    /// A sealed message has come. For this node's wallet: opened, and
+    /// kept for whoever takes what comes for it. Or offered to this
+    /// node to pass on: kept a while, and offered to the wallet it is
+    /// for, where that wallet is.
+    fn sealed_arrived(&mut self, now: Micros, from: SocketAddrV4, id: Digest, bytes: &[u8]) {
+        use super::message::{NOTICE_OFFLINE, NOTICE_PASSED};
+        if crate::msg::sealed_id(bytes) != id {
+            return self.tell(now, from, Notice::Strike(from));
+        }
+        let to = crate::msg::sealed_to(bytes);
+        let wallet = self.shared.participant.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(own) = wallet.as_ref().filter(|w| Some(w.id()) == to) {
+            if let Some(opened) = own.open(bytes, self.unix, now) {
+                self.shared.letters.lock().unwrap_or_else(|e| e.into_inner()).inbox.push(opened);
+                self.shared.say(Event::Mail);
+            }
+            return;
+        }
+        drop(wallet);
+        let Some(at) = self.offered.iter().position(|o| o.0 == id && o.2 == from) else { return };
+        let (_, whom, sender) = self.offered.swap_remove(at);
+        if Some(whom) != to {
+            return self.tell(now, from, Notice::Strike(from));
+        }
+        let there = self.shared.sessions.lock().unwrap_or_else(|e| e.into_inner()).get(&whom, now).map(|s| s.addr);
+        let Some(addr) = there else {
+            return self.to_say.push((sender, Message::Notice { id, what: NOTICE_OFFLINE }));
+        };
+        self.shared.letters.lock().unwrap_or_else(|e| e.into_inner()).pass(id, whom, bytes.to_vec(), now);
+        let grant = self.tokens.issue(&SocketAddr::V4(addr));
+        self.to_say.push((addr, Message::Offer { token: 0, grant, to: whom, id, len: bytes.len() as u32 }));
+        self.to_say.push((sender, Message::Notice { id, what: NOTICE_PASSED }));
     }
 
     /// Looks to what the chain's blocks vote for, now and then: asks
@@ -1319,6 +1481,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         self.budget = self.cfg.peers.unproven_pings;
         self.follow_votes(now, out);
         self.keep_sessions(now, out);
+        self.send_posts(now, out);
         let mut due = Vec::new();
         let (secret, numbers) = (&self.secret, &mut self.numbers);
         self.peers.pings_due(now, || Self::number(secret, numbers), |addr, number| due.push((addr, number)));
@@ -1511,6 +1674,15 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             // (With its token for this node, which the next saying is to
             // carry: told at once, if that is news.)
             Message::SessionState { id, seq, token } => {
+                // (Its token is kept whether or not the wallet is reached
+                // there: it is what the node is asked anything with.)
+                if token != 0 {
+                    self.grants.retain(|g| g.0 != from);
+                    self.grants.push_back((from, token));
+                    if self.grants.len() > GRANTS {
+                        self.grants.pop_front();
+                    }
+                }
                 let mut wallet = self.shared.participant.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(own) = wallet.as_mut().filter(|w| w.id() == id) else {
                     self.counts.unheard += 1;
@@ -1523,8 +1695,51 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     self.send(from, &Message::Session { token, grant, id, seq }, out);
                 }
             }
-            // (Messages are not yet passed on.)
-            Message::Offer { .. } | Message::Notice { .. } => self.counts.unheard += 1,
+            // A sealed message is offered. To a node that stands between
+            // wallets, with its token, to pass on: asked for, if the
+            // wallet it is for is here to take it. Or by such a node to
+            // this node's wallet, which it is for: asked for, once.
+            Message::Offer { token, grant, to, id, len } => {
+                let (most, object) = (crate::msg::MAX_SEALED as u32, Object::Sealed(id));
+                let fetching = self.fetches.iter().any(|f| f.object == object);
+                let own = self.shared.participant.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|w| w.id());
+                if own == Some(to) {
+                    let known = self.shared.letters.lock().unwrap_or_else(|e| e.into_inner()).seen(id);
+                    if !known && !fetching && len <= most {
+                        self.fetch_granted(now, object, from, len, grant);
+                    }
+                } else if self.cfg.relay && self.tokens.check(&SocketAddr::V4(from), token) && len <= most {
+                    let there = self.shared.sessions.lock().unwrap_or_else(|e| e.into_inner()).get(&to, now).is_some();
+                    match there {
+                        false => self.send(from, &Message::Notice { id, what: super::message::NOTICE_OFFLINE }, out),
+                        true if fetching => {}
+                        true => {
+                            self.offered.retain(|o| o.0 != id);
+                            self.offered.push((id, to, from));
+                            self.fetch_granted(now, object, from, len, grant);
+                        }
+                    }
+                } else {
+                    self.counts.unheard += 1;
+                }
+            }
+            // What became of a message this node's wallet sent.
+            Message::Notice { id, what } => {
+                use super::message::{NOTICE_OFFLINE, NOTICE_PASSED};
+                use super::sessions::Posted;
+                let mut mail = self.shared.letters.lock().unwrap_or_else(|e| e.into_inner());
+                let at = mail.posts.iter().position(|p| p.sealed.as_ref().is_some_and(|s| s.0 == id));
+                match (at, what) {
+                    (Some(at), NOTICE_PASSED) => mail.settle(at, Posted::Passed),
+                    // (Not there, by one node's account: another of
+                    // its nodes is tried, while there is time.)
+                    (Some(at), NOTICE_OFFLINE) => mail.posts[at].tried = None,
+                    (Some(_), _) => {}
+                    (None, _) => self.counts.unheard += 1,
+                }
+                drop(mail);
+                self.shared.work(self.me);
+            }
             // A block's leaves, if they are kept here: to whoever asks
             // with the token it was given.
             Message::GetLeaves { token, id } => {
@@ -2765,6 +2980,12 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 let sessions = self.shared.sessions.lock().unwrap_or_else(|e| e.into_inner());
                 sessions.get(&id, self.now).map(|s| s.announce.to_vec())
             }
+            // A sealed message: one this node's wallet sends, or one it
+            // passes on.
+            Object::Sealed(id) => {
+                let mail = self.shared.letters.lock().unwrap_or_else(|e| e.into_inner());
+                mail.sealed(&id).map(|s| s.to_vec())
+            }
             // The state as of a block of the chain that can still be
             // gone back to, in its pieces (`super::snapshot`).
             Object::Manifest(block) => self.past(&block, |past| Some(Manifest::of(past).encode())),
@@ -2814,6 +3035,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     /// done at `now`, and says when either next wants doing.
     fn pump(&mut self, now: Micros, out: Out<'_>) -> Micros {
         let mut wake = self.fetch(now, out);
+        for (to, message) in std::mem::take(&mut self.to_say) {
+            self.send(to, &message, out);
+        }
         // A body that arrived may have been applied in place, and what
         // came of that may want more fetched: until nothing does.
         while !self.shared.threaded.load(Ordering::Relaxed) && self.shared.ready.load(Ordering::Relaxed) > 0 {
@@ -2945,6 +3169,10 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     self.tell(now, from, Notice::Strike(from));
                 }
             }
+            // What a wallet announced, asked of a node it is reached
+            // at: the messages waiting for it are sealed to it.
+            Object::Announce { id, .. } => self.announce_arrived(now, from, id, bytes),
+            Object::Sealed(id) => self.sealed_arrived(now, from, id, bytes),
             // Asked for by whoever drives this node.
             _ => self.inbox.push((object, from, Some(bytes.to_vec()))),
         }
@@ -3009,6 +3237,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             pace: Arc::default(),
             sessions: Mutex::new(super::sessions::Sessions::new(cfg.sessions)),
             participant: Mutex::new(None),
+            letters: Mutex::new(super::sessions::Mail::default()),
             seeds: Mutex::new(BTreeSet::new()),
             consensus: Mutex::new(None),
             answered: (0..n).map(|_| Mutex::new(Vec::new())).collect(),
@@ -3394,6 +3623,33 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
     /// as long as the node runs.
     pub fn participate(&self, wallet: super::sessions::Participant) {
         *self.shared.participant.lock().unwrap_or_else(|e| e.into_inner()) = Some(wallet);
+    }
+
+    /// Sends a message of `kind` saying `body` from this node's wallet
+    /// to the wallet of id `to`: sealed to what that wallet announces,
+    /// which is `known` where the message answers one that carried it,
+    /// and is asked for otherwise. What becomes of it is said later
+    /// ([`Handle::take_posted`]).
+    pub fn post(&self, to: Digest, kind: u8, body: Vec<u8>, known: Option<Vec<u8>>) {
+        self.shared.letters.lock().unwrap_or_else(|e| e.into_inner()).post(to, kind, body, known);
+        (0..self.shared.mail.len()).for_each(|w| self.shared.wake(w));
+    }
+
+    /// The messages that have come for this node's wallet since this
+    /// was last asked.
+    pub fn take_messages(&self) -> Vec<crate::msg::Opened> {
+        std::mem::take(&mut self.shared.letters.lock().unwrap_or_else(|e| e.into_inner()).inbox)
+    }
+
+    /// What became of the messages sent, since this was last asked:
+    /// whom each was for, its kind, and what became of it.
+    pub fn take_posted(&self) -> Vec<(Digest, u8, super::sessions::Posted)> {
+        std::mem::take(&mut self.shared.letters.lock().unwrap_or_else(|e| e.into_inner()).posted)
+    }
+
+    /// Whether this node's wallet is reached anywhere.
+    pub fn reached(&self) -> bool {
+        self.sessions().1 > 0
     }
 
     /// How the node stands on the message layer: the sessions it holds

@@ -265,6 +265,12 @@ impl Participant {
         self.said.values().find(|s| s.seq == seq && seq != 0).map(|s| Arc::clone(&s.announce))
     }
 
+    /// An announcement of this wallet's that holds now: what a message
+    /// it sends carries, for the answer to be sealed to.
+    pub fn announced_any(&self) -> Option<Arc<Vec<u8>>> {
+        self.said.values().filter(|s| s.seq != 0).max_by_key(|s| s.seq).map(|s| Arc::clone(&s.announce))
+    }
+
     /// The announcement made for the node at `node`, if one was.
     pub fn announced_to(&self, node: &SocketAddrV4) -> Option<Arc<Vec<u8>>> {
         self.said.get(node).filter(|s| s.seq != 0).map(|s| Arc::clone(&s.announce))
@@ -309,6 +315,120 @@ impl Participant {
     pub fn open(&self, sealed: &[u8], unix: u64, now: Micros) -> Option<msg::Opened> {
         let before = self.before.as_ref().filter(|(_, until)| now < *until).map(|(key, _)| key);
         [Some(&self.kyber), before].into_iter().flatten().find_map(|key| msg::open(key, &self.id, sealed, unix))
+    }
+}
+
+/// How long a message is tried before it is given up, and how long
+/// between tries.
+pub const POST_HOLDS: Micros = 60 * SECOND;
+pub const POST_RETRY: Micros = 3 * SECOND;
+/// How long a node that passes a message on keeps it for the wallet it
+/// is for to ask for, and how many bytes of such it keeps at the most.
+const PASSING_HOLDS: Micros = 60 * SECOND;
+const PASSING_BYTES: usize = 32 << 20;
+
+/// What became of a message sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Posted {
+    /// Still being tried.
+    Waiting,
+    /// Passed on to the wallet it is for, by a node it is reached at.
+    Passed,
+    /// That wallet is not there to take it.
+    Offline,
+    /// No node it is reached at took it, in the time there was.
+    Unsent,
+}
+
+/// A message this node's wallet is sending.
+pub struct Post {
+    pub to: Digest,
+    pub kind: u8,
+    pub body: Vec<u8>,
+    /// The announcement of the wallet it is for, where that is known
+    /// already (an answer is sealed to what the message answered
+    /// carried); else it is asked for.
+    pub known: Option<Vec<u8>>,
+    /// Sealed, once it is: its id and its bytes.
+    pub sealed: Option<(Digest, Arc<Vec<u8>>)>,
+    /// When it was first looked to: not known to whoever posted it.
+    pub began: Option<Micros>,
+    /// When it was last tried, and of which of the wallet's nodes next.
+    pub tried: Option<Micros>,
+    pub turn: usize,
+    pub state: Posted,
+}
+
+/// The messages of a node: those its wallet sends, those it passes on
+/// for others, and those that have come for its wallet.
+#[derive(Default)]
+pub struct Mail {
+    pub posts: Vec<Post>,
+    /// Sealed messages being passed on: id, whom for, the bytes, when
+    /// taken.
+    passing: std::collections::VecDeque<(Digest, Digest, Arc<Vec<u8>>, Micros)>,
+    /// What has come for this node's wallet, opened.
+    pub inbox: Vec<msg::Opened>,
+    /// The ids of the sealed messages that have come, so that one is
+    /// taken once.
+    seen: std::collections::VecDeque<Digest>,
+    /// What became of the messages sent, for whoever sent them.
+    pub posted: Vec<(Digest, u8, Posted)>,
+}
+
+impl Mail {
+    /// A message to send.
+    pub fn post(&mut self, to: Digest, kind: u8, body: Vec<u8>, known: Option<Vec<u8>>) {
+        let (sealed, tried, turn, state) = (None, None, 0, Posted::Waiting);
+        self.posts.push(Post { to, kind, body, known, sealed, began: None, tried, turn, state });
+    }
+
+    /// Says what became of the post at `at`, and lets it go.
+    pub fn settle(&mut self, at: usize, state: Posted) {
+        let post = self.posts.swap_remove(at);
+        self.posted.push((post.to, post.kind, state));
+    }
+
+    /// Gives up the messages that have been tried for long enough.
+    pub fn expire(&mut self, now: Micros) {
+        self.posts.iter_mut().for_each(|p| p.began = p.began.or(Some(now)));
+        let old = |p: &Post| p.began.is_some_and(|began| now.saturating_sub(began) >= POST_HOLDS);
+        while let Some(at) = self.posts.iter().position(old) {
+            self.settle(at, Posted::Unsent);
+        }
+        while self.passing.front().is_some_and(|p| now.saturating_sub(p.3) >= PASSING_HOLDS) {
+            self.passing.pop_front();
+        }
+    }
+
+    /// Keeps a sealed message to pass on to the wallet of id `to`.
+    pub fn pass(&mut self, id: Digest, to: Digest, sealed: Vec<u8>, now: Micros) {
+        if self.passing.iter().any(|p| p.0 == id) {
+            return;
+        }
+        self.passing.push_back((id, to, Arc::new(sealed), now));
+        while self.passing.iter().map(|p| p.2.len()).sum::<usize>() > PASSING_BYTES {
+            self.passing.pop_front();
+        }
+    }
+
+    /// The sealed message of id `id`: one this node sends, or passes on.
+    pub fn sealed(&self, id: &Digest) -> Option<Arc<Vec<u8>>> {
+        let own = self.posts.iter().filter_map(|p| p.sealed.as_ref()).find(|s| s.0 == *id).map(|s| Arc::clone(&s.1));
+        own.or_else(|| self.passing.iter().find(|p| p.0 == *id).map(|p| Arc::clone(&p.2)))
+    }
+
+    /// Whether the sealed message of id `id` has come before; it has
+    /// now.
+    pub fn seen(&mut self, id: Digest) -> bool {
+        if self.seen.contains(&id) {
+            return true;
+        }
+        self.seen.push_back(id);
+        if self.seen.len() > 1024 {
+            self.seen.pop_front();
+        }
+        false
     }
 }
 

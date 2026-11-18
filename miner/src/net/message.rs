@@ -560,6 +560,16 @@ mod tests {
             Message::Block { header: header(rng), len: rng.next_u64() as u32 },
             Message::Tx { id: digest(rng), len: rng.next_u64() as u32 },
             Message::GetLeaves { token: rng.next_u64(), id: digest(rng) },
+            Message::Session { token: rng.next_u64(), grant: rng.next_u64(), id: digest(rng), seq: rng.next_u64() },
+            Message::SessionState { id: digest(rng), seq: rng.next_u64(), token: rng.next_u64() },
+            Message::Offer {
+                token: rng.next_u64(),
+                grant: rng.next_u64(),
+                to: digest(rng),
+                id: digest(rng),
+                len: rng.next_u64() as u32,
+            },
+            Message::Notice { id: digest(rng), what: NOTICE_OFFLINE },
             Message::Leaves {
                 id: digest(rng),
                 leaves: core::array::from_fn(|_| core::array::from_fn(|_| rng.next_u64() as u8)),

@@ -41,6 +41,9 @@ pub const HELP: &str = "commands:
                             spend; and pending, unverified, reserved, locked and lost
                             funds
   outputs                   the wallet's outputs
+  send AMOUNT [FEE] TO      pay AMOUNT to the wallet at TO: its address (tab1…) or its
+                            name (@name). Its wallet answers and this one signs,
+                            with nothing more asked: both must be reached
   send-file AMOUNT [FEE] FILE
                             start a payment by file: write the slate to FILE for the
                             recipient to `receive`, then `finalize` its answer
@@ -209,6 +212,8 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             ("balance", []) => self.balance(),
             ("address", []) => self.wallet().map(|wallet| wallet.address()),
             ("outputs", []) => self.outputs(),
+            ("send", [amount, to]) => self.send(amount, None, to),
+            ("send", [amount, fee, to]) => self.send(amount, Some(fee), to),
             ("send-file", [amount, file]) => self.send_file(amount, None, file),
             ("send-file", [amount, fee, file]) => self.send_file(amount, Some(fee), file),
             ("receive", [file]) => self.receive(file, &format!("{file}.received")),
@@ -248,10 +253,11 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             ("name-transfer", [file, fee]) => self.name_transfer(file, Some(fee)),
             ("scan", []) => self.scan(),
             (
-                "status" | "peers" | "mempool" | "fees" | "leaves" | "set-leaf" | "set-leaf-value" | "consensus"
-                | "balance" | "address" | "outputs" | "send-file" | "receive" | "finalize" | "slates" | "sent"
-                | "cancel" | "bump" | "resend" | "prune" | "seed" | "password" | "scan" | "help" | "quit" | "exit"
-                | "names" | "name" | "name-commit" | "name-reveal" | "name-update" | "name-offer" | "name-transfer",
+                "send" | "status" | "peers" | "mempool" | "fees" | "leaves" | "set-leaf" | "set-leaf-value"
+                | "consensus" | "balance" | "address" | "outputs" | "send-file" | "receive" | "finalize" | "slates"
+                | "sent" | "cancel" | "bump" | "resend" | "prune" | "seed" | "password" | "scan" | "help" | "quit"
+                | "exit" | "names" | "name" | "name-commit" | "name-reveal" | "name-update" | "name-offer"
+                | "name-transfer",
                 _,
             ) => Err(format!("{command}: not what it takes (see help)")),
             _ => Err(format!("{command}: no such command (see help)")),
@@ -623,6 +629,103 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         );
         (self.log)(&format!("P{}", &done[1..]));
         Self::write(file, slate.to_text(), format!("{done}; to be answered and then finalized"))
+    }
+
+    /// Whom a payment is to: a wallet's address, or the name of one
+    /// (`@name`), which says its address.
+    fn whom(&self, to: &str) -> Result<crate::hash::Digest, String> {
+        let Some(name) = to.strip_prefix('@') else {
+            return crate::address::decode(to).ok_or_else(|| format!("'{to}' is no address (tab1…) and no @name"));
+        };
+        let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
+        let snap = state.snapshot().map_err(|e| e.to_string())?;
+        let record = Registry::record(&snap, name.as_bytes()).map_err(|e| e.to_string())?;
+        let record = record.ok_or_else(|| format!("{name} is not registered"))?;
+        // (What a name says is a digest: an address, where it is one.)
+        match record.value == [crate::poseidon2::Fp::ZERO; 8] {
+            false => Ok(record.value),
+            true => Err(format!("{name} says no address")),
+        }
+    }
+
+    /// Begins a payment to a wallet, by its address or its name: the
+    /// slate is sent to it, sealed, through a node it is reached at;
+    /// its wallet answers, and this one signs the answer and pools the
+    /// transaction, with nothing more asked of either.
+    fn send(&self, amount: &str, fee: Option<&&str>, to: &str) -> Said {
+        let whom = self.whom(to)?;
+        let amount = parse_coins(amount).ok_or_else(|| format!("'{amount}' is not an amount of coins"))?;
+        let fee = Self::fee(fee)?;
+        if !self.hold.reached() {
+            return Err("this wallet is reached nowhere yet: it could not be answered (see status)".to_string());
+        }
+        let mut wallet = self.wallet()?;
+        if whom == wallet.id() {
+            return Err("that is this wallet's own address".to_string());
+        }
+        let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
+        let snap = state.snapshot().map_err(|e| e.to_string())?;
+        let slate = wallet.send(amount, fee, &snap, (self.unix)()).map_err(|e| Self::short_of(&wallet, &snap, e))?;
+        let done = format!(
+            "payment {} begun: {} and a fee of {}, to {}",
+            &slate.id_hex()[..8],
+            coins(slate.amount as u128),
+            coins(slate.fee as u128),
+            crate::address::encode(&whom)
+        );
+        (self.log)(&format!("P{}", &done[1..]));
+        self.hold.post(whom, crate::msg::KIND_SLATE, slate.to_text().into_bytes(), None);
+        Ok(format!("{done}; sent to its wallet, to be answered"))
+    }
+
+    /// Takes a message that has come for this wallet, and does what it
+    /// asks: a slate of a payment to this wallet is answered, and the
+    /// answer sent back; the answer to a slate this wallet began is
+    /// signed, and the transaction pooled. What was done, to be said.
+    pub fn take(&self, message: &crate::msg::Opened) -> Said {
+        if message.kind != crate::msg::KIND_SLATE {
+            return Err(format!("a message of a kind not known ({})", message.kind));
+        }
+        let from = crate::address::encode(&message.from);
+        let text = std::str::from_utf8(&message.body).map_err(|_| format!("what {from} sent is no slate"))?;
+        let mut slate = Slate::from_text(text).ok_or_else(|| format!("what {from} sent is no slate"))?;
+        let unix = (self.unix)();
+        // One this wallet began: its answer. (Signed only if it is the
+        // slate that was begun, answered: the wallet sees to that.)
+        let ours = self.wallet()?.pending_slates().iter().any(|(id, _)| *id == slate.id);
+        if ours {
+            self.observe()?;
+            let signed = self.wallet()?.finalize(&slate, unix).map_err(|e| e.to_string())?;
+            let id = short(&digest_to_bytes(&signed.tx.txid()));
+            return match self.hold.submit(&signed.tx.to_bytes(), unix) {
+                Ok(_) => {
+                    let done = format!(
+                        "payment {} answered by {from}, signed and pooled: transaction {id}, {} with a fee of {}",
+                        &slate.id_hex()[..8],
+                        coins(slate.amount as u128),
+                        coins(slate.fee as u128)
+                    );
+                    (self.log)(&format!("P{}", &done[1..]));
+                    Ok(done)
+                }
+                Err(why) => {
+                    let failed =
+                        format!("payment {} is signed, but the pool does not take it: {why}", &slate.id_hex()[..8]);
+                    (self.log)(&format!("Error: {failed}"));
+                    Err(failed)
+                }
+            };
+        }
+        // One somebody else began, to pay this wallet: answered.
+        self.wallet()?.receive_slate(&mut slate, unix).map_err(|e| e.to_string())?;
+        let done = format!(
+            "payment {} from {from} answered: {} to this wallet",
+            &slate.id_hex()[..8],
+            coins(slate.amount as u128)
+        );
+        (self.log)(&format!("P{}", &done[1..]));
+        self.hold.post(message.from, crate::msg::KIND_SLATE, slate.to_text().into_bytes(), Some(message.reply.clone()));
+        Ok(done)
     }
 
     fn receive(&self, file: &str, out: &str) -> Said {

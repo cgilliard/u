@@ -737,12 +737,86 @@ fn a_consensus_file_is_voted_for_and_followed() {
         assert!(began.elapsed() < Duration::from_secs(900), "the first says:\n{a}\nthe second says:\n{b}");
         std::thread::sleep(Duration::from_secs(2));
     }
+    // (Each says so in its log when it next looks to the votes: within
+    // a few seconds.)
     for dir in &dirs {
-        let log = std::fs::read_to_string(dir.join("tabernacle.log")).unwrap();
-        assert!(log.contains("The message layer is in onion mode: the consensus file "), "{log}");
+        let began = Instant::now();
+        loop {
+            let log = std::fs::read_to_string(dir.join("tabernacle.log")).unwrap();
+            if log.contains("The message layer is in onion mode: the consensus file ") {
+                break;
+            }
+            assert!(began.elapsed() < Duration::from_secs(30), "{log}");
+            std::thread::sleep(Duration::from_millis(500));
+        }
     }
     first.stop();
     second.stop();
+    for dir in &dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// A payment is made to an address: the wallet it is to is told
+/// nothing and types nothing. The slate goes to it sealed, through a
+/// node both are reached at and neither is otherwise anything to; its
+/// wallet answers, the sender's signs the answer, and a block carries
+/// the transaction.
+#[cfg(all(unix, feature = "dev"))]
+#[cfg_attr(debug_assertions, ignore = "proves blocks; run with --release")]
+#[test]
+fn a_payment_is_sent_to_an_address() {
+    use std::time::{Duration, Instant};
+    let dirs = [scratch("send-relay"), scratch("send-a"), scratch("send-b")];
+    let port = 33_000 + std::process::id() % 10_000;
+    let at = |i: u32| format!("127.0.0.1:{}", port + i);
+    // A node that stands between wallets, and is nobody's wallet here.
+    let relay = Command::new(TABMINER)
+        .args(["--network", "dev", "--threads", "2", "--no-mine", "--no-prompt", "--relay"])
+        .args(["--data-dir", &dirs[0].display().to_string(), "--listen", &at(0)])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let relay = Running(relay);
+    let mut payer = Prompted::start(&dirs[1], &at(1), &[at(0)], true, true);
+    let mut paid = Prompted::start(&dirs[2], &at(2), &[at(0)], false, true);
+    let to = paid.ask("address").trim().to_string();
+    assert!(to.starts_with("tab1") && to.len() == 62, "{to}");
+    // Until the payer has something to pay with, and both are reached.
+    let began = Instant::now();
+    loop {
+        let reached = |status: String| status.contains("reached at: 1 of 1 nodes");
+        if payer.confirmed() != "0" && reached(payer.ask("status")) && reached(paid.ask("status")) {
+            break;
+        }
+        assert!(began.elapsed() < Duration::from_secs(180), "{}\n{}", payer.ask("status"), paid.ask("status"));
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // Not to nobody, nor to itself.
+    assert!(payer.ask("send 5 tab1nothing").starts_with("error: 'tab1nothing' is no address"));
+    assert!(payer.ask("send 5 @nobody").starts_with("error: nobody is not registered"));
+    let own = payer.ask("address").trim().to_string();
+    assert!(payer.ask(&format!("send 5 {own}")).starts_with("error: that is this wallet's own address"));
+    let begun = payer.ask(&format!("send 5 {to}"));
+    assert!(begun.contains("begun: 5 and a fee of") && begun.contains(&to), "{begun}");
+    let began = Instant::now();
+    while paid.confirmed() != "5" {
+        assert!(began.elapsed() < Duration::from_secs(180), "the payment has not come: {}", paid.ask("balance"));
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // Each wallet's log says its part of it, and whom it was with.
+    let logs: Vec<String> = dirs.iter().map(|d| std::fs::read_to_string(d.join("tabernacle.log")).unwrap()).collect();
+    assert!(logs[1].contains(&format!(" answered by {to}, signed and pooled: transaction ")), "{}", logs[1]);
+    assert!(logs[2].contains(&format!(" from {own} answered: 5 to this wallet")), "{}", logs[2]);
+    // And the node between them saw a message offered, and nothing of
+    // what it said or who sent it: neither address is in its logs.
+    let between = format!("{}{}", logs[0], std::fs::read_to_string(dirs[0].join("request.log")).unwrap());
+    assert!(between.contains(" offer ") && !between.contains(&own) && !between.contains(&to), "{between}");
+    payer.stop();
+    paid.stop();
+    drop(relay);
     for dir in &dirs {
         let _ = std::fs::remove_dir_all(dir);
     }

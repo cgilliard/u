@@ -158,6 +158,7 @@ fn said(event: &Event) -> Option<String> {
             "The message layer is in {mode} mode: the consensus file {} is in force",
             hash[..4].iter().map(|b| format!("{b:02x}")).collect::<String>()
         ),
+        Event::Mail => return None,
         Event::Consensus { mode, file: None } => {
             format!("The message layer is in {mode} mode: no consensus file is in force")
         }
@@ -965,6 +966,38 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
         let console = Console { hold: hold.clone(), wallet: wallet.clone(), unix: socket::unix, log };
         let main = Arc::clone(&main);
         std::thread::Builder::new().name("prompt".into()).spawn(move || prompt(&console, &main)).map_err(threads)?;
+    }
+
+    // What comes for the wallet over the message layer is taken as it
+    // comes: a payment to it answered, the answer to one of its own
+    // signed and pooled. And what became of what it sent is said.
+    if let Some(wallet) = &wallet {
+        let said = Arc::clone(&main);
+        let log = Arc::new(move |line: &str| said.log(line));
+        let console = Console { hold: hold.clone(), wallet: Some(Arc::clone(wallet)), unix: socket::unix, log };
+        let (hold, main) = (hold.clone(), Arc::clone(&main));
+        let taking = move || loop {
+            std::thread::sleep(Duration::from_millis(250));
+            for message in hold.take_messages() {
+                if let Err(why) = console.take(&message) {
+                    main.log(&format!("Error: a message for the wallet: {why}"));
+                }
+            }
+            for (to, _, what) in hold.take_posted() {
+                use tabminer::net::sessions::Posted;
+                let to = tabminer::address::encode(&to);
+                match what {
+                    Posted::Passed | Posted::Waiting => {}
+                    Posted::Offline => {
+                        main.log(&format!("A message to {to} was not passed on: that wallet is not there"))
+                    }
+                    Posted::Unsent => {
+                        main.log(&format!("A message to {to} was not sent: no node it is reached at took it"))
+                    }
+                }
+            }
+        };
+        std::thread::Builder::new().name("messages".into()).spawn(taking).map_err(threads)?;
     }
 
     let watch = Watch { requests: Some(&requests), stats: Some(&stats), main: Some(&main) };
