@@ -2051,3 +2051,108 @@ fn wallets_are_reached_by_ways_that_lose_datagrams() {
 fn several_workers_reach_wallets_by_ways() {
     several(|| wallets_by_ways(0));
 }
+
+/// A wallet that is a name under a name is reached by that name: it
+/// shows the nodes the full name is reached at the certificate by
+/// which it is, and whoever sends to the name is shown it there, with
+/// what the wallet announces. The same whether wallets are reached at
+/// the seeds or by ways through relays. A certificate that is not the
+/// name's, by the chain, is nobody's.
+fn a_name_under_a_name(relays: bool) {
+    use crate::net::sessions::Posted;
+    use crate::{msg::KIND_SLATE, subnames};
+    let mut w = World::new(7, &Config { relay: true, ..Config::default() });
+    let ids: Vec<(Digest, SocketAddrV4)> = (0..7).map(|i| relay_of(&w, i)).collect();
+    let hold: Vec<_> = w.nodes.iter().map(|n| n.hold()).collect();
+    match relays {
+        true => {
+            let relays = ids[2..].iter().map(|(id, at)| crate::consensus::Relay { id: *id, addr: at.to_string() });
+            let file = crate::consensus::File { mode: crate::consensus::Mode::Onion, relays: relays.collect() };
+            hold.iter().for_each(|h| h.force_consensus(&file));
+        }
+        false => {
+            for i in 0..7 {
+                (2..7).filter(|seed| *seed != i).for_each(|seed| {
+                    w.nodes[i].add_peer(at(seed), true, 0);
+                });
+            }
+        }
+    }
+    // `mailhub` is held by a key that is no node's here; `alice` under
+    // it is the second wallet, and `mallory` says it is `bob`.
+    let owner = crate::mldsa::keygen(&[50; 32]);
+    let mallory = crate::mldsa::keygen(&[51; 32]);
+    hold.iter().for_each(|h| h.name_says(b"mailhub", crate::address::id_of(owner.public_key())));
+    let until = NOW + subnames::HOLDS;
+    let alice = subnames::bundle(&subnames::certify(&owner, b"alice", b"mailhub", &ids[1].0, 4, until), None);
+    let bob = subnames::bundle(&subnames::certify(&mallory, b"bob", b"mailhub", &ids[1].0, 4, until), None);
+    let (to_alice, to_bob) = (subnames::point(b"alice", b"mailhub"), subnames::point(b"bob", b"mailhub"));
+    hold[1].set_names(vec![(to_alice, 4, alice), (to_bob, 4, bob)]);
+    let began = w.now;
+    while !(hold[0].reached() && hold[1].name_reached(&to_alice) == 3) {
+        assert!(w.now - began < 120 * SECOND, "not reached by the name: {}", hold[1].name_reached(&to_alice));
+        w.run(50 * MILLI);
+    }
+    println!("a wallet was reached by a name under a name in {} ms (relays: {relays})", (w.now - began) / MILLI);
+    assert_eq!(hold[1].name_reached(&to_bob), 0, "a certificate that is not the name's is nobody's");
+    // Sent to the name: it comes to the wallet the name is, and whose
+    // it turned out to be is said.
+    let began = w.now;
+    hold[0].post_to_name(to_alice, KIND_SLATE, [7; 32], b"to alice".to_vec());
+    w.woken();
+    let mut came = Vec::new();
+    while came.is_empty() {
+        assert!(w.now - began < 120 * SECOND, "nothing comes");
+        w.run(20 * MILLI);
+        came = hold[1].take_messages();
+    }
+    println!("and a message to the name crossed in {} ms", (w.now - began) / MILLI);
+    assert_eq!((came[0].from, &came[0].body[..]), (ids[0].0, &b"to alice"[..]));
+    w.run(3 * SECOND);
+    assert_eq!(hold[0].take_resolved(), [([7; 32], ids[1].0)]);
+    assert_eq!(hold[0].take_posted(), [(ids[1].0, KIND_SLATE, [7; 32], Posted::Passed)]);
+    // To a name nobody is, and to one a wallet only says it is.
+    for (name, tag) in [(subnames::point(b"carol", b"mailhub"), [8; 32]), (to_bob, [9; 32])] {
+        hold[0].post_to_name(name, KIND_SLATE, tag, b"x".to_vec());
+        w.woken();
+        let began = w.now;
+        let mut posted = Vec::new();
+        while posted.is_empty() {
+            assert!(w.now - began < 120 * SECOND, "nothing is said of it");
+            w.run(100 * MILLI);
+            posted = hold[0].take_posted();
+        }
+        assert_eq!(posted, [(name, KIND_SLATE, tag, Posted::Offline)]);
+    }
+    assert!(hold[0].take_resolved().is_empty() && hold[1].take_messages().is_empty());
+    // The name is given to another wallet, by a newer certificate: it
+    // is that wallet's from then on, and the first is told no.
+    let newer = subnames::bundle(&subnames::certify(&owner, b"alice", b"mailhub", &ids[0].0, 5, until), None);
+    hold[0].set_names(vec![(to_alice, 5, newer)]);
+    let began = w.now;
+    while hold[0].name_reached(&to_alice) != 3 || hold[1].name_reached(&to_alice) != 0 {
+        assert!(
+            w.now - began < 240 * SECOND,
+            "{} {}",
+            hold[0].name_reached(&to_alice),
+            hold[1].name_reached(&to_alice)
+        );
+        w.run(SECOND);
+    }
+}
+
+#[test]
+fn a_wallet_is_reached_by_a_name_under_a_name_at_the_seeds() {
+    a_name_under_a_name(false);
+}
+
+#[test]
+fn a_wallet_is_reached_by_a_name_under_a_name_by_ways() {
+    a_name_under_a_name(true);
+}
+
+#[test]
+fn several_workers_reach_a_wallet_by_a_name_under_a_name() {
+    several(|| a_name_under_a_name(true));
+    several(|| a_name_under_a_name(false));
+}

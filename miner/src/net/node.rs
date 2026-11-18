@@ -651,6 +651,9 @@ pub(crate) struct Shared {
     pool: Mutex<Mempool>,
     #[cfg(test)]
     by_port: AtomicBool,
+    /// What names say, where a test says so in the chain's place.
+    #[cfg(test)]
+    pub(crate) names: Mutex<BTreeMap<Vec<u8>, Digest>>,
 }
 
 /// Something that happened to a node that whoever keeps its log would
@@ -1251,8 +1254,20 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         let height = self.chain.tip().map_or(0, |tip| tip.height);
         let mut wallet = self.shared.participant.lock().unwrap_or_else(|e| e.into_inner());
         let Some(own) = wallet.as_mut() else { return };
-        let points: Vec<SocketAddrV4> =
-            crate::msg::reached_points(&own.id(), height, seeds.len()).into_iter().map(|i| seeds[i]).collect();
+        // (The nodes the wallet is reached at: by its id, and by the id
+        // of each full name it is. At every one of them it says it is
+        // there; at those of a name, that it is that name too.)
+        let at = |id: &Digest| -> Vec<SocketAddrV4> {
+            crate::msg::reached_points(id, height, seeds.len()).into_iter().map(|i| seeds[i]).collect()
+        };
+        let mut points = at(&own.id());
+        let names: Vec<(Digest, u64, Vec<SocketAddrV4>)> =
+            own.aliases().into_iter().map(|(n, seq)| (n, seq, at(&n))).collect();
+        for node in names.iter().flat_map(|name| &name.2) {
+            if !points.contains(node) {
+                points.push(*node);
+            }
+        }
         own.keep(&points);
         let mut chance = [0u8; 64];
         if crate::random::fill(&mut chance).is_ok() {
@@ -1272,11 +1287,24 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 token => due.push((node, token, own.say(node, token, self.unix, now))),
             }
         }
+        let mut shown = Vec::new();
+        for (n, seq, nodes) in &names {
+            for node in nodes.iter().filter(|node| self.shared.owner(node) == self.me) {
+                if own.alias_due(n, node, now) {
+                    own.alias_shown(n, *node, now);
+                    shown.push((*node, own.token(node), *n, *seq));
+                }
+            }
+        }
         let id = own.id();
         drop(wallet);
         for (node, token, seq) in due {
             let grant = self.tokens.issue(&SocketAddr::V4(node));
             self.send(node, &Message::Session { token, grant, id, seq }, out);
+        }
+        for (node, token, n, seq) in shown {
+            let grant = self.tokens.issue(&SocketAddr::V4(node));
+            self.send(node, &Message::Alias { token, grant, n, seq }, out);
         }
         if self.cfg.relay {
             self.shared.sessions.lock().unwrap_or_else(|e| e.into_inner()).prune(now);
@@ -1466,6 +1494,19 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         self.peers.get(node).and_then(|p| p.token()).or_else(granted)
     }
 
+    /// What the name `name` says on the chain: the id of whoever
+    /// holds it.
+    fn name_value(&self, name: &[u8]) -> Option<Digest> {
+        #[cfg(test)]
+        if let Some(value) = self.shared.names.lock().unwrap().get(name) {
+            return Some(*value);
+        }
+        let key = crate::name::name_key(name).ok()?;
+        let state = self.chain.whole().ok()?;
+        let snap = state.snapshot().ok()?;
+        snap.name(key).ok()?.filter(|record| record.name.as_bytes() == name).map(|record| record.value)
+    }
+
     /// The relays in force: none in init mode.
     fn relays(&self) -> Arc<Relays> {
         Arc::clone(&self.shared.relays.lock().unwrap_or_else(|e| e.into_inner()))
@@ -1526,12 +1567,24 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         let id = own.id();
         // (Of the epoch the chain is in; and where one gives way to
         // the next, of both.)
+        // (And of the id of each full name the wallet is: at every
+        // one of them it says it is there; at those of a name, that it
+        // is that name too.)
         let mut points: Vec<(Digest, SocketAddrV4)> = Vec::new();
-        for epoch in crate::msg::reached_epochs(height) {
-            for point in Self::points_among(&id, epoch, relays) {
-                if !points.contains(&point) {
-                    points.push(point);
+        let mut names: Vec<(Digest, Vec<SocketAddrV4>)> = Vec::new();
+        let ids = [id].into_iter().chain(own.aliases().into_iter().map(|alias| alias.0));
+        for (nth, of) in ids.enumerate() {
+            let mut its = Vec::new();
+            for epoch in crate::msg::reached_epochs(height) {
+                for point in Self::points_among(&of, epoch, relays) {
+                    its.push(point.1);
+                    if !points.contains(&point) {
+                        points.push(point);
+                    }
                 }
+            }
+            if nth > 0 {
+                names.push((of, its));
             }
         }
         let at: Vec<SocketAddrV4> = points.iter().map(|p| p.1).collect();
@@ -1576,6 +1629,20 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     }
                     steps.extend(way.say(&said));
                 }
+                // Held there: and shown to be each full name that is
+                // reached there, until the node says it holds that.
+                Some(way) if way.ready() => {
+                    for (n, _) in names.iter().filter(|name| name.1.contains(&point.1)) {
+                        if own.alias_due(n, &point.1, now)
+                            && let Some(bundle) = own.alias_bundle(n)
+                        {
+                            own.alias_shown(n, point.1, now);
+                            let mut said = vec![super::circuits::HERE_AS];
+                            said.extend_from_slice(&bundle);
+                            steps.extend(way.say(&said));
+                        }
+                    }
+                }
                 Some(_) => {}
             }
         }
@@ -1611,7 +1678,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             if post.tried.is_some_and(|tried| now.saturating_sub(tried) < POST_RETRY) {
                 continue;
             }
-            let points = Self::points_among(&post.to, epoch, relays);
+            let points = Self::points_among(&post.asked(), epoch, relays);
             if points.is_empty() {
                 continue;
             }
@@ -1649,7 +1716,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                         }
                         None => {
                             said.push(ASK);
-                            said.extend_from_slice(&crate::poseidon2::digest_to_bytes(&post.to));
+                            said.extend_from_slice(&crate::poseidon2::digest_to_bytes(&post.asked()));
                         }
                     }
                     steps.extend(way.say(&said));
@@ -1716,11 +1783,33 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 if let Some(id) = digest_from_bytes(rest) {
                     back.push((
                         link,
-                        match sessions.get(&id, now) {
-                            Some(session) => made(ANNOUNCED, &[&session.announce]),
+                        match sessions.announced(&id, self.unix, now) {
+                            Some(announced) => made(ANNOUNCED, &[&announced]),
                             None => made(ABSENT, &[rest]),
                         },
                     ));
+                }
+            }
+            // A wallet held at the end of this way shows that it is a
+            // full name: taken if the certificate is the name's, by
+            // the chain, and the wallet is the one it names.
+            Some((&super::circuits::HERE_AS, bundle)) => {
+                let Some(checked) = crate::subnames::read(bundle, self.unix) else { return };
+                let n = digest_to_bytes(&checked.point());
+                let sound = self.name_value(&checked.name) == Some(checked.by);
+                let taken = sound.then(|| sessions.alias(&checked, bundle.to_vec(), here, now).ok()).flatten();
+                let seq = taken.map_or(0, |taken| taken.0);
+                back.push((link, made(super::circuits::AS_HELD, &[&n, &seq.to_le_bytes()])));
+                // (The wallet that was reached by the name until now
+                // is told it no longer is.)
+                match taken.and_then(|taken| taken.1) {
+                    Some(Where::Way(before, circuit)) => {
+                        back.push(((before, circuit), made(super::circuits::AS_HELD, &[&n, &[0; 8]])));
+                    }
+                    Some(Where::Addr(addr)) => {
+                        self.to_say.push((addr, Message::AliasState { n: checked.point(), seq: 0 }));
+                    }
+                    None => {}
                 }
             }
             Some((&GIVE, sealed)) => {
@@ -1783,6 +1872,13 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     own.held(&point, seq, 0);
                 }
             }
+            (Purpose::Session, Some((&super::circuits::AS_HELD, rest))) if rest.len() == 40 => {
+                let seq = u64::from_le_bytes(rest[32..].try_into().expect("eight bytes"));
+                let mut wallet = shared.participant.lock().unwrap_or_else(|e| e.into_inner());
+                if let (Some(own), Some(n)) = (wallet.as_mut(), digest_from_bytes(&rest[..32])) {
+                    own.alias_held(&n, &point, seq);
+                }
+            }
             // A sealed message for the wallet.
             (Purpose::Session, Some((&TAKE, sealed))) => {
                 let wallet = shared.participant.lock().unwrap_or_else(|e| e.into_inner());
@@ -1799,15 +1895,19 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             }
             // What the wallet a message is for announces: the message
             // is sealed to it, and given to be passed on.
-            (Purpose::Send, Some((&ANNOUNCED, announce))) => {
-                let Some(id) = crate::msg::Announced::read(announce, self.unix).map(|said| said.id()) else { return };
+            (Purpose::Send, Some((&ANNOUNCED, announced))) => {
                 let wallet = shared.participant.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(own) = wallet.as_ref() else { return };
                 let mut mail = shared.letters.lock().unwrap_or_else(|e| e.into_inner());
+                let Some((_, which)) = mail.announced(announced, self.unix, |name| self.name_value(name)) else {
+                    return;
+                };
+                let announce = &announced[..crate::msg::ANNOUNCE_LEN];
                 let mut ways = shared.ways.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(way) = ways.open.iter_mut().find(|w| w.circuit() == circuit) else { return };
                 let mut steps = Vec::new();
-                for post in mail.posts.iter_mut().filter(|p| p.to == id && p.sealed.is_none()) {
+                for at in which {
+                    let post = &mut mail.posts[at];
                     let Some(sealed) = Self::seal_for(own, announce, post, self.unix) else { continue };
                     let mut give = vec![GIVE];
                     give.extend_from_slice(&sealed.1);
@@ -1840,10 +1940,11 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     fn absent(&mut self, id: &Digest) {
         let nodes = self.points_of(id).len();
         let mut mail = self.shared.letters.lock().unwrap_or_else(|e| e.into_inner());
-        for post in mail.posts.iter_mut().filter(|p| p.to == *id && p.sealed.is_none()) {
+        for post in mail.posts.iter_mut().filter(|p| p.asked() == *id && p.sealed.is_none()) {
             (post.missed, post.tried) = (post.missed + 1, None);
         }
-        while let Some(at) = mail.posts.iter().position(|p| p.to == *id && p.sealed.is_none() && p.missed >= nodes) {
+        let gone = |p: &super::sessions::Post| p.asked() == *id && p.sealed.is_none() && p.missed >= nodes;
+        while let Some(at) = mail.posts.iter().position(gone) {
             mail.settle(at, super::sessions::Posted::Offline);
         }
     }
@@ -1900,8 +2001,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             if mail.posts[at].tried.is_some_and(|tried| now.saturating_sub(tried) < POST_RETRY) {
                 continue;
             }
-            let to = mail.posts[at].to;
-            let points = self.points_of(&to);
+            let (to, asked) = (mail.posts[at].to, mail.posts[at].asked());
+            let points = self.points_of(&asked);
             if points.is_empty() {
                 continue;
             }
@@ -1932,7 +2033,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     let len = bytes.len() as u32;
                     say.push((node, Message::Offer { token, grant, to, id: *id, len }));
                 }
-                None => ask.push((to, node, token)),
+                None => ask.push((asked, node, token)),
             }
         }
         drop(mail);
@@ -1943,7 +2044,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         for (to, node, token) in ask {
             let object = Object::Announce { id: to, seq: 0 };
             if !self.fetches.iter().any(|f| f.object == object) {
-                self.fetch_granted(now, object, node, crate::msg::ANNOUNCE_LEN as u32, token);
+                let most = crate::msg::ANNOUNCE_LEN + crate::subnames::MAX_BUNDLE;
+                self.fetch_granted(now, object, node, most as u32, token);
             }
         }
     }
@@ -1974,10 +2076,17 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         let mut mail = self.shared.letters.lock().unwrap_or_else(|e| e.into_inner());
         let Some(token) = self.token_of(&from) else { return };
         let grant = self.tokens.issue(&SocketAddr::V4(from));
-        for post in mail.posts.iter_mut().filter(|p| p.to == id && p.sealed.is_none()) {
-            let Some(sealed) = Self::seal_for(own, bytes, post, self.unix) else { continue };
+        // (Of the id that was asked, and of no other.)
+        let Some((asked, which)) = mail.announced(bytes, self.unix, |name| self.name_value(name)) else { return };
+        if asked != id {
+            return;
+        }
+        let announce = &bytes[..crate::msg::ANNOUNCE_LEN];
+        for at in which {
+            let post = &mut mail.posts[at];
+            let Some(sealed) = Self::seal_for(own, announce, post, self.unix) else { continue };
             let len = sealed.1.len() as u32;
-            self.to_say.push((from, Message::Offer { token, grant, to: id, id: sealed.0, len }));
+            self.to_say.push((from, Message::Offer { token, grant, to: post.to, id: sealed.0, len }));
             (post.sealed, post.tried) = (Some(sealed), Some(now));
         }
     }
@@ -2265,6 +2374,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             Message::SessionState { .. } => ("session-state", About::Nothing, "answered"),
             Message::Offer { .. } => ("offer", About::Nothing, "answered"),
             Message::Carry { .. } => ("carry", About::Nothing, "answered"),
+            Message::Alias { .. } => ("alias", About::Nothing, "alias-state"),
+            Message::AliasState { .. } => ("alias-state", About::Nothing, "answered"),
             Message::Stepped { .. } => ("stepped", About::Nothing, "carried"),
             Message::Carried { .. } => ("carried", About::Nothing, "answered"),
             Message::Notice { .. } => ("notice", About::Nothing, "answered"),
@@ -2451,6 +2562,31 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     self.fetch_granted(now, Object::Step(name), from, len, grant);
                 } else if !known {
                     self.counts.unheard += 1;
+                }
+            }
+            // A wallet held here says it is a full name, by a
+            // certificate of this number: held already, or asked for.
+            Message::Alias { token, grant, n, seq } => {
+                if !self.cfg.relay || !self.tokens.check(&SocketAddr::V4(from), token) {
+                    self.counts.unheard += 1;
+                    return;
+                }
+                let sessions = self.shared.sessions.lock().unwrap_or_else(|e| e.into_inner());
+                let at = super::sessions::Where::Addr(from);
+                let held = sessions.aliased(&n, self.unix, now).is_some_and(|(s, a)| s.at == at && a.seq == seq);
+                drop(sessions);
+                let object = Object::Alias(n);
+                if held {
+                    self.send(from, &Message::AliasState { n, seq }, out);
+                } else if !self.fetches.iter().any(|f| f.object == object && f.from == from) {
+                    self.fetch_granted(now, object, from, crate::subnames::MAX_BUNDLE as u32, grant);
+                }
+            }
+            Message::AliasState { n, seq } => {
+                let mut wallet = self.shared.participant.lock().unwrap_or_else(|e| e.into_inner());
+                match wallet.as_mut() {
+                    Some(own) => own.alias_held(&n, &from, seq),
+                    None => self.counts.unheard += 1,
                 }
             }
             // The same, said whole: of a way that is here, taken, once;
@@ -3746,7 +3882,13 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             }
             Object::Announce { id, .. } if self.cfg.relay => {
                 let sessions = self.shared.sessions.lock().unwrap_or_else(|e| e.into_inner());
-                sessions.get(&id, self.now).map(|s| s.announce.to_vec())
+                sessions.announced(&id, self.unix, self.now)
+            }
+            // The certificate by which this node's wallet is a full
+            // name: for the node that name is reached at.
+            Object::Alias(n) => {
+                let wallet = self.shared.participant.lock().unwrap_or_else(|e| e.into_inner());
+                wallet.as_ref()?.alias_bundle(&n).map(|bundle| bundle.to_vec())
             }
             // A sealed message: one this node's wallet sends, or one it
             // passes on.
@@ -3953,6 +4095,37 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             Object::Announce { id, .. } => self.announce_arrived(now, from, id, bytes),
             Object::Sealed(id) => self.sealed_arrived(now, from, id, bytes),
             Object::Step(name) => self.step_arrived(now, from, name, bytes),
+            // A certificate this node asked a wallet it holds for: the
+            // wallet is reached by that full name too, if the
+            // certificate is the name's, by the chain.
+            Object::Alias(n) if self.cfg.relay => {
+                let checked = crate::subnames::read(bytes, self.unix).filter(|c| c.point() == n);
+                let sound = checked.as_ref().is_some_and(|c| self.name_value(&c.name) == Some(c.by));
+                let mut sessions = self.shared.sessions.lock().unwrap_or_else(|e| e.into_inner());
+                let taken = checked.filter(|_| sound).and_then(|c| sessions.alias(&c, bytes.to_vec(), from, now).ok());
+                drop(sessions);
+                self.to_say.push((from, Message::AliasState { n, seq: taken.map_or(0, |taken| taken.0) }));
+                // (The wallet that was reached by the name until now
+                // is told it no longer is.)
+                match taken.and_then(|taken| taken.1) {
+                    Some(super::sessions::Where::Addr(addr)) => {
+                        self.to_say.push((addr, Message::AliasState { n, seq: 0 }));
+                    }
+                    Some(super::sessions::Where::Way(before, circuit)) => {
+                        let mut said = vec![super::circuits::AS_HELD];
+                        said.extend_from_slice(&crate::poseidon2::digest_to_bytes(&n));
+                        said.extend_from_slice(&[0; 8]);
+                        let step = self.shared.relayed.lock().unwrap_or_else(|e| e.into_inner()).say(
+                            (before, circuit),
+                            &said,
+                            now,
+                        );
+                        step.into_iter().for_each(|step| self.carry(now, step));
+                    }
+                    None => {}
+                }
+            }
+            Object::Alias(_) => {}
             // Asked for by whoever drives this node.
             _ => self.inbox.push((object, from, Some(bytes.to_vec()))),
         }
@@ -4053,6 +4226,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             told: RwLock::new(None),
             #[cfg(test)]
             by_port: AtomicBool::new(false),
+            #[cfg(test)]
+            names: Mutex::default(),
         });
         let list = Arc::new(RwLock::new(List::new(n)));
         // What is of the whole node is divided among its workers: but
@@ -4452,6 +4627,12 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
         *self.shared.relays.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(relays_of(Some(file)));
     }
 
+    /// Says what a name says, in the chain's place.
+    #[cfg(test)]
+    pub(crate) fn name_says(&self, name: &[u8], value: Digest) {
+        self.shared.names.lock().unwrap().insert(name.to_vec(), value);
+    }
+
     /// How the way of this number stands: open to its end, or not yet;
     /// none if there is none, or it was given up.
     pub fn way(&self, circuit: u64) -> Option<bool> {
@@ -4470,6 +4651,39 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
     /// was last asked: the way, and what.
     pub fn take_said(&self) -> Vec<(u64, Vec<u8>)> {
         std::mem::take(&mut self.shared.ways.lock().unwrap_or_else(|e| e.into_inner()).said)
+    }
+
+    /// Sends a message of `kind` saying `body` from this node's wallet
+    /// to whichever wallet the full name of id `n` is
+    /// ([`crate::subnames::point`]): the nodes that name is reached at
+    /// are asked, and show whose it is. Whose, is said when it is
+    /// known ([`Handle::take_resolved`]).
+    pub fn post_to_name(&self, n: Digest, kind: u8, tag: [u8; 32], body: Vec<u8>) {
+        self.shared.letters.lock().unwrap_or_else(|e| e.into_inner()).post_to_name(n, kind, tag, body);
+        (0..self.shared.mail.len()).for_each(|w| self.shared.wake(w));
+    }
+
+    /// Whose the full names messages were sent to turned out to be,
+    /// since this was last asked: what each message was posted with,
+    /// and the wallet.
+    pub fn take_resolved(&self) -> Vec<([u8; 32], Digest)> {
+        std::mem::take(&mut self.shared.letters.lock().unwrap_or_else(|e| e.into_inner()).resolved)
+    }
+
+    /// The full names this node's wallet is reached by are these: the
+    /// id each is reached at, its certificate's number, and the
+    /// certificate with what goes with it.
+    pub fn set_names(&self, all: Vec<(Digest, u64, Vec<u8>)>) {
+        if let Some(own) = self.shared.participant.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            own.set_aliases(all);
+        }
+    }
+
+    /// At how many nodes this node's wallet is reached by the full
+    /// name of id `n`.
+    pub fn name_reached(&self, n: &Digest) -> usize {
+        let wallet = self.shared.participant.lock().unwrap_or_else(|e| e.into_inner());
+        wallet.as_ref().map_or(0, |own| own.alias_reached(n))
     }
 
     /// The messages that have come for this node's wallet since this

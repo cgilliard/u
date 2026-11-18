@@ -86,11 +86,28 @@ pub enum Refused {
 pub struct Sessions {
     limits: Limits,
     held: BTreeMap<[u8; 32], Session>,
+    /// The full names wallets held here are reached by
+    /// ([`crate::subnames`]), by the id each is reached at.
+    aliases: BTreeMap<[u8; 32], Alias>,
 }
+
+/// A full name a wallet that is held here is reached by: for as long
+/// as the wallet is, and its certificate holds.
+#[derive(Clone, Debug)]
+pub struct Alias {
+    pub holder: Digest,
+    pub seq: u64,
+    pub expires: u64,
+    /// The certificate, with what goes with it, as it was shown.
+    pub bundle: Arc<Vec<u8>>,
+}
+
+/// Full names one wallet may be reached by at one node.
+pub const ALIASES_EACH: usize = 16;
 
 impl Sessions {
     pub fn new(limits: Limits) -> Sessions {
-        Sessions { limits, held: BTreeMap::new() }
+        Sessions { limits, held: BTreeMap::new(), aliases: BTreeMap::new() }
     }
 
     pub fn len(&self) -> usize {
@@ -166,10 +183,70 @@ impl Sessions {
         self.held.get(&digest_to_bytes(id)).filter(|s| now.saturating_sub(s.seen) < self.limits.idle)
     }
 
-    /// Forgets the wallets that have said nothing for too long.
+    /// Forgets the wallets that have said nothing for too long, and
+    /// the names they were reached by.
     pub fn prune(&mut self, now: Micros) {
         let idle = self.limits.idle;
         self.held.retain(|_, s| now.saturating_sub(s.seen) < idle);
+        let held = &self.held;
+        self.aliases.retain(|_, a| held.contains_key(&digest_to_bytes(&a.holder)));
+    }
+
+    /// A wallet held here, at `at`, shows that it is a full name: a
+    /// certificate that was read, and found to be the name's by
+    /// whoever reads the chain. Taken if the wallet is the one it
+    /// names and no newer certificate says the name is another's: the
+    /// certificate's number; and where the wallet is that was reached
+    /// by the name until now, if it is another, which is to be told.
+    pub fn alias(
+        &mut self,
+        checked: &crate::subnames::Checked,
+        bundle: Vec<u8>,
+        at: impl Into<Where>,
+        now: Micros,
+    ) -> Result<(u64, Option<Where>), Refused> {
+        let at = at.into();
+        self.prune(now);
+        if !self.get(&checked.holder, now).is_some_and(|s| s.at == at) {
+            return Err(Refused::NotBound);
+        }
+        let key = digest_to_bytes(&checked.point());
+        let before = self.aliases.get(&key).filter(|held| held.holder != checked.holder);
+        let before = before.and_then(|held| self.get(&held.holder, now)).map(|session| session.at);
+        match self.aliases.get(&key) {
+            Some(held) if held.seq > checked.seq || (held.seq == checked.seq && held.holder != checked.holder) => {
+                return Err(Refused::Stale);
+            }
+            Some(_) => {}
+            None => {
+                let of_it = self.aliases.values().filter(|a| a.holder == checked.holder).count();
+                if of_it >= ALIASES_EACH || self.aliases.len() >= 4 * self.limits.most {
+                    return Err(Refused::Full);
+                }
+            }
+        }
+        let (holder, seq, expires) = (checked.holder, checked.seq, checked.expires);
+        self.aliases.insert(key, Alias { holder, seq, expires, bundle: Arc::new(bundle) });
+        Ok((seq, before))
+    }
+
+    /// The wallet that is reached by the full name of id `n`, and the
+    /// certificate that says so: if the wallet is here, and the
+    /// certificate holds at `unix`.
+    pub fn aliased(&self, n: &Digest, unix: u64, now: Micros) -> Option<(&Session, &Alias)> {
+        let alias = self.aliases.get(&digest_to_bytes(n)).filter(|a| a.expires > unix)?;
+        Some((self.get(&alias.holder, now)?, alias))
+    }
+
+    /// What is announced under the id `id`, for whoever asks: what the
+    /// wallet of that id announced; or, of the id of a full name, what
+    /// the wallet it is announced, and after it the certificate.
+    pub fn announced(&self, id: &Digest, unix: u64, now: Micros) -> Option<Vec<u8>> {
+        if let Some(session) = self.get(id, now) {
+            return Some(session.announce.to_vec());
+        }
+        let (session, alias) = self.aliased(id, unix, now)?;
+        Some([&session.announce[..], &alias.bundle[..]].concat())
     }
 }
 
@@ -199,7 +276,26 @@ pub struct Participant {
     said: BTreeMap<SocketAddrV4, Said>,
     /// The number of the last announcement made: the next is higher.
     last: u64,
+    /// The full names this wallet is reached by.
+    aliases: Vec<Aliased>,
 }
+
+/// A full name this wallet is reached by: the id it is reached at, its
+/// certificate, and what each node it is shown to has said of it.
+struct Aliased {
+    n: Digest,
+    seq: u64,
+    bundle: Arc<Vec<u8>>,
+    /// To each node: the number it says it holds ([`ALIAS_ASKED`]
+    /// before it has said, none if it would not), and when it was
+    /// last shown.
+    at: BTreeMap<SocketAddrV4, (u64, Micros)>,
+}
+
+const ALIAS_ASKED: u64 = u64::MAX;
+/// How long before a node that would not take a certificate is shown
+/// it again.
+const ALIAS_REFUSED_RETRY: Micros = 60 * SECOND;
 
 struct Said {
     /// The node's token for this wallet's node: none (zero) until the
@@ -217,7 +313,16 @@ impl Participant {
     pub fn new(identity: mldsa::SecretKey, chance: &[u8; 64], now: Micros) -> Participant {
         let id = crate::address::id_of(identity.public_key());
         let kyber = mlkem::keygen(chance);
-        Participant { identity, id, kyber, made: now, before: None, said: BTreeMap::new(), last: 0 }
+        Participant {
+            identity,
+            id,
+            kyber,
+            made: now,
+            before: None,
+            said: BTreeMap::new(),
+            last: 0,
+            aliases: Vec::new(),
+        }
     }
 
     pub fn id(&self) -> Digest {
@@ -310,6 +415,13 @@ impl Participant {
     /// have: it is then to be told again at once, with that one.
     pub fn held(&mut self, node: &SocketAddrV4, seq: u64, token: u64) -> bool {
         let Some(said) = self.said.get_mut(node) else { return false };
+        // (A node that does not hold the announcement holds nothing of
+        // the names the wallet is reached by either.)
+        if seq != said.seq || said.seq == 0 {
+            self.aliases.iter_mut().for_each(|a| {
+                a.at.remove(node);
+            });
+        }
         // (Of an announcement made for another token it holds nothing
         // that counts.)
         said.held = if said.seq == 0 { u64::MAX } else { seq };
@@ -318,6 +430,65 @@ impl Participant {
             (said.bind, said.seq, said.held) = (token, 0, u64::MAX);
         }
         other
+    }
+
+    /// The full names this wallet is reached by are these: the id each
+    /// is reached at, its certificate's number, and the certificate
+    /// with what goes with it. (What a node has said of one that is
+    /// unchanged stands.)
+    pub fn set_aliases(&mut self, all: Vec<(Digest, u64, Vec<u8>)>) {
+        let mut before = std::mem::take(&mut self.aliases);
+        for (n, seq, bundle) in all {
+            let was = before.iter().position(|a| a.n == n && a.seq == seq).map(|at| before.swap_remove(at));
+            let at = was.map(|a| a.at).unwrap_or_default();
+            self.aliases.push(Aliased { n, seq, bundle: Arc::new(bundle), at });
+        }
+    }
+
+    /// The ids of the full names this wallet is reached by, and each
+    /// certificate's number.
+    pub fn aliases(&self) -> Vec<(Digest, u64)> {
+        self.aliases.iter().map(|a| (a.n, a.seq)).collect()
+    }
+
+    /// The certificate of the full name of id `n`, with what goes with
+    /// it.
+    pub fn alias_bundle(&self, n: &Digest) -> Option<Arc<Vec<u8>>> {
+        self.aliases.iter().find(|a| a.n == *n).map(|a| Arc::clone(&a.bundle))
+    }
+
+    /// Whether the certificate of the full name of id `n` is to be
+    /// shown to the node at `node` now: a node that holds what the
+    /// wallet announced, and has not said it holds the certificate.
+    pub fn alias_due(&self, n: &Digest, node: &SocketAddrV4, now: Micros) -> bool {
+        let Some(alias) = self.aliases.iter().find(|a| a.n == *n).filter(|_| self.is_held(node)) else { return false };
+        match alias.at.get(node) {
+            None => true,
+            Some((held, _)) if *held == alias.seq => false,
+            Some((0, shown)) => now.saturating_sub(*shown) >= ALIAS_REFUSED_RETRY,
+            Some((_, shown)) => now.saturating_sub(*shown) >= UNHELD_RETRY,
+        }
+    }
+
+    /// It is shown to that node now.
+    pub fn alias_shown(&mut self, n: &Digest, node: SocketAddrV4, now: Micros) {
+        if let Some(alias) = self.aliases.iter_mut().find(|a| a.n == *n) {
+            alias.at.entry(node).or_insert((ALIAS_ASKED, now)).1 = now;
+        }
+    }
+
+    /// The node at `node` says it holds the certificate of number
+    /// `seq` for the full name of id `n`, or none (zero).
+    pub fn alias_held(&mut self, n: &Digest, node: &SocketAddrV4, seq: u64) {
+        if let Some(shown) = self.aliases.iter_mut().find(|a| a.n == *n).and_then(|a| a.at.get_mut(node)) {
+            shown.0 = seq;
+        }
+    }
+
+    /// At how many nodes the full name of id `n` is reached.
+    pub fn alias_reached(&self, n: &Digest) -> usize {
+        let alias = self.aliases.iter().find(|a| a.n == *n);
+        alias.map_or(0, |a| a.at.iter().filter(|(node, held)| held.0 == a.seq && self.is_held(node)).count())
     }
 
     /// Whether the node at `node` holds what was last announced to it.
@@ -339,6 +510,7 @@ impl Participant {
 
     /// No longer says anything to the nodes that are not of `points`.
     pub fn keep(&mut self, points: &[SocketAddrV4]) {
+        self.aliases.iter_mut().for_each(|a| a.at.retain(|node, _| points.contains(node)));
         self.said.retain(|node, _| points.contains(node));
     }
 
@@ -376,6 +548,11 @@ pub enum Posted {
 /// A message this node's wallet is sending.
 pub struct Post {
     pub to: Digest,
+    /// The id of the full name it was sent to, where it was sent to
+    /// one ([`crate::subnames::point`]): the nodes that name is
+    /// reached at are asked, and `to` is not known until one of them
+    /// has shown whose the name is.
+    pub via: Option<Digest>,
     pub kind: u8,
     pub body: Vec<u8>,
     /// What whoever posted it knows it by (a slate's id): given back
@@ -413,13 +590,69 @@ pub struct Mail {
     seen: std::collections::VecDeque<Digest>,
     /// What became of the messages sent, for whoever sent them.
     pub posted: Vec<(Digest, u8, [u8; 32], Posted)>,
+    /// Whose the full names messages were sent to turned out to be:
+    /// what whoever posted each knows it by, and the wallet.
+    pub resolved: Vec<([u8; 32], Digest)>,
+}
+
+impl Post {
+    /// The id whose nodes are asked for the wallet it is for.
+    pub fn asked(&self) -> Digest {
+        self.via.unwrap_or(self.to)
+    }
 }
 
 impl Mail {
     /// A message to send.
     pub fn post(&mut self, to: Digest, kind: u8, tag: [u8; 32], body: Vec<u8>, known: Option<Vec<u8>>) {
-        let (sealed, tried, turn, state) = (None, None, 0, Posted::Waiting);
-        self.posts.push(Post { to, kind, body, tag, known, sealed, began: None, tried, turn, missed: 0, state });
+        let (sealed, tried, turn, state, via) = (None, None, 0, Posted::Waiting, None);
+        self.posts.push(Post { to, via, kind, body, tag, known, sealed, began: None, tried, turn, missed: 0, state });
+    }
+
+    /// A message to send to whichever wallet the full name of id `n`
+    /// is.
+    pub fn post_to_name(&mut self, n: Digest, kind: u8, tag: [u8; 32], body: Vec<u8>) {
+        self.post(n, kind, tag, body, None);
+        self.posts.last_mut().expect("it was put there").via = Some(n);
+    }
+
+    /// What is announced under the id that was asked has come:
+    /// `announced`, at `unix`. The messages waiting for it now know
+    /// whom they are for, and are to be sealed to what that wallet
+    /// announces: which of them, and that announcement. Of a full
+    /// name, the certificate that came with it is checked: it is the
+    /// name's if `value_of` its name, on the chain, is the id it is
+    /// signed by.
+    pub fn announced(
+        &mut self,
+        announced: &[u8],
+        unix: u64,
+        value_of: impl FnOnce(&[u8]) -> Option<Digest>,
+    ) -> Option<(Digest, Vec<usize>)> {
+        let (announce, bundle) = announced.split_at_checked(msg::ANNOUNCE_LEN)?;
+        let holder = Announced::read(announce, unix)?.id();
+        let asked = match bundle.is_empty() {
+            true => holder,
+            false => {
+                let checked = crate::subnames::read(bundle, unix).filter(|c| c.holder == holder)?;
+                if value_of(&checked.name) != Some(checked.by) {
+                    return None;
+                }
+                checked.point()
+            }
+        };
+        let mut which = Vec::new();
+        for (at, post) in self.posts.iter_mut().enumerate() {
+            if post.sealed.is_some() || post.asked() != asked || post.via.is_some() == bundle.is_empty() {
+                continue;
+            }
+            if post.via.is_some() && post.to != holder {
+                post.to = holder;
+                self.resolved.push((post.tag, holder));
+            }
+            which.push(at);
+        }
+        Some((asked, which))
     }
 
     /// Says what became of the post at `at`, and lets it go.

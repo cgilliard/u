@@ -58,6 +58,13 @@ pub const HELD: u8 = 5;
 /// (The same as [`HELD`], said in answer to [`HERE`]: filled out as
 /// that is.)
 pub const HERE_HELD: u8 = 12;
+/// What a wallet held at the end of a way says there to be reached by
+/// a full name as well: the certificate that it is that name, with
+/// what goes with it ([`crate::subnames`]). And what is said back: the
+/// id the name is reached by, and the number of the certificate held
+/// for it, or none (zero).
+pub const HERE_AS: u8 = 13;
+pub const AS_HELD: u8 = 14;
 /// What whoever sends to a wallet says to a node that wallet is
 /// reached at: "what does the wallet of this id announce?", answered
 /// with the announcement, or with the id if the wallet is not there;
@@ -131,7 +138,7 @@ fn emptied(filled: &[u8]) -> Option<&[u8]> {
 /// what it is.
 fn least(said: &[u8]) -> usize {
     match said.first() {
-        Some(&(HERE | HERE_HELD | ASK | ANNOUNCED | ABSENT)) => MIDDLE,
+        Some(&(HERE | HERE_HELD | HERE_AS | AS_HELD | ASK | ANNOUNCED | ABSENT)) => MIDDLE,
         _ => 0,
     }
 }

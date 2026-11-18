@@ -60,6 +60,8 @@ const GONE: u8 = 18;
 const CARRY: u8 = 19;
 const STEPPED: u8 = 20;
 const CARRIED: u8 = 21;
+const ALIAS: u8 = 22;
+const ALIAS_STATE: u8 = 23;
 
 /// The most a [`Message::Stepped`] carries.
 pub const MAX_STEPPED: usize = MAX_DATAGRAM - HEAD - 27;
@@ -258,6 +260,24 @@ pub enum Message<'a> {
     Carried {
         name: u64,
     },
+    /// "The wallet you hold a session for is this full name, by a
+    /// certificate of this number": said by the wallet's node to a
+    /// node that name is reached at ([`crate::subnames`]). `n` is the
+    /// id the name is reached by; the certificate is asked for with
+    /// `grant` if it is not held
+    /// ([`crate::net::object::Object::Alias`]).
+    Alias {
+        token: u64,
+        grant: u64,
+        n: Digest,
+        seq: u64,
+    },
+    /// And what that node holds for the name: the number of the
+    /// certificate, or none (zero).
+    AliasState {
+        n: Digest,
+        seq: u64,
+    },
     /// "I am going": the sender is not to be asked anything more.
     Goodbye {
         token: u64,
@@ -385,6 +405,18 @@ impl<'a> Message<'a> {
                 w.put(&name.to_le_bytes());
                 CARRIED
             }
+            Message::Alias { token, grant, n, seq } => {
+                w.put(&token.to_le_bytes());
+                w.put(&grant.to_le_bytes());
+                w.put(&digest_to_bytes(n));
+                w.put(&seq.to_le_bytes());
+                ALIAS
+            }
+            Message::AliasState { n, seq } => {
+                w.put(&digest_to_bytes(n));
+                w.put(&seq.to_le_bytes());
+                ALIAS_STATE
+            }
             Message::Get(g) => {
                 w.1 += g.encode(&mut w.0[HEAD..]);
                 GET
@@ -484,6 +516,13 @@ impl<'a> Message<'a> {
                 Message::Stepped { name, circuit, kind, count, bytes }
             }
             CARRIED => Message::Carried { name: r.u64().ok_or(BAD)? },
+            ALIAS => Message::Alias {
+                token: r.u64().ok_or(BAD)?,
+                grant: r.u64().ok_or(BAD)?,
+                n: r.digest().ok_or(BAD)?,
+                seq: r.u64().ok_or(BAD)?,
+            },
+            ALIAS_STATE => Message::AliasState { n: r.digest().ok_or(BAD)?, seq: r.u64().ok_or(BAD)? },
             CARRY => Message::Carry {
                 grant: r.u64().ok_or(BAD)?,
                 name: r.u64().ok_or(BAD)?,
@@ -644,6 +683,8 @@ mod tests {
             Message::Stepped { name: rng.next_u64(), circuit: rng.next_u64(), kind: 4, count: 9, bytes: &[1, 2, 3] },
             Message::Stepped { name: 1, circuit: 2, kind: 3, count: 4, bytes: &[7; MAX_STEPPED] },
             Message::Carried { name: rng.next_u64() },
+            Message::Alias { token: rng.next_u64(), grant: rng.next_u64(), n: digest(rng), seq: rng.next_u64() },
+            Message::AliasState { n: digest(rng), seq: rng.next_u64() },
             Message::Carry {
                 grant: rng.next_u64(),
                 name: rng.next_u64(),

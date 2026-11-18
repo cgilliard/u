@@ -60,6 +60,10 @@ pub enum Object {
     /// ([`super::circuits`]), by the number its holder said it has it
     /// under.
     Step(u64),
+    /// The certificate by which a wallet is the full name reached by
+    /// this id, with what goes with it ([`crate::subnames`]): asked of
+    /// the wallet's node.
+    Alias(Digest),
 }
 
 const BLOCK: u8 = 1;
@@ -75,6 +79,7 @@ const ROOTS: u8 = 10;
 const ANNOUNCE: u8 = 11;
 const SEALED: u8 = 12;
 const STEP: u8 = 13;
+const ALIAS: u8 = 14;
 
 impl Object {
     /// What kind of object it is, in a word: for the logs.
@@ -93,6 +98,7 @@ impl Object {
             Object::Announce { .. } => "announce",
             Object::Sealed(_) => "sealed",
             Object::Step(_) => "step",
+            Object::Alias(_) => "alias",
         }
     }
 
@@ -163,6 +169,10 @@ impl Object {
                 put(&[STEP]);
                 put(&name.to_le_bytes());
             }
+            Object::Alias(n) => {
+                put(&[ALIAS]);
+                put(&digest_to_bytes(n));
+            }
         }
         at
     }
@@ -187,6 +197,7 @@ impl Object {
             FILE => Object::File(with(0)?.0),
             TX => Object::Tx(with(0)?.0),
             SEALED => Object::Sealed(with(0)?.0),
+            ALIAS => Object::Alias(with(0)?.0),
             STEP => Object::Step(u64::from_le_bytes(rest.try_into().map_err(|_| BAD)?)),
             ANNOUNCE => {
                 let (id, tail) = with(8)?;
@@ -252,6 +263,7 @@ mod tests {
             Object::Announce { id: d, seq: rng.next_u64() },
             Object::Sealed(d),
             Object::Step(rng.next_u64()),
+            Object::Alias(d),
         ]
     }
 
