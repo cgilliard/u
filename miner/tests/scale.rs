@@ -63,6 +63,14 @@ fn scaled(n: u64) -> Duration {
     Duration::from_secs(3600 + 60 * (n / 1_000_000))
 }
 
+/// A port for the nodes of the test numbered `test` (it and the one
+/// after): its own, as likely as not, and under the ports a system
+/// gives out of itself. (Windows keeps runs of those for itself, and
+/// refuses whoever asks for one by number.)
+fn port(test: u32) -> u32 {
+    20_000 + test * 9_000 + std::process::id() % 8_990
+}
+
 fn report(test: &str, what: &str, value: impl std::fmt::Display) {
     println!("SCALE {test} {what} {value}");
 }
@@ -309,7 +317,7 @@ fn filled(test: &'static str, port: u32, n: u64, blocks: u64) -> (Node, Duration
 fn a_full_block_applies_on_a_large_state() {
     const T: &str = "full-block";
     let (n, blocks) = (outputs(), 10);
-    let port = 47_000 + std::process::id() % 15_000;
+    let port = port(0);
     let (mut node, ready) = filled(T, port, n, blocks);
     report(T, "outputs", n);
     report(T, "spacing", spacing());
@@ -359,7 +367,7 @@ fn a_fresh_node_fast_syncs_a_large_state() {
     // (More blocks than a node keeps: the first of them can no longer
     // be had, and the new node must take the state.)
     let (n, blocks) = (outputs(), 12);
-    let port = 48_000 + std::process::id() % 15_000;
+    let port = port(1);
     let (mut server, ready) = filled(T, port, n, blocks);
     report(T, "outputs", n);
     report(T, "spacing", spacing());
@@ -442,7 +450,7 @@ fn a_fresh_node_takes_a_years_headers() {
         }
         out
     };
-    let port = 46_000 + std::process::id() % 15_000;
+    let port = port(2);
     let within = Duration::from_secs(3600);
     let began = Instant::now();
     const NETWORK: &str = "dev-main-work";
