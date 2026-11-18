@@ -181,8 +181,10 @@ pub struct Serve {
     cost: Micros,
     /// The time the next chunk may go, were there no burst: it runs
     /// ahead of the clock by a chunk's cost for each chunk sent, and is
-    /// never let fall more than a burst behind it.
-    due: Micros,
+    /// never let fall more than a burst behind it. It may be one time
+    /// for several that serve ([`Serve::sharing`]): then the rate is
+    /// that of all of them together, whichever of them has the work.
+    due: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Serve {
@@ -202,8 +204,18 @@ impl Serve {
             jobs: 0,
             last: None,
             cost: (SECOND / limits.rate as u64).max(1),
-            due: 0,
+            due: Default::default(),
         }
+    }
+
+    /// The same, keeping its pace by `due`, which others keep theirs
+    /// by too: the rate is what all of them send together. So that of
+    /// the workers of a node, each with the addresses that are its
+    /// own, one that has all the asking sends at the whole rate, and
+    /// none of it is kept for workers nobody is asking.
+    pub fn sharing(mut self, due: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Serve {
+        self.due = due;
+        self
     }
 
     /// Requests waiting.
@@ -278,12 +290,19 @@ impl Serve {
         let Some(to) = self.turn() else {
             return Next::Idle;
         };
-        // Never more than a burst behind the clock.
-        let due = self.due.max(now.saturating_sub((BURST - 1) * self.cost));
-        if due > now {
-            return Next::Wait(due);
+        // Never more than a burst behind the clock. (Taken from the
+        // others that keep this pace, if one of them took it first.)
+        use std::sync::atomic::Ordering::Relaxed;
+        loop {
+            let was = self.due.load(Relaxed);
+            let due = was.max(now.saturating_sub((BURST - 1) * self.cost));
+            if due > now {
+                return Next::Wait(due);
+            }
+            if self.due.compare_exchange(was, due + self.cost, Relaxed, Relaxed).is_ok() {
+                break;
+            }
         }
-        self.due = due + self.cost;
         let queue = self.queues.get_mut(&to).expect("its turn");
         // An address's requests one after another, the first first.
         let j = queue.front_mut().expect("no address waits with nothing");

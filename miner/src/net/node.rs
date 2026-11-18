@@ -502,6 +502,9 @@ enum Notice {
 pub(crate) struct Shared {
     /// What is left for each worker by the others.
     mail: Vec<Mutex<Vec<Notice>>>,
+    /// The pace the workers serve at, all together
+    /// ([`Serve::sharing`]).
+    pace: Arc<AtomicU64>,
     /// What a host's address is mixed with to find its worker: so that
     /// nobody outside can choose addresses that are all one worker's.
     key: u64,
@@ -857,12 +860,13 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         list: Arc<RwLock<List>>,
     ) -> Worker<B, V> {
         let seed = u64::from_le_bytes(derive(&secret, b's', 0)[..8].try_into().unwrap());
+        let pace = Arc::clone(&shared.pace);
         Worker {
             me,
             peers: Peers::sharing(&cfg, seed, Arc::clone(&shared.totals)),
             shared,
             budget: cfg.peers.unproven_pings,
-            serve: Serve::with(cfg.serve.limits()),
+            serve: Serve::with(cfg.serve.limits()).sharing(pace),
             cfg,
             network,
             genesis: chain.params().genesis().header.hash(),
@@ -2668,6 +2672,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         let n = cfg.workers.max(1);
         let shared = Arc::new(Shared {
             mail: (0..n).map(|_| Mutex::new(Vec::new())).collect(),
+            pace: Arc::default(),
             key: u64::from_le_bytes(derive(&secret, b'h', 0)[..8].try_into().unwrap()),
             totals: Arc::new(Totals::new()),
             live: (0..n).map(|_| AtomicUsize::new(0)).collect(),
@@ -2685,10 +2690,11 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             by_port: AtomicBool::new(false),
         });
         let list = Arc::new(RwLock::new(List::new(n)));
-        // What is of the whole node is divided among its workers.
+        // What is of the whole node is divided among its workers: but
+        // for the rate it serves at, which they keep together, so that
+        // a worker with all the asking has all of it.
         let mut each = cfg;
         if n > 1 {
-            each.serve.rate = (each.serve.rate / n as u32).max(1);
             each.serve.waiting = (each.serve.waiting / n).max(each.serve.waiting_each);
         }
         let workers = (0..n).map(|me| {
