@@ -1,0 +1,64 @@
+name: scale
+
+# What a node needs at the size of a chain that has run for years,
+# measured every night: a state of 180,000,000 unspent outputs (somewhat
+# more than Bitcoin's), full blocks applied on it, and a new node taking
+# it from the one that has it (miner/tests/scale.rs). Each job prints
+# what it measured as SCALE lines, the last of them what the machine had
+# left of disk and of memory. The same in small runs on every push
+# (test.yml).
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      outputs:
+        description: "Unspent outputs in the state"
+        default: "180000000"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  scale:
+    name: ${{ matrix.test }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - a_full_block_applies_on_a_large_state
+          - a_fresh_node_fast_syncs_a_large_state
+    env:
+      TABMINER_SCALE_OUTPUTS: ${{ github.event.inputs.outputs || '180000000' }}
+    defaults:
+      run:
+        working-directory: miner
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+
+      # The data directories go where the machine has the most room.
+      - name: Choose where the state is kept
+        run: |
+          df -h / /mnt || true
+          free -m
+          nproc
+          room() { df -Pk "$1" 2>/dev/null | awk 'NR==2 {print $4}'; }
+          if [ "$(room /mnt || echo 0)" -gt "$(room /tmp)" ]; then
+            sudo mkdir -p /mnt/scale && sudo chown "$USER" /mnt/scale
+            echo "TMPDIR=/mnt/scale" >> "$GITHUB_ENV"
+          fi
+
+      - name: Test
+        run: cargo test --locked --release --features dev --test scale -- --ignored --exact --nocapture ${{ matrix.test }}

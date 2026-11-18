@@ -81,6 +81,29 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+  # The program at the size of a chain that has run for years, in small:
+  # a state of 2,000,000 outputs, full blocks applied on it, and a new
+  # node taking it (miner/tests/scale.rs). What each needed is printed as
+  # SCALE lines. The same at full size is run nightly (scale.yml).
+  scale:
+    name: scale (2,000,000 outputs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: miner
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+
+      - name: Test
+        run: cargo test --locked --release --features dev --test scale -- --ignored --nocapture --test-threads 1
+
   # The same tests in a release build: the optimized code a node runs,
   # without debug assertions or overflow checks. The fuzzers of the
   # decoders are quick here, so they run ten times their usual iterations.

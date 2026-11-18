@@ -19,6 +19,8 @@
 //! A [`Chain`] is a store with a network's rules over it.
 
 pub mod apply;
+#[cfg(feature = "dev")]
+pub mod debug;
 pub mod headers;
 pub mod leaves;
 pub mod params;

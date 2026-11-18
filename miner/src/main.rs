@@ -35,6 +35,32 @@ use tabminer::wallet::{Ask, Wallet, WalletError};
 #[global_allocator]
 static HEAP: tabminer::heap::Counting = tabminer::heap::Counting;
 
+/// How blocks are made here: what a block may carry, and, for
+/// debugging, what it is filled with in place of that.
+#[derive(Clone, Copy)]
+struct Making {
+    /// Signatures a block checks at the most.
+    max_signatures: usize,
+    /// The height above which no block is made.
+    blocks: Option<u64>,
+    /// Debugging: the outputs every block makes, and how many of the
+    /// outputs the chain began with it spends.
+    fill: Option<(usize, usize)>,
+    /// Debugging: the outputs the chain began with, and how far apart.
+    filled: Option<(u64, u64)>,
+}
+
+impl Making {
+    /// Debugging: what a block of `max_block_size` is filled with, if
+    /// blocks are filled: as much of what was asked for as fits.
+    fn filling(&self, max_block_size: usize) -> Option<(usize, usize)> {
+        #[cfg(feature = "dev")]
+        return self.fill.map(|(outputs, spends)| miner::fill_plan(max_block_size, outputs, spends));
+        #[cfg(not(feature = "dev"))]
+        return None.filter(|_: &(usize, usize)| max_block_size > 0 && self.fill.is_some() && self.filled.is_some());
+    }
+}
+
 /// The node's wallet, as its threads share it.
 type Purse = Arc<Mutex<Wallet<FileBackend>>>;
 
@@ -141,7 +167,7 @@ fn make_blocks(
     seed: SeedText<'static>,
     kept: &Path,
     prebuild: bool,
-    max_signatures: usize,
+    making: Making,
     wallet: &Purse,
     main: &Arc<Logger>,
     stats: &Arc<Stats>,
@@ -175,6 +201,11 @@ fn make_blocks(
     let mut letting_go: std::collections::VecDeque<std::thread::JoinHandle<()>> = Default::default();
     loop {
         let seen = hold.moves();
+        // No higher than told to.
+        if making.blocks.is_some_and(|most| hold.read().height as u64 >= most) {
+            hold.wait_moved(seen, Duration::from_secs(60));
+            continue;
+        }
         // Not while the state is being taken; and not, for a while,
         // while a chain known to be ahead of ours is coming in.
         let ahead = match hold.behind() {
@@ -239,8 +270,7 @@ fn make_blocks(
             let (hold, table, main, stats) = (hold.clone(), Arc::clone(&table), Arc::clone(main), Arc::clone(stats));
             let (wallet, watch) = (Arc::clone(wallet), ahead.is_none());
             std::thread::Builder::new().name("block".into()).spawn(move || {
-                let finished =
-                    make_block(&hold, &table, &wallet, &main, &stats, max_signatures, seen, watch, start, on);
+                let finished = make_block(&hold, &table, &wallet, &main, &stats, making, seen, watch, start, on);
                 let _ = done.send(finished);
             })
         };
@@ -284,7 +314,7 @@ fn make_block(
     wallet: &Purse,
     main: &Logger,
     stats: &Stats,
-    max_signatures: usize,
+    making: Making,
     seen: u64,
     watch: bool,
     start: u64,
@@ -317,7 +347,14 @@ fn make_block(
     };
     // What the block carries of the pool: none, if it cannot be
     // chosen.
-    let (pooled, sweeps) = match miner::choose(hold.chain(), &|f| hold.pool(f), max_signatures) {
+    // (Debugging: none, of a block that is filled with what nobody
+    // sent.)
+    let filling = making.filling(hold.chain().params().max_block_size);
+    let chosen = match filling {
+        Some(_) => Ok((Vec::new(), Vec::new())),
+        None => miner::choose(hold.chain(), &|f| hold.pool(f), making.max_signatures),
+    };
+    let (pooled, sweeps) = match chosen {
         Ok(chosen) => chosen,
         Err(e) => {
             main.log(&format!("Error: choosing a block's transactions: {e}"));
@@ -339,7 +376,12 @@ fn make_block(
     let unix = socket::unix();
     let purse = || wallet.lock().unwrap_or_else(|e| e.into_inner());
     let paid = match miner::reward_due(hold.chain(), &pooled) {
-        Ok(Some((height, due))) => purse().reward(due, height, unix).map_err(|e| e.to_string()),
+        // (A block that is filled makes an output of one unit for each
+        // it is filled with: its reward is less by as many.)
+        Ok(Some((height, due))) => {
+            let due = due.saturating_sub(filling.map_or(0, |(outputs, _)| outputs as u64));
+            purse().reward(due, height, unix).map_err(|e| e.to_string())
+        }
         Ok(None) => return true,
         Err(e) => Err(e.to_string()),
     };
@@ -352,7 +394,15 @@ fn make_block(
         }
     };
     let dataset = table.read().unwrap_or_else(|e| e.into_inner());
-    let made = miner::mine_with(hold.chain(), &*dataset, &paid, unix, start, &pooled, &sweeps, &proved, &cancel);
+    let made = match filling {
+        #[cfg(feature = "dev")]
+        Some((outputs, spends)) => {
+            let said = |line: &str| main.log(line);
+            let (chain, filled) = (hold.chain(), making.filled);
+            miner::mine_filled(chain, &*dataset, &paid, unix, start, outputs, spends, filled, &said, &cancel)
+        }
+        _ => miner::mine_with(hold.chain(), &*dataset, &paid, unix, start, &pooled, &sweeps, &proved, &cancel),
+    };
     // Kept, with its block's id, before the block is handed over; and
     // forgotten at once if there is no block.
     let kept = match &made {
@@ -484,17 +534,88 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     let stat_log = open(&c.stat_log)?.report_rotations_to(Arc::clone(&main));
 
     // The chain.
-    let (params, proofs) = match c.network {
+    #[allow(unused_mut)]
+    let (mut params, proofs) = match c.network {
         Network::Mainnet => (ChainParams::MAINNET, AggregatorParams::MAINNET),
         Network::Dev => (ChainParams::DEV, AggregatorParams::DEV),
         Network::DevRecursive => (ChainParams::DEV_RECURSIVE, AggregatorParams::DEV_RECURSIVE),
     };
+    // Debugging: a chain begun with a state filled at once. Its first
+    // block says that state's root, which is made from the two numbers
+    // given: so it is the first block of every node told the same.
+    #[cfg(feature = "dev")]
+    let filled = c.debug_outputs.map(|(n, spacing, _)| {
+        let began = Instant::now();
+        main.log(&format!(
+            "debug: making the roots of a state of {} outputs, one every {spacing} positions",
+            commas(n)
+        ));
+        let said = std::sync::atomic::AtomicU64::new(0);
+        let (root, roots) = tabminer::chain::debug::root(n, spacing, &|done| {
+            // (About every ten million.)
+            if said.fetch_max(done / 10_000_000, std::sync::atomic::Ordering::Relaxed) < done / 10_000_000 {
+                main.log(&format!(
+                    "debug: the roots of {} outputs made in {:.1}s",
+                    commas(done),
+                    began.elapsed().as_secs_f64()
+                ));
+            }
+        });
+        params.genesis_state = Some(root);
+        main.log(&format!(
+            "debug: the first block of a chain of {} outputs ready in {:.1}s",
+            commas(n),
+            began.elapsed().as_secs_f64()
+        ));
+        roots
+    });
     let seed = SeedText::new(params.pow);
-    let verifier = AggregateVerifier::new(proofs, params.emission, Genesis::of(&params.genesis().header, &seed));
+    let mut verifier = AggregateVerifier::new(proofs, params.emission, Genesis::of(&params.genesis().header, &seed));
+    // A data directory is of blocks that were checked, or of blocks
+    // that were not, for good: blocks nobody checked must never pass
+    // for checked ones, nor a chain that was checked take any.
+    let marker = c.data_dir.join("unchecked");
     let store = c.data_dir.join("chain.store");
+    match (c.debug_unchecked, marker.exists()) {
+        (true, false) if store.exists() => {
+            return Err(format!(
+                "{} holds a chain whose blocks were checked: --debug-no-validate-proofs needs a data directory of its own",
+                c.data_dir.display()
+            ));
+        }
+        (true, false) => std::fs::write(&marker, "blocks here were taken without checking their proofs\n")
+            .map_err(|e| format!("cannot write {}: {e}", marker.display()))?,
+        (false, true) => {
+            return Err(format!(
+                "{} was run with --debug-no-validate-proofs: its blocks were never checked. Give another --data-dir, \
+                 or that option again",
+                c.data_dir.display()
+            ));
+        }
+        _ => {}
+    }
+    if c.debug_unchecked {
+        verifier = verifier.unchecked();
+    }
     let backend = FileBackend::open(&store).map_err(|e| format!("cannot open the store {}: {e}", store.display()))?;
     let chain = Chain::open(backend, c.keep, params, seed, verifier)
         .map_err(|e| format!("cannot open the store {}: {e}", store.display()))?;
+    // Debugging: the state the chain begins with, put as a state taken
+    // from other nodes is put, unless this node is to have only its
+    // first block.
+    #[cfg(feature = "dev")]
+    if let (Some((n, spacing, false)), Some(roots)) = (c.debug_outputs, &filled) {
+        let began = Instant::now();
+        let said = std::cell::Cell::new(0);
+        let filling = tabminer::chain::debug::fill(&chain, n, spacing, roots, &|done| {
+            if done / 10_000_000 > said.get() {
+                said.set(done / 10_000_000);
+                main.log(&format!("debug: {} outputs filled in {:.1}s", commas(done), began.elapsed().as_secs_f64()));
+            }
+        });
+        filling.map_err(|e| format!("debug: filling the state: {e}"))?;
+        main.log(&format!("debug: a state of {} outputs ready in {:.1}s", commas(n), began.elapsed().as_secs_f64()));
+    }
     // A chain made under other rules than this build's is not gone on
     // with: nothing made here could build on it, and nothing of it
     // would be taken from a peer.
@@ -559,10 +680,17 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     // Blocks are made on a thread of their own, for as long as the
     // node runs.
     {
-        let main = Arc::clone(&main);
+        let (main, debug) = (Arc::clone(&main), c.debug_unchecked);
         hold.on_event(Box::new(move |event| {
             if let Some(line) = said(event) {
                 main.log(&line);
+            }
+            // Debugging: how long the block took to apply.
+            if debug && let Event::Block { header, .. } = event {
+                let (height, took) = tabminer::chain::apply::last_applied();
+                if height == header.height {
+                    main.log(&format!("debug: block {height} applied in {:.3}s", took.as_secs_f64()));
+                }
             }
         }));
     }
@@ -646,7 +774,13 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     }
     if let (Some((seed, table)), Some(wallet)) = (mining, &wallet) {
         let (hold, main, stats, prebuild) = (hold.clone(), Arc::clone(&main), Arc::clone(&stats), c.prebuild_table);
-        let (most, wallet) = (c.max_block_signatures, Arc::clone(wallet));
+        let most = Making {
+            max_signatures: c.max_block_signatures,
+            blocks: c.blocks,
+            fill: c.debug_fill,
+            filled: c.debug_outputs.map(|(n, spacing, _)| (n, spacing)),
+        };
+        let wallet = Arc::clone(wallet);
         std::thread::Builder::new()
             .name("miner".into())
             .spawn(move || make_blocks(&hold, seed, &table, prebuild, most, &wallet, &main, &stats))

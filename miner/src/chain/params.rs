@@ -71,6 +71,12 @@ pub struct ChainParams {
     pub min_reveal: u32,
     /// The block time and difficulty schedule.
     pub schedule: Schedule,
+    /// Debugging only ([`crate::chain::debug`]): the state root the
+    /// first block's header has, where it is not that of nothing: a
+    /// chain begun with a state filled at once, for trying a node at
+    /// the size of a chain that has run for years. None on every
+    /// network there is.
+    pub genesis_state: Option<crate::hash::Digest>,
 }
 
 impl ChainParams {
@@ -86,6 +92,7 @@ impl ChainParams {
         emission: MAINNET_EMISSION,
         min_reveal: crate::name::MIN_REVEAL,
         schedule: Schedule::MAINNET,
+        genesis_state: None,
     };
 
     /// The dev network (`--network dev`), for rapid testing on a machine
@@ -104,6 +111,7 @@ impl ChainParams {
         emission: MAINNET_EMISSION,
         min_reveal: crate::name::MIN_REVEAL,
         schedule: Schedule { block_time: 1, half_life: 60, from_first_block: true },
+        genesis_state: None,
     };
 
     /// The recursive dev network (`--network dev-recursive`): as
@@ -169,7 +177,7 @@ impl ChainParams {
             height: 0,
             timestamp: self.genesis_timestamp,
             body_commitment: body.commitment(),
-            state_root: *empty(STATE_HEIGHT),
+            state_root: self.genesis_state.unwrap_or(*empty(STATE_HEIGHT)),
             aux: [0u8; 32],
             mix: EMPTY,
             nonce: self.genesis_nonce,

@@ -130,6 +130,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Chain<B, V> {
     /// is not checked again; one whose branch leaves the chain below
     /// what can be undone is set aside.
     pub fn apply_block(&self, block: &BlockRef<'_>, now: u64) -> Result<Applied, Error> {
+        let _timed = Timed(std::time::Instant::now(), block.header().height);
         let id = block.header().hash();
         // The blocks to mark if the branch fails: from the one that
         // failed on. The block itself if nothing else is said.
@@ -466,6 +467,30 @@ impl<B: Backend + 'static, V> Chain<B, V> {
 
 fn corrupt(what: &'static str) -> Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, what).into()
+}
+
+/// How long the block last given to [`Chain::apply_block`] took, in
+/// microseconds, and its height: for whoever measures a node. (Of any
+/// chain in the program: there is one.)
+static LAST_APPLIED: (std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64) =
+    (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0));
+
+/// The height of the block last given to be applied, and how long that
+/// took.
+pub fn last_applied() -> (u32, std::time::Duration) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (LAST_APPLIED.0.load(Relaxed) as u32, std::time::Duration::from_micros(LAST_APPLIED.1.load(Relaxed)))
+}
+
+/// Says, when it is let go, how long has passed since it was made.
+struct Timed(std::time::Instant, u32);
+
+impl Drop for Timed {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        LAST_APPLIED.0.store(self.1 as u64, Relaxed);
+        LAST_APPLIED.1.store(self.0.elapsed().as_micros() as u64, Relaxed);
+    }
 }
 
 #[cfg(test)]

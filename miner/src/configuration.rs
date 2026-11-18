@@ -241,6 +241,32 @@ const OPTIONS: &[(&str, &[Opt])] = &[
         ],
     ),
     (
+        "Debugging",
+        &[
+            Opt {
+                name: "debug-no-validate-proofs",
+                takes: Takes::Nothing,
+                help: "take blocks without checking their proofs, and make them\nwithout proving: only on a dev network, in a build that has\nthem, and in a data directory of its own, which is marked as\none whose blocks were never checked",
+            },
+            Opt {
+                name: "debug-fill",
+                takes: Takes::Value("N[,S]"),
+                help: "with the above: every block made here makes N outputs and\nspends S of those the chain began with, as many as fit a\nblock",
+            },
+            Opt {
+                name: "debug-fill-outputs",
+                takes: Takes::Value("N[,K]"),
+                help: "with the above: begin the chain with N outputs nobody made,\none every K positions (5 if not said): a state the size of\na chain that has run for years. The same on every node\ntold the same",
+            },
+            Opt {
+                name: "debug-genesis-outputs",
+                takes: Takes::Value("N[,K]"),
+                help: "with the above: begin with the first block of a chain so\nfilled, and none of its outputs: a new node of that chain,\nto take its state from the others",
+            },
+            Opt { name: "blocks", takes: Takes::Value("N"), help: "make no block above height N" },
+        ],
+    ),
+    (
         "Logging",
         &[
             Opt {
@@ -415,6 +441,16 @@ pub struct Configuration {
     pub min_confirmations: u32,
     /// Whether commands are taken from the terminal.
     pub prompt: bool,
+    /// Debugging: whether blocks' proofs go unchecked, and unmade.
+    pub debug_unchecked: bool,
+    /// Debugging: the outputs every block made here makes, and how
+    /// many of those the chain began with it spends.
+    pub debug_fill: Option<(usize, usize)>,
+    /// Debugging: the outputs the chain begins with and how far apart
+    /// they are, and whether this node has only their root.
+    pub debug_outputs: Option<(u64, u64, bool)>,
+    /// The height above which no block is made here.
+    pub blocks: Option<u64>,
     pub listen: SocketAddrV4,
     /// Peers given by hand.
     pub peers: Vec<SocketAddrV4>,
@@ -727,6 +763,41 @@ impl Configuration {
             return Err(wrong(e.to_string()));
         }
 
+        // The debugging options: a number, and perhaps a second after
+        // a comma.
+        let pair = |name: &str, second: u64| -> Result<Option<(u64, u64)>, Refused> {
+            let Some(text) = given.one(name) else { return Ok(None) };
+            let (first, rest) = text.split_once(',').map_or((text, None), |(a, b)| (a, Some(b)));
+            let number = |t: &str| t.parse::<u64>().map_err(|_| wrong(format!("--{name}: '{text}' is not N or N,M")));
+            Ok(Some((number(first)?, rest.map_or(Ok(second), number)?)))
+        };
+        let debug_unchecked = given.flag("debug-no-validate-proofs");
+        let debug_fill = pair("debug-fill", 0)?.map(|(n, s)| (n as usize, s as usize));
+        let (filled, rooted) = (pair("debug-fill-outputs", 5)?, pair("debug-genesis-outputs", 5)?);
+        if debug_unchecked && (network == Network::Mainnet || !cfg!(feature = "dev")) {
+            return clash(
+                "--debug-no-validate-proofs needs --network dev, in a build that has the dev networks".into(),
+            );
+        }
+        for (name, given) in [
+            ("debug-fill", debug_fill.is_some()),
+            ("debug-fill-outputs", filled.is_some()),
+            ("debug-genesis-outputs", rooted.is_some()),
+        ] {
+            if given && !debug_unchecked {
+                return clash(format!("--{name} needs --debug-no-validate-proofs"));
+            }
+        }
+        let debug_outputs = match (filled, rooted) {
+            (Some(_), Some(_)) => {
+                return clash(
+                    "--debug-genesis-outputs needs --debug-fill-outputs not to be given: it is one or the other".into(),
+                );
+            }
+            (Some((n, k)), None) => Some((n, k.max(1), false)),
+            (None, Some((n, k))) => Some((n, k.max(1), true)),
+            (None, None) => None,
+        };
         let (mine, wallet) = (!given.flag("no-mine"), !given.flag("no-wallet"));
         if mine && !wallet {
             return clash("--no-wallet needs --no-mine: the rewards of blocks made here are paid to the wallet".into());
@@ -768,6 +839,10 @@ impl Configuration {
             min_confirmations: count("min-confirmations", 1)?
                 .map_or(crate::wallet::MIN_CONFIRMATIONS, |n| n.min(u32::MAX as usize) as u32),
             prompt: !given.flag("no-prompt"),
+            debug_unchecked,
+            debug_fill,
+            debug_outputs,
+            blocks: given.number("blocks", 0)?,
             listen,
             peers,
             seeds,
@@ -803,6 +878,9 @@ impl Configuration {
         ]);
         lines.push(("Wallet", yes(self.wallet)));
         lines.push(("Min Confirmations", commas(self.min_confirmations as u64)));
+        if self.debug_unchecked {
+            lines.push(("Debug", "blocks' proofs are not checked".to_string()));
+        }
         lines.extend([
             ("Threads", if self.threads == 0 { "one a core".to_string() } else { commas(self.threads as u64) }),
             ("Request Queue Size", commas(self.net.request_queue as u64)),
@@ -1269,7 +1347,7 @@ mod tests {
     fn the_help_and_the_options_are_one_list() {
         let help = help();
         assert!(help.starts_with("tabminer: a node of the Tabernacle network."));
-        for section in ["General", "Mining", "Wallet", "Network", "Peers", "Sync", "Serving", "Logging"] {
+        for section in ["General", "Mining", "Wallet", "Network", "Peers", "Sync", "Serving", "Debugging", "Logging"] {
             assert!(help.contains(&format!("\n{section}\n")), "{section}");
         }
         let mut named = 0;
@@ -1279,7 +1357,7 @@ mod tests {
             let value = match takes {
                 "NAME" => Some("dev"),
                 "DIR" | "FILE" => Some("/somewhere/of/its/own"),
-                "N" | "TIME" | "SIZE" => Some("70"),
+                "N" | "TIME" | "SIZE" | "N[,S]" | "N[,K]" => Some("70"),
                 "HEX" => Some("0000000000000000000000000000000000000000000000000000000000000000"),
                 "ADDR:PORT" => Some("10.1.2.3:4000"),
                 "HOST:PORT" => Some("seed.example.org:4000"),

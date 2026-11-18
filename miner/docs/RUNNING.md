@@ -765,3 +765,30 @@ command of the program (the library can).
 3. **The peers file and the built-in seeds.** `--peer` and `--seed` are
    what a node begins from today.
 4. **The genesis tool** itself, in its package.
+
+## Debugging: a node at the size of an old chain
+
+A build with the dev networks (`--features dev`) can try a node at the
+size of a chain that has run for years, without running one. None of it
+is for a network anybody uses: it needs `--network dev`, and
+`--debug-no-validate-proofs`, with which blocks are taken without
+checking their proofs and made without proving. A data directory run so
+is marked (a file `unchecked`), and is never opened without the option
+again; nor is one whose blocks were checked opened with it.
+
+| Option | What it does |
+|---|---|
+| `--debug-fill-outputs N[,K]` | The chain begins with N outputs nobody made, one every K positions (5 if not said). Its first block is another than the network's, and the same on every node told the same. |
+| `--debug-genesis-outputs N[,K]` | That first block, and none of the outputs: a new node of that chain, which takes the state from the others. |
+| `--debug-fill N[,S]` | Every block made here makes N outputs and spends S of those the chain began with: as many of both as fit a block. |
+| `--blocks N` | No block is made above height N. |
+
+The main log says how long each block took to apply
+(`debug: block 9 applied in 0.140s`), and the stat log and `status` say
+how much memory the node holds and the most it has held.
+
+`tests/scale.rs` runs a node so, and prints what it needed as `SCALE`
+lines: a state of 2,000,000 outputs on every push, and of 180,000,000
+every night (`.github/workflows/scale.yml`).
+
+    TABMINER_SCALE_OUTPUTS=20000000 cargo test --release --features dev --test scale -- --ignored --nocapture --test-threads 1
