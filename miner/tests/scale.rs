@@ -70,6 +70,8 @@ struct Node {
     /// is its own (not the files it reads), in megabytes.
     resident: Arc<AtomicU64>,
     own: Arc<AtomicU64>,
+    /// How many lines of its main log have been shown.
+    shown: usize,
 }
 
 impl Drop for Node {
@@ -115,7 +117,7 @@ impl Node {
                 std::thread::sleep(Duration::from_secs(1));
             }
         });
-        Node { name, child, dir, listen, resident, own }
+        Node { name, child, dir, listen, resident, own, shown: 0 }
     }
 
     /// The lines of its main log that have `text` in them.
@@ -124,12 +126,26 @@ impl Node {
         log.lines().filter(|l| l.contains(text)).map(str::to_string).collect()
     }
 
+    /// Shows what its main log has said since it was last shown: each
+    /// line as the node wrote it, after the node's name. So that what a
+    /// run prints is what whoever ran the two nodes would have read.
+    fn show(&mut self) {
+        let log = std::fs::read_to_string(self.dir.join("tabernacle.log")).unwrap_or_default();
+        // (Not a last line still being written.)
+        let whole = log.matches('\n').count();
+        for line in log.lines().take(whole).skip(self.shown) {
+            println!("{:>6} | {line}", self.name);
+        }
+        self.shown = self.shown.max(whole);
+    }
+
     /// Waits until its log has `count` lines with `text` in them, and
     /// gives them: the test fails if `within` passes first, or the node
     /// ends, or says of anything that it is an error.
     fn wait(&mut self, text: &str, count: usize, within: Duration) -> Vec<String> {
-        let (began, mut told) = (Instant::now(), Instant::now());
+        let began = Instant::now();
         loop {
+            self.show();
             let lines = self.lines(text);
             if lines.len() >= count {
                 return lines;
@@ -146,12 +162,6 @@ impl Node {
                 panic!("{} ended ({ended}) before its log said '{text}' {count} times", self.name);
             }
             assert!(began.elapsed() < within, "{}: '{text}' {} of {count} times in {within:?}", self.name, lines.len());
-            // (Something is said every minute, of a wait that is long.)
-            if told.elapsed() >= Duration::from_secs(60) {
-                told = Instant::now();
-                let last = self.lines("").pop().unwrap_or_default();
-                println!("PROGRESS {} {:.0}s {last}", self.name, began.elapsed().as_secs_f64());
-            }
             std::thread::sleep(Duration::from_millis(200));
         }
     }
@@ -274,6 +284,7 @@ fn a_full_block_applies_on_a_large_state() {
         // too much for them to be held to a number.)
         assert!(secs[secs.len() - 1] < 300.0, "{what} took {:.1}s", secs[secs.len() - 1]);
     }
+    node.show();
     node.report(T, "node");
     report_left(T);
 }
@@ -324,6 +335,8 @@ fn a_fresh_node_fast_syncs_a_large_state() {
     report(T, "state_taken_secs", format!("{:.1}", taken.as_secs_f64()));
     report(T, "state_fetch_secs", format!("{:.1}", (taken - headers).as_secs_f64()));
     report(T, "synced_secs", format!("{:.1}", synced.as_secs_f64()));
+    server.show();
+    new.show();
     server.report(T, "server");
     new.report(T, "new");
     report_left(T);
