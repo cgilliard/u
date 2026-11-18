@@ -238,14 +238,19 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Chain<B, V> {
         // of each height, and planned no more.
         state.write_blocks(|txn, blocks| {
             let known = self.known_in(txn, blocks, &target.block)?.ok_or_else(|| corrupt("the block is not kept"))?;
+            // (All of them at once: a chain is as many heights as it
+            // has blocks.)
             let mut h = known.header;
+            let mut heights = Vec::with_capacity(h.height as usize);
             while h.height > 0 {
-                blocks.set_at(txn, h.height, Some(h.hash()))?;
+                heights.push((h.height, h.hash()));
                 h = self
                     .known_in(txn, blocks, &h.prev_hash)?
                     .ok_or_else(|| corrupt("a header's ancestor is missing"))?
                     .header;
             }
+            heights.reverse();
+            blocks.set_many(txn, &heights)?;
             blocks.drop_planned(txn, 0, target.height.saturating_add(1))?;
             blocks.put_entry(txn, &Known { status: Status::Valid, ..known }.entry())?;
             blocks.put_body(txn, target.height, &target.block, body)

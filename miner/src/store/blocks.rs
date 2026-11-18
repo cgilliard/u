@@ -392,6 +392,23 @@ impl Blocks {
         }
     }
 
+    /// Says which block is the chain's at each of `heights`, which
+    /// ascend: [`Blocks::set_at`] of each, in one pass over the table.
+    /// Said one at a time in one transaction, each writes anew the
+    /// pages the one before wrote, and a chain of a year's blocks
+    /// leaves ten times its size of pages behind it in the file.
+    pub fn set_many<B: Backend>(&mut self, txn: &Txn<'_, B>, heights: &[(u32, Digest)]) -> Result<(), Error> {
+        debug_assert!(heights.windows(2).all(|w| w[0].0 < w[1].0), "heights ascend");
+        let mut puts = Vec::with_capacity(heights.len());
+        for (height, id) in heights {
+            let there = trie::get::<HeightTree>(txn, self.heights, *height as u128)?.is_some();
+            puts.push((*height, *id, there));
+        }
+        let edits: Edits<'_, HeightTree> = Edits { puts: &puts, ..Edits::none() };
+        self.heights = trie::update_on(txn, self.heights, 0, edits, 1)?.0;
+        Ok(())
+    }
+
     /// The id of the planned branch's block at `height`.
     pub fn planned_at(&self, pages: &impl ReadPages, height: u32) -> io::Result<Option<Digest>> {
         Ok(trie::get::<HeightTree>(pages, self.planned, height as u128)?.map(|r| r.0))

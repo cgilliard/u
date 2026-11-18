@@ -475,4 +475,9 @@ fn a_fresh_node_takes_a_years_headers() {
     server.report(T, "server");
     new.report(T, "new");
     report_left(T);
+    // A header is two hundred bytes, and what a node keeps of one
+    // somewhat under twice that: the file of a node that has taken a
+    // year of them is not many times what they come to.
+    let (disk, headers) = (dir_size(&new.dir), blocks * 204);
+    assert!(disk < 6 * headers, "{} MB on disk for {} MB of headers", disk / 1_000_000, headers / 1_000_000);
 }
