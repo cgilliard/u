@@ -60,6 +60,9 @@ pub struct Chain<B: Backend + 'static, V> {
     anchor: Mutex<Option<(Digest, Header)>>,
     /// The work of genesis, whose header claims none: computed once.
     genesis_work: std::sync::OnceLock<crate::pow_air::Work>,
+    /// Debugging only: a header's work is taken as what it claims
+    /// ([`Chain::debug_trust_work`]).
+    trust_work: std::sync::atomic::AtomicBool,
     /// Heights whose full proof of work was checked, for the tests.
     #[cfg(test)]
     pub(crate) full_pow_heights: Mutex<Vec<u32>>,
@@ -121,6 +124,7 @@ impl<B: Backend + 'static, V> Chain<B, V> {
             dataset: RwLock::new(None),
             anchor: Mutex::new(None),
             genesis_work: std::sync::OnceLock::new(),
+            trust_work: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             full_pow_heights: Mutex::new(Vec::new()),
         })
@@ -198,6 +202,16 @@ impl<B: Backend + 'static, V> Chain<B, V> {
             Store::Receiving(receiving) => receiving.write_blocks(change),
             Store::Gone => Err(Error::Receiving),
         }
+    }
+
+    /// Debugging only: from here until it is said otherwise, a header's
+    /// work is taken as what the header claims of it. For a node making
+    /// a long chain of its own to try others with
+    /// ([`crate::miner::extend_empty`]): never for what comes from
+    /// anyone else.
+    #[cfg(feature = "dev")]
+    pub fn debug_trust_work(&self, trust: bool) {
+        self.trust_work.store(trust, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Gives the chain a table of the proof of work to check headers

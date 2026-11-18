@@ -269,6 +269,13 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         );
         let (held, most) = (crate::heap::now() / 1_000_000, crate::heap::peak() / 1_000_000);
         out.push_str(&format!("\nmemory: {} MB held, {} MB at the most", commas(held as u64), commas(most as u64)));
+        // (Of the store's file, what is in use and how long it is: the
+        // rest is space inside it, taken again before the file grows.)
+        if let Ok(state) = self.hold.chain().whole() {
+            let (used, end) = state.file().space();
+            let mb = |units: u64| commas(units * crate::store::pagefile::UNIT as u64 / 1_000_000);
+            out.push_str(&format!("\nstore: {} MB in use, of a file of {} MB", mb(used), mb(end)));
+        }
         if let Ok(wallet) = self.wallet() {
             let balance = follow::balance(self.hold.chain(), &wallet).map_err(|e| e.to_string())?;
             out.push_str(&format!("\nwallet: {} confirmed", coins(balance.confirmed)));

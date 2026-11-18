@@ -14,7 +14,10 @@
 //! A third test is of a chain's length, not its state's size: a chain
 //! of a year's blocks (`TABMINER_SCALE_BLOCKS`, or 144 x 365 = 52,560)
 //! is made in a couple of minutes (`--debug-blocks`: empty blocks, of
-//! next to no work), and a new node takes its headers.
+//! next to no work), and a new node takes its headers. It is of a
+//! network with the main network's work (`--network dev-main-work`):
+//! its table, its targets, its times. What a header costs to check is
+//! what it costs there.
 //!
 //! Each test prints what it measured as `SCALE` lines, one fact a line,
 //! to be read and compared between runs: `SCALE <test> <what> <value>`.
@@ -89,11 +92,16 @@ impl Drop for Node {
 
 impl Node {
     fn start(name: &'static str, test: &str, port: u32, args: &[&str]) -> Node {
+        Node::start_on("dev", name, test, port, args)
+    }
+
+    /// A node of the network `network`.
+    fn start_on(network: &str, name: &'static str, test: &str, port: u32, args: &[&str]) -> Node {
         let dir = std::env::temp_dir().join(format!("tabminer-scale-{test}-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let listen = format!("127.0.0.1:{port}");
         let child = Command::new(TABMINER)
-            .args(["--network", "dev", "--debug-no-validate-proofs", "--no-prompt"])
+            .args(["--network", network, "--debug-no-validate-proofs", "--no-prompt"])
             .args(["--max-undo-blocks", KEPT, "--sync-point", SYNC_POINT])
             .args(["--stat-interval-seconds", "1", "--stat-summary-seconds", "60"])
             .args(["--data-dir", &dir.display().to_string(), "--listen", &listen])
@@ -407,12 +415,16 @@ fn a_fresh_node_fast_syncs_a_large_state() {
 /// or `TABMINER_SCALE_BLOCKS`) from the one node that has it, and then
 /// joins it: how long the headers take, and what the node needed.
 ///
-/// The work of each header is checked as a node of the main network
-/// checks it while it catches up: by what the header claims, the rest
-/// left to the proof of the block the state is taken as of, and checked
-/// in full only from that block up. (What that full check costs is the
-/// main network's own, and is not what this measures: there it is tens
-/// of milliseconds a header, of a handful of headers.)
+/// The chain is of a network with the main network's work, and the new
+/// node, which makes no blocks, has no table of it: so it checks
+/// headers as a node of the main network does. The work of each is
+/// checked by what the header claims, the rest left to the proof of the
+/// block the state is taken as of, and checked in full, from the seed's
+/// text, only from that block up. Were every header checked in full the
+/// run would fail: all but the last of this chain's headers claim work
+/// that was never done (`--debug-blocks`), which is what makes a year
+/// of them in minutes. (At tens of milliseconds a header, it would also
+/// take most of an hour.)
 #[test]
 #[ignore = "slow: a job of its own in .github/workflows/test.yml, and nightly"]
 fn a_fresh_node_takes_a_years_headers() {
@@ -433,13 +445,14 @@ fn a_fresh_node_takes_a_years_headers() {
     let port = 46_000 + std::process::id() % 15_000;
     let within = Duration::from_secs(3600);
     let began = Instant::now();
-    let mut server = Node::start("server", T, port, &["--no-mine", "--debug-blocks", &blocks.to_string()]);
+    const NETWORK: &str = "dev-main-work";
+    let mut server = Node::start_on(NETWORK, "server", T, port, &["--no-mine", "--debug-blocks", &blocks.to_string()]);
     server.wait("Server is ready!", 1, within);
     report(T, "blocks", blocks);
     report(T, "chain_made_secs", format!("{:.1}", began.elapsed().as_secs_f64()));
     report(T, "server_disk_mb", dir_size(&server.dir) / 1_000_000);
 
-    let mut new = Node::start("new", T, port + 1, &["--no-mine", "--peer", &server.listen]);
+    let mut new = Node::start_on(NETWORK, "new", T, port + 1, &["--no-mine", "--peer", &server.listen]);
     new.wait("Server is ready!", 1, within);
     let began = Instant::now();
     new.wait("Syncing headers 1 to ", 1, within);
@@ -450,6 +463,10 @@ fn a_fresh_node_takes_a_years_headers() {
     // blocks after it.
     new.wait(&format!("Synced at block {}", said(blocks)), 1, within);
     let synced = began.elapsed();
+    // (Its headers were kept with their work pending, and those from
+    // the block the state was taken as of checked in full: it says
+    // nothing of either, but it could not have joined otherwise.)
+    report(T, "network", NETWORK);
     report(T, "headers_secs", format!("{:.1}", (headers - asked).as_secs_f64()));
     report(T, "headers_a_second", format!("{:.0}", blocks as f64 / (headers - asked).as_secs_f64()));
     report(T, "synced_secs", format!("{:.1}", synced.as_secs_f64()));

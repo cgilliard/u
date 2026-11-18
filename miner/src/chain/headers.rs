@@ -381,6 +381,9 @@ impl<B: Backend + 'static, V> Chain<B, V> {
         if !header.quick_pow_check(target) {
             return false;
         }
+        if self.trust_work.load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
         #[cfg(test)]
         self.full_pow_heights.lock().unwrap().push(header.height);
         let log_items = self.seed.params().log_items_at(header.height as u64);

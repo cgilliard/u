@@ -387,6 +387,8 @@ pub enum Network {
     Mainnet,
     Dev,
     DevRecursive,
+    /// A dev network with the main network's work.
+    DevMainWork,
 }
 
 impl Network {
@@ -395,6 +397,7 @@ impl Network {
             Network::Mainnet => "mainnet",
             Network::Dev => "dev",
             Network::DevRecursive => "dev-recursive",
+            Network::DevMainWork => "dev-main-work",
         }
     }
 
@@ -405,6 +408,7 @@ impl Network {
             Network::Mainnet => *b"TABM",
             Network::Dev => *b"TABD",
             Network::DevRecursive => *b"TABR",
+            Network::DevMainWork => *b"TABW",
         }
     }
 
@@ -414,6 +418,7 @@ impl Network {
             Network::Mainnet => "tabminer",
             Network::Dev => "tabminer-dev",
             Network::DevRecursive => "tabminer-dev-recursive",
+            Network::DevMainWork => "tabminer-dev-main-work",
         }
     }
 }
@@ -652,8 +657,9 @@ impl Configuration {
             None | Some("mainnet") => Network::Mainnet,
             Some("dev") => Network::Dev,
             Some("dev-recursive") => Network::DevRecursive,
+            Some("dev-main-work") => Network::DevMainWork,
             Some(other) => {
-                return Err(wrong(format!("--network: '{other}' is not mainnet, dev or dev-recursive")));
+                return Err(wrong(format!("--network: '{other}' is not mainnet, dev, dev-recursive or dev-main-work")));
             }
         };
         let path = |name: &str| -> Result<Option<PathBuf>, Refused> {
@@ -1217,7 +1223,10 @@ mod tests {
         // Given twice, where once is all there may be.
         assert_eq!(wrong(&["--max-peers", "5", "--max-peers", "6"]), "--max-peers was given twice");
         assert!(read(&["--peer", "1.2.3.4:5", "--peer", "1.2.3.4:6"]).is_ok());
-        assert_eq!(wrong(&["--network", "testnet"]), "--network: 'testnet' is not mainnet, dev or dev-recursive");
+        assert_eq!(
+            wrong(&["--network", "testnet"]),
+            "--network: 'testnet' is not mainnet, dev, dev-recursive or dev-main-work"
+        );
         // Limits that cannot both hold.
         assert_eq!(wrong(&["--target-peers", "100"]), "--target-peers (100) is over --max-peers (64)");
         assert_eq!(

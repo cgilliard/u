@@ -572,6 +572,11 @@ pub fn mine_filled<B: Backend + 'static, S: ItemSource + Sync>(
     Ok(Mined::Block { block: Block { header, body }.to_bytes(), header, proved: took, hashes, solved })
 }
 
+/// The last blocks of a chain made long without a table whose work is
+/// done ([`extend_empty`]): more than a node joining it checks in full.
+#[cfg(feature = "dev")]
+pub const WORKED: u32 = 16;
+
 /// Debugging only: makes `chain`, whose blocks' proofs go unchecked,
 /// `blocks` blocks long, of blocks that are empty but for what each
 /// pays (to nobody) and carry no proof: a chain as long as one that has
@@ -581,10 +586,21 @@ pub fn mine_filled<B: Backend + 'static, S: ItemSource + Sync>(
 /// meant to be: so each asks for the least work there is. `unix` is
 /// the time now, which no block's time may be ahead of; `progress` is
 /// told, now and then, how long the chain is.
+///
+/// With a table (`dataset`) every block's work is done. Without one a
+/// block's work is tens of milliseconds a try, from the seed's text,
+/// and a year of blocks most of a day: so only the last [`WORKED`] have
+/// their work done, and the rest claim work they have not, in a header
+/// that is otherwise what it should be; the chain is told to take
+/// their word while they are made ([`Chain::debug_trust_work`]). To a
+/// node that takes them as headers, leaving their work to a proof, and
+/// checks in full only the last few, they are what any chain's are.
 #[cfg(feature = "dev")]
-pub fn extend_empty<B: Backend + 'static, S: ItemSource + Sync>(
+#[allow(clippy::too_many_arguments)]
+pub fn extend_empty<B: Backend + 'static>(
     chain: &Chain<B, AggregateVerifier>,
-    dataset: &S,
+    seed: &crate::pow::SeedText<'_>,
+    dataset: Option<&crate::pow::Dataset<'_>>,
     blocks: u32,
     spacing: u64,
     unix: u64,
@@ -620,11 +636,33 @@ pub fn extend_empty<B: Backend + 'static, S: ItemSource + Sync>(
             nonce: [0; 32],
         };
         let target = chain.expected_target(&tip)?;
-        let Some((nonce, mix, _)) = solve(dataset, &header.pow_hash(), &target, height as u64, &|| false) else {
+        let worked = dataset.is_some() || height + WORKED > blocks;
+        chain.debug_trust_work(!worked);
+        let found = match (dataset, worked) {
+            (Some(table), _) => solve(table, &header.pow_hash(), &target, height as u64, &|| false),
+            (None, true) => solve(&seed.at(height as u64), &header.pow_hash(), &target, height as u64, &|| false),
+            // The first nonce whose claim, of a mix of nothing, meets
+            // the target.
+            (None, false) => {
+                let mut claimed = Header { mix: [Fp::ZERO; 8], ..header };
+                let mut tried = 0u64;
+                loop {
+                    claimed.nonce = crate::pow::nonce_from_u64(tried);
+                    if claimed.quick_pow_check(&target) {
+                        break Some((claimed.nonce, claimed.mix, tried));
+                    }
+                    tried += 1;
+                }
+            }
+        };
+        let Some((nonce, mix, _)) = found else {
+            chain.debug_trust_work(false);
             return Ok(());
         };
         let block = Block { header: Header { nonce, mix, ..header }, body }.to_bytes();
-        chain.apply_block(&crate::block::BlockRef::from_bytes(&block)?, unix)?;
+        let applied = chain.apply_block(&crate::block::BlockRef::from_bytes(&block)?, unix);
+        chain.debug_trust_work(false);
+        applied?;
         if height.is_multiple_of(5000) {
             progress(height);
         }

@@ -545,6 +545,7 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
         Network::Mainnet => (ChainParams::MAINNET, AggregatorParams::MAINNET),
         Network::Dev => (ChainParams::DEV, AggregatorParams::DEV),
         Network::DevRecursive => (ChainParams::DEV_RECURSIVE, AggregatorParams::DEV_RECURSIVE),
+        Network::DevMainWork => (ChainParams::DEV_MAIN_WORK, AggregatorParams::DEV),
     };
     // Debugging: a chain begun with a state filled at once. Its first
     // block says that state's root, which is made from the two numbers
@@ -630,18 +631,25 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     #[cfg(feature = "dev")]
     if let Some(blocks) = c.debug_blocks {
         let began = Instant::now();
-        let dataset = Dataset::built_in(&seed).ok_or("debug: --debug-blocks needs the dev network's own table")?;
-        // (Checked against the table as they are applied, as they are
-        // from here on: from the seed's text a header is a hundred
-        // times the work.)
-        chain.set_dataset(Arc::new(Dataset::built_in(&seed).ok_or("debug: no table")?));
+        // (Checked against the table as they are applied, where the
+        // network's is built in, as they are from here on: from the
+        // seed's text a header is a hundred times the work.)
+        let dataset = Dataset::built_in(&seed);
+        if let Some(table) = Dataset::built_in(&seed) {
+            chain.set_dataset(Arc::new(table));
+        }
         let unix = socket::unix();
-        let spacing = (unix.saturating_sub(params.genesis_timestamp) / (blocks as u64 + 1)).clamp(1, 500);
+        // (As far apart as there is time for since the first block,
+        // and not so far that the chain would end ahead of now: later
+        // than its blocks are meant to be, so that each asks for the
+        // least work there is.)
+        let most = 500.max(2 * params.schedule.block_time as u64);
+        let spacing = (unix.saturating_sub(params.genesis_timestamp) / (blocks as u64 + 1)).clamp(1, most);
         main.log(&format!("debug: making the chain {} blocks long", commas(blocks as u64)));
         let said = |height: u32| {
             main.log(&format!("debug: {} blocks made in {:.1}s", commas(height as u64), began.elapsed().as_secs_f64()))
         };
-        miner::extend_empty(&chain, &dataset, blocks, spacing, unix, &said)
+        miner::extend_empty(&chain, &seed, dataset.as_ref(), blocks, spacing, unix, &said)
             .map_err(|e| format!("debug: making the chain longer: {e}"))?;
         let now = chain.tip().map_or(0, |tip| tip.height);
         main.log(&format!(

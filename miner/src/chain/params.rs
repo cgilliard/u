@@ -114,6 +114,20 @@ impl ChainParams {
         genesis_state: None,
     };
 
+    /// A dev network with the main network's work (`--network
+    /// dev-main-work`): its table, its targets and its times, and the
+    /// least work a block may have from the first. For trying, with the
+    /// debugging options, what the main network's rules cost a node:
+    /// above all the checking of headers, which a node that makes no
+    /// blocks does from the seed's text. Its own genesis, well in the
+    /// past: a chain years long has room before now.
+    pub const DEV_MAIN_WORK: ChainParams = ChainParams {
+        genesis_timestamp: 1_735_689_600, // 2025-01-01
+        genesis_nonce: *b"tabminer dev network, main work.",
+        genesis_target: ChainParams::MAINNET.max_target,
+        ..Self::MAINNET
+    };
+
     /// The recursive dev network (`--network dev-recursive`): as
     /// [`ChainParams::DEV`], a block every ten seconds, its blocks to
     /// carry chain proofs made the mainnet way at the smallest
