@@ -1141,13 +1141,17 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     }
 
     /// Keeps this node's wallet reached: says to each of the nodes it
-    /// is reached at, of those that are this worker's peers, that it is
-    /// there, as often as is due; makes it another key in time; and
-    /// lets the nodes it is no longer reached at forget it.
+    /// is reached at that it is there, as often as is due; makes it
+    /// another key in time; and lets the nodes it is no longer reached
+    /// at forget it.
     ///
     /// The nodes are the seeds and the peers the node was given, while
     /// no consensus file names others: three of them at the most,
-    /// chosen by the wallet's id and the epoch.
+    /// chosen by the wallet's id and the epoch. A node the wallet is
+    /// reached at need not be a peer of this one, and nothing here asks
+    /// whether it is: it is an address, which gives its own token to
+    /// whoever says to it that a wallet is there. (Whichever worker
+    /// comes to it first says so: what is due is due once.)
     fn keep_sessions(&mut self, now: Micros, out: Out<'_>) {
         let seeds: Vec<SocketAddrV4> =
             self.shared.seeds.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
@@ -1163,9 +1167,16 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         }
         let mut due = Vec::new();
         for node in points {
-            let Some(token) = self.peers.get(&node).and_then(|p| p.token()) else { continue };
-            if own.due(&node, now, self.cfg.keepalive) {
-                due.push((node, token, own.say(node, token, self.unix, now)));
+            if !own.due(&node, now, self.cfg.keepalive) {
+                continue;
+            }
+            // (Before the node has said its token: asked for it.)
+            match own.token(&node) {
+                0 => {
+                    own.greet(node, now);
+                    due.push((node, 0, 0));
+                }
+                token => due.push((node, token, own.say(node, token, self.unix, now))),
             }
         }
         let id = own.id();
@@ -1476,23 +1487,40 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             // A wallet says it is there, to a node that holds sessions:
             // the session goes on, or its announcement is asked for.
             Message::Session { token, grant, id, seq } => {
-                if !self.cfg.relay || seq == 0 || !self.asked_rightly(&from, token) {
-                    self.counts.unheard += !self.cfg.relay as u64;
+                if !self.cfg.relay {
+                    self.counts.unheard += 1;
                     return;
+                }
+                // Whoever says so is told this node's token for where it
+                // says it from: nothing is kept of the asking, and the
+                // answer is no longer than it. Only an asking that
+                // carries that token is gone into.
+                let ours = self.tokens.issue(&SocketAddr::V4(from));
+                if seq == 0 || !self.tokens.check(&SocketAddr::V4(from), token) {
+                    return self.send(from, &Message::SessionState { id, seq: 0, token: ours }, out);
                 }
                 let held = self.shared.sessions.lock().unwrap_or_else(|e| e.into_inner()).seen(&id, from, seq, now);
                 let object = Object::Announce { id, seq };
                 if !held && !self.fetches.iter().any(|f| f.object == object && f.from == from) {
                     self.fetch_granted(now, object, from, crate::msg::ANNOUNCE_LEN as u32, grant);
                 }
-                self.send(from, &Message::SessionState { id, seq: if held { seq } else { 0 } }, out);
+                let seq = if held { seq } else { 0 };
+                self.send(from, &Message::SessionState { id, seq, token: ours }, out);
             }
             // And a node says what it holds for this node's wallet.
-            Message::SessionState { id, seq } => {
+            // (With its token for this node, which the next saying is to
+            // carry: told at once, if that is news.)
+            Message::SessionState { id, seq, token } => {
                 let mut wallet = self.shared.participant.lock().unwrap_or_else(|e| e.into_inner());
-                match wallet.as_mut().filter(|w| w.id() == id) {
-                    Some(own) => own.held(&from, seq),
-                    None => self.counts.unheard += 1,
+                let Some(own) = wallet.as_mut().filter(|w| w.id() == id) else {
+                    self.counts.unheard += 1;
+                    return;
+                };
+                if own.held(&from, seq, token) {
+                    let seq = own.say(from, token, self.unix, now);
+                    drop(wallet);
+                    let grant = self.tokens.issue(&SocketAddr::V4(from));
+                    self.send(from, &Message::Session { token, grant, id, seq }, out);
                 }
             }
             // (Messages are not yet passed on.)

@@ -200,10 +200,14 @@ pub enum Message<'a> {
         seq: u64,
     },
     /// The answer: the number of the announcement the node holds for
-    /// that wallet, zero while it holds none.
+    /// that wallet, zero while it holds none; and the node's token for
+    /// whoever asked, which the next asking is to carry. (So a wallet
+    /// need be nothing else to the node it is reached at: not its peer,
+    /// nor known to it before.)
     SessionState {
         id: Digest,
         seq: u64,
+        token: u64,
     },
     /// "Here is a sealed message for this wallet": its id and length,
     /// to be asked for with `grant`, the sender's token for whoever it
@@ -307,9 +311,10 @@ impl<'a> Message<'a> {
                 w.put(&seq.to_le_bytes());
                 SESSION
             }
-            Message::SessionState { id, seq } => {
+            Message::SessionState { id, seq, token } => {
                 w.put(&digest_to_bytes(id));
                 w.put(&seq.to_le_bytes());
+                w.put(&token.to_le_bytes());
                 SESSION_STATE
             }
             Message::Offer { token, grant, to, id, len } => {
@@ -403,7 +408,11 @@ impl<'a> Message<'a> {
                 id: r.digest().ok_or(BAD)?,
                 seq: r.u64().ok_or(BAD)?,
             },
-            SESSION_STATE => Message::SessionState { id: r.digest().ok_or(BAD)?, seq: r.u64().ok_or(BAD)? },
+            SESSION_STATE => Message::SessionState {
+                id: r.digest().ok_or(BAD)?,
+                seq: r.u64().ok_or(BAD)?,
+                token: r.u64().ok_or(BAD)?,
+            },
             OFFER => Message::Offer {
                 token: r.u64().ok_or(BAD)?,
                 grant: r.u64().ok_or(BAD)?,

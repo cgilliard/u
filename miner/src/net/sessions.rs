@@ -174,6 +174,8 @@ pub struct Participant {
 }
 
 struct Said {
+    /// The node's token for this wallet's node: none (zero) until the
+    /// node has said it.
     bind: u64,
     seq: u64,
     announce: Arc<Vec<u8>>,
@@ -217,10 +219,23 @@ impl Participant {
     /// announced to it, and sooner until it does.
     pub fn due(&self, node: &SocketAddrV4, now: Micros, keepalive: Micros) -> bool {
         match self.said.get(node) {
-            Some(said) if said.held == said.seq => now.saturating_sub(said.asked) >= keepalive,
+            Some(said) if said.seq != 0 && said.held == said.seq => now.saturating_sub(said.asked) >= keepalive,
             Some(said) => now.saturating_sub(said.asked) >= UNHELD_RETRY,
             None => true,
         }
+    }
+
+    /// The token the node at `node` gave for this wallet's node: none
+    /// (zero) before it has given one.
+    pub fn token(&self, node: &SocketAddrV4) -> u64 {
+        self.said.get(node).map_or(0, |s| s.bind)
+    }
+
+    /// The node at `node` is asked for its token, having given none
+    /// yet: so that it is not asked again at once.
+    pub fn greet(&mut self, node: SocketAddrV4, now: Micros) {
+        let none = Said { bind: 0, seq: 0, announce: Arc::new(Vec::new()), held: u64::MAX, asked: now };
+        self.said.entry(node).or_insert(none).asked = now;
     }
 
     /// What is to be said to the node at `node`, whose token for this
@@ -230,7 +245,7 @@ impl Participant {
     /// seconds: a number that only rises is made of it (so that it
     /// rises from one run of the node to the next, too).
     pub fn say(&mut self, node: SocketAddrV4, token: u64, unix: u64, now: Micros) -> u64 {
-        let fresh = self.said.get(&node).is_none_or(|s| s.bind != token);
+        let fresh = self.said.get(&node).is_none_or(|s| s.bind != token || s.seq == 0);
         if fresh {
             let stamp = (unix << 20).max(self.last + 1);
             self.last = stamp;
@@ -247,26 +262,34 @@ impl Participant {
     /// The announcement of the number `seq`, for whoever asks: one made
     /// for some node, and still the one for it.
     pub fn announced(&self, seq: u64) -> Option<Arc<Vec<u8>>> {
-        self.said.values().find(|s| s.seq == seq).map(|s| Arc::clone(&s.announce))
+        self.said.values().find(|s| s.seq == seq && seq != 0).map(|s| Arc::clone(&s.announce))
     }
 
     /// The announcement made for the node at `node`, if one was.
     pub fn announced_to(&self, node: &SocketAddrV4) -> Option<Arc<Vec<u8>>> {
-        self.said.get(node).map(|s| Arc::clone(&s.announce))
+        self.said.get(node).filter(|s| s.seq != 0).map(|s| Arc::clone(&s.announce))
     }
 
     /// The node at `node` says it holds the announcement of number
-    /// `seq` for this wallet.
-    pub fn held(&mut self, node: &SocketAddrV4, seq: u64) {
-        if let Some(said) = self.said.get_mut(node) {
-            said.held = seq;
+    /// `seq` for this wallet, and that its token for this wallet's node
+    /// is `token`. True if that token is another than it was known to
+    /// have: it is then to be told again at once, with that one.
+    pub fn held(&mut self, node: &SocketAddrV4, seq: u64, token: u64) -> bool {
+        let Some(said) = self.said.get_mut(node) else { return false };
+        // (Of an announcement made for another token it holds nothing
+        // that counts.)
+        said.held = if said.seq == 0 { u64::MAX } else { seq };
+        let other = token != 0 && said.bind != token;
+        if other {
+            (said.bind, said.seq, said.held) = (token, 0, u64::MAX);
         }
+        other
     }
 
     /// The nodes this wallet is reached at now: those that hold what it
     /// last announced to them.
     pub fn reached_at(&self) -> impl Iterator<Item = SocketAddrV4> + '_ {
-        self.said.iter().filter(|(_, s)| s.held == s.seq).map(|(node, _)| *node)
+        self.said.iter().filter(|(_, s)| s.seq != 0 && s.held == s.seq).map(|(node, _)| *node)
     }
 
     /// The nodes it has said it is there to, whether or not they hold
@@ -396,10 +419,27 @@ mod tests {
         // again only now and then.
         assert_eq!(alice.reached_at().count(), 0);
         let now = alice.say(node, 2, 5000, KEY_LIFE);
-        alice.held(&node, now);
+        assert!(!alice.held(&node, now, 2));
         assert_eq!(alice.reached_at().collect::<Vec<_>>(), [node]);
         assert!(!alice.due(&node, KEY_LIFE + 29 * SECOND, 30 * SECOND));
         assert!(alice.due(&node, KEY_LIFE + 30 * SECOND, 30 * SECOND));
+        // The node's token for it is another: what it holds counts for
+        // nothing until it has an announcement made for that one.
+        assert!(alice.held(&node, now, 3));
+        assert_eq!((alice.token(&node), alice.reached_at().count()), (3, 0));
+        assert!(alice.due(&node, KEY_LIFE + 40 * SECOND, 30 * SECOND));
+        let again = alice.say(node, 3, 5000, KEY_LIFE + 40 * SECOND);
+        assert!(again > now && !alice.held(&node, again, 3));
+        assert_eq!(alice.reached_at().collect::<Vec<_>>(), [node]);
+        // And a node not yet heard from: asked for its token, and not
+        // again at once.
+        let (mut carol, far) = (wallet(3), at(8, 3737));
+        assert!(carol.due(&far, 0, 30 * SECOND) && carol.token(&far) == 0);
+        carol.greet(far, 0);
+        assert!(!carol.due(&far, SECOND, 30 * SECOND) && carol.due(&far, 2 * SECOND, 30 * SECOND));
+        assert_eq!((carol.said_to(), carol.reached_at().count(), carol.announced(0)), (1, 0, None));
+        assert!(carol.held(&far, 0, 9));
+        assert_eq!(carol.token(&far), 9);
         alice.keep(&[]);
         assert_eq!(alice.said_to(), 0);
     }
