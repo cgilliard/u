@@ -338,6 +338,8 @@ const SEND_WAY_IDLE: Micros = 120 * crate::transport::SECOND;
 /// How long a way kept to go on from is kept before another is made.
 const SPARE_WAY_LIFE: Micros = 600 * crate::transport::SECOND;
 const SPARE_WAYS: usize = 2;
+/// Of how many messages passed on it is kept who gave each.
+const GIVERS: usize = 65_536;
 /// How long a relay that did not answer is not gone by.
 const SUSPECT_FOR: Micros = 60 * crate::transport::SECOND;
 /// How long a wallet has to say that a message sent down its way came,
@@ -623,6 +625,11 @@ pub(crate) struct Shared {
     /// has not yet said that they came: the message, the way it went
     /// down, the way of whoever gave it, and when.
     delivering: Mutex<Vec<([u8; 32], (SocketAddrV4, u64), (SocketAddrV4, u64), Micros)>>,
+    /// Who gave this node each message it passed on to a wallet, for
+    /// a while: the message's id, and the way (or the address) it was
+    /// given by. The wallet's answer goes back there, and the wallet
+    /// is told nothing of it.
+    givers: Mutex<VecDeque<([u8; 32], super::sessions::Where, Micros)>>,
     /// Whether those were given by whoever drives the node, and are
     /// not the chain's to change ([`Handle::force_consensus`]).
     forced: AtomicBool,
@@ -1733,8 +1740,27 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         let suspect = self.suspects();
         let mut ways = shared.ways.lock().unwrap_or_else(|e| e.into_inner());
         let mut steps = Vec::new();
+        let mut awaited = Vec::new();
         for post in mail.posts.iter_mut() {
             if post.tried.is_some_and(|tried| now.saturating_sub(tried) < POST_RETRY) {
+                continue;
+            }
+            // An answer: back by the way to the node the message came
+            // by, which knows who gave it the message.
+            if let Some(answer) = post.answers.clone() {
+                if post.sealed.is_none() {
+                    post.sealed = Self::seal_answer(own, post);
+                }
+                let back = |w: &&mut super::circuits::Way| w.purpose == Purpose::Session && w.end().1 == answer.by;
+                if let (Some((_, bytes)), Some(way)) =
+                    (&post.sealed, ways.open.iter_mut().find(back).filter(|w| w.ready()))
+                {
+                    post.tried = Some(now);
+                    let mut said = vec![super::circuits::REPLY];
+                    said.extend_from_slice(bytes);
+                    way.awaits(now);
+                    steps.extend(way.say(&said));
+                }
                 continue;
             }
             let points = Self::points_among(&post.asked(), epoch, relays);
@@ -1767,11 +1793,6 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     }
                 }
                 Some(way) if way.ready() => {
-                    if post.sealed.is_none()
-                        && let Some(known) = post.known.clone()
-                    {
-                        post.sealed = Self::seal_for(own, &known, post, self.unix);
-                    }
                     (post.tried, post.turn) = (Some(now), post.turn + 1);
                     let mut said = Vec::new();
                     match &post.sealed {
@@ -1796,10 +1817,32 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             }
         }
         drop(ways);
+        mail.awaited.append(&mut awaited);
         drop(mail);
         drop(wallet);
         for step in steps {
             self.carry(now, step);
+        }
+    }
+
+    /// Who gave this node the message of id `id` to pass on, if that
+    /// was lately.
+    fn giver_of(&self, id: &Digest) -> Option<super::sessions::Where> {
+        let id = crate::poseidon2::digest_to_bytes(id);
+        self.shared.givers.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|g| g.0 == id).map(|g| g.1)
+    }
+
+    /// The message of id `id` was given to this node to pass on, by
+    /// `giver`: kept, for its answer to go back by.
+    fn given_by(&self, id: [u8; 32], giver: super::sessions::Where, now: Micros) {
+        let mut givers = self.shared.givers.lock().unwrap_or_else(|e| e.into_inner());
+        while givers.front().is_some_and(|g| now.saturating_sub(g.2) >= super::sessions::ANSWER_HOLDS)
+            || givers.len() >= GIVERS
+        {
+            givers.pop_front();
+        }
+        if !givers.iter().any(|g| g.0 == id) {
+            givers.push_back((id, giver, now));
         }
     }
 
@@ -1892,9 +1935,33 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     !it
                 });
             }
+            // A wallet reached here answers a message that came to it
+            // here: back to whoever gave that message, by the way (or
+            // to the address) they gave it by.
+            Some((&super::circuits::REPLY, sealed)) => {
+                let (sealed_id, id) = (crate::msg::sealed_id(sealed), digest_to_bytes(&crate::msg::sealed_id(sealed)));
+                let Some(of) = crate::msg::sealed_answers(sealed) else { return };
+                let what = match self.giver_of(&of) {
+                    Some(Where::Way(before, circuit)) => {
+                        back.push(((before, circuit), made(super::circuits::ANSWER, &[sealed])));
+                        NOTICE_PASSED
+                    }
+                    Some(Where::Addr(addr)) => {
+                        let mut mail = shared.letters.lock().unwrap_or_else(|e| e.into_inner());
+                        mail.pass(sealed_id, of, sealed.to_vec(), now);
+                        let grant = self.tokens.issue(&SocketAddr::V4(addr));
+                        let len = sealed.len() as u32;
+                        self.to_say.push((addr, Message::Offer { token: 0, grant, to: of, id: sealed_id, len }));
+                        NOTICE_PASSED
+                    }
+                    None => NOTICE_OFFLINE,
+                };
+                back.push((link, made(NOTICE, &[&id, &[what]])));
+            }
             Some((&GIVE, sealed)) => {
                 let id = digest_to_bytes(&crate::msg::sealed_id(sealed));
                 let Some(to) = crate::msg::sealed_to(sealed) else { return };
+                self.given_by(id, here, now);
                 match sessions.get(&to, now).map(|s| s.at) {
                     None => back.push((link, made(NOTICE, &[&id, &[NOTICE_OFFLINE]]))),
                     // (Sent down the wallet's way; and whoever gave it
@@ -1974,8 +2041,10 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 let mut mail = shared.letters.lock().unwrap_or_else(|e| e.into_inner());
                 let id = crate::msg::sealed_id(sealed);
                 if !mail.seen(id)
-                    && let Some(opened) = own.open(sealed, self.unix, now)
+                    && let Some(mut opened) = own.open(sealed, now)
                 {
+                    // (Its answer goes back by this node.)
+                    opened.by = Some(point);
                     mail.inbox.push(opened);
                     shared.say(Event::Mail);
                 }
@@ -1991,8 +2060,6 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             // What the wallet a message is for announces: the message
             // is sealed to it, and given to be passed on.
             (Purpose::Send, Some((&ANNOUNCED, announced))) => {
-                let wallet = shared.participant.lock().unwrap_or_else(|e| e.into_inner());
-                let Some(own) = wallet.as_ref() else { return };
                 let mut mail = shared.letters.lock().unwrap_or_else(|e| e.into_inner());
                 let Some((_, which)) = mail.announced(announced, self.unix, |name| self.name_value(name)) else {
                     return;
@@ -2001,15 +2068,18 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 let mut ways = shared.ways.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(way) = ways.open.iter_mut().find(|w| w.circuit() == circuit) else { return };
                 let mut steps = Vec::new();
+                let mut awaited = Vec::new();
                 for at in which {
                     let post = &mut mail.posts[at];
-                    let Some(sealed) = Self::seal_for(own, announce, post, self.unix) else { continue };
+                    let Some((sealed, wait)) = Self::seal_for(announce, post, self.unix, now) else { continue };
                     let mut give = vec![GIVE];
                     give.extend_from_slice(&sealed.1);
                     steps.extend(way.say(&give));
                     (post.sealed, post.tried) = (Some(sealed), Some(now));
+                    awaited.push(wait);
                 }
-                drop((ways, mail, wallet));
+                mail.awaited.append(&mut awaited);
+                drop((ways, mail));
                 for step in steps {
                     self.carry(now, step);
                 }
@@ -2019,11 +2089,15 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     self.absent(&id);
                 }
             }
-            (Purpose::Send, Some((&NOTICE, rest))) if rest.len() == 33 => {
+            // (Of a message this wallet sent, or of an answer it gave.)
+            (Purpose::Send | Purpose::Session, Some((&NOTICE, rest))) if rest.len() == 33 => {
                 if let Some(id) = digest_from_bytes(&rest[..32]) {
                     self.noticed(&id, rest[32]);
                 }
             }
+            // The answer to a message this wallet sent, back by the way
+            // it was sent by.
+            (Purpose::Send, Some((&super::circuits::ANSWER, sealed))) => self.answer_arrived(sealed),
             _ => {}
         }
     }
@@ -2096,6 +2170,26 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             if mail.posts[at].tried.is_some_and(|tried| now.saturating_sub(tried) < POST_RETRY) {
                 continue;
             }
+            // An answer: back to the node the message came by, which
+            // knows who gave it the message.
+            if let Some(answer) = mail.posts[at].answers.clone() {
+                let node = answer.by;
+                if self.shared.owner(&node) != self.me {
+                    continue;
+                }
+                let grant = self.tokens.issue(&SocketAddr::V4(node));
+                let token = self.token_of(&node).or(Some(own.token(&node)).filter(|token| *token != 0));
+                let Some(token) = token else { continue };
+                if mail.posts[at].sealed.is_none() {
+                    mail.posts[at].sealed = Self::seal_answer(own, &mail.posts[at]);
+                }
+                mail.posts[at].tried = Some(now);
+                if let Some((id, bytes)) = &mail.posts[at].sealed {
+                    let len = bytes.len() as u32;
+                    say.push((node, Message::Offer { token, grant, to: answer.of, id: *id, len }));
+                }
+                continue;
+            }
             let (to, asked) = (mail.posts[at].to, mail.posts[at].asked());
             let points = self.points_of(&asked);
             if points.is_empty() {
@@ -2111,16 +2205,11 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             // A node that has not yet said its token is asked for it.
             let Some(token) = self.token_of(&node) else {
                 mail.posts[at].tried = Some(now);
-                say.push((node, Message::Session { token: 0, grant, id: own.id(), seq: 0 }));
+                // (Asked as nobody: whoever sends says nothing of
+                // itself, to this node either.)
+                say.push((node, Message::Session { token: 0, grant, id: Digest::default(), seq: 0 }));
                 continue;
             };
-            // Sealed, if what the wallet announced is known.
-            if mail.posts[at].sealed.is_none()
-                && let Some(known) = mail.posts[at].known.clone()
-            {
-                let sealed = Self::seal_for(own, &known, &mail.posts[at], self.unix);
-                mail.posts[at].sealed = sealed;
-            }
             mail.posts[at].tried = Some(now);
             mail.posts[at].turn += 1;
             match &mail.posts[at].sealed {
@@ -2147,29 +2236,58 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         }
     }
 
-    /// Seals `post` to the wallet that announced `to`, from this node's
-    /// wallet: none if that is not an announcement of the wallet the
-    /// post is for, or this wallet has announced nothing to answer to.
+    /// Seals `post` to the wallet that announced `to`, with a key made
+    /// for its answer and nothing of this wallet: none if that is not
+    /// an announcement of the wallet the post is for. With it, what is
+    /// kept while the answer may come.
     fn seal_for(
-        own: &super::sessions::Participant,
         to: &[u8],
         post: &super::sessions::Post,
         unix: u64,
-    ) -> Option<(Digest, Arc<Vec<u8>>)> {
+        now: Micros,
+    ) -> Option<((Digest, Arc<Vec<u8>>), super::sessions::Awaited)> {
         let said = crate::msg::Announced::read(to, unix).filter(|said| said.id() == post.to)?;
-        let ours = own.announced_any()?;
+        let mut chance = [0u8; 96];
+        crate::random::fill(&mut chance).ok()?;
+        let key = crate::mlkem::keygen(chance[..64].try_into().expect("64 bytes"));
+        let seal_chance: &[u8; 32] = chance[64..].try_into().expect("32 bytes");
+        let sealed = crate::msg::seal(&said, key.public_key(), post.kind, &post.body, seal_chance)?;
+        let id = crate::msg::sealed_id(&sealed);
+        Some(((id, Arc::new(sealed)), super::sessions::Awaited { id, key, to: post.to, since: now }))
+    }
+
+    /// Seals `post`, the answer to a message that came for this node's
+    /// wallet: to the key that message carried, under the wallet's
+    /// signature.
+    fn seal_answer(own: &super::sessions::Participant, post: &super::sessions::Post) -> Option<(Digest, Arc<Vec<u8>>)> {
+        let answer = post.answers.as_ref()?;
         let mut chance = [0u8; 32];
         crate::random::fill(&mut chance).ok()?;
-        let sealed = crate::msg::seal(own.identity(), &ours, &said, post.kind, &post.body, &chance)?;
+        let sealed = crate::msg::seal_answer(own.identity(), &answer.key, &answer.of, post.kind, &post.body, &chance)?;
         Some((crate::msg::sealed_id(&sealed), Arc::new(sealed)))
+    }
+
+    /// The answer to a message this node's wallet sent has come: taken
+    /// if it is sealed to the key that message carried, and signed by
+    /// the wallet the message was sent to.
+    fn answer_arrived(&mut self, sealed: &[u8]) {
+        let Some(of) = crate::msg::sealed_answers(sealed) else { return };
+        let mut mail = self.shared.letters.lock().unwrap_or_else(|e| e.into_inner());
+        let opened = mail.awaited(&of).and_then(|wait| {
+            crate::msg::open_answer(&wait.key, &of, sealed).filter(|opened| opened.from == Some(wait.to))
+        });
+        if let Some(opened) = opened
+            && !mail.seen(opened.id)
+        {
+            mail.inbox.push(opened);
+            self.shared.say(Event::Mail);
+        }
     }
 
     /// What a wallet announced has come, from a node it is reached at:
     /// the messages waiting for it are sealed to it, and offered to
     /// that node.
     fn announce_arrived(&mut self, now: Micros, from: SocketAddrV4, id: Digest, bytes: &[u8]) {
-        let wallet = self.shared.participant.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(own) = wallet.as_ref() else { return };
         let mut mail = self.shared.letters.lock().unwrap_or_else(|e| e.into_inner());
         let Some(token) = self.token_of(&from) else { return };
         let grant = self.tokens.issue(&SocketAddr::V4(from));
@@ -2179,13 +2297,16 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             return;
         }
         let announce = &bytes[..crate::msg::ANNOUNCE_LEN];
+        let mut awaited = Vec::new();
         for at in which {
             let post = &mut mail.posts[at];
-            let Some(sealed) = Self::seal_for(own, announce, post, self.unix) else { continue };
+            let Some((sealed, wait)) = Self::seal_for(announce, post, self.unix, now) else { continue };
             let len = sealed.1.len() as u32;
             self.to_say.push((from, Message::Offer { token, grant, to: post.to, id: sealed.0, len }));
             (post.sealed, post.tried) = (Some(sealed), Some(now));
+            awaited.push(wait);
         }
+        mail.awaited.append(&mut awaited);
     }
 
     /// A sealed message has come. For this node's wallet: opened, and
@@ -2197,21 +2318,55 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         if crate::msg::sealed_id(bytes) != id {
             return self.tell(now, from, Notice::Strike(from));
         }
-        let to = crate::msg::sealed_to(bytes);
+        let (to, answers) = (crate::msg::sealed_to(bytes), crate::msg::sealed_answers(bytes));
         let wallet = self.shared.participant.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(own) = wallet.as_ref().filter(|w| Some(w.id()) == to) {
-            if let Some(opened) = own.open(bytes, self.unix, now) {
+            if let Some(mut opened) = own.open(bytes, now) {
+                // (Its answer goes back by the node it came by.)
+                opened.by = Some(from);
                 self.shared.letters.lock().unwrap_or_else(|e| e.into_inner()).inbox.push(opened);
                 self.shared.say(Event::Mail);
             }
             return;
         }
         drop(wallet);
+        // The answer to a message this node's wallet sent.
+        let awaited = |of: &Digest| self.shared.letters.lock().unwrap_or_else(|e| e.into_inner()).awaited(of).is_some();
+        if answers.is_some_and(|of| awaited(&of)) {
+            return self.answer_arrived(bytes);
+        }
         let Some(at) = self.offered.iter().position(|o| o.0 == id && o.2 == from) else { return };
         let (_, whom, sender) = self.offered.swap_remove(at);
+        // An answer, given by the wallet that answers: back to whoever
+        // gave the message it answers.
+        if answers == Some(whom) {
+            let what = match self.giver_of(&whom) {
+                Some(super::sessions::Where::Way(before, circuit)) => {
+                    let mut answer = vec![super::circuits::ANSWER];
+                    answer.extend_from_slice(bytes);
+                    let step = self.shared.relayed.lock().unwrap_or_else(|e| e.into_inner()).say(
+                        (before, circuit),
+                        &answer,
+                        now,
+                    );
+                    let passed = step.is_some();
+                    step.into_iter().for_each(|step| self.carry(now, step));
+                    if passed { NOTICE_PASSED } else { NOTICE_OFFLINE }
+                }
+                Some(super::sessions::Where::Addr(addr)) => {
+                    self.shared.letters.lock().unwrap_or_else(|e| e.into_inner()).pass(id, whom, bytes.to_vec(), now);
+                    let grant = self.tokens.issue(&SocketAddr::V4(addr));
+                    self.to_say.push((addr, Message::Offer { token: 0, grant, to: whom, id, len: bytes.len() as u32 }));
+                    NOTICE_PASSED
+                }
+                None => NOTICE_OFFLINE,
+            };
+            return self.to_say.push((sender, Message::Notice { id, what }));
+        }
         if Some(whom) != to {
             return self.tell(now, from, Notice::Strike(from));
         }
+        self.given_by(crate::poseidon2::digest_to_bytes(&id), super::sessions::Where::Addr(sender), now);
         let there = self.shared.sessions.lock().unwrap_or_else(|e| e.into_inner()).get(&whom, now).map(|s| s.at);
         // (At the end of a way: given to it there.)
         if let Some(super::sessions::Where::Way(before, circuit)) = there {
@@ -2688,14 +2843,19 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 let (most, object) = (crate::msg::MAX_SEALED as u32, Object::Sealed(id));
                 let fetching = self.fetches.iter().any(|f| f.object == object);
                 let own = self.shared.participant.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|w| w.id());
-                if own == Some(to) {
+                // (For this node's wallet; or the answer to a message
+                // it sent, which `to` then is.)
+                let awaited = self.shared.letters.lock().unwrap_or_else(|e| e.into_inner()).awaited(&to).is_some();
+                if own == Some(to) || awaited {
                     let known = self.shared.letters.lock().unwrap_or_else(|e| e.into_inner()).seen(id);
                     if !known && !fetching && len <= most {
                         self.fetch_granted(now, object, from, len, grant);
                     }
                 } else if self.cfg.relay && self.tokens.check(&SocketAddr::V4(from), token) && len <= most {
+                    // (For a wallet that is here; or the answer to a
+                    // message this node passed on, for whoever gave it.)
                     let there = self.shared.sessions.lock().unwrap_or_else(|e| e.into_inner()).get(&to, now).is_some();
-                    match there {
+                    match there || self.giver_of(&to).is_some() {
                         false => self.send(from, &Message::Notice { id, what: super::message::NOTICE_OFFLINE }, out),
                         true if fetching => {}
                         true => {
@@ -4385,6 +4545,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             relays: Mutex::default(),
             suspect: Mutex::default(),
             delivering: Mutex::default(),
+            givers: Mutex::default(),
             forced: AtomicBool::new(false),
             leaving: Mutex::default(),
             key: u64::from_le_bytes(derive(&secret, b'h', 0)[..8].try_into().unwrap()),
@@ -4792,14 +4953,24 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
         *self.shared.participant.lock().unwrap_or_else(|e| e.into_inner()) = Some(wallet);
     }
 
-    /// Sends a message of `kind` saying `body` from this node's wallet
-    /// to the wallet of id `to`: sealed to what that wallet announces,
-    /// which is `known` where the message answers one that carried it,
-    /// and is asked for otherwise. What becomes of it is said later
+    /// Sends a message of `kind` saying `body` to the wallet of id
+    /// `to`: sealed to what that wallet announces, which is asked for.
+    /// The message says nothing of who sends it; its answer comes back
+    /// the way it went. What becomes of it is said later
     /// ([`Handle::take_posted`]).
-    pub fn post(&self, to: Digest, kind: u8, tag: [u8; 32], body: Vec<u8>, known: Option<Vec<u8>>) {
-        self.shared.letters.lock().unwrap_or_else(|e| e.into_inner()).post(to, kind, tag, body, known);
+    pub fn post(&self, to: Digest, kind: u8, tag: [u8; 32], body: Vec<u8>) {
+        self.shared.letters.lock().unwrap_or_else(|e| e.into_inner()).post(to, kind, tag, body);
         (0..self.shared.mail.len()).for_each(|w| self.shared.wake(w));
+    }
+
+    /// Answers `message`, which came for this node's wallet: `body`,
+    /// of `kind`, under the wallet's signature, back by the node the
+    /// message came by to whoever sent it. False of a message that
+    /// cannot be answered.
+    pub fn answer(&self, message: &crate::msg::Opened, kind: u8, tag: [u8; 32], body: Vec<u8>) -> bool {
+        let posted = self.shared.letters.lock().unwrap_or_else(|e| e.into_inner()).answer(message, kind, tag, body);
+        (0..self.shared.mail.len()).for_each(|w| self.shared.wake(w));
+        posted
     }
 
     /// Opens a way through the relays of `path`, nearest first: each

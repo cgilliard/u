@@ -38,10 +38,17 @@ use crate::{mldsa, mlkem};
 pub const ANNOUNCE_LEN: usize = mldsa::PK_LEN + mlkem::EK_LEN + 24 + mldsa::SIG_LEN;
 /// The most a message may say: what it carries, not what carries it.
 pub const MAX_BODY: usize = 64 << 10;
-/// The bytes a sealed message is longer than what it says by.
-pub const OVERHEAD: usize = 32 + mlkem::CT_LEN + ANNOUNCE_LEN + 1 + mldsa::SIG_LEN + aead::TAG_LEN;
+/// The bytes a sealed message is longer than what it says by: one sent
+/// to a wallet, which says nothing of who sends it, and its answer,
+/// which is signed.
+pub const OVERHEAD: usize = 1 + 32 + mlkem::CT_LEN + mlkem::EK_LEN + 1 + aead::TAG_LEN;
+pub const ANSWER_OVERHEAD: usize = 1 + 32 + mlkem::CT_LEN + mldsa::PK_LEN + 1 + mldsa::SIG_LEN + aead::TAG_LEN;
 /// The longest sealed message.
-pub const MAX_SEALED: usize = OVERHEAD + MAX_BODY;
+pub const MAX_SEALED: usize = ANSWER_OVERHEAD + MAX_BODY;
+/// The first byte of a sealed message: one sent to a wallet, or the
+/// answer to one.
+const SENT: u8 = 0;
+const ANSWER: u8 = 1;
 
 /// What a message says: a slate, of a payment being made.
 pub const KIND_SLATE: u8 = 1;
@@ -144,9 +151,14 @@ pub fn sealed_id(sealed: &[u8]) -> Digest {
     hash_domain_of(DOM_SEALED, packed(sealed))
 }
 
-/// Whom a sealed message is for, if it is long enough to be one.
+/// Whom a sealed message is for, if it is one sent to a wallet.
 pub fn sealed_to(sealed: &[u8]) -> Option<Digest> {
-    digest_from_bytes(sealed.get(..32)?)
+    digest_from_bytes(sealed.strip_prefix(&[SENT])?.get(..32)?)
+}
+
+/// The id of the message a sealed message answers, if it is an answer.
+pub fn sealed_answers(sealed: &[u8]) -> Option<Digest> {
+    digest_from_bytes(sealed.strip_prefix(&[ANSWER])?.get(..32)?)
 }
 
 /// The key a message is sealed under: of the secret agreed and of whom
@@ -158,38 +170,33 @@ fn key_of(secret: &[u8; mlkem::SS_LEN], to: &[u8]) -> [u8; aead::KEY_LEN] {
     crate::keccak::sha3_256(&input)
 }
 
-/// What a sender signs: whom the message is for, the encapsulation it
-/// is sealed under, its kind and what it says. (So that it is this
-/// message to this wallet, and not to be passed to another as its own.)
-fn signed_of(to: &[u8], ct: &[u8], kind: u8, body: &[u8]) -> [u8; 32] {
+/// What whoever answers signs: the message it answers, the
+/// encapsulation the answer is sealed under, its kind and what it
+/// says. (So that it is this answer to that message, and no other.)
+fn signed_of(answers: &[u8], ct: &[u8], kind: u8, body: &[u8]) -> [u8; 32] {
     let mut h = crate::keccak::Sponge::shake256();
-    h.absorb(to).absorb(ct).absorb(&[kind]).absorb(body);
+    h.absorb(answers).absorb(ct).absorb(&[kind]).absorb(body);
     h.squeezed()
 }
 
-/// Seals `body`, of `kind`, to the wallet that announced `to`, from the
-/// wallet whose key is `sender` and whose own announcement is `own`
-/// (which goes inside: the answer is sealed to it). `chance` is 32
-/// random bytes. None if `body` is longer than a message may be.
-pub fn seal(
-    sender: &mldsa::SecretKey,
-    own: &[u8],
-    to: &Announced<'_>,
-    kind: u8,
-    body: &[u8],
-    chance: &[u8; 32],
-) -> Option<Vec<u8>> {
-    if body.len() > MAX_BODY || own.len() != ANNOUNCE_LEN {
+/// Seals `body`, of `kind`, to the wallet that announced `to`. Nothing
+/// in it says who sends it: it carries `reply`, a Kyber key made for
+/// this message alone, which its answer is sealed to; and the answer
+/// comes back the way the message went, so that the wallet it is for
+/// need not know where its sender is, or who. `chance` is 32 random
+/// bytes. None if `body` is longer than a message may be.
+pub fn seal(to: &Announced<'_>, reply: &[u8], kind: u8, body: &[u8], chance: &[u8; 32]) -> Option<Vec<u8>> {
+    if body.len() > MAX_BODY || reply.len() != mlkem::EK_LEN {
         return None;
     }
     let (secret, ct) = mlkem::encapsulate_with(to.kyber(), chance)?;
     let id = digest_to_bytes(&to.id());
-    let mut inner = Vec::with_capacity(ANNOUNCE_LEN + 1 + body.len() + mldsa::SIG_LEN);
-    inner.extend_from_slice(own);
+    let mut inner = Vec::with_capacity(mlkem::EK_LEN + 1 + body.len());
+    inner.extend_from_slice(reply);
     inner.push(kind);
     inner.extend_from_slice(body);
-    inner.extend_from_slice(&sender.sign(&signed_of(&id, &ct, kind, body), CTX_MESSAGE));
     let mut out = Vec::with_capacity(OVERHEAD + body.len());
+    out.push(SENT);
     out.extend_from_slice(&id);
     out.extend_from_slice(&ct);
     // (No nonce but nothing: the key is of this encapsulation alone.)
@@ -198,40 +205,107 @@ pub fn seal(
     Some(out)
 }
 
-/// A message opened: who sent it, by a key that was checked; the
-/// announcement to answer it to; and what it says.
+/// Seals the answer to the message of id `answers`, to the key that
+/// message carried for it (`reply`), signed by `signer`, the wallet
+/// the message was for: whoever sent the message knows whom it sent it
+/// to, and takes the answer from that wallet alone.
+pub fn seal_answer(
+    signer: &mldsa::SecretKey,
+    reply: &[u8],
+    answers: &Digest,
+    kind: u8,
+    body: &[u8],
+    chance: &[u8; 32],
+) -> Option<Vec<u8>> {
+    if body.len() > MAX_BODY {
+        return None;
+    }
+    let (secret, ct) = mlkem::encapsulate_with(reply, chance)?;
+    let id = digest_to_bytes(answers);
+    let mut inner = Vec::with_capacity(mldsa::PK_LEN + 1 + body.len() + mldsa::SIG_LEN);
+    inner.extend_from_slice(signer.public_key());
+    inner.push(kind);
+    inner.extend_from_slice(body);
+    inner.extend_from_slice(&signer.sign(&signed_of(&id, &ct, kind, body), CTX_MESSAGE));
+    let mut out = Vec::with_capacity(ANSWER_OVERHEAD + body.len());
+    out.push(ANSWER);
+    out.extend_from_slice(&id);
+    out.extend_from_slice(&ct);
+    let sealed = aead::seal(&key_of(&secret, &id), &[0; aead::NONCE_LEN], &out, &inner);
+    out.extend_from_slice(&sealed);
+    Some(out)
+}
+
+/// A message opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Opened {
-    pub from: Digest,
-    /// The sender's announcement ([`Announced::read`] has taken it).
+    /// The message's own id ([`sealed_id`]): what its answer names.
+    pub id: Digest,
+    /// Who sent it, by a key that was checked: of an answer, the
+    /// wallet that answers. Of a message sent to this wallet, nobody:
+    /// it does not say.
+    pub from: Option<Digest>,
+    /// Of an answer: the id of the message it answers.
+    pub answers: Option<Digest>,
+    /// Of a message sent to this wallet: the key its answer is sealed
+    /// to.
     pub reply: Vec<u8>,
+    /// The node it came by, which its answer goes back by: said by
+    /// whoever took it from that node.
+    pub by: Option<std::net::SocketAddrV4>,
     pub kind: u8,
     pub body: Vec<u8>,
 }
 
 /// Opens a message sealed to the wallet of id `own`, with the Kyber key
-/// it was sealed to, at `now`. None if it is not for this wallet, was
-/// not sealed to this key, was changed on the way, or is not signed by
-/// the wallet whose announcement it carries.
-pub fn open(kyber: &mlkem::SecretKey, own: &Digest, sealed: &[u8], now: u64) -> Option<Opened> {
-    if sealed.len() < OVERHEAD || sealed.len() > MAX_SEALED {
+/// it was sealed to. None if it is not for this wallet, was not sealed
+/// to this key, or was changed on the way.
+pub fn open(kyber: &mlkem::SecretKey, own: &Digest, sealed: &[u8]) -> Option<Opened> {
+    if sealed.len() < OVERHEAD || sealed.len() > MAX_SEALED || sealed[0] != SENT {
         return None;
     }
-    let (head, rest) = sealed.split_at(32 + mlkem::CT_LEN);
-    let (to, ct) = head.split_at(32);
+    let (head, rest) = sealed.split_at(1 + 32 + mlkem::CT_LEN);
+    let (to, ct) = head[1..].split_at(32);
     if to != digest_to_bytes(own) {
         return None;
     }
     let secret = kyber.decapsulate(ct)?;
     let inner = aead::open(&key_of(&secret, to), &[0; aead::NONCE_LEN], head, rest)?;
-    let (reply, said) = inner.split_at_checked(ANNOUNCE_LEN)?;
-    let (said, signature) = said.split_at_checked(said.len().checked_sub(mldsa::SIG_LEN)?)?;
+    let (reply, said) = inner.split_at_checked(mlkem::EK_LEN)?;
     let (kind, body) = said.split_first()?;
-    let sender = Announced::read(reply, now)?;
-    if !mldsa::verify(sender.key(), &signed_of(to, ct, *kind, body), CTX_MESSAGE, signature) {
+    if !mlkem::valid_public_key(reply) {
         return None;
     }
-    Some(Opened { from: sender.id(), reply: reply.to_vec(), kind: *kind, body: body.to_vec() })
+    let (id, reply, body) = (sealed_id(sealed), reply.to_vec(), body.to_vec());
+    Some(Opened { id, from: None, answers: None, reply, by: None, kind: *kind, body })
+}
+
+/// Opens the answer to the message of id `answers`, with the key that
+/// message carried for it. None if it is not an answer to that
+/// message, was not sealed to that key, was changed on the way, or is
+/// not signed by the key it carries: whose that key is, is
+/// [`Opened::from`], for whoever sent the message to hold against whom
+/// it sent it to.
+pub fn open_answer(reply: &mlkem::SecretKey, answers: &Digest, sealed: &[u8]) -> Option<Opened> {
+    if sealed.len() < ANSWER_OVERHEAD || sealed.len() > MAX_SEALED || sealed[0] != ANSWER {
+        return None;
+    }
+    let (head, rest) = sealed.split_at(1 + 32 + mlkem::CT_LEN);
+    let (of, ct) = head[1..].split_at(32);
+    if of != digest_to_bytes(answers) {
+        return None;
+    }
+    let secret = reply.decapsulate(ct)?;
+    let inner = aead::open(&key_of(&secret, of), &[0; aead::NONCE_LEN], head, rest)?;
+    let (key, said) = inner.split_at_checked(mldsa::PK_LEN)?;
+    let (said, signature) = said.split_at_checked(said.len().checked_sub(mldsa::SIG_LEN)?)?;
+    let (kind, body) = said.split_first()?;
+    if !mldsa::verify(key, &signed_of(of, ct, *kind, body), CTX_MESSAGE, signature) {
+        return None;
+    }
+    let from = Some(crate::address::id_of(key));
+    let (id, answers, body) = (sealed_id(sealed), Some(*answers), body.to_vec());
+    Some(Opened { id, from, answers, reply: Vec::new(), by: None, kind: *kind, body })
 }
 
 /// Which of `nodes` nodes a wallet of id `id` is to be reached at in
@@ -364,83 +438,82 @@ mod tests {
         }
     }
 
-    /// A message sealed to a wallet is opened by it, and says who sent
-    /// it; nobody else opens it, and changed on the way it is nothing.
+    /// A message sealed to a wallet is opened by it and by nobody else,
+    /// and changed on the way it is nothing. It says nothing of who
+    /// sent it: only a key to answer to.
     #[test]
-    fn a_message_is_for_one_wallet_and_from_one() {
+    fn a_message_is_for_one_wallet_and_says_nothing_of_its_sender() {
         let (alice, bob, carol) = (wallet(1), wallet(2), wallet(3));
-        let (from_alice, to_bob) = (said(&alice, 1, 5000, 0), said(&bob, 1, 5000, 0));
+        let to_bob = said(&bob, 1, 5000, 0);
         let bob_said = Announced::read(&to_bob, 1000).unwrap();
-        let sealed = seal(&alice.0, &from_alice, &bob_said, KIND_SLATE, b"a slate", &[9; 32]).unwrap();
+        let reply = mlkem::keygen(&[7; 64]);
+        let sealed = seal(&bob_said, reply.public_key(), KIND_SLATE, b"a slate", &[9; 32]).unwrap();
         assert_eq!(sealed.len(), OVERHEAD + 7);
-        assert_eq!(sealed_to(&sealed), Some(bob_said.id()));
-        let opened = open(&bob.1, &bob_said.id(), &sealed, 1000).unwrap();
-        assert_eq!(
-            (opened.from, opened.kind, &opened.body[..]),
-            (id_of(alice.0.public_key()), KIND_SLATE, &b"a slate"[..])
-        );
-        assert_eq!(opened.reply, from_alice);
-        // Who it is from is not to be read on the way: Alice's key is
-        // nowhere in it in the clear.
+        assert_eq!((sealed_to(&sealed), sealed_answers(&sealed)), (Some(bob_said.id()), None));
+        let opened = open(&bob.1, &bob_said.id(), &sealed).unwrap();
+        assert_eq!((opened.from, opened.kind, &opened.body[..]), (None, KIND_SLATE, &b"a slate"[..]));
+        assert_eq!((opened.id, &opened.reply[..]), (sealed_id(&sealed), reply.public_key()));
+        // Nothing of Alice is in it, sealed or opened: not her key, nor
+        // anything made of it.
         let key = alice.0.public_key();
         assert!(!sealed.windows(32).any(|w| w == &key[..32]));
-        // Not Carol's to open, with her key or as if it were hers; nor
-        // Bob's with another of his keys.
+        assert!(!opened.reply.windows(32).any(|w| w == &key[..32]));
+        // Not for Carol, nor to be opened with her key; nor with a key
+        // of Bob's that it was not sealed to.
         let carol_id = id_of(carol.0.public_key());
-        assert_eq!(open(&carol.1, &carol_id, &sealed, 1000), None);
-        assert_eq!(open(&carol.1, &bob_said.id(), &sealed, 1000), None);
-        assert_eq!(open(&mlkem::keygen(&[50; 64]), &bob_said.id(), &sealed, 1000), None);
-        // Changed anywhere: nothing.
-        for at in [0, 31, 32, 32 + mlkem::CT_LEN - 1, 32 + mlkem::CT_LEN, sealed.len() - 1] {
+        assert_eq!(open(&carol.1, &carol_id, &sealed), None);
+        assert_eq!(open(&carol.1, &bob_said.id(), &sealed), None);
+        assert_eq!(open(&mlkem::keygen(&[50; 64]), &bob_said.id(), &sealed), None);
+        // Changed anywhere, or cut short.
+        for at in [0, 1, 20, 40, 1 + 32 + mlkem::CT_LEN, sealed.len() - 1] {
             let mut changed = sealed.clone();
             changed[at] ^= 1;
-            assert_eq!(open(&bob.1, &bob_said.id(), &changed, 1000), None, "byte {at}");
+            assert_eq!(open(&bob.1, &bob_said.id(), &changed), None, "byte {at}");
         }
-        // Once the sender's announcement is past its time, the message
-        // is: there is nothing to answer it to.
-        assert_eq!(open(&bob.1, &bob_said.id(), &sealed, 5000), None);
-        // Another message, another id; too long, none.
-        let other = seal(&alice.0, &from_alice, &bob_said, KIND_SLATE, b"another", &[9; 32]).unwrap();
-        assert_ne!(sealed_id(&other), sealed_id(&sealed));
-        assert_eq!(seal(&alice.0, &from_alice, &bob_said, KIND_SLATE, &vec![0; MAX_BODY + 1], &[9; 32]), None);
-        assert!(seal(&alice.0, &from_alice, &bob_said, KIND_SLATE, &vec![0; MAX_BODY], &[9; 32]).is_some());
+        assert_eq!(open(&bob.1, &bob_said.id(), &sealed[..sealed.len() - 1]), None);
+        // No longer than a message may be; and a key to answer to that
+        // is one.
+        assert_eq!(seal(&bob_said, reply.public_key(), KIND_SLATE, &vec![0; MAX_BODY + 1], &[9; 32]), None);
+        assert!(seal(&bob_said, reply.public_key(), KIND_SLATE, &vec![0; MAX_BODY], &[9; 32]).is_some());
+        assert_eq!(seal(&bob_said, &reply.public_key()[1..], KIND_SLATE, b"x", &[9; 32]), None);
     }
 
-    /// A message cannot be passed on as one's own: Carol, who was sent
-    /// Alice's, cannot seal what it said to Bob as from Alice.
+    /// The answer to a message goes to the key the message carried, and
+    /// says who answers, by a key that is checked: whoever sent the
+    /// message takes it from the wallet it sent to, and from no other.
+    /// It answers that message and no other.
     #[test]
-    fn a_message_is_not_passed_on_as_anothers() {
-        let (alice, bob, carol) = (wallet(1), wallet(2), wallet(3));
-        let (a, b, c) = (said(&alice, 1, 5000, 0), said(&bob, 1, 5000, 0), said(&carol, 1, 5000, 0));
-        let carol_said = Announced::read(&c, 1000).unwrap();
-        let bob_said = Announced::read(&b, 1000).unwrap();
-        let sealed = seal(&alice.0, &a, &carol_said, KIND_SLATE, b"pay carol", &[4; 32]).unwrap();
-        let opened = open(&carol.1, &carol_said.id(), &sealed, 1000).unwrap();
-        // What Carol has of it: Alice's announcement, the words, and a
-        // signature that is over Carol's id and her encapsulation. Put
-        // under an encapsulation to Bob, it is not signed for him.
-        let (secret, ct) = mlkem::encapsulate_with(bob_said.kyber(), &[5; 32]).unwrap();
-        let id = digest_to_bytes(&bob_said.id());
-        let inner_from = |signature: &[u8]| {
-            let mut inner = opened.reply.clone();
-            inner.push(opened.kind);
-            inner.extend_from_slice(&opened.body);
-            inner.extend_from_slice(signature);
-            inner
-        };
-        let carols_copy = aead::open(
-            &key_of(&carol.1.decapsulate(&sealed[32..32 + mlkem::CT_LEN]).unwrap(), &sealed[..32]),
-            &[0; aead::NONCE_LEN],
-            &sealed[..32 + mlkem::CT_LEN],
-            &sealed[32 + mlkem::CT_LEN..],
-        )
-        .unwrap();
-        let signature = &carols_copy[carols_copy.len() - mldsa::SIG_LEN..];
-        let mut forged = id.to_vec();
-        forged.extend_from_slice(&ct);
-        let body = aead::seal(&key_of(&secret, &id), &[0; aead::NONCE_LEN], &forged, &inner_from(signature));
-        forged.extend_from_slice(&body);
-        assert_eq!(open(&bob.1, &bob_said.id(), &forged, 1000), None);
+    fn an_answer_is_its_signers_and_to_one_message() {
+        let (bob, carol) = (wallet(2), wallet(3));
+        let bob_said_bytes = said(&bob, 1, 5000, 0);
+        let bob_said = Announced::read(&bob_said_bytes, 1000).unwrap();
+        let reply = mlkem::keygen(&[7; 64]);
+        let sent = seal(&bob_said, reply.public_key(), KIND_SLATE, b"a slate", &[9; 32]).unwrap();
+        let got = open(&bob.1, &bob_said.id(), &sent).unwrap();
+        // Bob answers.
+        let answer = seal_answer(&bob.0, &got.reply, &got.id, KIND_SLATE, b"its answer", &[4; 32]).unwrap();
+        assert_eq!(answer.len(), ANSWER_OVERHEAD + 10);
+        assert_eq!((sealed_answers(&answer), sealed_to(&answer)), (Some(got.id), None));
+        let back = open_answer(&reply, &got.id, &answer).unwrap();
+        assert_eq!((back.from, back.answers), (Some(id_of(bob.0.public_key())), Some(got.id)));
+        assert_eq!((back.kind, &back.body[..], back.reply.len()), (KIND_SLATE, &b"its answer"[..], 0));
+        // Carol, who saw the message pass, answers in Bob's place: it
+        // opens, and is Carol's. (Whoever sent the message holds that
+        // against whom it sent it to.)
+        let forged = seal_answer(&carol.0, reply.public_key(), &got.id, KIND_SLATE, b"pay me", &[4; 32]).unwrap();
+        assert_eq!(open_answer(&reply, &got.id, &forged).unwrap().from, Some(id_of(carol.0.public_key())));
+        // Not the answer to another message; not to be opened with
+        // another key; not changed; and no message sent to a wallet.
+        let other = sealed_id(b"another message");
+        assert_eq!(open_answer(&reply, &other, &answer), None);
+        assert_eq!(open_answer(&mlkem::keygen(&[8; 64]), &got.id, &answer), None);
+        for at in [0, 5, 1 + 32 + mlkem::CT_LEN + 3, answer.len() - 1] {
+            let mut changed = answer.clone();
+            changed[at] ^= 1;
+            assert_eq!(open_answer(&reply, &got.id, &changed), None, "byte {at}");
+        }
+        assert_eq!(open_answer(&reply, &got.id, &sent), None);
+        assert_eq!(open(&bob.1, &bob_said.id(), &answer), None);
     }
 
     /// A wallet's points are of its id and the epoch: the same for

@@ -823,7 +823,9 @@ fn a_payment_is_sent_to_an_address() {
     loop {
         let log = std::fs::read_to_string(dirs[1].join("tabernacle.log")).unwrap();
         if log.contains(&format!(" answered by {own}, signed and pooled: transaction ")) {
-            assert!(log.contains(&format!(" from {own} answered: 1 to this wallet")), "{log}");
+            // (Whom it is from is not said: the wallet that is paid is
+            // not told, though here it is itself.)
+            assert!(log.contains(" answered: 1 to this wallet") && !log.contains(" from tab1"), "{log}");
             break;
         }
         assert!(began.elapsed() < Duration::from_secs(60), "the wallet does not pay itself: {log}");

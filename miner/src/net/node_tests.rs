@@ -2004,7 +2004,7 @@ fn wallets_by_ways(loss: u64) {
     );
     // From the first to the second.
     let began = w.now;
-    hold[0].post(ids[1].0, crate::msg::KIND_SLATE, [7; 32], b"a slate".to_vec(), None);
+    hold[0].post(ids[1].0, crate::msg::KIND_SLATE, [7; 32], b"a slate".to_vec());
     w.woken();
     let mut came = Vec::new();
     while came.is_empty() {
@@ -2013,9 +2013,13 @@ fn wallets_by_ways(loss: u64) {
         came = hold[1].take_messages();
     }
     println!("a message crossed in {} ms", (w.now - began) / MILLI);
-    assert_eq!((came.len(), came[0].from, &came[0].body[..]), (1, ids[0].0, &b"a slate"[..]));
+    // (It says nothing of who sent it: no key of the sender's, nor
+    // anything its address could be had from.)
+    assert_eq!((came.len(), came[0].from, &came[0].body[..]), (1, None, &b"a slate"[..]));
+    let key = crate::mldsa::keygen(&[0u8; 32]);
+    assert!(!came[0].reply.windows(32).any(|w| w == &key.public_key()[..32]));
     // And its answer, sealed to what it carried.
-    hold[1].post(ids[0].0, crate::msg::KIND_SLATE, [8; 32], b"its answer".to_vec(), Some(came[0].reply.clone()));
+    assert!(hold[1].answer(&came[0], crate::msg::KIND_SLATE, [8; 32], b"its answer".to_vec()));
     w.woken();
     let mut back = Vec::new();
     while back.is_empty() {
@@ -2024,10 +2028,13 @@ fn wallets_by_ways(loss: u64) {
         back = hold[0].take_messages();
     }
     println!("and its answer was back in {} ms from the first", (w.now - began) / MILLI);
-    assert_eq!((back[0].from, &back[0].body[..]), (ids[1].0, &b"its answer"[..]));
+    // (Who answers is known, by a key that was checked: it is the
+    // wallet the message was sent to.)
+    assert_eq!((back[0].from, &back[0].body[..]), (Some(ids[1].0), &b"its answer"[..]));
+    assert_eq!(back[0].answers, Some(came[0].id));
     w.run(5 * SECOND);
     assert_eq!(hold[0].take_posted(), [(ids[1].0, crate::msg::KIND_SLATE, [7; 32], Posted::Passed)]);
-    assert_eq!(hold[1].take_posted(), [(ids[0].0, crate::msg::KIND_SLATE, [8; 32], Posted::Passed)]);
+    assert_eq!(hold[1].take_posted(), [(Digest::default(), crate::msg::KIND_SLATE, [8; 32], Posted::Passed)]);
     // Each came once.
     assert!(hold[0].take_messages().is_empty() && hold[1].take_messages().is_empty());
     // The two wallets' nodes never said anything to each other.
@@ -2048,7 +2055,7 @@ fn wallets_by_ways(loss: u64) {
             let mut came = Vec::new();
             for again in 0..2 {
                 assert!(again == 0 || nth == 0, "with relay {silent} silent, nothing comes ({nth})");
-                hold[0].post(ids[1].0, crate::msg::KIND_SLATE, [20 + nth; 32], vec![nth], None);
+                hold[0].post(ids[1].0, crate::msg::KIND_SLATE, [20 + nth; 32], vec![nth]);
                 w.woken();
                 let sent = w.now;
                 while came.is_empty() && w.now - sent < 62 * SECOND {
@@ -2070,7 +2077,7 @@ fn wallets_by_ways(loss: u64) {
     }
     // To a wallet that is nowhere: said to be so.
     let nobody = crate::address::id_of(crate::mldsa::keygen(&[99; 32]).public_key());
-    hold[0].post(nobody, crate::msg::KIND_SLATE, [9; 32], b"x".to_vec(), None);
+    hold[0].post(nobody, crate::msg::KIND_SLATE, [9; 32], b"x".to_vec());
     let began = w.now;
     let mut posted = Vec::new();
     while posted.is_empty() {
@@ -2151,7 +2158,7 @@ fn a_name_under_a_name(relays: bool) {
         came = hold[1].take_messages();
     }
     println!("and a message to the name crossed in {} ms", (w.now - began) / MILLI);
-    assert_eq!((came[0].from, &came[0].body[..]), (ids[0].0, &b"to alice"[..]));
+    assert_eq!((came[0].from, &came[0].body[..]), (None, &b"to alice"[..]));
     w.run(3 * SECOND);
     assert_eq!(hold[0].take_resolved(), [([7; 32], ids[1].0)]);
     assert_eq!(hold[0].take_posted(), [(ids[1].0, KIND_SLATE, [7; 32], Posted::Passed)]);

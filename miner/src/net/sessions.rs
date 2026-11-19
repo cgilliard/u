@@ -566,9 +566,9 @@ impl Participant {
     /// Opens a message sealed to this wallet, at `unix` by the calendar
     /// and `now` by the clock: with the key it announces, or the one
     /// before while that still opens.
-    pub fn open(&self, sealed: &[u8], unix: u64, now: Micros) -> Option<msg::Opened> {
+    pub fn open(&self, sealed: &[u8], now: Micros) -> Option<msg::Opened> {
         let before = self.before.as_ref().filter(|(_, until)| now < *until).map(|(key, _)| key);
-        [Some(&self.kyber), before].into_iter().flatten().find_map(|key| msg::open(key, &self.id, sealed, unix))
+        [Some(&self.kyber), before].into_iter().flatten().find_map(|key| msg::open(key, &self.id, sealed))
     }
 }
 
@@ -607,10 +607,10 @@ pub struct Post {
     /// What whoever posted it knows it by (a slate's id): given back
     /// with what became of it.
     pub tag: [u8; 32],
-    /// The announcement of the wallet it is for, where that is known
-    /// already (an answer is sealed to what the message answered
-    /// carried); else it is asked for.
-    pub known: Option<Vec<u8>>,
+    /// What it answers, if it is the answer to a message that came
+    /// for this wallet: it goes back by the node that message came by,
+    /// to whoever sent it, of whom nothing else is known.
+    pub answers: Option<Answering>,
     /// Sealed, once it is: its id and its bytes.
     pub sealed: Option<(Digest, Arc<Vec<u8>>)>,
     /// When it was first looked to: not known to whoever posted it.
@@ -624,11 +624,35 @@ pub struct Post {
     pub state: Posted,
 }
 
+/// What an answer answers: the message's id, the key that message
+/// carried for its answer, and the node it came by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Answering {
+    pub of: Digest,
+    pub key: Vec<u8>,
+    pub by: SocketAddrV4,
+}
+
+/// A message this wallet sent, while its answer may still come: its
+/// id, the key its answer is sealed to, whom it was sent to (and whom
+/// alone its answer is taken from), and when it was sealed.
+pub struct Awaited {
+    pub id: Digest,
+    pub key: mlkem::SecretKey,
+    pub to: Digest,
+    pub since: Micros,
+}
+
+/// How long the answer to a message sent is waited for.
+pub const ANSWER_HOLDS: Micros = 180 * SECOND;
+
 /// The messages of a node: those its wallet sends, those it passes on
 /// for others, and those that have come for its wallet.
 #[derive(Default)]
 pub struct Mail {
     pub posts: Vec<Post>,
+    /// The messages sent whose answers may still come.
+    pub awaited: Vec<Awaited>,
     /// Sealed messages being passed on: id, whom for, the bytes, when
     /// taken.
     passing: std::collections::VecDeque<(Digest, Digest, Arc<Vec<u8>>, Micros)>,
@@ -653,19 +677,37 @@ impl Post {
 
 impl Mail {
     /// A message to send.
-    pub fn post(&mut self, to: Digest, kind: u8, tag: [u8; 32], body: Vec<u8>, known: Option<Vec<u8>>) {
+    pub fn post(&mut self, to: Digest, kind: u8, tag: [u8; 32], body: Vec<u8>) {
         // (Of the nodes the wallet is reached at, one by chance first:
         // the others if that one does not answer.)
         let mut chance = [0u8; 1];
         let _ = crate::random::fill(&mut chance);
         let (sealed, tried, turn, state, via) = (None, None, chance[0] as usize, Posted::Waiting, None);
-        self.posts.push(Post { to, via, kind, body, tag, known, sealed, began: None, tried, turn, missed: 0, state });
+        let answers = None;
+        self.posts.push(Post { to, via, kind, body, tag, answers, sealed, began: None, tried, turn, missed: 0, state });
+    }
+
+    /// The answer to a message that came for this wallet: to go back
+    /// by the node the message came by. Nothing, of a message that
+    /// carries no key to answer to, or came by no node.
+    pub fn answer(&mut self, to: &msg::Opened, kind: u8, tag: [u8; 32], body: Vec<u8>) -> bool {
+        let Some(by) = to.by.filter(|_| !to.reply.is_empty()) else { return false };
+        // (Whom it is for is not known, and is nobody's to say.)
+        self.post(Digest::default(), kind, tag, body);
+        let post = self.posts.last_mut().expect("it was put there");
+        post.answers = Some(Answering { of: to.id, key: to.reply.clone(), by });
+        true
+    }
+
+    /// The message sent of id `id`, if its answer may still come.
+    pub fn awaited(&self, id: &Digest) -> Option<&Awaited> {
+        self.awaited.iter().find(|a| a.id == *id)
     }
 
     /// A message to send to whichever wallet the full name of id `n`
     /// is.
     pub fn post_to_name(&mut self, n: Digest, kind: u8, tag: [u8; 32], body: Vec<u8>) {
-        self.post(n, kind, tag, body, None);
+        self.post(n, kind, tag, body);
         self.posts.last_mut().expect("it was put there").via = Some(n);
     }
 
@@ -696,7 +738,8 @@ impl Mail {
         };
         let mut which = Vec::new();
         for (at, post) in self.posts.iter_mut().enumerate() {
-            if post.sealed.is_some() || post.asked() != asked || post.via.is_some() == bundle.is_empty() {
+            let other = post.answers.is_some() || post.asked() != asked || post.via.is_some() == bundle.is_empty();
+            if post.sealed.is_some() || other {
                 continue;
             }
             if post.via.is_some() && post.to != holder {
@@ -724,6 +767,7 @@ impl Mail {
         while self.passing.front().is_some_and(|p| now.saturating_sub(p.3) >= PASSING_HOLDS) {
             self.passing.pop_front();
         }
+        self.awaited.retain(|a| now.saturating_sub(a.since) < ANSWER_HOLDS);
     }
 
     /// Keeps a sealed message to pass on to the wallet of id `to`.
@@ -844,22 +888,22 @@ mod tests {
     fn a_wallet_opens_what_is_sealed_to_its_keys() {
         let (mut alice, mut bob) = (wallet(1), wallet(2));
         let node = at(9, 3737);
-        let said = bob.say(node, 1, 1000, 0);
-        let own = bob.announced(said).unwrap();
+        bob.say(node, 1, 1000, 0);
         let seq = alice.say(node, 2, 1000, 0);
         let to = alice.announced(seq).unwrap();
+        let reply = mlkem::keygen(&[6; 64]);
         let sealed =
-            msg::seal(bob.identity(), &own, &Announced::read(&to, 1000).unwrap(), 1, b"hello", &[3; 32]).unwrap();
-        assert_eq!(alice.open(&sealed, 1000, 0).unwrap().body, b"hello");
-        assert_eq!(bob.open(&sealed, 1000, 0), None);
+            msg::seal(&Announced::read(&to, 1000).unwrap(), reply.public_key(), 1, b"hello", &[3; 32]).unwrap();
+        assert_eq!(alice.open(&sealed, 0).unwrap().body, b"hello");
+        assert_eq!(bob.open(&sealed, 0), None);
         // Not yet time for another key; then it is, and everything is
         // announced again.
         assert!(!alice.rotate(&[9; 64], KEY_LIFE - 1));
         assert!(alice.rotate(&[9; 64], KEY_LIFE));
         assert_eq!((alice.said_to(), alice.announced(seq)), (0, None));
         assert_ne!(alice.say(node, 2, 5000, KEY_LIFE), seq);
-        assert_eq!(alice.open(&sealed, 1000, KEY_LIFE + KEY_GRACE - 1).unwrap().body, b"hello");
-        assert_eq!(alice.open(&sealed, 1000, KEY_LIFE + KEY_GRACE), None);
+        assert_eq!(alice.open(&sealed, KEY_LIFE + KEY_GRACE - 1).unwrap().body, b"hello");
+        assert_eq!(alice.open(&sealed, KEY_LIFE + KEY_GRACE), None);
         // Which nodes hold what it last said; and one that does is told
         // again only now and then.
         assert_eq!(alice.reached_at().count(), 0);

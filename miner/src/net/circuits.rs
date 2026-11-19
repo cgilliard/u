@@ -73,6 +73,13 @@ pub const AS_HELD: u8 = 14;
 /// message has come to it down its way: the message's id. Only then
 /// is whoever gave the message told that it was passed on.
 pub const TAKEN: u8 = 15;
+/// What a wallet says to the node it is reached at to answer a
+/// message that came to it there: the answer, sealed, which names the
+/// message it answers. The node passes it back to whoever gave it that
+/// message, of whom the wallet knows nothing: [`ANSWER`], said to them
+/// along the way they gave it by.
+pub const REPLY: u8 = 16;
+pub const ANSWER: u8 = 17;
 /// How long a way may leave what was said along it unanswered before
 /// it is taken to go nowhere any more: a relay of it is gone.
 pub const ANSWERED_WITHIN: Micros = 4 * SECOND;

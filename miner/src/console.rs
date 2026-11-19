@@ -816,9 +816,6 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         };
         let amount = parse_coins(amount).ok_or_else(|| format!("'{amount}' is not an amount of coins"))?;
         let fee = Self::fee(fee)?;
-        if !self.hold.reached() {
-            return Err("this wallet is reached nowhere yet: it could not be answered (see status)".to_string());
-        }
         // (To this wallet itself, if that is what is asked: a payment
         // that shows the wallet is reached.)
         let mut wallet = self.wallet()?;
@@ -843,7 +840,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
                 self.names.lock().unwrap_or_else(|e| e.into_inner()).sent.insert(slate.id, to.to_string());
                 self.hold.post_to_name(n, crate::msg::KIND_SLATE, slate.id, body);
             }
-            None => self.hold.post(whom, crate::msg::KIND_SLATE, slate.id, body, None),
+            None => self.hold.post(whom, crate::msg::KIND_SLATE, slate.id, body),
         }
         Ok(format!("{done}; sent to its wallet, to be answered"))
     }
@@ -859,24 +856,26 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         if message.kind != crate::msg::KIND_SLATE {
             return Err(format!("a message of a kind not known ({})", message.kind));
         }
-        let from = crate::address::encode(&message.from);
+        // (Who sent a message is not said, and is nobody's to know: of
+        // an answer, who answers is, by a key that was checked.)
+        let from = message.from.map_or("its sender".to_string(), |from| crate::address::encode(&from));
         let text = std::str::from_utf8(&message.body).map_err(|_| format!("what {from} sent is no slate"))?;
         let mut slate = Slate::from_text(text).ok_or_else(|| format!("what {from} sent is no slate"))?;
         let unix = (self.unix)();
-        // One this wallet began: its answer. (Signed only if it is the
-        // slate that was begun, answered: the wallet sees to that.)
-        // (Unless it is its own slate come round, not yet answered: a
-        // payment of this wallet's to itself, which it answers as any.)
-        let wallet = self.wallet()?;
-        let to_itself = slate.stage == 1 && message.from == wallet.id();
-        let ours = !to_itself && wallet.pending_slates().iter().any(|(id, _)| *id == slate.id);
-        drop(wallet);
+        // An answer, to a slate this wallet began. (Signed only if it
+        // is the slate that was begun, answered: the wallet sees to
+        // that.) A slate that comes as no answer is a payment to this
+        // wallet, whoever began it: this wallet itself, if it likes.
+        let ours = message.answers.is_some();
         if ours {
+            if !self.wallet()?.pending_slates().iter().any(|(id, _)| *id == slate.id) {
+                return Err(format!("an answer to payment {}, which this wallet has not begun", &slate.id_hex()[..8]));
+            }
             // From the wallet it was sent to, or it is nobody's answer:
             // whoever answers says where the payment goes. (One begun
             // in a file was sent to nobody, and is finalized by hand.)
             match self.wallet()?.sent_to(&slate.id) {
-                Some(whom) if whom == message.from => {}
+                Some(whom) if Some(whom) == message.from => {}
                 Some(whom) => {
                     let whom = crate::address::encode(&whom);
                     return Err(format!(
@@ -916,14 +915,13 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         }
         // One somebody else began, to pay this wallet: answered.
         self.wallet()?.receive_slate(&mut slate, unix).map_err(|e| e.to_string())?;
-        let done = format!(
-            "payment {} from {from} answered: {} to this wallet",
-            &slate.id_hex()[..8],
-            coins(slate.amount as u128)
-        );
+        // (Who pays is not known here, and need not be: the answer
+        // goes back the way the slate came.)
+        let done = format!("payment {} answered: {} to this wallet", &slate.id_hex()[..8], coins(slate.amount as u128));
         (self.log)(&format!("P{}", &done[1..]));
-        let (answer, known) = (slate.to_text().into_bytes(), Some(message.reply.clone()));
-        self.hold.post(message.from, crate::msg::KIND_SLATE, slate.id, answer, known);
+        if !self.hold.answer(message, crate::msg::KIND_SLATE, slate.id, slate.to_text().into_bytes()) {
+            return Err(format!("payment {} cannot be answered: it came by no node", &slate.id_hex()[..8]));
+        }
         Ok(done)
     }
 
@@ -1099,7 +1097,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
 
     fn send_certificate(&self, label: &[u8], name: &[u8], holder: crate::hash::Digest, bundle: Vec<u8>) {
         let tag = digest_to_bytes(&crate::subnames::point(label, name));
-        self.hold.post(holder, crate::msg::KIND_NAME, tag, bundle, None);
+        self.hold.post(holder, crate::msg::KIND_NAME, tag, bundle);
     }
 
     /// Gives a name out no longer.
