@@ -771,6 +771,22 @@ those the chain still takes, with the ages they had. The command
 `fees` says what a payment is to pay a byte to be in a block soon, by
 the hour or within the day, as the pool reckons it.
 
+What the pool asks beyond a transaction's being valid is the node's
+own, and its operator's to set; none of it is a rule of the chain, and
+a block is no less valid for what it has. `--min-fee N` is the least a
+transaction pays a byte, in base units, to be kept and passed on here
+(10 if not said); the smallest output kept is one worth spending at
+that, and the wallet here pays no less when it is told no fee.
+`--fee-half-life N`: a pool that filled asks more than the least, and
+that falls halfway back in N hours (12). `--mempool-expiry N`: a
+transaction that has waited N days is dropped, and refused for as long
+again (14). `--reserve N`: of the space for transactions in a block
+this node mines, N in a hundred goes to those that have waited
+longest, oldest first, whatever they pay (10), so that what pays the
+least is not kept out for ever by what pays more; 0 fills a block by
+fee alone. A node that asks more than the network's least does not
+take, or pass on, what pays less: it still takes blocks that have it.
+
 **The prompt.** Once the node is ready it takes commands on the
 terminal, at `> `, and answers each there; nothing else is said on the
 terminal (the logs are where the node says what happens). `quit`, or

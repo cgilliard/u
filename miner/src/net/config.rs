@@ -33,6 +33,9 @@ pub struct Config {
     pub request_queue: usize,
     /// Bytes of transactions the pool holds at the most.
     pub pool: usize,
+    /// What the pool asks of a transaction beyond its being valid, and
+    /// what of a block this node mines is for the oldest.
+    pub policy: crate::mempool::Policy,
     /// Whether the node stands between wallets on the message layer:
     /// holds sessions for them, and passes on what is sealed to them
     /// ([`super::sessions`]). Only a node told to does.
@@ -218,6 +221,7 @@ impl Default for Config {
             workers: 1,
             request_queue: 4096,
             pool: crate::mempool::DEFAULT_CAPACITY,
+            policy: crate::mempool::Policy::MAINNET,
             relay: false,
             sessions: super::sessions::Limits::default(),
             circuits: super::circuits::Limits::default(),

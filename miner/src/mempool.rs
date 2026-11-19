@@ -226,6 +226,11 @@ pub struct Policy {
     /// whatever the rolling minimum; at most half the pool, so that fees
     /// always compete for the rest.
     pub protect_bytes: usize,
+    /// The share of a block's space for transactions that this node,
+    /// mining, gives to the longest-waiting ones, oldest first,
+    /// whatever they pay: of a hundred. None of it, and a block is
+    /// filled by fee alone.
+    pub reserve_percent: usize,
 }
 
 impl Policy {
@@ -235,6 +240,7 @@ impl Policy {
         half_life_secs: HALF_LIFE_SECS,
         expiry_secs: EXPIRY_SECS,
         protect_bytes: PROTECT_BYTES,
+        reserve_percent: RESERVE_PERCENT,
     };
     /// Anything valid, for tests.
     pub const NONE: Policy = Policy { min_fee_per_byte: 0, dust: 0, ..Policy::MAINNET };
@@ -242,6 +248,21 @@ impl Policy {
     /// The mainnet policy at another floor, its dust limit following.
     pub const fn with_floor(min_fee_per_byte: u64) -> Policy {
         Policy { min_fee_per_byte, dust: (INPUT_SIZE as u64) * min_fee_per_byte, ..Policy::MAINNET }
+    }
+
+    /// The policy an operator sets: the floor, in base units a byte
+    /// (the dust limit follows it); the half-life of the raised
+    /// minimum, in hours; how long a transaction may wait, in days;
+    /// and the reserve, of a hundred (what is kept from eviction is a
+    /// day of it, as by default).
+    pub const fn set(min_fee_per_byte: u64, half_life_hours: u64, expiry_days: u64, reserve_percent: usize) -> Policy {
+        Policy {
+            half_life_secs: half_life_hours * 3600,
+            expiry_secs: expiry_days * 86400,
+            protect_bytes: reserve_bytes(MAX_BLOCK_SIZE, reserve_percent) * (86_400 / BLOCK_TIME as usize),
+            reserve_percent,
+            ..Policy::with_floor(min_fee_per_byte)
+        }
     }
 
     /// The smallest fee a transaction of `inputs` and `outputs` and no
@@ -678,10 +699,12 @@ impl Mempool {
     }
 
     /// Blocks a transaction of `size` arriving now waits at most for the
-    /// aged reserve, if miners keep the default: everything pooled is
-    /// older and ahead of it.
-    pub fn reserve_wait(&self, size: usize) -> u64 {
-        (self.bytes + size).div_ceil(RESERVE_BYTES.max(1)) as u64
+    /// aged reserve, if miners keep what this node does: everything
+    /// pooled is older and ahead of it. Nothing, if there is no
+    /// reserve: then nothing but its fee brings it into a block.
+    pub fn reserve_wait(&self, size: usize) -> Option<u64> {
+        let reserve = reserve_bytes(MAX_BLOCK_SIZE, self.policy.reserve_percent);
+        (reserve > 0).then(|| (self.bytes + size).div_ceil(reserve) as u64)
     }
 
     /// The confirmations the estimates use, oldest first: rate (base

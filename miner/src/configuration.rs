@@ -170,6 +170,26 @@ is given (default 5)",
                 help: "bytes of transactions waiting for a block that are kept at\nthe most: what pays least gives way to what pays more\n(default 64m)",
             },
             Opt {
+                name: "min-fee",
+                takes: Takes::Value("N"),
+                help: "base units a byte a transaction pays at the least to be\nkept and passed on here; the smallest output kept follows\nit. The wallet pays no less (default 10)",
+            },
+            Opt {
+                name: "fee-half-life",
+                takes: Takes::Value("N"),
+                help: "what a full pool asks, above the least, falls halfway\nback in N hours (default 12)",
+            },
+            Opt {
+                name: "mempool-expiry",
+                takes: Takes::Value("N"),
+                help: "a transaction that has waited N days for a block\nis dropped, and refused for as long again (default 14)",
+            },
+            Opt {
+                name: "reserve",
+                takes: Takes::Value("N"),
+                help: "of the space for transactions of a block mined here, N in\na hundred is for those that have waited longest, oldest first,\nwhatever they pay (default 10; 0: all of it by fee)",
+            },
+            Opt {
                 name: "request-queue-size",
                 takes: Takes::Value("N"),
                 help: "requests that may wait for one thread; one that comes\nwhen so many do is dropped (default 4096)",
@@ -796,6 +816,14 @@ impl Configuration {
         net.serve.waiting = count("serve-queue", 1)?.unwrap_or(net.serve.waiting);
         net.request_queue = count("request-queue-size", 1)?.unwrap_or(net.request_queue);
         net.pool = given.size("mempool-size", 1 << 20)?.map_or(net.pool, |bytes| bytes as usize);
+        let was = net.policy;
+        let reserve = given.number("reserve", 0)?.map_or(was.reserve_percent as u64, |p| p.min(100));
+        net.policy = crate::mempool::Policy::set(
+            given.number("min-fee", 0)?.unwrap_or(was.min_fee_per_byte).min(1 << 32),
+            given.number("fee-half-life", 1)?.unwrap_or(was.half_life_secs / 3600).min(100_000),
+            given.number("mempool-expiry", 1)?.unwrap_or(was.expiry_secs / 86400).min(100_000),
+            reserve as usize,
+        );
         net.relay = given.flag("relay");
         net.sessions.most = count("max-sessions", 1)?.unwrap_or(net.sessions.most);
         if given.one("max-sessions").is_some() && !net.relay {
@@ -975,6 +1003,10 @@ impl Configuration {
             ("Threads", if self.threads == 0 { "one a core".to_string() } else { commas(self.threads as u64) }),
             ("Request Queue Size", commas(self.net.request_queue as u64)),
             ("Mempool Size", format!("{} bytes", commas(self.net.pool as u64))),
+            ("Min Fee", format!("{} a byte", commas(self.net.policy.min_fee_per_byte))),
+            ("Fee Half Life", format!("{} hours", commas(self.net.policy.half_life_secs / 3600))),
+            ("Mempool Expiry", format!("{} days", commas(self.net.policy.expiry_secs / 86400))),
+            ("Block Reserve", format!("{}%", self.net.policy.reserve_percent)),
             (
                 "Relay",
                 if self.net.relay {
@@ -1117,6 +1149,13 @@ mod tests {
     fn nothing_given_is_every_default() {
         let c = read(&[]).unwrap();
         assert_eq!((c.network, c.mine, c.threads, c.keep), (Network::Mainnet, true, 0, 1008));
+        // The pool's policy: the default, or what is set of it.
+        assert_eq!(c.net.policy, crate::mempool::Policy::MAINNET);
+        let set = read(&["--min-fee", "50", "--fee-half-life", "6", "--mempool-expiry", "3", "--reserve", "25"]);
+        assert_eq!(set.unwrap().net.policy, crate::mempool::Policy::set(50, 6, 3, 25));
+        let some = read(&["--reserve", "0"]).unwrap().net.policy;
+        assert_eq!(some, crate::mempool::Policy::set(10, 12, 14, 0));
+        assert!(read(&["--fee-half-life", "0"]).is_err() && read(&["--mempool-expiry", "0"]).is_err());
         assert!(!c.prebuild_table && read(&["--prebuild-table"]).unwrap().prebuild_table);
         assert_eq!(c.max_block_signatures, 256);
         assert_eq!(c.pow_table, c.data_dir.join("pow.table"));

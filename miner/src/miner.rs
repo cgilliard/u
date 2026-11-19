@@ -37,7 +37,7 @@ use crate::chain::verify::BlockStatement;
 use crate::difficulty::Target;
 use crate::error::Error;
 use crate::hash::Digest;
-use crate::mempool::{Mempool, PROOF_BYTES, RESERVE_PERCENT};
+use crate::mempool::{Mempool, PROOF_BYTES};
 use crate::name::NameOp;
 use crate::name_air::{NameWitness, SWEEP_ROWS, op_rows_bound};
 use crate::output::{INPUT_SIZE, Output, Sig};
@@ -197,7 +197,7 @@ pub fn choose<B: Backend + 'static>(
         // (What is chosen so far, decoded once: the choosing asks of
         // all of it each time one more is tried.)
         let mut so_far: Vec<Transaction> = Vec::new();
-        let reserve = max_signatures * INPUT_SIZE * RESERVE_PERCENT / 100;
+        let reserve = max_signatures * INPUT_SIZE * pool.policy().reserve_percent / 100;
         let taken = pool.select(&snap, height, params.min_reveal, reserve, |trying| {
             so_far.truncate(trying.len() - 1);
             so_far.push(trying[trying.len() - 1].to_transaction());

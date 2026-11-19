@@ -675,11 +675,17 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
                 let seen = if pool.estimate(target, unix).is_some() { "" } else { " (too little seen yet: the least)" };
                 lines.push(format!("  within {what:<11} {} a byte{seen}", commas(pool.suggest(target, size, unix))));
             }
-            lines.push(format!(
-                "  the least         {} a byte: about {} blocks at the most, by its age",
-                commas(pool.admission_fee(unix)),
-                commas(pool.reserve_wait(size))
-            ));
+            lines.push(match pool.reserve_wait(size) {
+                Some(blocks) => format!(
+                    "  the least         {} a byte: about {} blocks at the most, by its age",
+                    commas(pool.admission_fee(unix)),
+                    commas(blocks)
+                ),
+                None => format!(
+                    "  the least         {} a byte: when blocks have room for it (nothing is kept here for what waits)",
+                    commas(pool.admission_fee(unix))
+                ),
+            });
         });
         lines.push(format!("a simple payment is about {} bytes; fees are in base units", commas(size as u64)));
         Ok(lines.join("\n"))
@@ -807,11 +813,20 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
 
     /// A fee as it is written: coins in all, or `N/byte`; the least
     /// that will do if none is.
-    fn fee(text: Option<&&str>) -> Result<Fee, String> {
+    /// The fee as it was said; or, said nothing of, the least: which is
+    /// this node's own least, where that is more than the network's
+    /// (else its own pool would not take what its wallet makes).
+    fn fee(&self, text: Option<&&str>) -> Result<Fee, String> {
+        let mut floor = 0;
+        self.hold.pool(&mut |pool| floor = pool.policy().min_fee_per_byte);
+        let floor = floor.max(crate::mempool::MIN_FEE_PER_BYTE);
         match text {
-            None => Ok(Fee::from(None)),
+            None => Ok(Fee::PerByte(floor)),
             Some(text) => match text.strip_suffix("/byte") {
-                Some(rate) => Ok(Fee::PerByte(rate.parse().map_err(|_| format!("'{text}' is not a fee"))?)),
+                Some(rate) => match rate.parse().map_err(|_| format!("'{text}' is not a fee"))? {
+                    rate if rate < floor => Err(format!("this node takes nothing that pays less than {floor} a byte")),
+                    rate => Ok(Fee::PerByte(rate)),
+                },
                 None => Ok(Fee::Total(parse_coins(text).ok_or_else(|| format!("'{text}' is not a fee"))?)),
             },
         }
@@ -826,7 +841,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
 
     fn send_file(&self, amount: &str, fee: Option<&&str>, file: &str, note: &str) -> Said {
         let amount = parse_coins(amount).ok_or_else(|| format!("'{amount}' is not an amount of coins"))?;
-        let fee = Self::fee(fee)?;
+        let fee = self.fee(fee)?;
         let mut wallet = self.wallet()?;
         let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
         let snap = state.snapshot().map_err(|e| e.to_string())?;
@@ -950,7 +965,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
     fn burn(&self, amount: &str, purpose: &str, to: Option<&&str>, fee: Option<&&str>) -> Said {
         use crate::proofs::{Beneficiary, Burn, MAX_NOTE};
         let amount = parse_coins(amount).ok_or_else(|| format!("'{amount}' is not an amount of coins"))?;
-        let fee = Self::fee(fee)?;
+        let fee = self.fee(fee)?;
         if purpose.is_empty() || purpose.len() > MAX_NOTE {
             return Err(format!("what a burn is for is 1 to {MAX_NOTE} bytes, between quotes"));
         }
@@ -1030,7 +1045,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             None => self.whom(to)?,
         };
         let amount = parse_coins(amount).ok_or_else(|| format!("'{amount}' is not an amount of coins"))?;
-        let fee = Self::fee(fee)?;
+        let fee = self.fee(fee)?;
         // (To this wallet itself, if that is what is asked: a payment
         // that shows the wallet is reached.)
         let mut wallet = self.wallet()?;
@@ -1559,7 +1574,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
     }
 
     fn cancel(&self, id: &str, fee: Option<&&str>) -> Said {
-        let fee = Self::fee(fee)?;
+        let fee = self.fee(fee)?;
         self.observe()?;
         let mut wallet = self.wallet()?;
         let hex = |id: &[u8; 32]| id.iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -1595,7 +1610,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
     }
 
     fn bump(&self, id: &str, fee: Option<&&str>) -> Said {
-        let fee = Self::fee(fee)?;
+        let fee = self.fee(fee)?;
         self.observe()?;
         let mut wallet = self.wallet()?;
         let was = Self::sent_of(&wallet, id)?;
@@ -1781,7 +1796,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
     }
 
     fn name_commit(&self, name: &str, value: &str, fee: Option<&&str>) -> Said {
-        let fee = Self::fee(fee)?;
+        let fee = self.fee(fee)?;
         self.free_to_take(name)?;
         self.observe()?;
         let mut wallet = self.wallet()?;
@@ -1796,7 +1811,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
     }
 
     fn name_reveal(&self, name: &str, wait: &str, fee: Option<&&str>) -> Said {
-        let fee = Self::fee(fee)?;
+        let fee = self.fee(fee)?;
         // (Registered by another since it was committed to: the commit
         // is kept as it is, and nothing is signed.)
         self.free_to_take(name)?;
@@ -1818,7 +1833,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
     }
 
     fn name_update(&self, name: &str, value: &str, fee: Option<&&str>) -> Said {
-        let (value, fee) = (Self::value(value)?, Self::fee(fee)?);
+        let (value, fee) = (Self::value(value)?, self.fee(fee)?);
         self.observe()?;
         let mut wallet = self.wallet()?;
         let (op, _) = wallet.name_update(name.as_bytes(), value).map_err(|e| e.to_string())?;
@@ -1846,7 +1861,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
     }
 
     fn name_transfer(&self, file: &str, fee: Option<&&str>) -> Said {
-        let fee = Self::fee(fee)?;
+        let fee = self.fee(fee)?;
         let text = std::fs::read_to_string(Path::new(file)).map_err(|e| format!("cannot read {file}: {e}"))?;
         let (begin, end) = (format!("-----BEGIN {OFFER_MARKER}-----"), format!("-----END {OFFER_MARKER}-----"));
         let record = text

@@ -251,7 +251,31 @@ fn the_aged_reserve_goes_to_the_longest_waiting() {
     assert_eq!(ids(pool.select(&state, 2, 0, 0, |_| true)), [high, low, old]);
     // Only while they fit.
     assert_eq!(ids(pool.select(&state, 2, 0, size, |chosen| chosen.len() <= 2)), [old, high]);
-    assert_eq!(pool.reserve_wait(0), 1);
+    assert_eq!(pool.reserve_wait(0), Some(1));
+    // With no reserve nothing is promised to what waits.
+    let none = Mempool::with_policy(1 << 20, Policy { reserve_percent: 0, ..Policy::NONE });
+    assert_eq!(none.reserve_wait(0), None);
+}
+
+/// An operator's policy is what it sets, and what follows from it: the
+/// dust limit from the floor, what is kept from eviction from the
+/// reserve; and what it does not set is the default.
+#[test]
+fn an_operators_policy_is_what_it_sets() {
+    assert_eq!(Policy::set(MIN_FEE_PER_BYTE, 12, 14, RESERVE_PERCENT), Policy::MAINNET);
+    let set = Policy::set(50, 6, 3, 25);
+    assert_eq!((set.min_fee_per_byte, set.dust), (50, 5 * DUST));
+    assert_eq!((set.half_life_secs, set.expiry_secs, set.reserve_percent), (6 * 3600, 3 * 86400, 25));
+    assert_eq!(set.protect_bytes, PROTECT_BYTES / 10 * 25);
+    assert_eq!(Policy::set(0, 1, 1, 0).protect_bytes, 0);
+    // The floor is what the pool refuses below.
+    let mut state = Fake::default();
+    state.fund(0, 1, 1_000_000);
+    let mut pool = Mempool::with_policy(1 << 20, set);
+    let size = spend(1, 1_000_000, 0).len();
+    let below = spend(1, 1_000_000, 50 * size as u64 - 1);
+    assert!(matches!(pool.insert(&below, &state, 1, 0), Err(Reject::FeeTooLow { .. })));
+    assert!(pool.insert(&spend(1, 1_000_000, 50 * size as u64), &state, 1, 0).is_ok());
 }
 
 /// What is not a spend the state allows is refused, each for its reason;

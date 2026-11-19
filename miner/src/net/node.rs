@@ -4561,7 +4561,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             waker: RwLock::new(None),
             turn: AtomicUsize::new(0),
             moved: (Mutex::new(()), std::sync::Condvar::new()),
-            pool: Mutex::new(Mempool::new(cfg.pool)),
+            pool: Mutex::new(Mempool::with_policy(cfg.pool, cfg.policy)),
             told: RwLock::new(None),
             #[cfg(test)]
             by_port: AtomicBool::new(false),
