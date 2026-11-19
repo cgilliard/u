@@ -808,12 +808,14 @@ mod tests {
         assert_eq!(lengths(&with(HERE, &announce), &with(HERE_HELD, &[0; 41])), (MIDDLE, MIDDLE));
         assert_eq!(lengths(&with(ASK, &id), &with(ANNOUNCED, &announce)), (MIDDLE, MIDDLE));
         assert_eq!(lengths(&with(ASK, &id), &with(ABSENT, &id)), (MIDDLE, MIDDLE));
-        // A sealed message, by its length: the least holds a slate of
-        // a few thousand bytes, the greatest the longest there is.
+        // A sealed message, by its length: one that says a few thousand
+        // bytes is of the length of a wallet's saying it is there, and
+        // the greatest holds the longest there is.
         let sealed = |body: usize| vec![GIVE; 1 + crate::msg::OVERHEAD + body];
-        assert_eq!(lengths(&sealed(100), &with(NOTICE, &[0; 34])), (SIZES[2], SIZES[0]));
-        assert_eq!(lengths(&sealed(5_000), &with(NOTICE, &[0; 34])), (SIZES[2], SIZES[0]));
-        assert_eq!(lengths(&sealed(6_000), &with(NOTICE, &[0; 34])), (SIZES[3], SIZES[0]));
+        assert_eq!(lengths(&sealed(100), &with(NOTICE, &[0; 34])), (SIZES[1], SIZES[0]));
+        assert_eq!(lengths(&sealed(5_000), &with(NOTICE, &[0; 34])), (SIZES[1], SIZES[0]));
+        assert_eq!(lengths(&sealed(6_000), &with(NOTICE, &[0; 34])), (SIZES[2], SIZES[0]));
+        assert_eq!(lengths(&sealed(20_000), &with(NOTICE, &[0; 34])), (SIZES[3], SIZES[0]));
         assert_eq!(lengths(&sealed(crate::msg::MAX_BODY), &with(NOTICE, &[0; 34])).0, SIZES[5]);
         // What is not of one of the lengths says nothing.
         assert_eq!(emptied(&filled(b"abc", 0)), Some(&b"abc"[..]));
