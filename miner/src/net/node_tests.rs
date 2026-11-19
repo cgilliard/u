@@ -667,6 +667,15 @@ fn over_real_sockets() {
     sockets_sync(1);
 }
 
+/// How long nodes on real sockets are given to do what is asked of
+/// them. A build that is not optimized checks a block in a second or
+/// more, and on a machine that runs every other test at once forty-five
+/// of them have taken the minute that an optimized build does it all in
+/// a dozen times over: what looked like a node stuck at block 35, or
+/// 38, or 39 of 45 was one still going.
+const SOCKETS_WITHIN: std::time::Duration =
+    std::time::Duration::from_secs(if cfg!(debug_assertions) { 300 } else { 60 });
+
 /// And each with four workers, every one on a thread of its own.
 #[test]
 fn over_real_sockets_with_several_workers() {
@@ -717,7 +726,7 @@ fn sockets_sync(workers: usize) {
             first = Some(start.elapsed());
         }
         assert!(
-            start.elapsed() < Duration::from_secs(60),
+            start.elapsed() < SOCKETS_WITHIN,
             "at {} of {}: its headers were in after {headers:?}, its first block after {first:?}",
             behind.tip().unwrap().height,
             tip.height
@@ -844,7 +853,7 @@ fn over_real_sockets_requests_are_logged_and_counted() {
             first = Some(start.elapsed());
         }
         assert!(
-            start.elapsed() < Duration::from_secs(60),
+            start.elapsed() < SOCKETS_WITHIN,
             "at {} of {}: its headers were in after {headers:?}, its first block after {first:?}",
             behind.tip().unwrap().height,
             tip.height
@@ -1558,7 +1567,7 @@ fn sockets_state(workers: usize) {
         .collect();
     let start = Instant::now();
     while behind.receiving() || behind.tip().unwrap() != target {
-        assert!(start.elapsed() < Duration::from_secs(60), "receiving: {}", behind.receiving());
+        assert!(start.elapsed() < SOCKETS_WITHIN, "receiving: {}", behind.receiving());
         std::thread::sleep(Duration::from_millis(20));
     }
     std::thread::sleep(Duration::from_millis(300));
@@ -1824,7 +1833,7 @@ fn over_real_sockets_blocks_come_from_several_peers_of_several_workers() {
             first = Some(start.elapsed());
         }
         assert!(
-            start.elapsed() < Duration::from_secs(60),
+            start.elapsed() < SOCKETS_WITHIN,
             "at {} of {}: its headers were in after {headers:?}, its first block after {first:?}",
             behind.tip().unwrap().height,
             tip.height
