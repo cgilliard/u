@@ -524,6 +524,43 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         for (hash, n, _) in &running.counts {
             lines.push(format!("since then: {} has {} votes", hex(hash), commas(*n as u64)));
         }
+        // And what that would come to, were it decided as it stands:
+        // so that a file that is not held, or is no file, is found out
+        // now and not at the boundary.
+        let next = boundary(height) + WINDOW;
+        match running.counts.is_empty() {
+            true => lines.push(format!(
+                "no valid votes received since then: init mode will be used from block {} unless a file receives votes",
+                commas(next as u64)
+            )),
+            false => {
+                let would =
+                    crate::consensus::Current::decide(&running, |hash| chain.consensus_file(hash).ok().flatten());
+                for (hash, n, why) in &would.skipped {
+                    lines.push(format!(
+                        "  as it stands not counted: {} ({} votes): {why}",
+                        hex(hash),
+                        commas(*n as u64)
+                    ));
+                }
+                let by = would.winner.map_or("no file that counts".to_string(), |(hash, _)| hex(&hash));
+                lines.push(format!(
+                    "as the votes stand, from block {} the mode will be {}, by {by}",
+                    commas(next as u64),
+                    would.mode
+                ));
+            }
+        }
+        // What the blocks made here vote for: of those begun since it
+        // was set (one being made when it was set does not carry it).
+        match chain.aux_leaves().map_err(|e| e.to_string())?[0] {
+            vote if vote == [0u8; 32] => {
+                lines.push("the blocks made here vote for nothing (set-leaf 0 FILE)".to_string())
+            }
+            vote => {
+                lines.push(format!("the blocks made here vote for {}: each one begun since that was set", hex(&vote)))
+            }
+        }
         Ok(lines.join("\n"))
     }
 
