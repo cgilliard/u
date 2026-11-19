@@ -866,6 +866,29 @@ impl<B: Backend + 'static> Past<'_, B> {
             .map(|(p, record, _)| (p, record))
             .collect())
     }
+
+    /// The output that was unspent at `position` as of this block, and
+    /// its path up to the state's root then: the sibling at each of
+    /// the [`STATE_HEIGHT`] levels. None if no output was unspent
+    /// there. (The outputs of its part as they were, which give its
+    /// path within the part; then the roots of the parts as they
+    /// were; then the names' root.)
+    pub fn prove(&self, position: u64) -> io::Result<Option<(Record, [Digest; STATE_HEIGHT])>> {
+        use super::sparse::{EMPTY, root_with_path};
+        let (level, index) = (self.level as usize, position >> self.level);
+        let part = self.part(index)?;
+        let Some(record) = part.iter().find(|(p, _)| *p == position).map(|(_, record)| *record) else {
+            return Ok(None);
+        };
+        let mut path = [EMPTY; STATE_HEIGHT];
+        let mut leaves: Vec<(u64, Digest)> = part.iter().map(|(p, record)| (*p, record.leaf())).collect();
+        let (within, above) = path.split_at_mut(level);
+        root_with_path(0, level, &mut leaves, Some((position, within)));
+        let top = super::outputs::HEIGHT as usize;
+        root_with_path(level, top, &mut self.parts.clone(), Some((index, &mut above[..top - level])));
+        path[STATE_HEIGHT - 1] = self.names_root;
+        Ok(Some((record, path)))
+    }
 }
 
 /// The state after one block, held: reads through it see that state
@@ -1522,6 +1545,16 @@ mod tests {
                 let want = replay(chain, height);
                 assert_eq!(past.next(), chain.blocks[..height].iter().map(|b| b.2.len() as u64).sum::<u64>());
                 assert_eq!(receive(&past), want, "as of block {height} at {tip}");
+                // Each output unspent then has a path to the root then:
+                // of some of them, and of a position nothing was at.
+                for (index, _) in past.parts().iter().step_by(3) {
+                    for (position, record) in past.part(*index).unwrap().into_iter().step_by(37) {
+                        let (shown, path) = past.prove(position).unwrap().expect("it was unspent then");
+                        assert_eq!(shown, record);
+                        assert_eq!(root_of_path(position, &record.leaf(), &path), root, "{position} as of {height}");
+                    }
+                }
+                assert_eq!(past.prove(past.next()).unwrap(), None);
             }
             if tip > keep {
                 assert_eq!(state.past((tip - keep - 1) as u32).err(), Some(Error::NoUndoRecord));

@@ -23,7 +23,10 @@ use crate::store::blob::Blob;
 use crate::store::{Backend, PageFile};
 
 /// Tables a file holds, at the most: what fits its root record.
-pub const TABLES: usize = 16;
+pub const TABLES: usize = 32;
+/// As many as a file made before there were so many has: such a file
+/// is opened, its other tables empty, and written with all of them.
+const TABLES_BEFORE: usize = 16;
 
 const MAGIC: &[u8; 6] = b"tabwlt";
 /// How the root record is laid out.
@@ -48,10 +51,11 @@ impl<B: Backend> Records<B> {
         let root = file.root();
         let payload = root.payload();
         if !payload.is_empty() {
-            if payload.len() != 8 + TABLES * Blob::BYTES || &payload[..6] != MAGIC || payload[6] != FORMAT {
+            if payload.len() < 8 || &payload[..6] != MAGIC || payload[6] != FORMAT {
                 return Err(corrupt("not a wallet's file, or one of a format not known here"));
             }
-            if payload[7] as usize != TABLES {
+            let held = payload[7] as usize;
+            if ![TABLES, TABLES_BEFORE].contains(&held) || payload.len() != 8 + held * Blob::BYTES {
                 return Err(corrupt("a wallet's file of another number of tables"));
             }
             for (table, place) in tables.iter_mut().zip(payload[8..].chunks_exact(Blob::BYTES)) {

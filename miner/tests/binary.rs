@@ -837,8 +837,9 @@ fn a_payment_is_sent_to_an_address() {
         std::thread::sleep(Duration::from_millis(300));
     }
     let sent = Instant::now();
-    let begun = payer.ask(&format!("send 5 {to}"));
+    let begun = payer.ask(&format!("send 5 {to} \"deposit 4821\""));
     assert!(begun.contains("begun: 5 and a fee of") && begun.contains(&to), "{begun}");
+    assert!(begun.contains("note: \"deposit 4821\""), "{begun}");
     // Answered, signed and pooled: how long that took is said, for
     // whoever reads the run.
     let pooled = loop {
@@ -854,6 +855,67 @@ fn a_payment_is_sent_to_an_address() {
     while paid.confirmed() != "5" {
         assert!(began.elapsed() < Duration::from_secs(180), "the payment has not come: {}", paid.ask("balance"));
         std::thread::sleep(Duration::from_millis(500));
+    }
+    // What it was for is said to the wallet that was paid, and kept
+    // with what it was paid; who paid is not.
+    let log = std::fs::read_to_string(dirs[2].join("tabernacle.log")).unwrap();
+    assert!(log.contains(" answered: 5 to this wallet, note: \"deposit 4821\""), "{log}");
+    assert!(!log.contains(&own) && paid.ask("outputs").contains("\"deposit 4821\""), "{log}");
+    // The payment is proven: kept by the wallet that paid, its proof
+    // made when a block had it, and checked by another node against
+    // nothing but its chain.
+    let began = Instant::now();
+    let listed = loop {
+        let listed = payer.ask("payments");
+        if listed.lines().any(|l| l.contains(&format!("paid to {to} \"deposit 4821\"")) && l.contains("proof ready")) {
+            break listed;
+        }
+        assert!(began.elapsed() < Duration::from_secs(60), "{listed}");
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    let line = listed.lines().find(|l| l.contains(&format!("paid to {to}"))).unwrap();
+    let txid = line.split_whitespace().next().unwrap().to_string();
+    let file = dirs[1].join("payment.proof").display().to_string();
+    assert!(payer.ask(&format!("payment-proof {txid} {file}")).starts_with("the proof of "));
+    assert!(std::fs::read_to_string(&file).unwrap().starts_with("-----BEGIN TAB PAYMENT PROOF-----\n"));
+    let shown = paid.ask(&format!("verify-proof {file}"));
+    assert!(
+        shown.starts_with(&format!("the proof holds: 5 was paid to {to}, note: \"deposit 4821\", in block ")),
+        "{shown}"
+    );
+    // (Changed, it does not hold; and what is no proof is none.)
+    let text = std::fs::read_to_string(&file).unwrap();
+    let at = text.find('\n').unwrap() + 40;
+    let swapped = if &text[at..at + 1] == "A" { "B" } else { "A" };
+    std::fs::write(&file, format!("{}{swapped}{}", &text[..at], &text[at + 1..])).unwrap();
+    let refused = paid.ask(&format!("verify-proof {file}"));
+    assert!(refused.starts_with("error: ") && !refused.contains("holds:"), "{refused}");
+    // Coins are burned, to the credit of a name as it is written: and
+    // that is proven as a payment is.
+    let burned = payer.ask("burn 2 \"a year of hosting\" alice@mailhub");
+    assert!(burned.starts_with("Burned: 2 for alice@mailhub, for \"a year of hosting\": transaction "), "{burned}");
+    let began = Instant::now();
+    let listed = loop {
+        let listed = payer.ask("payments");
+        if listed.lines().any(|l| l.contains("burned for alice@mailhub") && l.contains("proof ready")) {
+            break listed;
+        }
+        assert!(began.elapsed() < Duration::from_secs(120), "{listed}");
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    let line = listed.lines().find(|l| l.contains("burned for alice@mailhub")).unwrap();
+    let txid = line.split_whitespace().next().unwrap().to_string();
+    let file = dirs[1].join("burn.proof").display().to_string();
+    assert!(payer.ask(&format!("burn-proof {txid} {file}")).starts_with("the proof of "));
+    let shown = paid.ask(&format!("verify-proof {file}"));
+    assert!(
+        shown.starts_with("the proof holds: 2 was burned for alice@mailhub, for \"a year of hosting\", in block "),
+        "{shown}"
+    );
+    assert!(payer.ask("burn 1 nothing").starts_with("error: burn: not what it takes"));
+    while payer.confirmed() == "0" {
+        assert!(began.elapsed() < Duration::from_secs(120), "{}", payer.ask("balance"));
+        std::thread::sleep(Duration::from_millis(300));
     }
     // A payment to a wallet that is not there is no payment: said to be
     // so, given up, and nothing spent.
@@ -874,7 +936,8 @@ fn a_payment_is_sent_to_an_address() {
     // Each wallet's log says its part of it, and whom it was with.
     let logs: Vec<String> = dirs.iter().map(|d| std::fs::read_to_string(d.join("tabernacle.log")).unwrap()).collect();
     assert!(logs[1].contains(&format!(" answered by {to}, signed and pooled: transaction ")), "{}", logs[1]);
-    assert!(logs[2].contains(&format!(" from {own} answered: 5 to this wallet")), "{}", logs[2]);
+    // (The wallet that was paid was not told who paid it.)
+    assert!(logs[2].contains(" answered: 5 to this wallet") && !logs[2].contains(&own), "{}", logs[2]);
     // And the node between them saw a message offered, and nothing of
     // what it said or who sent it: neither address is in its logs.
     let between = format!("{}{}", logs[0], std::fs::read_to_string(dirs[0].join("request.log")).unwrap());

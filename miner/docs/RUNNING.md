@@ -656,6 +656,43 @@ ahead or behind, finds it. In a build with the dev networks, on one of them,
 the command `debug-consensus FILE` puts a file in force at that node
 alone, whatever the chain has decided.
 
+**Who pays is not said.** A slate says nothing of the wallet that sends
+it: not its address, nor anything its address is had from. It carries a
+key made for its answer; the node it is given to remembers for three
+minutes who gave it, and the answer goes back by that node, the way
+(or to the address) the slate was given by. The wallet that is paid
+answers a payment and does not know whose. Its answer is signed with
+its own key, and taken only from the wallet the slate was sent to. A
+wallet that only pays need not be reached anywhere.
+
+**What a payment is for.** `send 5 tab1… "deposit 4821"`: the last
+argument, between quotes, is a note, up to 255 bytes. It goes in the
+slate, to the wallet that is paid and nobody else; that wallet's log
+says it, `outputs` shows it beside what was paid, and its receipt is
+over it. It is how a wallet that is paid by many, and told by none who
+they are, knows which payment is whose.
+
+**Proofs.** A wallet that is paid answers with a receipt: its
+signature, by the key its address is the hash of, over the output, the
+slate, its note, and the hash of a secret the paying wallet keeps. The
+paying wallet signs only with that. When a block has the payment it
+takes the output's path to that block's state root (which it can for
+as long as the chain can be taken back to that block: a week of
+blocks, if not told otherwise), and from then on has a proof:
+`payments` lists them, `payment-proof TXID [FILE]` writes one, text
+between `-----BEGIN TAB PAYMENT PROOF-----` and its end, and
+`verify-proof FILE` at any node checks one against that node's headers
+and nothing else, and says what it shows: how much, to which address,
+with what note, in which block, with how many confirmations. It shows
+that the wallet of that address said it was paid, to whoever holds the
+proof; it names no paying address, and says nothing of what became of
+the output. `burn AMOUNT "PURPOSE" [FOR [FEE]]` pays nobody: an output
+no key can spend, whose memo is the hash of whom it is to the credit of
+(an address, `@name` or `label@name`, as written: a name is credited as
+a name, whoever holds it then or later; this wallet's address if nobody
+is said), what for, and a number of its own. `burn-proof TXID [FILE]`
+gives its proof, checked the same way.
+
 **Names under names.** The chain keeps a few names a block: not one
 for everybody. Whoever holds a name gives out names under it,
 `label@name`, as many as it likes, and the chain knows nothing of

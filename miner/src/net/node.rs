@@ -2276,9 +2276,10 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         let opened = mail.awaited(&of).and_then(|wait| {
             crate::msg::open_answer(&wait.key, &of, sealed).filter(|opened| opened.from == Some(wait.to))
         });
-        if let Some(opened) = opened
-            && !mail.seen(opened.id)
-        {
+        // (Taken once: a message has one answer, and is waited for no
+        // longer when it has come.)
+        if let Some(opened) = opened {
+            mail.awaited.retain(|wait| wait.id != of);
             mail.inbox.push(opened);
             self.shared.say(Event::Mail);
         }

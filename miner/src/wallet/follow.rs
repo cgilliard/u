@@ -142,6 +142,16 @@ pub fn follow_when<B: Backend + 'static, V, W: Backend>(
         done.restored = true;
     }
     done.changed = wallet.reconcile(&snap, height, chain.keep() as u32, undone_from)?;
+    // The payments made that a block now has: each one's path to that
+    // block's state root, which is what proves it, taken while the
+    // chain can still be taken back to that block.
+    for (txid, at, position) in wallet.payments_to_prove() {
+        if let Ok(past) = state.past(at)
+            && let Ok(Some((record, path))) = past.prove(position)
+        {
+            wallet.prove_payment(&txid, at, position, &record.memo, path)?;
+        }
+    }
     // Its names, as the chain's records now have them.
     wallet.sync_names(&snap)?;
     // Rewards of blocks found, once no reorganization reaches them:

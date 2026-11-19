@@ -61,6 +61,22 @@ pub const HELP: &str = "commands:
                             giving the name to another wallet)
   subname drop LABEL@NAME   be a name this wallet was given no longer
   subnames                  the names given out, and the names this wallet is
+  send … \"NOTE\"             a note for the wallet that is paid, last and between
+                            quotes (send 5 tab1… \"deposit 4821\"): what the payment is
+                            for. It goes in the slate, to that wallet alone, which
+                            keeps it; its receipt is over it
+  payments                  the payments made and the coins burned, the block that
+                            has each, and whether its proof is ready
+  payment-proof TXID [FILE] the proof of a payment: that the block made the output,
+                            and the paid wallet's word that it is its own. Text, said
+                            or written to FILE; for whoever has the chain's headers
+  burn AMOUNT \"PURPOSE\" [FOR [FEE]]
+                            burn AMOUNT, which nobody can spend from then on, to the
+                            credit of FOR: an address, @name or label@name as it is
+                            written (this wallet's address, if not said)
+  burn-proof TXID [FILE]    the proof of a burn
+  verify-proof FILE         check a proof against this node's chain, and say what it
+                            shows
   send-file AMOUNT [FEE] FILE
                             start a payment by file: write the slate to FILE for the
                             recipient to `receive`, then `finalize` its answer
@@ -208,6 +224,37 @@ pub fn parse_coins(text: &str) -> Option<u64> {
     whole.parse::<u64>().ok()?.checked_mul(COIN)?.checked_add(part)
 }
 
+/// What a line says, in its words: what is between double quotes is
+/// one word, spaces and all, and is said to have been quoted.
+fn split(line: &str) -> (Vec<String>, Vec<bool>) {
+    let (mut words, mut quoted) = (Vec::new(), Vec::new());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.peek().copied() {
+        if c.is_whitespace() {
+            chars.next();
+        } else if c == '"' {
+            chars.next();
+            words.push(chars.by_ref().take_while(|c| *c != '"').collect());
+            quoted.push(true);
+        } else {
+            let mut word = String::new();
+            while let Some(c) = chars.peek().copied().filter(|c| !c.is_whitespace()) {
+                word.push(c);
+                chars.next();
+            }
+            words.push(word);
+            quoted.push(false);
+        }
+    }
+    (words, quoted)
+}
+
+/// What a slate's note says, for a line of the log or the terminal:
+/// with nothing in it that would break the line.
+fn shown(note: &[u8]) -> String {
+    String::from_utf8_lossy(note).chars().map(|c| if c.is_control() || c == '"' { '?' } else { c }).collect()
+}
+
 fn short(bytes: &[u8]) -> String {
     bytes[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -234,7 +281,12 @@ pub fn observe<B: Backend + 'static, W: Backend>(
 impl<B: Backend + 'static, W: Backend> Console<B, W> {
     /// Does what `line` asks, and gives what is to be said of it.
     pub fn run(&self, line: &str) -> Reply {
-        let words: Vec<&str> = line.split_whitespace().collect();
+        // (Words; and what is between quotes is one, spaces and all:
+        // the note of a payment, or what a burn is for.)
+        let (owned, quoted) = split(line);
+        let words: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let q = |at: usize| quoted.get(at).copied().unwrap_or(false);
+        let noted = quoted.last().copied().unwrap_or(false);
         let Some((command, args)) = words.split_first() else { return Reply::Nothing };
         let said = match (*command, args) {
             ("quit" | "exit", []) => return Reply::Quit,
@@ -258,10 +310,21 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             ("balance", []) => self.balance(),
             ("address", []) => self.wallet().map(|wallet| wallet.address()),
             ("outputs", []) => self.outputs(),
-            ("send", [amount, to]) => self.send(amount, None, to),
-            ("send", [amount, fee, to]) => self.send(amount, Some(fee), to),
-            ("send-file", [amount, file]) => self.send_file(amount, None, file),
-            ("send-file", [amount, fee, file]) => self.send_file(amount, Some(fee), file),
+            ("send", [amount, to]) if !noted => self.send(amount, None, to, ""),
+            ("send", [amount, to, note]) if noted => self.send(amount, None, to, note),
+            ("send", [amount, fee, to]) if !noted => self.send(amount, Some(fee), to, ""),
+            ("send", [amount, fee, to, note]) if noted => self.send(amount, Some(fee), to, note),
+            ("send-file", [amount, file]) if !noted => self.send_file(amount, None, file, ""),
+            ("send-file", [amount, file, note]) if noted => self.send_file(amount, None, file, note),
+            ("send-file", [amount, fee, file]) if !noted => self.send_file(amount, Some(fee), file, ""),
+            ("send-file", [amount, fee, file, note]) if noted => self.send_file(amount, Some(fee), file, note),
+            ("payments", []) => self.payments(),
+            ("payment-proof" | "burn-proof", [txid]) => self.proof(txid, "-"),
+            ("payment-proof" | "burn-proof", [txid, file]) => self.proof(txid, file),
+            ("verify-proof", [file]) => self.verify_proof(file),
+            ("burn", [amount, purpose]) if q(2) => self.burn(amount, purpose, None, None),
+            ("burn", [amount, purpose, to]) if q(2) => self.burn(amount, purpose, Some(to), None),
+            ("burn", [amount, purpose, to, fee]) if q(2) => self.burn(amount, purpose, Some(to), Some(fee)),
             ("receive", [file]) => self.receive(file, &format!("{file}.received")),
             ("receive", [file, out]) => self.receive(file, out),
             ("finalize", [file]) => self.finalize(file),
@@ -303,7 +366,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
                 | "consensus" | "balance" | "address" | "outputs" | "send-file" | "receive" | "finalize" | "slates"
                 | "sent" | "cancel" | "bump" | "resend" | "prune" | "seed" | "password" | "scan" | "help" | "quit"
                 | "exit" | "names" | "name" | "name-commit" | "name-reveal" | "name-update" | "name-offer"
-                | "name-transfer",
+                | "name-transfer" | "payments" | "payment-proof" | "burn-proof" | "verify-proof" | "burn",
                 _,
             ) => Err(format!("{command}: not what it takes (see help)")),
             _ => Err(format!("{command}: no such command (see help)")),
@@ -694,8 +757,10 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
                 (State::Spent, false) => "spent",
             };
             let at = o.position.map_or("-".to_string(), |p| commas(p));
+            // (What the slate that paid it said it was for.)
+            let note = wallet.note_of(&o.commitment).map_or(String::new(), |note| format!("  \"{}\"", shown(note)));
             lines.push(format!(
-                "  {}  {:>24}  {what:<9}  at {at}",
+                "  {}  {:>24}  {what:<9}  at {at}{note}",
                 short(&digest_to_bytes(&o.commitment)),
                 coins(o.amount as u128)
             ));
@@ -759,13 +824,15 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         }
     }
 
-    fn send_file(&self, amount: &str, fee: Option<&&str>, file: &str) -> Said {
+    fn send_file(&self, amount: &str, fee: Option<&&str>, file: &str, note: &str) -> Said {
         let amount = parse_coins(amount).ok_or_else(|| format!("'{amount}' is not an amount of coins"))?;
         let fee = Self::fee(fee)?;
         let mut wallet = self.wallet()?;
         let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
         let snap = state.snapshot().map_err(|e| e.to_string())?;
-        let slate = wallet.send(amount, fee, &snap, (self.unix)()).map_err(|e| Self::short_of(&wallet, &snap, e))?;
+        let slate = wallet
+            .send_noted(amount, fee, note.as_bytes(), &snap, (self.unix)())
+            .map_err(|e| Self::short_of(&wallet, &snap, e))?;
         let done = format!(
             "payment {} begun: {} and a fee of {}, from {} outputs",
             &slate.id_hex()[..8],
@@ -775,6 +842,154 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         );
         (self.log)(&format!("P{}", &done[1..]));
         Self::write(file, slate.to_text(), format!("{done}; to be answered and then finalized"))
+    }
+
+    /// The payments made and the coins burned: each one's
+    /// transaction, how much, to whom or for what, the block that has
+    /// it, and whether its proof is ready.
+    fn payments(&self) -> Said {
+        use crate::proofs::Claim;
+        let wallet = self.wallet()?;
+        let mut lines = Vec::new();
+        for p in wallet.payments() {
+            let what = match &p.proof.claim {
+                Claim::Payment { receipt, note, .. } => {
+                    let note = if note.is_empty() { String::new() } else { format!(" \"{}\"", shown(note)) };
+                    format!("paid to {}{note}", crate::address::encode(&receipt.recipient()))
+                }
+                Claim::Burn(burn) => format!("burned for {}, for \"{}\"", burn.beneficiary.said(), burn.purpose),
+            };
+            let at = match (p.landed, p.proven) {
+                (Some((height, _)), true) => format!("in block {}, proof ready", commas(height as u64)),
+                (Some((height, _)), false) => format!("in block {}, no proof yet", commas(height as u64)),
+                (None, _) => "in no block yet".to_string(),
+            };
+            lines.push(format!(
+                "  {}  {:>20}  {what}: {at}",
+                short(&digest_to_bytes(&p.txid)),
+                coins(p.proof.amount as u128)
+            ));
+        }
+        match lines.is_empty() {
+            true => Ok("no payments made, and nothing burned".to_string()),
+            false => Ok(lines.join("\n")),
+        }
+    }
+
+    /// The proof of the payment (or the burn) of the transaction whose
+    /// id begins `txid`: text, written to `file` or said. Made now, if
+    /// a block has the payment and its path has not been taken yet.
+    fn proof(&self, txid: &str, file: &str) -> Said {
+        let mut wallet = self.wallet()?;
+        let hex = |p: &crate::wallet::Payment| Self::hex(&p.txid);
+        let mut found: Vec<crate::wallet::Payment> =
+            wallet.payments().into_iter().filter(|p| !txid.is_empty() && hex(p).starts_with(txid)).collect();
+        let payment = match found.len() {
+            0 => return Err(format!("no payment or burn of a transaction that begins {txid} (see payments)")),
+            1 => found.remove(0),
+            n => return Err(format!("{n} payments are of transactions that begin {txid}: say more of it")),
+        };
+        let Some((height, position)) = payment.landed else {
+            return Err("that payment is in no block yet: there is nothing to prove".to_string());
+        };
+        if !payment.proven {
+            let path = self.hold.chain().output_proof_at(position, height).map_err(|e| {
+                format!("the block that has it is further back than this node can go to make its proof: {e}")
+            })?;
+            let Some((record, path)) = path else { return Err("the chain has no such output there".to_string()) };
+            wallet.prove_payment(&payment.txid, height, position, &record.memo, path).map_err(|e| e.to_string())?;
+        }
+        let payment = wallet.payments().into_iter().find(|p| p.txid == payment.txid).filter(|p| p.proven);
+        let payment = payment.ok_or("the output the chain has there is another's: no proof")?;
+        let done =
+            format!("the proof of {}, in block {}", short(&digest_to_bytes(&payment.txid)), commas(height as u64));
+        Self::write(file, payment.proof.to_text(), done)
+    }
+
+    /// Checks the proof in `file` against this node's chain, and says
+    /// what it shows.
+    fn verify_proof(&self, file: &str) -> Said {
+        use crate::proofs::Claim;
+        let text = std::fs::read_to_string(Path::new(file)).map_err(|e| format!("cannot read {file}: {e}"))?;
+        let proof = crate::proofs::Proof::from_text(&text).ok_or_else(|| format!("{file} holds no proof"))?;
+        let chain = self.hold.chain();
+        let header = chain.header_at(proof.height).map_err(|e| e.to_string())?;
+        let header = header.ok_or_else(|| {
+            format!("the chain here has no block {}: the proof cannot be checked", commas(proof.height as u64))
+        })?;
+        proof.check(&header.state_root).map_err(|e| format!("the proof does not hold: {e}"))?;
+        let confirmations = self.hold.read().height.saturating_sub(proof.height) + 1;
+        let block = format!(
+            "block {} ({}), which has {} confirmations",
+            commas(proof.height as u64),
+            short(&digest_to_bytes(&header.hash())),
+            commas(confirmations as u64)
+        );
+        Ok(match &proof.claim {
+            Claim::Payment { note, receipt, .. } => {
+                let note = if note.is_empty() { String::new() } else { format!(", note: \"{}\"", shown(note)) };
+                format!(
+                    "the proof holds: {} was paid to {}{note}, in {block}. The wallet that was paid says so, to \
+                     whoever holds this proof",
+                    coins(proof.amount as u128),
+                    crate::address::encode(&receipt.recipient())
+                )
+            }
+            Claim::Burn(burn) => format!(
+                "the proof holds: {} was burned for {}, for \"{}\", in {block}. Nobody can spend it",
+                coins(proof.amount as u128),
+                burn.beneficiary.said(),
+                burn.purpose
+            ),
+        })
+    }
+
+    /// Burns `amount` for `purpose`, to the credit of `to` (an
+    /// address, or a name as it is written; this wallet's address if
+    /// nobody is said): a transaction with an output nobody can spend.
+    fn burn(&self, amount: &str, purpose: &str, to: Option<&&str>, fee: Option<&&str>) -> Said {
+        use crate::proofs::{Beneficiary, Burn, MAX_NOTE};
+        let amount = parse_coins(amount).ok_or_else(|| format!("'{amount}' is not an amount of coins"))?;
+        let fee = Self::fee(fee)?;
+        if purpose.is_empty() || purpose.len() > MAX_NOTE {
+            return Err(format!("what a burn is for is 1 to {MAX_NOTE} bytes, between quotes"));
+        }
+        self.observe()?;
+        let mut wallet = self.wallet()?;
+        let beneficiary = match to {
+            None => Beneficiary::Address(wallet.id()),
+            Some(to) => Beneficiary::read(to)
+                .ok_or_else(|| format!("'{to}' is no address (tab1…), no @name and no label@name"))?,
+        };
+        let mut nonce = [0u8; 32];
+        crate::random::fill(&mut nonce).map_err(|e| e.to_string())?;
+        let burn = Burn { beneficiary, nonce, purpose: purpose.to_string() };
+        let unix = (self.unix)();
+        let signed = {
+            let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
+            let snap = state.snapshot().map_err(|e| e.to_string())?;
+            wallet.burn(amount, fee, burn.clone(), &snap, unix).map_err(|e| Self::short_of(&wallet, &snap, e))?
+        };
+        let id = short(&digest_to_bytes(&signed.tx.txid()));
+        match self.hold.submit(&signed.tx.to_bytes(), unix) {
+            Ok(_) => {
+                let done = format!(
+                    "Burned: {} for {}, for \"{purpose}\": transaction {id}, with a fee of {}. Nobody can spend it; \
+                     its proof is had with burn-proof {id} once a block has it",
+                    coins(amount as u128),
+                    burn.beneficiary.said(),
+                    coins(signed.tx.balance().max(0) as u128)
+                );
+                (self.log)(&done);
+                Ok(done)
+            }
+            Err(why) => {
+                wallet.unsend(&signed.tx.txid()).map_err(|e| e.to_string())?;
+                let failed = format!("the pool does not take the burn: {why}. Nothing was burned");
+                (self.log)(&format!("Error: {failed}"));
+                Err(failed)
+            }
+        }
     }
 
     /// Whom a payment is to: a wallet's address, or the name of one
@@ -798,7 +1013,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
     /// slate is sent to it, sealed, through a node it is reached at;
     /// its wallet answers, and this one signs the answer and pools the
     /// transaction, with nothing more asked of either.
-    fn send(&self, amount: &str, fee: Option<&&str>, to: &str) -> Said {
+    fn send(&self, amount: &str, fee: Option<&&str>, to: &str, note: &str) -> Said {
         // A name under a name: whose it is, is asked of the nodes the
         // full name is reached at when the payment is sent. Until one
         // of them shows it, the payment is to the name.
@@ -821,7 +1036,9 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         let mut wallet = self.wallet()?;
         let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
         let snap = state.snapshot().map_err(|e| e.to_string())?;
-        let slate = wallet.send(amount, fee, &snap, (self.unix)()).map_err(|e| Self::short_of(&wallet, &snap, e))?;
+        let slate = wallet
+            .send_noted(amount, fee, note.as_bytes(), &snap, (self.unix)())
+            .map_err(|e| Self::short_of(&wallet, &snap, e))?;
         let done = format!(
             "payment {} begun: {} and a fee of {}, to {}",
             &slate.id_hex()[..8],
@@ -833,6 +1050,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         // Whom it is sent to is kept with it: its answer is taken from
         // that wallet, and from no other. (Of a name under a name,
         // from nobody until it is known whose the name is.)
+        let done = if note.is_empty() { done } else { format!("{done}, note: \"{}\"", shown(note.as_bytes())) };
         wallet.send_to(&slate.id, &whom).map_err(|e| e.to_string())?;
         let body = slate.to_text().into_bytes();
         match under {
@@ -875,7 +1093,9 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             // whoever answers says where the payment goes. (One begun
             // in a file was sent to nobody, and is finalized by hand.)
             match self.wallet()?.sent_to(&slate.id) {
-                Some(whom) if Some(whom) == message.from => {}
+                // (And its receipt is that wallet's, as the answer is.)
+                Some(whom)
+                    if Some(whom) == message.from && slate.receipt.as_ref().map(|r| r.recipient()) == Some(whom) => {}
                 Some(whom) => {
                     let whom = crate::address::encode(&whom);
                     return Err(format!(
@@ -917,7 +1137,9 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         self.wallet()?.receive_slate(&mut slate, unix).map_err(|e| e.to_string())?;
         // (Who pays is not known here, and need not be: the answer
         // goes back the way the slate came.)
-        let done = format!("payment {} answered: {} to this wallet", &slate.id_hex()[..8], coins(slate.amount as u128));
+        let said = if slate.note.is_empty() { String::new() } else { format!(", note: \"{}\"", shown(&slate.note)) };
+        let done =
+            format!("payment {} answered: {} to this wallet{said}", &slate.id_hex()[..8], coins(slate.amount as u128));
         (self.log)(&format!("P{}", &done[1..]));
         if !self.hold.answer(message, crate::msg::KIND_SLATE, slate.id, slate.to_text().into_bytes()) {
             return Err(format!("payment {} cannot be answered: it came by no node", &slate.id_hex()[..8]));

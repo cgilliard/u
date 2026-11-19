@@ -573,8 +573,8 @@ impl<B: Backend> Wallet<B> {
             }
         }
         if changed > 0 {
-            let tables: &[usize] =
-                if gave_up { &[T_COMMITS, T_NAMES, T_OUTPUTS, T_SENT] } else { &[T_COMMITS, T_NAMES] };
+            let all = &[T_COMMITS, T_NAMES, T_OUTPUTS, T_SENT, super::T_PAYMENTS];
+            let tables: &[usize] = if gave_up { all } else { &[T_COMMITS, T_NAMES] };
             self.commit(t, tables)?;
         }
         Ok(changed)

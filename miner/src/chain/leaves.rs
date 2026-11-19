@@ -181,6 +181,22 @@ impl<B: Backend + 'static, V> Chain<B, V> {
         Ok(hash)
     }
 
+    /// The output that was unspent at `position` as of the block at
+    /// `height` on this chain, and its path to that block's state
+    /// root: what shows that the block made it, where `height` is the
+    /// height it was made at ([`crate::proofs`]). None if there was no
+    /// such output; [`Error::NoUndoRecord`] of a block further back
+    /// than the chain can still be taken to.
+    pub fn output_proof_at(
+        &self,
+        position: u64,
+        height: u32,
+    ) -> Result<Option<(crate::store::outputs::Record, [Digest; crate::store::sparse::STATE_HEIGHT])>, Error> {
+        let state = self.whole()?;
+        let past = state.past(height)?;
+        Ok(past.prove(position)?)
+    }
+
     /// A consensus file held, by its SHA-256.
     pub fn consensus_file(&self, hash: &Hash) -> Result<Option<Vec<u8>>, Error> {
         let store = self.store();

@@ -800,3 +800,76 @@ fn names_under_names_are_kept() {
     assert!(owner.take_name_back(b"al", b"mailhub").unwrap() && !owner.take_name_back(b"al", b"mailhub").unwrap());
     assert_eq!((alice.names_held().len(), owner.names_given().len()), (1, 1));
 }
+
+/// A payment says what it is for, and is receipted: the slate carries
+/// a note to the wallet that is paid, which answers with its word that
+/// the output is its own; the wallet that pays signs only with that,
+/// and keeps what will prove the payment, which holds once the block
+/// that made the output is known. And coins are burned, for whoever
+/// the burn says.
+#[test]
+fn payments_are_receipted_and_kept_to_be_proven() {
+    use crate::proofs::{Beneficiary, Burn, Claim, sender_tag};
+    use crate::store::sparse::{STATE_HEIGHT, empty, root_of_path};
+    let mut chain = Outputs::default();
+    let mut alice = funded(&mut chain, 10 * COIN);
+    let mut bob = new();
+    let slate = alice.send_noted(COIN, None, b"deposit 4821", &chain, NOW).unwrap();
+    assert_eq!((&slate.note[..], slate.receipt.as_ref()), (&b"deposit 4821"[..], None));
+    // As text and back, before it is answered and after.
+    assert_eq!(Slate::from_text(&slate.to_text()), Some(slate.clone()));
+    let mut answered = slate.clone();
+    bob.receive_slate(&mut answered, NOW).unwrap();
+    assert_eq!(Slate::from_text(&answered.to_text()), Some(answered.clone()));
+    let receipt = answered.receipt.clone().unwrap();
+    assert_eq!(receipt.recipient(), bob.id());
+    let paid = answered.outputs.last().unwrap().clone();
+    assert_eq!(bob.note_of(&paid.commitment), Some(&b"deposit 4821"[..]));
+    // Nothing of Alice's address is in it: only the hash of a secret.
+    assert_ne!(slate.sender, alice.id());
+    // Not signed without the receipt, nor with one for another note, or
+    // by another wallet for another output.
+    let without = Slate { receipt: None, stage: 1, ..answered.clone() };
+    assert!(alice.finalize(&without, NOW).is_err());
+    let other_note = Slate { note: b"deposit 1".to_vec(), ..answered.clone() };
+    let forged = crate::proofs::Receipt::sign(&bob.identity_key(), &paid, &slate.id, &slate.sender, b"deposit 1");
+    let forged = Slate { receipt: Some(forged), ..other_note };
+    assert!(matches!(alice.finalize(&forged, NOW), Err(WalletError::BadSlate("no receipt for this payment"))));
+    let signed = alice.finalize(&answered, NOW).unwrap();
+    // Kept, and not yet proven: no block has it.
+    let kept = alice.payments();
+    assert_eq!((kept.len(), kept[0].txid, kept[0].proven, kept[0].landed), (1, signed.tx.txid(), false, None));
+    assert!(alice.payments_to_prove().is_empty());
+    let Claim::Payment { secret, slate: of, note, receipt: held } = kept[0].proof.claim.clone() else { panic!() };
+    assert_eq!((sender_tag(&secret), of, &note[..], held), (slate.sender, slate.id, &b"deposit 4821"[..], receipt));
+    // A block takes it: where its output is, is known, and its path
+    // is asked for. (Here the state is that output alone.)
+    chain.take(&signed.tx, &mut [&mut alice, &mut bob]);
+    let due = alice.payments_to_prove();
+    assert_eq!(due.len(), 1);
+    let (txid, height, position) = due[0];
+    let mut path = [[Fp::ZERO; 8]; STATE_HEIGHT];
+    path.iter_mut().enumerate().for_each(|(level, sibling)| *sibling = *empty(level));
+    assert!(alice.prove_payment(&txid, height, position, &paid.memo, path).unwrap());
+    let proven = reopened(&alice, "").unwrap().payments();
+    assert_eq!(proven, alice.payments());
+    assert!(proven[0].proven && alice.payments_to_prove().is_empty());
+    let leaf = crate::output::output_leaf(&paid.commitment, &paid.memo, paid.amount, height);
+    assert_eq!(proven[0].proof.check(&root_of_path(position, &leaf, &path)), Ok(()));
+    // Burned: nobody's to spend, and to the credit of whom it says.
+    let burn =
+        Burn { beneficiary: Beneficiary::Name("alice@mailhub".into()), nonce: [5; 32], purpose: "a year".into() };
+    let held = alice.balance(&chain).unwrap();
+    let burned = alice.burn(2 * COIN, None, burn.clone(), &chain, NOW).unwrap();
+    let gone = burned.tx.outputs.last().unwrap();
+    assert_eq!((gone.key_hash, gone.amount, gone.memo), (crate::proofs::BURN_KEY_HASH, 2 * COIN, burn.memo()));
+    chain.take(&burned.tx, &mut [&mut alice]);
+    let all = alice.payments();
+    assert_eq!((all.len(), alice.payments_to_prove().len()), (2, 1));
+    assert!(all.iter().any(|p| p.proof.claim == Claim::Burn(burn.clone())));
+    assert!(alice.balance(&chain).unwrap().confirmed < held.confirmed - 2 * COIN as u128 + 1);
+    // Another's memo at that position is not this burn: nothing is kept.
+    let (txid, height, position) = alice.payments_to_prove()[0];
+    assert!(!alice.prove_payment(&txid, height, position, &[Fp::new(1); 5], path).unwrap());
+    assert!(alice.payments_to_prove().is_empty());
+}

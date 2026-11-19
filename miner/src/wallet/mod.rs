@@ -101,6 +101,12 @@ const T_NAMES_HELD: usize = 14;
 /// them ([`crate::subnames::delegate`]): by an id made of the name,
 /// that word.
 const T_NAMES_SIGNED: usize = 15;
+/// The payments made and the coins burned, each with what proves it
+/// ([`crate::proofs`]): by the id of its transaction.
+const T_PAYMENTS: usize = 16;
+/// What the slates that paid this wallet said (their notes): by the
+/// commitment of the output each made.
+const T_NOTES: usize = 17;
 
 /// A name this wallet has given out under a name it holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -155,7 +161,7 @@ const RECENT: usize = 2048;
 
 /// A slate of this wallet's making: the reference's, less its sender and
 /// its receipt.
-const SLATE_MAGIC: &[u8; 8] = b"tabslt0p";
+const SLATE_MAGIC: &[u8; 8] = b"tabslt0q";
 /// What a slate as text is marked with.
 pub const SLATE_MARKER: &str = "TAB SLATE";
 
@@ -271,6 +277,17 @@ pub struct Slate {
     pub stage: u8,
     pub amount: u64,
     pub fee: u64,
+    /// Whoever pays, as the receipt names it: the hash of a secret the
+    /// paying wallet keeps ([`crate::proofs::sender_tag`]). Not its
+    /// address, nor anything that is had from it.
+    pub sender: crate::hash::Digest,
+    /// What the payment is for, in the words of whoever pays: a number
+    /// the wallet that is paid gave out, say. Up to
+    /// [`crate::proofs::MAX_NOTE`] bytes; nothing, if nothing is said.
+    pub note: Vec<u8>,
+    /// The receipt of the wallet that is paid: there once the slate is
+    /// answered, and not before.
+    pub receipt: Option<crate::proofs::Receipt>,
     pub inputs: Vec<(PublicKey, u64)>,
     /// The sender's change (if any) first, then the recipient's output.
     pub outputs: Vec<Output>,
@@ -287,6 +304,9 @@ impl Slate {
         w.u64(self.amount);
         w.u64(self.fee);
         w.u32(self.change);
+        w.digest(&self.sender);
+        w.0.push(self.note.len() as u8);
+        w.0.extend_from_slice(&self.note);
         w.u32(self.inputs.len() as u32);
         for (pk, amount) in &self.inputs {
             w.0.extend_from_slice(&pk.to_bytes());
@@ -295,6 +315,9 @@ impl Slate {
         w.u32(self.outputs.len() as u32);
         for o in &self.outputs {
             w.0.extend_from_slice(&o.to_bytes());
+        }
+        if let Some(receipt) = &self.receipt {
+            w.0.extend_from_slice(&receipt.to_bytes());
         }
         w.finish()
     }
@@ -310,6 +333,9 @@ impl Slate {
         let amount = r.u64()?;
         let fee = r.u64()?;
         let change = r.u32()?;
+        let sender = r.digest()?;
+        let noted = r.take(1)?[0] as usize;
+        let note = r.take(noted)?.to_vec();
         let n = r.len(PublicKey::SIZE + 8)?;
         let mut inputs = Vec::with_capacity(n);
         for _ in 0..n {
@@ -324,7 +350,12 @@ impl Slate {
         if (change as usize) > outputs.len() || !(1..=2).contains(&stage) {
             return None;
         }
-        r.is_empty().then_some(Slate { id, stage, amount, fee, inputs, outputs, change })
+        // (Answered, it carries a receipt; not yet answered, none.)
+        let receipt = match stage {
+            2 => Some(crate::proofs::Receipt::from_bytes(r.take(crate::proofs::Receipt::SIZE)?)?),
+            _ => None,
+        };
+        r.is_empty().then_some(Slate { id, stage, amount, fee, sender, note, receipt, inputs, outputs, change })
     }
 
     /// The slate as text to paste or keep in a file: base64 between
@@ -424,6 +455,54 @@ struct Pending {
     change: Option<Commitment>,
     amount: u64,
     fee: u64,
+    /// The secret this payment is this wallet's by: its hash is what
+    /// the slate, and the receipt, name whoever pays by.
+    secret: [u8; 32],
+    /// What the slate said the payment is for.
+    note: Vec<u8>,
+}
+
+/// A payment made, or coins burned: the transaction, and what proves
+/// it to whoever has the chain's headers ([`crate::proofs::Proof`]),
+/// once the block that made its output is known.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Payment {
+    pub txid: Commitment,
+    pub fee: u64,
+    pub created: u64,
+    /// Whether the proof's path is of the block the output is in: the
+    /// proof holds. Until then its height, position and path are
+    /// nothing.
+    pub proven: bool,
+    /// Where a block made the output, once one has: its height, and
+    /// the output's position.
+    pub landed: Option<(u32, u64)>,
+    pub proof: crate::proofs::Proof,
+}
+
+impl Payment {
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut w = Writer::default();
+        w.digest(&self.txid);
+        w.u64(self.fee);
+        w.u64(self.created);
+        w.0.push(self.proven as u8);
+        w.0.push(self.landed.is_some() as u8);
+        let (height, position) = self.landed.unwrap_or_default();
+        w.u32(height);
+        w.u64(position);
+        w.0.extend_from_slice(&self.proof.to_bytes());
+        w.finish()
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Option<Payment> {
+        let mut r = Reader(bytes);
+        let (txid, fee, created) = (r.digest()?, r.u64()?, r.u64()?);
+        let (proven, landed) = (r.take(1)?[0] == 1, r.take(1)?[0] == 1);
+        let at = (r.u32()?, r.u64()?);
+        let proof = crate::proofs::Proof::from_bytes(r.0)?;
+        Some(Payment { txid, fee, created, proven, landed: landed.then_some(at), proof })
+    }
 }
 
 /// What the sender keeps about a finalized payment.
@@ -460,6 +539,9 @@ impl Pending {
         }
         w.u64(self.amount);
         w.u64(self.fee);
+        w.0.extend_from_slice(&self.secret);
+        w.0.push(self.note.len() as u8);
+        w.0.extend_from_slice(&self.note);
         w.finish()
     }
 
@@ -473,7 +555,15 @@ impl Pending {
         };
         let amount = r.u64()?;
         let fee = r.u64()?;
-        r.is_empty().then_some(Pending { inputs, change, amount, fee })
+        // (One begun before slates said who pays: with no secret, and
+        // not to be finalized as it is. Given up with `cancel`.)
+        if r.is_empty() {
+            return Some(Pending { inputs, change, amount, fee, secret: [0; 32], note: Vec::new() });
+        }
+        let secret = r.take(32)?.try_into().ok()?;
+        let noted = r.take(1)?[0] as usize;
+        let note = r.take(noted)?.to_vec();
+        r.is_empty().then_some(Pending { inputs, change, amount, fee, secret, note })
     }
 }
 
@@ -837,6 +927,10 @@ struct Tables {
     names_held: BTreeMap<Id, Vec<u8>>,
     /// The names this wallet signs for by their holders' word.
     names_signed: BTreeMap<Id, Vec<u8>>,
+    /// The payments made and coins burned, and what each slate that
+    /// paid this wallet said.
+    payments: BTreeMap<Id, Payment>,
+    notes: BTreeMap<Id, Vec<u8>>,
     /// Which of the wallet's addresses it is at: the first, for a new
     /// wallet; one drawn at random, for a wallet made again from its
     /// words, so that it is at an address never used before.
@@ -922,6 +1016,8 @@ impl Tables {
             T_NAMES_GIVEN => put_entries(self.names_given.iter().map(|(at, given)| (at, given.to_bytes()))),
             T_NAMES_HELD => put_entries(self.names_held.iter().map(|(at, bundle)| (at, bundle.clone()))),
             T_NAMES_SIGNED => put_entries(self.names_signed.iter().map(|(at, word)| (at, word.clone()))),
+            T_PAYMENTS => put_entries(self.payments.iter().map(|(id, payment)| (id, payment.to_bytes()))),
+            T_NOTES => put_entries(self.notes.iter().map(|(id, note)| (id, note.clone()))),
             T_ADDRESS => match self.address {
                 0 => Vec::new(),
                 at => at.to_le_bytes().to_vec(),
@@ -957,6 +1053,12 @@ impl Tables {
         }
         for (at, given) in get_entries(&table(T_NAMES_GIVEN)?).ok_or(WalletError::Corrupt("names given"))? {
             t.names_given.insert(at, Given::from_bytes(given).ok_or(WalletError::Corrupt("name given"))?);
+        }
+        for (id, payment) in get_entries(&table(T_PAYMENTS)?).ok_or(WalletError::Corrupt("payments"))? {
+            t.payments.insert(id, Payment::from_bytes(payment).ok_or(WalletError::Corrupt("payment"))?);
+        }
+        for (id, note) in get_entries(&table(T_NOTES)?).ok_or(WalletError::Corrupt("notes"))? {
+            t.notes.insert(id, note.to_vec());
         }
         for (at, word) in get_entries(&table(T_NAMES_SIGNED)?).ok_or(WalletError::Corrupt("names signed for"))? {
             t.names_signed.insert(at, word.to_vec());
@@ -1269,13 +1371,23 @@ impl<B: Backend> Wallet<B> {
         end: u64,
     ) -> Result<usize> {
         let mut t = self.t.clone();
-        let mut found = 0;
+        let (mut found, mut paid) = (0, 0);
         for (i, c) in outputs.iter().enumerate() {
             let id = digest_to_bytes(c);
             if let Some(o) = t.outputs.get_mut(&id) {
                 o.position = Some(first + i as u64);
                 t.answered.remove(&id);
                 found += 1;
+            }
+            // An output this wallet paid for, or burned: where it is,
+            // for its proof. (Of a block other than it was in before,
+            // if the chain went another way: proven again.)
+            for payment in t.payments.values_mut().filter(|p| p.proof.output().commitment == *c) {
+                let here = Some((height, first + i as u64));
+                if payment.landed != here {
+                    (payment.landed, payment.proven) = (here, false);
+                    paid += 1;
+                }
             }
         }
         t.synced = Some((height, *block));
@@ -1288,8 +1400,14 @@ impl<B: Backend> Wallet<B> {
         while t.recent.len() > RECENT {
             t.recent.pop_front();
         }
-        let dirty: &[usize] = if found > 0 { &[T_META, T_RECENT, T_OUTPUTS, T_ANSWERED] } else { &[T_META, T_RECENT] };
-        self.commit(t, dirty)?;
+        let mut dirty = vec![T_META, T_RECENT];
+        if found > 0 {
+            dirty.extend([T_OUTPUTS, T_ANSWERED]);
+        }
+        if paid > 0 {
+            dirty.push(T_PAYMENTS);
+        }
+        self.commit(t, &dirty)?;
         Ok(found)
     }
 
@@ -1537,6 +1655,23 @@ impl<B: Backend> Wallet<B> {
     /// them, adds change to a fresh output, and returns the stage-1 slate
     /// for the recipient. Change below the dust limit goes to the fee.
     pub fn send(&mut self, amount: u64, fee: impl Into<Fee>, chain: &impl Unspent, now: u64) -> Result<Slate> {
+        self.send_noted(amount, fee, &[], chain, now)
+    }
+
+    /// [`Wallet::send`], with what the payment is for: `note`, which
+    /// the slate carries to the wallet that is paid, and its receipt
+    /// is over.
+    pub fn send_noted(
+        &mut self,
+        amount: u64,
+        fee: impl Into<Fee>,
+        note: &[u8],
+        chain: &impl Unspent,
+        now: u64,
+    ) -> Result<Slate> {
+        if note.len() > crate::proofs::MAX_NOTE {
+            return Err(WalletError::BadSlate("the note is too long"));
+        }
         if amount == 0 {
             return Err(WalletError::BadSlate("amount is zero"));
         }
@@ -1601,12 +1736,14 @@ impl<B: Backend> Wallet<B> {
                 o.state = State::Reserved;
             }
         }
-        let id = random_bytes::<32>()?;
-        let pending = Pending { inputs: picked.iter().map(|c| c.commitment).collect(), change, amount, fee };
+        let (id, secret) = (random_bytes::<32>()?, random_bytes::<32>()?);
+        let (commitments, note) = (picked.iter().map(|c| c.commitment).collect(), note.to_vec());
+        let pending = Pending { inputs: commitments, change, amount, fee, secret, note: note.clone() };
         t.slates.insert(id, pending);
         self.commit(t, &[T_OUTPUTS, T_SLATES])?;
         let inputs = picked.iter().map(|c| (self.key(&c.nonce).public_key(), c.amount)).collect();
-        Ok(Slate { id, stage: 1, amount, fee, inputs, outputs, change: u32::from(change.is_some()) })
+        let (sender, change) = (crate::proofs::sender_tag(&secret), u32::from(change.is_some()));
+        Ok(Slate { id, stage: 1, amount, fee, sender, note, receipt: None, inputs, outputs, change })
     }
 
     /// The recipient's step: adds an output for the slate's amount,
@@ -1624,7 +1761,15 @@ impl<B: Backend> Wallet<B> {
         let mut t = self.t.clone();
         let out = self.receive_in(&mut t, slate.amount, now)?;
         t.answered.insert(digest_to_bytes(&out.commitment));
-        self.commit(t, &[T_OUTPUTS, T_ANSWERED])?;
+        // (What it is for, as whoever pays said: kept with the output.)
+        if !slate.note.is_empty() {
+            t.notes.insert(digest_to_bytes(&out.commitment), slate.note.clone());
+        }
+        self.commit(t, &[T_OUTPUTS, T_ANSWERED, T_NOTES])?;
+        // The receipt: this wallet's word, by the key its address is
+        // the hash of, that the output is its own, for this slate.
+        let key = self.identity_key();
+        slate.receipt = Some(crate::proofs::Receipt::sign(&key, &out, &slate.id, &slate.sender, &slate.note));
         slate.outputs.push(out);
         slate.stage = 2;
         Ok(())
@@ -1634,10 +1779,32 @@ impl<B: Backend> Wallet<B> {
     /// pending record and the balance, signs the inputs (marking them
     /// spent), records the payment, and returns the transaction to pool.
     pub fn finalize(&mut self, slate: &Slate, now: u64) -> Result<Signed> {
+        self.finalize_as(slate, now, None)
+    }
+
+    /// [`Wallet::finalize`]; or, with `burn`, the signing of a slate
+    /// whose one output this wallet made itself, for nobody: there is
+    /// no receipt, and what proves it is what the output's memo is the
+    /// hash of.
+    fn finalize_as(&mut self, slate: &Slate, now: u64, burn: Option<crate::proofs::Burn>) -> Result<Signed> {
         if slate.stage != 2 {
             return Err(WalletError::BadSlate("not a stage-2 slate"));
         }
         let pending = self.t.slates.get(&slate.id).cloned().ok_or(WalletError::Unknown)?;
+        // Answered by a receipt for this payment: the output the slate
+        // now has, its id and note, to whoever holds this wallet's
+        // secret for it. (Whose the receipt is, is for whoever sent
+        // the slate to hold against whom it sent it to.)
+        let made = slate.outputs.last().ok_or(WalletError::BadSlate("no recipient output"))?.clone();
+        let tag = crate::proofs::sender_tag(&pending.secret);
+        let claim = match (burn, &slate.receipt) {
+            (Some(burn), _) => crate::proofs::Claim::Burn(burn),
+            (None, Some(receipt)) if receipt.verify(&made, &slate.id, &tag, &pending.note) => {
+                let (secret, note, receipt) = (pending.secret, pending.note.clone(), receipt.clone());
+                crate::proofs::Claim::Payment { secret, slate: slate.id, note, receipt }
+            }
+            (None, _) => return Err(WalletError::BadSlate("no receipt for this payment")),
+        };
         if pending.inputs.len() != slate.inputs.len() {
             return Err(WalletError::BadSlate("inputs changed"));
         }
@@ -1697,9 +1864,91 @@ impl<B: Backend> Wallet<B> {
             created: now,
             tx: signed.tx.clone(),
         };
+        // What will prove it, once a block has made its output.
+        let (key_hash, amount, memo) = (made.key_hash, made.amount, made.memo);
+        let path = [[Fp::ZERO; DIGEST]; crate::store::sparse::STATE_HEIGHT];
+        let proof = crate::proofs::Proof { height: 0, position: 0, key_hash, amount, memo, path, claim };
+        let payment = Payment { txid: sent.txid, fee: slate.fee, created: now, proven: false, landed: None, proof };
+        t.payments.insert(digest_to_bytes(&sent.txid), payment);
         t.sent.insert(digest_to_bytes(&sent.txid), sent);
-        self.commit(t, &[T_OUTPUTS, T_SLATES, T_SENT])?;
+        self.commit(t, &[T_OUTPUTS, T_SLATES, T_SENT, T_PAYMENTS])?;
         Ok(signed)
+    }
+
+    /// Burns `amount`, for `burn`: a transaction of this wallet's with
+    /// an output nobody can spend, whose memo is the hash of whom the
+    /// burn is to the credit of and what for. Signed at once: nobody
+    /// answers it. Kept, with what will prove it
+    /// ([`Wallet::payments`]).
+    pub fn burn(
+        &mut self,
+        amount: u64,
+        fee: impl Into<Fee>,
+        burn: crate::proofs::Burn,
+        chain: &impl Unspent,
+        now: u64,
+    ) -> Result<Signed> {
+        if burn.purpose.len() > crate::proofs::MAX_NOTE {
+            return Err(WalletError::BadSlate("what the burn is for is too long"));
+        }
+        let mut slate = self.send(amount, fee, chain, now)?;
+        slate.outputs.push(burn.output(amount));
+        slate.stage = 2;
+        match self.finalize_as(&slate, now, Some(burn)) {
+            Ok(signed) => Ok(signed),
+            Err(e) => {
+                let _ = self.cancel_slate(&slate.id);
+                Err(e)
+            }
+        }
+    }
+
+    /// The payments made and the coins burned, the newest first.
+    pub fn payments(&self) -> Vec<Payment> {
+        let mut all: Vec<Payment> = self.t.payments.values().cloned().collect();
+        all.sort_by_key(|p| std::cmp::Reverse(p.created));
+        all
+    }
+
+    /// Those of them a block has made the output of, and whose proof
+    /// is not yet of that block: each one's transaction, the height of
+    /// the block, and the output's position.
+    pub fn payments_to_prove(&self) -> Vec<(Commitment, u32, u64)> {
+        let due = self.t.payments.values().filter(|p| !p.proven);
+        due.filter_map(|p| p.landed.map(|(height, position)| (p.txid, height, position))).collect()
+    }
+
+    /// The output of the payment of this transaction was made by the
+    /// block at `height`, at `position`, and `path` is its path to
+    /// that block's state root: its proof holds from now on. `memo` is
+    /// the memo of the output the chain has there: another's, if it is
+    /// not this payment's (two burns of one amount look alike until
+    /// their memos are seen), and then nothing is kept.
+    pub fn prove_payment(
+        &mut self,
+        txid: &Commitment,
+        height: u32,
+        position: u64,
+        memo: &Memo,
+        path: [crate::hash::Digest; crate::store::sparse::STATE_HEIGHT],
+    ) -> Result<bool> {
+        let mut t = self.t.clone();
+        let Some(payment) = t.payments.get_mut(&digest_to_bytes(txid)) else { return Ok(false) };
+        if payment.proof.memo != *memo {
+            (payment.landed, payment.proven) = (None, false);
+            self.commit(t, &[T_PAYMENTS])?;
+            return Ok(false);
+        }
+        (payment.proof.height, payment.proof.position, payment.proof.path) = (height, position, path);
+        (payment.landed, payment.proven) = (Some((height, position)), true);
+        self.commit(t, &[T_PAYMENTS])?;
+        Ok(true)
+    }
+
+    /// What the slate that made the output of commitment `c` said it
+    /// was for, if it said anything.
+    pub fn note_of(&self, c: &Commitment) -> Option<&[u8]> {
+        self.t.notes.get(&digest_to_bytes(c)).map(|note| &note[..])
     }
 
     /// Gives up a transaction this wallet signed and nobody took: one
@@ -1711,7 +1960,7 @@ impl<B: Backend> Wallet<B> {
     pub fn unsend(&mut self, txid: &Commitment) -> Result<bool> {
         let mut t = self.t.clone();
         let was = Self::unsend_in(&mut t, txid);
-        self.commit(t, &[T_OUTPUTS, T_SENT])?;
+        self.commit(t, &[T_OUTPUTS, T_SENT, T_PAYMENTS])?;
         Ok(was)
     }
 
@@ -1726,6 +1975,7 @@ impl<B: Backend> Wallet<B> {
         for made in &sent.tx.outputs {
             t.outputs.remove(&digest_to_bytes(&made.commitment));
         }
+        t.payments.remove(&digest_to_bytes(txid));
         true
     }
 
