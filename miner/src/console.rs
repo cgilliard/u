@@ -38,8 +38,11 @@ pub const HELP: &str = "commands:
   mempool                   the transactions waiting to be mined
   address                   this wallet's address: what it is known by, as tab1…
   balance                   what there is to spend; what is confirmed but too new to
-                            spend; and pending, unverified, reserved, locked and lost
-                            funds
+                            spend; and pending, unverified, reserved and locked funds
+                            (and orphaned: paid to this wallet by a block that was
+                            undone. Rewards of such blocks are under `mining`)
+  mining                    the blocks this node won of late, and those of them that
+                            were orphaned: undone, for a longer chain without them
   outputs                   the wallet's outputs
   send AMOUNT [FEE] TO      pay AMOUNT to the wallet at TO: its address (tab1…), its
                             name (@name), or a name under a name (label@name). Its
@@ -310,6 +313,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             ("balance", []) => self.balance(),
             ("address", []) => self.wallet().map(|wallet| wallet.address()),
             ("outputs", []) => self.outputs(),
+            ("mining", []) => self.mining(),
             ("send", [amount, to]) if !noted => self.send(amount, None, to, ""),
             ("send", [amount, to, note]) if noted => self.send(amount, None, to, note),
             ("send", [amount, fee, to]) if !noted => self.send(amount, Some(fee), to, ""),
@@ -366,7 +370,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
                 | "consensus" | "balance" | "address" | "outputs" | "send-file" | "receive" | "finalize" | "slates"
                 | "sent" | "cancel" | "bump" | "resend" | "prune" | "seed" | "password" | "scan" | "help" | "quit"
                 | "exit" | "names" | "name" | "name-commit" | "name-reveal" | "name-update" | "name-offer"
-                | "name-transfer" | "payments" | "payment-proof" | "burn-proof" | "verify-proof" | "burn",
+                | "name-transfer" | "mining" | "payments" | "payment-proof" | "burn-proof" | "verify-proof" | "burn",
                 _,
             ) => Err(format!("{command}: not what it takes (see help)")),
             _ => Err(format!("{command}: no such command (see help)")),
@@ -732,12 +736,21 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
                 wallet.min_confirmations()
             ));
         }
+        // (Of what was in the chain and is no longer, the rewards of
+        // blocks this node made are not here: they are nothing the
+        // wallet was paid, and `mining` says them.)
+        let rewards: std::collections::BTreeSet<_> =
+            wallet.rewards().into_iter().map(|(c, ..)| digest_to_bytes(&c)).collect();
+        let all = wallet.outputs();
+        let orphaned =
+            all.iter().filter(|o| rewards.contains(&digest_to_bytes(&o.commitment)) && wallet.is_lost(&o.commitment));
+        let orphaned: u128 = orphaned.map(|o| o.amount as u128).sum();
         let rest = [
             ("pending", b.pending),
             ("unverified", b.unverified),
             ("reserved", b.reserved),
             ("locked", b.locked),
-            ("orphaned", b.lost),
+            ("orphaned", b.lost.saturating_sub(orphaned)),
         ];
         for (what, amount) in rest {
             if amount > 0 {
@@ -745,6 +758,60 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             }
         }
         Ok(out)
+    }
+
+    /// The blocks this node won, of those not yet so deep in the chain
+    /// that nothing undoes them: how many, what they paid, and each
+    /// that was orphaned (undone, for a longer chain that has not it).
+    fn mining(&self) -> Said {
+        let wallet = self.wallet()?;
+        let chain = self.hold.chain();
+        let amounts: std::collections::BTreeMap<_, _> =
+            wallet.outputs().iter().map(|o| (digest_to_bytes(&o.commitment), o.amount)).collect();
+        let mut won = Vec::new();
+        for (c, height, block) in wallet.rewards() {
+            // (One of no block yet is of the block being made now.)
+            if block == [0; 32] {
+                continue;
+            }
+            let header = chain.header_at(height).map_err(|e| e.to_string())?;
+            let kept = header.is_some_and(|h| digest_to_bytes(&h.hash()) == block);
+            won.push((height, block, amounts.get(&digest_to_bytes(&c)).copied().unwrap_or(0), kept));
+        }
+        won.sort_by_key(|(height, ..)| std::cmp::Reverse(*height));
+        let within = commas(chain.keep() as u64);
+        if won.is_empty() {
+            return Ok(format!("no blocks won in the last {within} (those before are settled, and not kept count of)"));
+        }
+        let total = |kept: bool| -> (usize, u128) {
+            let of = won.iter().filter(|w| w.3 == kept);
+            (of.clone().count(), of.map(|w| w.2 as u128).sum())
+        };
+        let ((kept, paid), (orphans, gone)) = (total(true), total(false));
+        let mut said = format!(
+            "blocks won in the last {within}: {} in the chain, which paid {}",
+            commas(kept as u64),
+            coins(paid)
+        );
+        if orphans > 0 {
+            said.push_str(&format!("; {} orphaned, which would have paid {}", commas(orphans as u64), coins(gone)));
+        }
+        let mut lines = vec![said];
+        let line = |(height, block, amount, kept): &(u32, [u8; 32], u64, bool)| {
+            let what = if *kept { "in the chain" } else { "orphaned" };
+            format!("  block {:>9} ({})  {:>20}  {what}", commas(*height as u64), short(block), coins(*amount as u128))
+        };
+        // The newest of those kept, and every one that was not.
+        const SHOWN: usize = 10;
+        lines.extend(won.iter().filter(|w| w.3).take(SHOWN).map(line));
+        if kept > SHOWN {
+            lines.push(format!("  … and {} before", commas((kept - SHOWN) as u64)));
+        }
+        if orphans > 0 {
+            lines.push("orphaned (another chain went further without them; what they paid is not there):".to_string());
+            lines.extend(won.iter().filter(|w| !w.3).map(line));
+        }
+        Ok(lines.join("\n"))
     }
 
     fn outputs(&self) -> Said {
