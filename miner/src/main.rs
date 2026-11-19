@@ -975,8 +975,21 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     // comes: a payment to it answered, the answer to one of its own
     // signed and pooled. And what became of what it sent is said.
     if let Some(wallet) = &wallet {
-        let said = Arc::clone(&main);
-        let log = Arc::new(move |line: &str| said.log(line));
+        // (What happens to the wallet's payments while nobody asked is
+        // said in the log, and to whoever is at the terminal: a line
+        // each, and the prompt again after it.)
+        let at_terminal = c.prompt && std::io::IsTerminal::is_terminal(&std::io::stderr());
+        let aloud = {
+            let main = Arc::clone(&main);
+            move |line: &str| {
+                main.log(line);
+                if at_terminal {
+                    use std::io::Write;
+                    let _ = write!(std::io::stderr(), "\r{line}\n> ");
+                }
+            }
+        };
+        let log = Arc::new(aloud.clone());
         let (wallet, debug, names) = (Some(Arc::clone(wallet)), false, Arc::clone(&names));
         let (unix, max_names) = (socket::unix, c.max_names);
         let console = Console { hold: hold.clone(), wallet, unix, log, debug, max_names, names };
@@ -985,7 +998,7 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
         if let Err(why) = console.renew_names() {
             main.log(&format!("Error: the wallet's names: {why}"));
         }
-        let (hold, main) = (hold.clone(), Arc::clone(&main));
+        let hold = hold.clone();
         let mut looked = std::time::Instant::now();
         let mut passed: Vec<(tabminer::hash::Digest, [u8; 32], std::time::Instant)> = Vec::new();
         let taking = move || loop {
@@ -993,20 +1006,20 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
             if looked.elapsed() >= Duration::from_secs(600) {
                 looked = std::time::Instant::now();
                 if let Err(why) = console.renew_names() {
-                    main.log(&format!("Error: the wallet's names: {why}"));
+                    aloud(&format!("Error: the wallet's names: {why}"));
                 }
             }
             // (Whose a name is, is known before its wallet answers.)
             for (slate, whom) in hold.take_resolved() {
                 match console.resolved(&slate, &whom) {
-                    Ok(said) if !said.is_empty() => main.log(&format!("P{}", &said[1..])),
+                    Ok(said) if !said.is_empty() => aloud(&format!("P{}", &said[1..])),
                     Ok(_) => {}
-                    Err(why) => main.log(&format!("Error: a payment to a name: {why}")),
+                    Err(why) => aloud(&format!("Error: a payment to a name: {why}")),
                 }
             }
             for message in hold.take_messages() {
                 if let Err(why) = console.take(&message) {
-                    main.log(&format!("Error: a message for the wallet: {why}"));
+                    aloud(&format!("Error: a message for the wallet: {why}"));
                 }
             }
             // (A payment passed on and not answered in a minute is no
@@ -1015,7 +1028,7 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
             let late = |since: &std::time::Instant| since.elapsed() >= Duration::from_secs(60);
             for (to, tag, _) in passed.extract_if(.., |p| late(&p.2)).collect::<Vec<_>>() {
                 if console.awaits_answer(&tag) {
-                    main.log(&console.undelivered(&to, &tag, "it was passed on, and is not answered"));
+                    aloud(&console.undelivered(&to, &tag, "it was passed on, and is not answered"));
                 }
             }
             for (to, _, tag, what) in hold.take_posted() {
@@ -1023,8 +1036,8 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
                 match what {
                     Posted::Passed if console.awaits_answer(&tag) => passed.push((to, tag, std::time::Instant::now())),
                     Posted::Passed | Posted::Waiting => {}
-                    Posted::Offline => main.log(&console.undelivered(&to, &tag, "that wallet is not there")),
-                    Posted::Unsent => main.log(&console.undelivered(&to, &tag, "no node it is reached at took it")),
+                    Posted::Offline => aloud(&console.undelivered(&to, &tag, "that wallet is not there")),
+                    Posted::Unsent => aloud(&console.undelivered(&to, &tag, "no node it is reached at took it")),
                 }
             }
         };

@@ -387,7 +387,28 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
 
     fn peers(&self) -> Said {
         let standing = self.hold.read();
-        Ok(format!("{} peers known, {} of them live", commas(standing.peers as u64), commas(standing.live as u64)))
+        let mut lines = vec![format!(
+            "{} peers known, {} of them live",
+            commas(standing.peers as u64),
+            commas(standing.live as u64)
+        )];
+        // Each of them: where it is, how it stands, how high it says
+        // its chain is, and how long since anything came from it.
+        for peer in self.hold.peer_list() {
+            let stands = match (peer.live, peer.answered) {
+                (true, _) => "live",
+                (false, true) => "silent",
+                (false, false) => "never answered",
+            };
+            let height = peer.height.map_or("-".to_string(), |h| format!("block {}", commas(h as u64)));
+            let heard = match peer.silent {
+                Some(micros) => format!("heard {} s ago", commas(micros / 1_000_000)),
+                None => "never heard".to_string(),
+            };
+            let seed = if peer.seed { "  (seed or given)" } else { "" };
+            lines.push(format!("  {:<21}  {stands:<14}  {height:<14}  {heard}{seed}", peer.addr.to_string()));
+        }
+        Ok(lines.join("\n"))
     }
 
     /// The sixteen leaves the blocks made here commit to, and their

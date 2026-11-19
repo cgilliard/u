@@ -602,6 +602,9 @@ pub(crate) struct Shared {
     /// said: for whoever keeps them from one run to the next
     /// ([`Handle::answered`]).
     answered: Vec<Mutex<Vec<SocketAddrV4>>>,
+    /// Every peer of each worker, as it last stood: for whoever asks
+    /// what the node sees ([`Handle::peer_list`]).
+    listed: Vec<Mutex<Vec<PeerSeen>>>,
     /// The ways through relays that pass through this node, if it is
     /// one they do ([`Config::relay`]); those it opened itself; and
     /// what is on its way to a neighbour on either
@@ -666,6 +669,22 @@ pub(crate) struct Shared {
     /// What names say, where a test says so in the chain's place.
     #[cfg(test)]
     pub(crate) names: Mutex<BTreeMap<Vec<u8>, Digest>>,
+}
+
+/// A peer as the node sees it: for whoever asks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerSeen {
+    pub addr: SocketAddrV4,
+    /// A seed, or given by hand: kept whatever it does.
+    pub seed: bool,
+    /// Whether it has ever answered: it is at its address.
+    pub answered: bool,
+    /// Whether it answers now.
+    pub live: bool,
+    /// How high it says its chain is, if it has said.
+    pub height: Option<u32>,
+    /// How long ago anything came from it, if anything has.
+    pub silent: Option<Micros>,
 }
 
 /// Something that happened to a node that whoever keeps its log would
@@ -2347,6 +2366,21 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             *said = answered;
         }
         drop(said);
+        // And how each stands, for whoever asks what the node sees.
+        let live: Vec<SocketAddrV4> = self.peers.live(now).map(|p| p.addr).collect();
+        let listed: Vec<PeerSeen> = self
+            .peers
+            .all()
+            .map(|p| PeerSeen {
+                addr: p.addr,
+                seed: p.seed,
+                answered: p.proven,
+                live: live.contains(&p.addr),
+                height: p.status.map(|s| s.height),
+                silent: p.last_seen.map(|seen| now.saturating_sub(seen)),
+            })
+            .collect();
+        *self.shared.listed[self.me].lock().unwrap_or_else(|e| e.into_inner()) = listed;
         self.budget = self.cfg.peers.unproven_pings;
         self.follow_votes(now, out);
         self.keep_sessions(now, out);
@@ -4337,6 +4371,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             seeds: Mutex::new(BTreeSet::new()),
             consensus: Mutex::new(None),
             answered: (0..n).map(|_| Mutex::new(Vec::new())).collect(),
+            listed: (0..n).map(|_| Mutex::new(Vec::new())).collect(),
             relayed: Mutex::new(super::circuits::Relayed::new(cfg.circuits)),
             ways: Mutex::default(),
             relays: Mutex::default(),
@@ -4728,6 +4763,17 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
             all.extend(worker.lock().unwrap_or_else(|e| e.into_inner()).iter());
         }
         all.sort_unstable();
+        all
+    }
+
+    /// Every peer the node knows, as its workers last saw them (within
+    /// a tick): in the order of their addresses.
+    pub fn peer_list(&self) -> Vec<PeerSeen> {
+        let mut all: Vec<PeerSeen> = Vec::new();
+        for worker in &self.shared.listed {
+            all.extend(worker.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned());
+        }
+        all.sort_unstable_by_key(|p| p.addr);
         all
     }
 

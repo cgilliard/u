@@ -637,6 +637,16 @@ impl Given {
 }
 
 impl Configuration {
+    /// Whether the node listens on this machine alone while it has
+    /// seeds or peers that are elsewhere: they will not answer it.
+    pub fn listens_alone(&self) -> bool {
+        let here = |host: &str| host == "localhost" || host.starts_with("127.");
+        let seeds = self.all_seeds();
+        let elsewhere = self.peers.iter().any(|peer| !peer.ip().is_loopback())
+            || seeds.iter().any(|seed| !here(seed.rsplit_once(':').map_or(seed, |(host, _)| host)));
+        elsewhere && self.listen.ip().is_loopback()
+    }
+
     /// The seeds the node begins from: those built in, of the main
     /// network unless told not to, and those it was given.
     pub fn all_seeds(&self) -> Vec<String> {
@@ -947,7 +957,7 @@ impl Configuration {
         let secs = |micros: u64| format!("{} seconds", commas(micros / SECOND));
         let yes = |b: bool| if b { "yes" } else { "no" }.to_string();
         let limit = |n: u64, unit: &str| if n == 0 { "no limit".to_string() } else { format!("{} {unit}", commas(n)) };
-        let mut lines: Vec<(&str, String)> = vec![("UDP Server Listening on", self.listen.to_string())];
+        let mut lines: Vec<(&str, String)> = vec![(LISTENING, self.listen.to_string())];
         lines.extend(self.files.iter().map(|file| ("Configuration File", file.display().to_string())));
         lines.extend([
             ("Network", self.network.name().to_string()),
@@ -1030,7 +1040,11 @@ impl Configuration {
         main.log_all(&format!("Server started {}", crate::logger::Moment::of(main.now()).started()));
         main.log_all_no_header(&RULE);
         for (name, value) in &lines {
-            main.log_all(&format!("{}'{value}'", column(&format!("{name}:"), wide, ' ')));
+            // (A node that listens on this machine alone hears nothing
+            // from any other: said beside it, since what follows looks
+            // like peers that do not answer.)
+            let note = if *name == LISTENING && self.listens_alone() { LOOPBACK } else { "" };
+            main.log_all(&format!("{}'{value}'{note}", column(&format!("{name}:"), wide, ' ')));
         }
         main.log_all_no_header(&RULE);
     }
@@ -1053,6 +1067,11 @@ impl Configuration {
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+const LISTENING: &str = "UDP Server Listening on";
+/// What is said beside the address a node listens on, when that is
+/// this machine alone and its seeds or peers are elsewhere.
+pub const LOOPBACK: &str = " WARNING: Binding to loopback. Probably not what you want!";
 
 /// What a node says when it can take requests.
 pub const READY: &str = "Server is ready!";
