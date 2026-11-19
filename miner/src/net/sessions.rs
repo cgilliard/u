@@ -305,7 +305,15 @@ struct Said {
     announce: Arc<Vec<u8>>,
     held: u64,
     asked: Micros,
+    /// How many times it has been said to since it last said anything
+    /// back: a node that says nothing is not one the wallet is reached
+    /// at, whatever it held.
+    unanswered: u8,
 }
+
+/// How many sayings a node may leave unanswered before the wallet is
+/// taken not to be reached there.
+const UNANSWERED: u8 = 3;
 
 impl Participant {
     /// The wallet whose Dilithium key is `identity`, at `now`. `chance`
@@ -352,7 +360,9 @@ impl Participant {
     /// announced to it, and sooner until it does.
     pub fn due(&self, node: &SocketAddrV4, now: Micros, keepalive: Micros) -> bool {
         match self.said.get(node) {
-            Some(said) if said.seq != 0 && said.held == said.seq => now.saturating_sub(said.asked) >= keepalive,
+            Some(said) if said.seq != 0 && said.held == said.seq && said.unanswered < UNANSWERED => {
+                now.saturating_sub(said.asked) >= keepalive
+            }
             Some(said) => now.saturating_sub(said.asked) >= UNHELD_RETRY,
             None => true,
         }
@@ -367,7 +377,8 @@ impl Participant {
     /// The node at `node` is asked for its token, having given none
     /// yet: so that it is not asked again at once.
     pub fn greet(&mut self, node: SocketAddrV4, now: Micros) {
-        let none = Said { bind: 0, seq: 0, announce: Arc::new(Vec::new()), held: u64::MAX, asked: now };
+        let (announce, unanswered) = (Arc::new(Vec::new()), 0);
+        let none = Said { bind: 0, seq: 0, announce, held: u64::MAX, asked: now, unanswered };
         self.said.entry(node).or_insert(none).asked = now;
     }
 
@@ -384,11 +395,18 @@ impl Participant {
             self.last = stamp;
             let ek: [u8; mlkem::EK_LEN] = self.kyber.public_key().try_into().expect("a key's length");
             let announce = msg::announce(&self.identity, &ek, stamp, unix + ANNOUNCE_HOLDS, token);
-            let said = Said { bind: token, seq: stamp, announce: Arc::new(announce), held: 0, asked: now };
+            let announce = Arc::new(announce);
+            let said = Said { bind: token, seq: stamp, announce, held: 0, asked: now, unanswered: 0 };
             self.said.insert(node, said);
+            // (What the node held of the names the wallet is, it held
+            // with the announcement before: shown again.)
+            self.aliases.iter_mut().for_each(|a| {
+                a.at.remove(&node);
+            });
         }
         let said = self.said.get_mut(&node).expect("it was put there");
         said.asked = now;
+        said.unanswered = said.unanswered.saturating_add(1);
         said.seq
     }
 
@@ -415,6 +433,7 @@ impl Participant {
     /// have: it is then to be told again at once, with that one.
     pub fn held(&mut self, node: &SocketAddrV4, seq: u64, token: u64) -> bool {
         let Some(said) = self.said.get_mut(node) else { return false };
+        said.unanswered = 0;
         // (A node that does not hold the announcement holds nothing of
         // the names the wallet is reached by either.)
         if seq != said.seq || said.seq == 0 {
@@ -493,13 +512,13 @@ impl Participant {
 
     /// Whether the node at `node` holds what was last announced to it.
     pub fn is_held(&self, node: &SocketAddrV4) -> bool {
-        self.said.get(node).is_some_and(|s| s.seq != 0 && s.held == s.seq)
+        self.said.get(node).is_some_and(|s| s.seq != 0 && s.held == s.seq && s.unanswered < UNANSWERED)
     }
 
     /// The nodes this wallet is reached at now: those that hold what it
     /// last announced to them.
     pub fn reached_at(&self) -> impl Iterator<Item = SocketAddrV4> + '_ {
-        self.said.iter().filter(|(_, s)| s.seq != 0 && s.held == s.seq).map(|(node, _)| *node)
+        self.said.iter().filter(|(node, _)| self.is_held(node)).map(|(node, _)| *node)
     }
 
     /// The nodes it has said it is there to, whether or not they hold
@@ -526,7 +545,7 @@ impl Participant {
 /// How long a message is tried before it is given up, and how long
 /// between tries.
 pub const POST_HOLDS: Micros = 60 * SECOND;
-pub const POST_RETRY: Micros = 3 * SECOND;
+pub const POST_RETRY: Micros = SECOND;
 /// How long a node that passes a message on keeps it for the wallet it
 /// is for to ask for, and how many bytes of such it keeps at the most.
 const PASSING_HOLDS: Micros = 60 * SECOND;

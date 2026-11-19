@@ -2024,6 +2024,41 @@ fn wallets_by_ways(loss: u64) {
     // The two wallets' nodes never said anything to each other.
     let said = |a: usize, b: usize| w.strays.iter().any(|s| (s.0, s.1) == (at(a), at(b)));
     assert!(!said(0, 1) && !said(1, 0));
+    // A relay falls silent: what is sent still crosses, by the others,
+    // and from then on as soon as before. (Each relay in turn, so that
+    // whichever the wallets are reached at is among them.)
+    for silent in 2..7 {
+        w.mute = vec![silent];
+        let mut took = Vec::new();
+        for nth in 0..3u8 {
+            // (What is not passed on in a minute is given up, and is
+            // sent again by whoever sent it: once, at the most, and
+            // only of the first, while the ways that went by the
+            // silent relay are found out.)
+            let began = w.now;
+            let mut came = Vec::new();
+            for again in 0..2 {
+                assert!(again == 0 || nth == 0, "with relay {silent} silent, nothing comes ({nth})");
+                hold[0].post(ids[1].0, crate::msg::KIND_SLATE, [20 + nth; 32], vec![nth], None);
+                w.woken();
+                let sent = w.now;
+                while came.is_empty() && w.now - sent < 62 * SECOND {
+                    w.run(50 * MILLI);
+                    came = hold[1].take_messages();
+                }
+                if !came.is_empty() {
+                    break;
+                }
+            }
+            assert!(!came.is_empty(), "with relay {silent} silent, nothing comes ({nth})");
+            assert_eq!(came[0].body, [nth]);
+            took.push((w.now - began) / MILLI);
+        }
+        println!("with relay {silent} silent, messages crossed in {took:?} ms");
+        w.mute.clear();
+        w.run(40 * SECOND);
+        hold[0].take_posted();
+    }
     // To a wallet that is nowhere: said to be so.
     let nobody = crate::address::id_of(crate::mldsa::keygen(&[99; 32]).public_key());
     hold[0].post(nobody, crate::msg::KIND_SLATE, [9; 32], b"x".to_vec(), None);

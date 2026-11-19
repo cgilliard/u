@@ -338,6 +338,11 @@ const SEND_WAY_IDLE: Micros = 120 * crate::transport::SECOND;
 /// How long a way kept to go on from is kept before another is made.
 const SPARE_WAY_LIFE: Micros = 600 * crate::transport::SECOND;
 const SPARE_WAYS: usize = 2;
+/// How long a relay that did not answer is not gone by.
+const SUSPECT_FOR: Micros = 60 * crate::transport::SECOND;
+/// How long a wallet has to say that a message sent down its way came,
+/// before whoever gave the message is told it did not.
+const DELIVERED_WITHIN: Micros = 3 * crate::transport::SECOND;
 const SEND_WAY_SLOW: Micros = 5 * crate::transport::SECOND;
 /// The most that is kept on its way to neighbours on ways, that is
 /// being asked of them at once by one worker, and that a worker
@@ -608,6 +613,13 @@ pub(crate) struct Shared {
     /// mode is init. Wallets are then reached at the end of ways
     /// through them, and no longer at the seeds.
     relays: Mutex<Arc<Relays>>,
+    /// Relays that did not answer the opening of a way, and when: ways
+    /// go by others for a while.
+    suspect: Mutex<Vec<(SocketAddrV4, Micros)>>,
+    /// Sealed messages sent down a wallet's way, of which the wallet
+    /// has not yet said that they came: the message, the way it went
+    /// down, the way of whoever gave it, and when.
+    delivering: Mutex<Vec<([u8; 32], (SocketAddrV4, u64), (SocketAddrV4, u64), Micros)>>,
     /// Whether those were given by whoever drives the node, and are
     /// not the chain's to change ([`Handle::force_consensus`]).
     forced: AtomicBool,
@@ -1509,6 +1521,11 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         snap.name(key).ok()?.filter(|record| record.name.as_bytes() == name).map(|record| record.value)
     }
 
+    /// The relays that lately did not answer the opening of a way.
+    fn suspects(&self) -> Vec<SocketAddrV4> {
+        self.shared.suspect.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|s| s.0).collect()
+    }
+
     /// The relays in force: none in init mode.
     fn relays(&self) -> Arc<Relays> {
         Arc::clone(&self.shared.relays.lock().unwrap_or_else(|e| e.into_inner()))
@@ -1539,6 +1556,13 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         let not_it = |id: &Digest| point.is_none_or(|p| p.0 != *id) && id != own;
         let mut others: Vec<(Digest, SocketAddrV4)> =
             relays.iter().filter(|r| not_it(&r.0)).filter_map(|r| Some((r.0, r.1?))).collect();
+        // (Not by relays that lately did not answer, while there are
+        // others: by one relay rather than by two of which one is not
+        // there.)
+        let suspect = self.suspects();
+        if others.iter().any(|relay| !suspect.contains(&relay.1)) {
+            others.retain(|relay| !suspect.contains(&relay.1));
+        }
         let mut path = Vec::with_capacity(3);
         for draw in chance[96..].chunks(8).take(others.len().min(2)) {
             let at = u64::from_le_bytes(draw.try_into().expect("eight bytes")) as usize % others.len();
@@ -1599,6 +1623,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         let mut ways = shared.ways.lock().unwrap_or_else(|e| e.into_inner());
         ways.open.retain(|w| match w.purpose {
             Purpose::Session => at.contains(&w.end().1) && (!w.ready() || now.saturating_sub(w.seen) < silent),
+            // (And one that says nothing back when asked whether it
+            // still goes anywhere.)
+            Purpose::Spare if now.saturating_sub(w.seen) >= silent => false,
             Purpose::Send => now.saturating_sub(w.seen) < SEND_WAY_IDLE,
             // (One kept to go on from: a fresh one now and then, so
             // that what is sent this hour does not all go by the
@@ -1629,6 +1656,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                             said.extend_from_slice(&seq.to_le_bytes());
                         }
                     }
+                    way.awaits(now);
                     steps.extend(way.say(&said));
                 }
                 // Held there: and shown to be each full name that is
@@ -1674,6 +1702,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             return;
         }
         let epoch = self.chain.tip().map_or(0, |tip| tip.height / crate::consensus::EPOCH);
+        let suspect = self.suspects();
         let mut ways = shared.ways.lock().unwrap_or_else(|e| e.into_inner());
         let mut steps = Vec::new();
         for post in mail.posts.iter_mut() {
@@ -1685,6 +1714,12 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 continue;
             }
             let point = points[post.turn % points.len()];
+            // (Not by a relay that lately did not answer, while the
+            // wallet is reached at another.)
+            if suspect.contains(&point.1) && points.iter().any(|p| !suspect.contains(&p.1)) {
+                post.turn += 1;
+                continue;
+            }
             match ways.open.iter_mut().find(|w| w.purpose == Purpose::Send && w.end().1 == point.1) {
                 // No way there: the one kept to go on from goes on to
                 // it, if it is open and does not pass that relay
@@ -1721,6 +1756,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                             said.extend_from_slice(&crate::poseidon2::digest_to_bytes(&post.asked()));
                         }
                     }
+                    way.awaits(now);
                     steps.extend(way.say(&said));
                 }
                 // (A way that is slow to open: another of the wallet's
@@ -1814,14 +1850,31 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     None => {}
                 }
             }
+            // The wallet at the end of this way says a message came.
+            Some((&super::circuits::TAKEN, id)) if id.len() == 32 => {
+                let mut delivering = shared.delivering.lock().unwrap_or_else(|e| e.into_inner());
+                delivering.retain(|d| {
+                    let it = d.0 == id && d.1 == link;
+                    if it {
+                        back.push((d.2, made(NOTICE, &[id, &[NOTICE_PASSED]])));
+                    }
+                    !it
+                });
+            }
             Some((&GIVE, sealed)) => {
                 let id = digest_to_bytes(&crate::msg::sealed_id(sealed));
                 let Some(to) = crate::msg::sealed_to(sealed) else { return };
                 match sessions.get(&to, now).map(|s| s.at) {
                     None => back.push((link, made(NOTICE, &[&id, &[NOTICE_OFFLINE]]))),
+                    // (Sent down the wallet's way; and whoever gave it
+                    // is told it was passed on when the wallet says it
+                    // came, or that it was not if the wallet does not.)
                     Some(Where::Way(before, circuit)) => {
                         back.push(((before, circuit), made(TAKE, &[sealed])));
-                        back.push((link, made(NOTICE, &[&id, &[NOTICE_PASSED]])));
+                        let mut delivering = shared.delivering.lock().unwrap_or_else(|e| e.into_inner());
+                        if delivering.len() < LEAVING {
+                            delivering.push((id, (before, circuit), link, now));
+                        }
                     }
                     // (A wallet that says it is here from an address,
                     // as before relays were in force: offered there.)
@@ -1888,12 +1941,21 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     return;
                 };
                 let mut mail = shared.letters.lock().unwrap_or_else(|e| e.into_inner());
-                if !mail.seen(crate::msg::sealed_id(sealed))
+                let id = crate::msg::sealed_id(sealed);
+                if !mail.seen(id)
                     && let Some(opened) = own.open(sealed, self.unix, now)
                 {
                     mail.inbox.push(opened);
                     shared.say(Event::Mail);
                 }
+                drop((mail, wallet));
+                // (It came: said back, each time it does.)
+                let mut taken = vec![super::circuits::TAKEN];
+                taken.extend_from_slice(&crate::poseidon2::digest_to_bytes(&id));
+                let mut ways = shared.ways.lock().unwrap_or_else(|e| e.into_inner());
+                let step = ways.open.iter_mut().find(|w| w.circuit() == circuit).and_then(|way| way.say(&taken));
+                drop(ways);
+                step.into_iter().for_each(|step| self.carry(now, step));
             }
             // What the wallet a message is for announces: the message
             // is sealed to it, and given to be passed on.
@@ -2045,7 +2107,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         }
         for (to, node, token) in ask {
             let object = Object::Announce { id: to, seq: 0 };
-            if !self.fetches.iter().any(|f| f.object == object) {
+            // (Of this node, whatever is still asked of another that
+            // does not answer.)
+            if !self.fetches.iter().any(|f| f.object == object && f.from == node) {
                 let most = crate::msg::ANNOUNCE_LEN + crate::subnames::MAX_BUNDLE;
                 self.fetch_granted(now, object, node, most as u32, token);
             }
@@ -2282,8 +2346,66 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         }
         // (A way that does not open is given up.)
         let mut ways = self.shared.ways.lock().unwrap_or_else(|e| e.into_inner());
+        // (And a relay that does not answer the opening of one is not
+        // gone by for a while: the next way goes by others.)
+        let silent =
+            |w: &super::circuits::Way| w.unanswered() && now.saturating_sub(w.began) >= super::circuits::FIRST_ANSWER;
+        let dead: Vec<SocketAddrV4> = ways.open.iter().filter(|w| silent(w)).map(|w| w.first()).collect();
+        // (Nor is one kept that leaves what was said along it
+        // unanswered: a relay of it is gone, and another way is
+        // opened in its place by whoever needs one.)
+        let before = ways.open.len();
+        ways.open.retain(|w| !silent(w) && !w.gone(now));
         ways.open.retain(|w| w.ready() || now.saturating_sub(w.began) < super::circuits::OPENING);
+        // (Where one went nowhere, a relay is gone, and the others may
+        // go by it too: each is asked at once whether it still goes
+        // anywhere, and not when it is next due.)
+        let lost = ways.open.len() < before;
+        // (A way kept to go on from is asked now and then whether it
+        // still goes anywhere.)
+        let mut pings = Vec::new();
+        let asked = |w: &super::circuits::Way| w.purpose != super::circuits::Purpose::Asked && w.ready();
+        for way in ways.open.iter_mut().filter(|w| asked(w)) {
+            let spare = way.purpose == super::circuits::Purpose::Spare;
+            if (spare && now.saturating_sub(way.seen) >= self.cfg.keepalive) || (lost && !way.gone(now)) {
+                way.awaits(now);
+                pings.extend(way.say(&[super::circuits::PING]));
+            }
+        }
         drop(ways);
+        for step in pings {
+            self.carry(now, step);
+        }
+        // What was sent down a wallet's way and not said to have come:
+        // whoever gave it is told it was not passed on.
+        if self.cfg.relay {
+            let mut late = Vec::new();
+            let mut delivering = self.shared.delivering.lock().unwrap_or_else(|e| e.into_inner());
+            delivering.retain(|d| {
+                let is = now.saturating_sub(d.3) >= DELIVERED_WITHIN;
+                if is {
+                    late.push((d.2, d.0));
+                }
+                !is
+            });
+            drop(delivering);
+            let mut relayed = self.shared.relayed.lock().unwrap_or_else(|e| e.into_inner());
+            let mut steps = Vec::new();
+            for (giver, id) in late {
+                let mut notice = vec![super::circuits::NOTICE];
+                notice.extend_from_slice(&id);
+                notice.push(super::message::NOTICE_OFFLINE);
+                steps.extend(relayed.say(giver, &notice, now));
+            }
+            drop(relayed);
+            for step in steps {
+                self.carry(now, step);
+            }
+        }
+        let mut suspect = self.shared.suspect.lock().unwrap_or_else(|e| e.into_inner());
+        suspect.retain(|s| now.saturating_sub(s.1) < SUSPECT_FOR && !dead.contains(&s.0));
+        suspect.extend(dead.into_iter().map(|relay| (relay, now)));
+        drop(suspect);
         let mut due = Vec::new();
         let (secret, numbers) = (&self.secret, &mut self.numbers);
         self.peers.pings_due(now, || Self::number(secret, numbers), |addr, number| due.push((addr, number)));
@@ -4210,6 +4332,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             relayed: Mutex::new(super::circuits::Relayed::new(cfg.circuits)),
             ways: Mutex::default(),
             relays: Mutex::default(),
+            suspect: Mutex::default(),
+            delivering: Mutex::default(),
             forced: AtomicBool::new(false),
             leaving: Mutex::default(),
             key: u64::from_le_bytes(derive(&secret, b'h', 0)[..8].try_into().unwrap()),

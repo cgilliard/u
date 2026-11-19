@@ -65,6 +65,13 @@ pub const HERE_HELD: u8 = 12;
 /// for it, or none (zero).
 pub const HERE_AS: u8 = 13;
 pub const AS_HELD: u8 = 14;
+/// What a wallet says back to the node it is reached at when a sealed
+/// message has come to it down its way: the message's id. Only then
+/// is whoever gave the message told that it was passed on.
+pub const TAKEN: u8 = 15;
+/// How long a way may leave what was said along it unanswered before
+/// it is taken to go nowhere any more: a relay of it is gone.
+pub const ANSWERED_WITHIN: Micros = 4 * SECOND;
 /// What whoever sends to a wallet says to a node that wallet is
 /// reached at: "what does the wallet of this id announce?", answered
 /// with the announcement, or with the id if the wallet is not there;
@@ -415,7 +422,11 @@ pub struct Leaving {
 pub const TELL_AGAIN: Micros = SECOND * 2 / 5;
 pub const KEPT: Micros = 30 * SECOND;
 /// How long a way may take to open.
-pub const OPENING: Micros = 30 * SECOND;
+pub const OPENING: Micros = 10 * SECOND;
+/// And how long its first relay may take to answer: that is one
+/// asking and one answer, and a relay that leaves it so long is not
+/// there.
+pub const FIRST_ANSWER: Micros = 3 * SECOND;
 
 /// The ways this node opened, and what has come back along them.
 #[derive(Default)]
@@ -441,6 +452,9 @@ pub struct Way {
     /// How many things have been sent out along it.
     sent: u64,
     pub purpose: Purpose,
+    /// Since when something said along it is unanswered: none while
+    /// nothing is.
+    waiting: Option<Micros>,
     pub began: Micros,
     /// When something last came back along it.
     pub seen: Micros,
@@ -455,7 +469,8 @@ impl Way {
         let step = Step { to: path[0].1, circuit, kind: OPEN, count: 0, bytes: opening.hello().to_vec() };
         let hops = Vec::with_capacity(path.len());
         let purpose = Purpose::Asked;
-        (Way { circuit, path, hops, opening: Some(opening), sent: 0, purpose, began: now, seen: now }, step)
+        let (opening, waiting) = (Some(opening), Some(now));
+        (Way { circuit, path, hops, opening, sent: 0, purpose, waiting, began: now, seen: now }, step)
     }
 
     pub fn circuit(&self) -> u64 {
@@ -492,6 +507,7 @@ impl Way {
         if self.ready() {
             return Came::Ready;
         }
+        self.waiting = Some(self.seen);
         Came::Step(self.reach(chance))
     }
 
@@ -508,6 +524,22 @@ impl Way {
         self.wrapped(&tell, MIDDLE)
     }
 
+    /// Something that is to be answered is said along it at `now`.
+    pub fn awaits(&mut self, now: Micros) {
+        self.waiting = self.waiting.or(Some(now));
+    }
+
+    /// Whether what was said along it has gone unanswered too long at
+    /// `now`: the way goes nowhere any more.
+    pub fn gone(&self, now: Micros) -> bool {
+        self.waiting.is_some_and(|since| now.saturating_sub(since) >= ANSWERED_WITHIN)
+    }
+
+    /// Whether its first relay has not yet answered.
+    pub fn unanswered(&self) -> bool {
+        self.hops.is_empty()
+    }
+
     /// Whether the relay of id `id` is one of the way's.
     pub fn passes(&self, id: &Digest) -> bool {
         self.path.iter().any(|relay| relay.0 == *id)
@@ -520,7 +552,7 @@ impl Way {
             return None;
         }
         self.path.push(to);
-        self.began = now;
+        (self.began, self.waiting) = (now, Some(now));
         Some(self.reach(chance))
     }
 
@@ -532,7 +564,7 @@ impl Way {
 
     /// The first relay has answered the opening.
     pub fn opened(&mut self, answer: &[u8], chance: &[u8; 96], now: Micros) -> Came {
-        self.seen = now;
+        (self.seen, self.waiting) = (now, None);
         match self.hops.is_empty() {
             true => self.grown(answer, chance),
             false => Came::Bad,
@@ -542,7 +574,7 @@ impl Way {
     /// Something has come back along the way, the `count`-th of
     /// whichever relay said it.
     pub fn back(&mut self, count: u64, bytes: &[u8], chance: &[u8; 96], now: Micros) -> Came {
-        self.seen = now;
+        (self.seen, self.waiting) = (now, None);
         let Some(said) = circuit::unwrap(&self.hops, count, bytes) else { return Came::Bad };
         let Some(said) = emptied(&said) else { return Came::Bad };
         match said.split_first() {
