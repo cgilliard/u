@@ -49,6 +49,7 @@ pub mod poseidon2;
 pub mod poseidon2_air;
 pub mod pow;
 pub mod pow_air;
+pub mod proofs;
 pub mod random;
 pub mod recursion;
 pub mod sha256;
