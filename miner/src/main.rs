@@ -1001,6 +1001,7 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
         let hold = hold.clone();
         let mut looked = std::time::Instant::now();
         let mut passed: Vec<(tabminer::hash::Digest, [u8; 32], std::time::Instant)> = Vec::new();
+        let mut warned: Option<std::time::Instant> = None;
         let taking = move || loop {
             std::thread::sleep(Duration::from_millis(50));
             if looked.elapsed() >= Duration::from_secs(600) {
@@ -1008,6 +1009,17 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
                 if let Err(why) = console.renew_names() {
                     aloud(&format!("Error: the wallet's names: {why}"));
                 }
+            }
+            // (Another node saying it is this wallet: said, and no more
+            // than every ten minutes. Nothing is stopped for it.)
+            if let Some(node) = hold.take_twin()
+                && warned.is_none_or(|at: std::time::Instant| at.elapsed() >= Duration::from_secs(600))
+            {
+                warned = Some(std::time::Instant::now());
+                aloud(&format!(
+                    "Warning: another node is running this wallet (seen at {node}). Two copies of one wallet at once \
+                     can sign twice with one key, and only one of them is reached: stop one of them"
+                ));
             }
             // (Whose a name is, is known before its wallet answers.)
             for (slate, whom) in hold.take_resolved() {

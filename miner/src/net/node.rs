@@ -1833,7 +1833,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     Err(_) => None,
                 };
                 if let Some(id) = id
-                    && let Some(seq) = sessions.get(&id, now).filter(|s| s.at == here).map(|s| s.seq)
+                    && let Some(seq) = sessions.get(&id, now).filter(|s| s.at == here || taken.is_err()).map(|s| s.seq)
                 {
                     back.push((link, made(HERE_HELD, &[&digest_to_bytes(&id), &seq.to_le_bytes()])));
                 }
@@ -1841,7 +1841,10 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             Some((&STILL, rest)) if rest.len() == 40 => {
                 if let Some(id) = digest_from_bytes(&rest[..32]) {
                     let seq = u64::from_le_bytes(rest[32..].try_into().expect("eight bytes"));
-                    let held = if sessions.seen(&id, here, seq, now) { seq } else { 0 };
+                    let held = match sessions.seen(&id, here, seq, now) {
+                        true => seq,
+                        false => sessions.get(&id, now).map_or(0, |s| s.seq),
+                    };
                     back.push((link, made(HELD, &[&rest[..32], &held.to_le_bytes()])));
                 }
             }
@@ -2638,7 +2641,12 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 if !held && !self.fetches.iter().any(|f| f.object == object && f.from == from) {
                     self.fetch_granted(now, object, from, crate::msg::ANNOUNCE_LEN as u32, grant);
                 }
-                let seq = if held { seq } else { 0 };
+                // (What it holds for that wallet, where that is another
+                // announcement than was said: the wallet knows by it
+                // that something else announces as it.)
+                let other =
+                    || self.shared.sessions.lock().unwrap_or_else(|e| e.into_inner()).get(&id, now).map(|s| s.seq);
+                let seq = if held { seq } else { other().unwrap_or(0) };
                 self.send(from, &Message::SessionState { id, seq, token: ours }, out);
             }
             // And a node says what it holds for this node's wallet.
@@ -4818,6 +4826,13 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
     #[cfg(test)]
     pub(crate) fn name_says(&self, name: &[u8], value: Digest) {
         self.shared.names.lock().unwrap().insert(name.to_vec(), value);
+    }
+
+    /// A node at which another node has announced this node's wallet
+    /// since this one did, if one has since this was last asked: two
+    /// copies of one wallet are running at once.
+    pub fn take_twin(&self) -> Option<SocketAddrV4> {
+        self.shared.participant.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|own| own.take_twin())
     }
 
     /// How the way of this number stands: open to its end, or not yet;

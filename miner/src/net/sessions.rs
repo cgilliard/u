@@ -278,6 +278,10 @@ pub struct Participant {
     last: u64,
     /// The full names this wallet is reached by.
     aliases: Vec<Aliased>,
+    /// A node that holds, for this wallet, an announcement newer than
+    /// any this node made for it: another node is saying it is this
+    /// wallet ([`Participant::take_twin`]).
+    twin: Option<SocketAddrV4>,
 }
 
 /// A full name this wallet is reached by: the id it is reached at, its
@@ -330,6 +334,7 @@ impl Participant {
             said: BTreeMap::new(),
             last: 0,
             aliases: Vec::new(),
+            twin: None,
         }
     }
 
@@ -434,6 +439,12 @@ impl Participant {
     pub fn held(&mut self, node: &SocketAddrV4, seq: u64, token: u64) -> bool {
         let Some(said) = self.said.get_mut(node) else { return false };
         said.unanswered = 0;
+        // (It holds one newer than this node ever made for it: made by
+        // another, with this wallet's key. One left from before this
+        // node was last started is older, and is nothing.)
+        if said.seq != 0 && seq > said.seq {
+            self.twin = Some(*node);
+        }
         // (A node that does not hold the announcement holds nothing of
         // the names the wallet is reached by either.)
         if seq != said.seq || said.seq == 0 {
@@ -520,6 +531,13 @@ impl Participant {
                 a.at.remove(node);
             });
         }
+    }
+
+    /// A node at which another node has announced this wallet since
+    /// this one did, if one has since this was last asked: two copies
+    /// of one wallet are running at once.
+    pub fn take_twin(&mut self) -> Option<SocketAddrV4> {
+        self.twin.take()
     }
 
     /// Whether the node at `node` holds what was last announced to it.
