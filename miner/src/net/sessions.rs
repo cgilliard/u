@@ -510,6 +510,18 @@ impl Participant {
         alias.map_or(0, |a| a.at.iter().filter(|(node, held)| held.0 == a.seq && self.is_held(node)).count())
     }
 
+    /// The wallet is not reached at the node at `node` any more, by
+    /// what this node can tell: there is no way there that goes
+    /// anywhere. (What was announced to it stands, to be said again.)
+    pub fn unreached(&mut self, node: &SocketAddrV4) {
+        if let Some(said) = self.said.get_mut(node) {
+            said.held = 0;
+            self.aliases.iter_mut().for_each(|a| {
+                a.at.remove(node);
+            });
+        }
+    }
+
     /// Whether the node at `node` holds what was last announced to it.
     pub fn is_held(&self, node: &SocketAddrV4) -> bool {
         self.said.get(node).is_some_and(|s| s.seq != 0 && s.held == s.seq && s.unanswered < UNANSWERED)

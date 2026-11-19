@@ -1261,7 +1261,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         }
         // (No way is kept of a time when wallets were reached by them.)
         let mut ways = self.shared.ways.lock().unwrap_or_else(|e| e.into_inner());
-        ways.open.retain(|w| w.purpose == super::circuits::Purpose::Asked);
+        ways.give_up(|w| w.purpose != super::circuits::Purpose::Asked);
         drop(ways);
         let seeds: Vec<SocketAddrV4> =
             self.shared.seeds.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
@@ -1348,7 +1348,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     /// it says it is, and a way is not made for whoever is not.)
     fn said_whole(step: &super::circuits::Step, len: usize) -> bool {
         use super::circuits::{BACK, FORWARD};
-        matches!(step.kind, FORWARD | BACK) && len <= super::message::MAX_STEPPED
+        matches!(step.kind, FORWARD | BACK | super::circuits::CLOSE) && len <= super::message::MAX_STEPPED
     }
 
     /// What a neighbour is told of something that is there for it.
@@ -1375,6 +1375,10 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         for (circuit, said) in std::mem::take(&mut ways.to_say) {
             let way = ways.open.iter_mut().find(|w| w.circuit() == circuit);
             steps.extend(way.and_then(|way| way.say(&said)));
+        }
+        // (The first relay of each way given up is told it is no more.)
+        for (to, circuit) in std::mem::take(&mut ways.closed) {
+            steps.push(super::circuits::Step { to, circuit, kind: super::circuits::CLOSE, count: 0, bytes: vec![0] });
         }
         drop(ways);
         for step in steps {
@@ -1451,6 +1455,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 }
                 Out::Nothing => None,
             },
+            super::circuits::CLOSE => relayed.close(from, circuit),
             OPENED if relayed.goes_on_to(&link) => relayed.opened(from, circuit, bytes, now),
             BACK if relayed.goes_on_to(&link) => relayed.back(from, circuit, count, bytes.to_vec(), now),
             _ => {
@@ -1496,7 +1501,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             // (A way being opened that is answered wrongly is no way.
             // One that is open stays so: what does not open on it is
             // nothing.)
-            Came::Bad if !ways.open[at].ready() => drop(ways.open.swap_remove(at)),
+            Came::Bad if !ways.open[at].ready() => drop(ways.give_up(|w| (w.first(), w.circuit()) == link)),
             Came::Bad => {}
         }
     }
@@ -1621,7 +1626,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         }
         let silent = 3 * self.cfg.keepalive;
         let mut ways = shared.ways.lock().unwrap_or_else(|e| e.into_inner());
-        ways.open.retain(|w| match w.purpose {
+        ways.give_up(|w| !match w.purpose {
             Purpose::Session => at.contains(&w.end().1) && (!w.ready() || now.saturating_sub(w.seen) < silent),
             // (And one that says nothing back when asked whether it
             // still goes anywhere.)
@@ -1641,7 +1646,11 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         }
         for point in points {
             match ways.open.iter_mut().find(|w| w.purpose == Purpose::Session && w.end().1 == point.1) {
-                None => steps.extend(self.begin_way(&mut ways, Purpose::Session, relays, Some(point), &id, now)),
+                // (No way there: not reached there, until there is.)
+                None => {
+                    own.unreached(&point.1);
+                    steps.extend(self.begin_way(&mut ways, Purpose::Session, relays, Some(point), &id, now))
+                }
                 Some(way) if way.ready() && own.due(&point.1, now, self.cfg.keepalive) => {
                     let seq = own.say(point.1, way.bind(), self.unix, now);
                     let mut said = Vec::new();
@@ -2354,13 +2363,12 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         // (Nor is one kept that leaves what was said along it
         // unanswered: a relay of it is gone, and another way is
         // opened in its place by whoever needs one.)
-        let before = ways.open.len();
-        ways.open.retain(|w| !silent(w) && !w.gone(now));
-        ways.open.retain(|w| w.ready() || now.saturating_sub(w.began) < super::circuits::OPENING);
+        let gone = ways.give_up(|w| silent(w) || w.gone(now));
+        let slow = ways.give_up(|w| !w.ready() && now.saturating_sub(w.began) >= super::circuits::OPENING);
         // (Where one went nowhere, a relay is gone, and the others may
         // go by it too: each is asked at once whether it still goes
         // anywhere, and not when it is next due.)
-        let lost = ways.open.len() < before;
+        let lost = gone + slow > 0;
         // (A way kept to go on from is asked now and then whether it
         // still goes anywhere.)
         let mut pings = Vec::new();
@@ -2722,7 +2730,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 let of_a_way = || {
                     let relayed = self.shared.relayed.lock().unwrap_or_else(|e| e.into_inner());
                     match kind {
-                        FORWARD => relayed.holds(&link),
+                        FORWARD | super::circuits::CLOSE => relayed.holds(&link),
                         BACK => {
                             let ways = self.shared.ways.lock().unwrap_or_else(|e| e.into_inner());
                             relayed.goes_on_to(&link) || ways.open.iter().any(|w| (w.first(), w.circuit()) == link)

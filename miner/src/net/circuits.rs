@@ -31,6 +31,10 @@ pub const OPENED: u8 = 2;
 pub const FORWARD: u8 = 3;
 /// Something coming back.
 pub const BACK: u8 = 4;
+/// "This way is no more": said by whoever opened it, and passed on by
+/// each relay to the next, which forget it. (A relay that is never
+/// told forgets a way nothing passes along, a while later.)
+pub const CLOSE: u8 = 5;
 
 /// What the last relay of a way is told, as the first byte of what is
 /// said to it: to go on to another relay, at this address, with this
@@ -196,7 +200,10 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Limits {
-        Limits { most: 50_000, each_host: 64, idle: 1800 * SECOND }
+        // (A way that is in use has something pass along it every half
+        // minute: one that has had nothing for five times that is no
+        // longer anybody's.)
+        Limits { most: 50_000, each_host: 256, idle: 150 * SECOND }
     }
 }
 
@@ -385,6 +392,14 @@ impl Relayed {
         self.through.iter().any(|t| t.after == Some(*after))
     }
 
+    /// Whoever is before this relay on a way says the way is no more:
+    /// forgotten, and the relay after told the same.
+    pub fn close(&mut self, from: SocketAddrV4, circuit: u64) -> Option<Step> {
+        let at = self.through.iter().position(|t| t.before == (from, circuit))?;
+        let (to, circuit) = self.through.swap_remove(at).after?;
+        Some(Step { to, circuit, kind: CLOSE, count: 0, bytes: vec![0] })
+    }
+
     /// Forgets the ways nothing has passed along for too long.
     pub fn prune(&mut self, now: Micros) {
         let idle = self.limits.idle;
@@ -439,6 +454,26 @@ pub struct Ways {
     pub wanted: Vec<(u64, Vec<(Digest, SocketAddrV4)>)>,
     /// What is to be said along a way, and has not yet been sent.
     pub to_say: Vec<(u64, Vec<u8>)>,
+    /// Ways given up, of which the first relay is still to be told:
+    /// where it is, and the number it knows the way by.
+    pub closed: Vec<(SocketAddrV4, u64)>,
+}
+
+impl Ways {
+    /// Gives up the ways of which `gone` says so: their relays are to
+    /// be told. How many.
+    pub fn give_up(&mut self, mut gone: impl FnMut(&Way) -> bool) -> usize {
+        let before = self.open.len();
+        let closed = &mut self.closed;
+        self.open.retain(|way| {
+            let goes = gone(way);
+            if goes {
+                closed.push((way.first(), way.circuit()));
+            }
+            !goes
+        });
+        before - self.open.len()
+    }
 }
 
 /// A way, as whoever opened it has it.
@@ -650,6 +685,7 @@ mod tests {
                     OPEN => relay.open(&self.keys[i], from, step.circuit, &step.bytes, &[i as u8; 32], false, 0),
                     OPENED => relay.opened(from, step.circuit, &step.bytes, 0),
                     BACK => relay.back(from, step.circuit, step.count, step.bytes, 0),
+                    CLOSE => relay.close(from, step.circuit),
                     FORWARD => match relay.forward(from, step.circuit, step.count, step.bytes, self.fresh, 0) {
                         Out::Step(step) => Some(step),
                         Out::Said { way, said } => return (None, Some((way, said))),
@@ -850,6 +886,13 @@ mod tests {
         let step = two.say(b"to the third").unwrap();
         let (known_by, said) = world.carry(at(ME), step).1.unwrap();
         assert_eq!((known_by.0, &said[..]), (at(2), &b"to the third"[..]));
+        // A way that is no more is forgotten by each relay of it, told
+        // by the one before.
+        let (way, held) = (world.open_other(31), world.relays.iter().map(Relayed::len).collect::<Vec<_>>());
+        let step = Step { to: way.first(), circuit: way.circuit(), kind: CLOSE, count: 0, bytes: vec![0] };
+        world.carry(at(ME), step);
+        let after: Vec<usize> = world.relays.iter().map(Relayed::len).collect();
+        assert_eq!(after, held.iter().map(|n| n - 1).collect::<Vec<_>>());
         // A relay forgets a way nothing passes along.
         world.relays[0].prune(Limits::default().idle);
         assert!(world.relays[0].is_empty());

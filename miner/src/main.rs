@@ -987,6 +987,7 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
         }
         let (hold, main) = (hold.clone(), Arc::clone(&main));
         let mut looked = std::time::Instant::now();
+        let mut passed: Vec<(tabminer::hash::Digest, [u8; 32], std::time::Instant)> = Vec::new();
         let taking = move || loop {
             std::thread::sleep(Duration::from_millis(50));
             if looked.elapsed() >= Duration::from_secs(600) {
@@ -1008,9 +1009,19 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
                     main.log(&format!("Error: a message for the wallet: {why}"));
                 }
             }
+            // (A payment passed on and not answered in a minute is no
+            // payment: its wallet is gone, or cannot answer. Given up,
+            // so that what it would have spent is free again.)
+            let late = |since: &std::time::Instant| since.elapsed() >= Duration::from_secs(60);
+            for (to, tag, _) in passed.extract_if(.., |p| late(&p.2)).collect::<Vec<_>>() {
+                if console.awaits_answer(&tag) {
+                    main.log(&console.undelivered(&to, &tag, "it was passed on, and is not answered"));
+                }
+            }
             for (to, _, tag, what) in hold.take_posted() {
                 use tabminer::net::sessions::Posted;
                 match what {
+                    Posted::Passed if console.awaits_answer(&tag) => passed.push((to, tag, std::time::Instant::now())),
                     Posted::Passed | Posted::Waiting => {}
                     Posted::Offline => main.log(&console.undelivered(&to, &tag, "that wallet is not there")),
                     Posted::Unsent => main.log(&console.undelivered(&to, &tag, "no node it is reached at took it")),

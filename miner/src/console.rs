@@ -882,6 +882,12 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         Ok(record.ok_or_else(|| format!("{name} is not registered"))?.value)
     }
 
+    /// Whether the payment of this slate is one this wallet began, sent
+    /// to a wallet, and still waits for its answer.
+    pub fn awaits_answer(&self, slate: &[u8; 32]) -> bool {
+        self.wallet().is_ok_and(|wallet| wallet.sent_to(slate).is_some())
+    }
+
     /// Whose the full name a payment was sent to turned out to be: its
     /// answer is taken from that wallet, and from no other.
     pub fn resolved(&self, slate: &[u8; 32], whom: &crate::hash::Digest) -> Said {

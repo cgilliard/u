@@ -2,9 +2,11 @@
 
 What to start and what to type to pay by address, by name and by a
 name under a name, first at the seeds (init mode) and then by ways
-through relays (onion mode). Six nodes on one machine. This has been
-run by the automated tests on the dev network only: on mainnet's
-parameters it is to be tried here for the first time.
+through relays (onion mode). Six nodes on one machine. Every step
+here has been run on the dev network, by `tools/live_dry_run.py`,
+which starts the six nodes and types what follows (twenty-seven
+checks, seven minutes): on mainnet's parameters it is to be tried
+here for the first time.
 
 Every node is given the same two seeds: where a wallet is reached is
 found from them, by everyone alike. `--peer` is not enough.
@@ -30,13 +32,20 @@ Common to all: `--no-seeds --seed 127.0.0.1:3737 --seed 127.0.0.1:3738
     ./target/release/tabminer --data-dir target/live-w1 --listen 127.0.0.1:3742 --no-mine          COMMON
     ./target/release/tabminer --data-dir target/live-w2 --listen 127.0.0.1:3743 --no-mine          COMMON
 
+A wallet's change is its to spend again only once a block has it: one
+funded by a single payment makes one payment a block. Fund each
+wallet with several payments before starting (step 1), or wait a
+block between payments from the same wallet.
+
 At each, `address` says its wallet's address (`tab1…`); `status` says
 `reached at: 2 of 2 nodes` once it is reached at both seeds.
 
 ## 1. Init mode
 
-1. Fund the wallets: at A, `send 100 <H>`, `send 100 <W1>`; each is
-   answered and pooled within a second, and mined with the next block.
+1. Fund the wallets: at A, `send 20 <H>` and `send 20 <W1>`, five
+   times each, a block apart (the miner's own change is as any
+   wallet's); each is answered and pooled within a second, and mined
+   with the next block.
 2. By address: at W1, `send 5 <W2's address>`. W1's log says `payment …
    answered by tab1…, signed and pooled`; W2's `balance` has it after
    a block.
@@ -57,7 +66,9 @@ At each, `address` says its wallet's address (`tab1…`); `status` says
    <W1's address> 10 /tmp/mailhub.word`; at W1, `subname signer
    /tmp/mailhub.word`, then `subname set desk@mailhub <H's address>`.
    At W2, `send 1 desk@mailhub`.
-9. Stop B (one seed of two): payments still go, by A. Start it again.
+9. Stop B (one seed of two): payments still go, by A, a second or
+   two slower when B is tried first. `status` says `reached at: 1 of
+   2 nodes` after a minute and a half. Start it again.
 
 ## 2. Onion mode
 
@@ -76,12 +87,21 @@ At each, `address` says its wallet's address (`tab1…`); `status` says
    nodes` within a few seconds.
 4. Repeat steps 2 to 8 of part 1. A cold payment takes a second or two
    longer than at the seeds; what is said is the same.
-5. Stop C: payments still go, by the two relays left. (A wallet whose
-   way went through C opens another within a minute and a half.)
-6. Leave it running over the next multiple of 144: for two blocks
-   either side `status` says `reached at: 6 of 6 nodes` (or fewer,
-   where the old three and the new share relays), then 3 of 3 again;
-   payments go throughout.
+5. Stop C. With three relays every way goes by all three, so every
+   way is lost at once: the first payment after takes up to a minute
+   (a wallet that is sending nothing finds out at its next word to
+   its relays, every half minute) and may be given up with an error,
+   to be sent again. From then on payments go as before, by ways of
+   one relay less; `status` says `reached at: 2 of 3 nodes`. Start C
+   again: 3 of 3 within a minute or two.
+6. Leave it running over the next multiple of 144, paying as it
+   passes: payments go throughout. (With three relays the wallet's
+   three are the same before and after, and `status` says 3 of 3
+   throughout; with more it says up to 6 for two blocks either side.)
+
+A payment that is passed on and not answered within a minute is
+given up with an error, as one that is not delivered is: nothing
+stays begun.
 
 To have onion mode at once instead of waiting for the vote, run every
 node with `--network dev-main-work` in a build with `--features dev`
