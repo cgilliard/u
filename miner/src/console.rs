@@ -49,7 +49,16 @@ pub const HELP: &str = "commands:
                             give a name under NAME, which this wallet holds, to the
                             wallet at ADDRESS: it is sent a certificate, signed again
                             daily while this node runs
-  subname del LABEL@NAME    give it out no longer
+  subname delegate NAME ADDRESS [DAYS] FILE
+                            say that the key of the wallet at ADDRESS signs for NAME,
+                            which this wallet holds, for DAYS days (30): so that the
+                            wallet that holds a name need not be the one that runs
+                            all day. Written to FILE, for that wallet to take
+  subname signer FILE       take such a word: this wallet then gives names under
+                            that name
+  subname del LABEL@NAME    sign for it no longer: its last certificate holds until
+                            its time is past (there is no ending it sooner, but by
+                            giving the name to another wallet)
   subname drop LABEL@NAME   be a name this wallet was given no longer
   subnames                  the names given out, and the names this wallet is
   send-file AMOUNT [FEE] FILE
@@ -238,6 +247,9 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             ("consensus", []) => self.consensus(),
             ("debug-consensus", [file]) if self.debug => self.debug_consensus(file),
             ("subname", ["set", full, to]) => self.subname_set(full, to),
+            ("subname", ["delegate", name, signer, file]) => self.subname_delegate(name, signer, "30", file),
+            ("subname", ["delegate", name, signer, days, file]) => self.subname_delegate(name, signer, days, file),
+            ("subname", ["signer", file]) => self.subname_signer(file),
             ("subname", ["del", full]) => self.subname_del(full),
             ("subname", ["drop", full]) => self.subname_drop(full),
             ("subnames", []) => self.subnames(),
@@ -719,10 +731,9 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         if !self.hold.reached() {
             return Err("this wallet is reached nowhere yet: it could not be answered (see status)".to_string());
         }
+        // (To this wallet itself, if that is what is asked: a payment
+        // that shows the wallet is reached.)
         let mut wallet = self.wallet()?;
-        if whom == wallet.id() {
-            return Err("that is this wallet's own address".to_string());
-        }
         let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
         let snap = state.snapshot().map_err(|e| e.to_string())?;
         let slate = wallet.send(amount, fee, &snap, (self.unix)()).map_err(|e| Self::short_of(&wallet, &snap, e))?;
@@ -766,7 +777,12 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         let unix = (self.unix)();
         // One this wallet began: its answer. (Signed only if it is the
         // slate that was begun, answered: the wallet sees to that.)
-        let ours = self.wallet()?.pending_slates().iter().any(|(id, _)| *id == slate.id);
+        // (Unless it is its own slate come round, not yet answered: a
+        // payment of this wallet's to itself, which it answers as any.)
+        let wallet = self.wallet()?;
+        let to_itself = slate.stage == 1 && message.from == wallet.id();
+        let ours = !to_itself && wallet.pending_slates().iter().any(|(id, _)| *id == slate.id);
+        drop(wallet);
         if ours {
             // From the wallet it was sent to, or it is nobody's answer:
             // whoever answers says where the payment goes. (One begun
@@ -884,17 +900,12 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
     fn subname_set(&self, full: &str, to: &str) -> Said {
         let (label, name) = crate::subnames::split(full).ok_or_else(|| format!("'{full}' is no label@name"))?;
         let holder = crate::address::decode(to).ok_or_else(|| format!("'{to}' is no address (tab1…)"))?;
-        let says = self.value_of(name)?;
         let mut wallet = self.wallet()?;
-        if says != wallet.id() {
-            return Err(format!(
-                "{name} is not this wallet's to give names under: it says {}, and this wallet is {}",
-                crate::address::encode(&says),
-                wallet.address()
-            ));
-        }
+        let word = self.signs(&wallet, name)?;
         let unix = (self.unix)();
-        let bundle = wallet.give_name(label.as_bytes(), name.as_bytes(), &holder, unix).map_err(|e| e.to_string())?;
+        let bundle = wallet
+            .give_name(label.as_bytes(), name.as_bytes(), &holder, unix, word.as_deref())
+            .map_err(|e| e.to_string())?;
         let own = holder == wallet.id();
         drop(wallet);
         let days = crate::subnames::HOLDS / 86_400;
@@ -905,6 +916,91 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             false => self.send_certificate(label.as_bytes(), name.as_bytes(), holder, bundle),
         }
         Ok(format!("{done}; sent to that wallet, which is the name once it has it"))
+    }
+
+    /// Whether this wallet signs for `name`: as the wallet the name
+    /// says, with nothing more; or by the word of the wallet it says,
+    /// which then goes with what is signed. An error if neither.
+    fn signs(&self, wallet: &Wallet<W>, name: &str) -> Result<Option<Vec<u8>>, String> {
+        let says = self.value_of(name)?;
+        if says == wallet.id() {
+            return Ok(None);
+        }
+        let unix = (self.unix)();
+        let word = wallet.signs_for(name.as_bytes()).and_then(|word| {
+            let read = crate::subnames::delegated(word, unix)?;
+            (read.by == says && read.signer == wallet.id()).then(|| word.to_vec())
+        });
+        word.map(Some).ok_or_else(|| {
+            format!(
+                "{name} is not this wallet's to give names under: it says {}, this wallet is {}, and has no word of                  that wallet's that holds (subname signer FILE)",
+                crate::address::encode(&says),
+                wallet.address()
+            )
+        })
+    }
+
+    /// Says that the key of the wallet at `signer` signs for `name`,
+    /// for `days` days: the word of this wallet, which holds the name,
+    /// written to `file` for that wallet to take (`subname signer`).
+    /// (Nothing is asked of the chain: a wallet kept where nothing can
+    /// get at it has none. The word is the name's holder's if this
+    /// wallet's address is what the name says.)
+    fn subname_delegate(&self, name: &str, signer: &str, days: &str, file: &str) -> Said {
+        if !crate::name::valid_name(name.as_bytes()) {
+            return Err(format!("{name} is not a valid name"));
+        }
+        let to = crate::address::decode(signer).ok_or_else(|| format!("'{signer}' is no address (tab1…)"))?;
+        let most = crate::subnames::MOST_HOLDS / 86_400;
+        let days: u64 = days
+            .parse()
+            .ok()
+            .filter(|d| (1..=most).contains(d))
+            .ok_or_else(|| format!("'{days}' is not a number of days from 1 to {most}"))?;
+        let wallet = self.wallet()?;
+        let until = (self.unix)() + days * 86_400 - 1;
+        let word = crate::subnames::delegate(&wallet.identity_key(), name.as_bytes(), &to, until);
+        let done = format!(
+            "for {days} days the key of {signer} signs for {name}, by the word of this wallet ({}): there is no              taking it back sooner, but by having the name say another address",
+            wallet.address()
+        );
+        (self.log)(&format!("Name {name}: {done}"));
+        std::fs::write(file, word).map_err(|e| format!("{file}: {e}"))?;
+        Ok(format!("{done}. Written to {file}, for that wallet to take with: subname signer {file}"))
+    }
+
+    /// Takes the word of a name's holder that this wallet's key signs
+    /// for the name.
+    fn subname_signer(&self, file: &str) -> Said {
+        let word = std::fs::read(file).map_err(|e| format!("{file}: {e}"))?;
+        let unix = (self.unix)();
+        let read = crate::subnames::delegated(&word, unix)
+            .ok_or_else(|| format!("{file} is not the word of a name's holder, or is past its time"))?;
+        let name = String::from_utf8_lossy(&read.name).to_string();
+        let mut wallet = self.wallet()?;
+        if read.signer != wallet.id() {
+            return Err(format!(
+                "{file} says the key of {} signs for {name}: this wallet is {}",
+                crate::address::encode(&read.signer),
+                wallet.address()
+            ));
+        }
+        let says = self.value_of(&name)?;
+        if says != read.by {
+            return Err(format!(
+                "{file} is the word of {}, and {name} says {}: not taken",
+                crate::address::encode(&read.by),
+                crate::address::encode(&says)
+            ));
+        }
+        wallet.sign_for(read.name.as_slice(), &word).map_err(|e| e.to_string())?;
+        let days = read.expires.saturating_sub(unix) as f64 / 86_400.0;
+        let done = format!(
+            "this wallet signs for {name} for {days:.1} days more, by the word of {}",
+            crate::address::encode(&read.by)
+        );
+        (self.log)(&format!("Name {name}: {done}"));
+        Ok(done)
     }
 
     fn send_certificate(&self, label: &[u8], name: &[u8], holder: crate::hash::Digest, bundle: Vec<u8>) {
@@ -949,6 +1045,16 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
                     self.hold.name_reached(&n)
                 )),
                 None => lines.push("a certificate past its time (it is this wallet's name no longer)".to_string()),
+            }
+        }
+        for word in wallet.signs_for_all() {
+            if let Some(read) = crate::subnames::delegated(&word, unix) {
+                lines.push(format!(
+                    "signs for {}, by the word of {}, for {} more",
+                    String::from_utf8_lossy(&read.name),
+                    crate::address::encode(&read.by),
+                    days(read.expires)
+                ));
             }
         }
         for given in wallet.names_given() {
@@ -1016,12 +1122,12 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         let mut due = wallet.names_to_renew(unix);
         due.extend(wallet.names_given().into_iter().filter(|g| again.contains(&at(g))));
         for given in due {
-            // (Only of a name that is still this wallet's.)
+            // (Only of a name this wallet still signs for.)
             let name = String::from_utf8_lossy(&given.name).to_string();
-            if self.value_of(&name).ok() != Some(wallet.id()) {
-                continue;
-            }
-            let bundle = wallet.give_name(&given.label, &given.name, &given.holder, unix).map_err(|e| e.to_string())?;
+            let Ok(word) = self.signs(&wallet, &name) else { continue };
+            let bundle = wallet
+                .give_name(&given.label, &given.name, &given.holder, unix, word.as_deref())
+                .map_err(|e| e.to_string())?;
             match given.holder == wallet.id() {
                 true => drop(wallet.hold_name(
                     &crate::subnames::read(&bundle, unix).ok_or("no certificate")?,

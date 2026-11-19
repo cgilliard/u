@@ -588,7 +588,7 @@ pub(crate) struct Shared {
     /// passes on, those that have come for its wallet.
     letters: Mutex<super::sessions::Mail>,
     /// The nodes wallets are reached at while no consensus file names
-    /// others: the seeds, and the peers the node was given.
+    /// others: the seeds, which all of a network have the same.
     seeds: Mutex<BTreeSet<SocketAddrV4>>,
     /// The consensus file last said to be in force: its mode, and the
     /// file's hash if there is one.
@@ -1233,9 +1233,11 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     /// another key in time; and lets the nodes it is no longer reached
     /// at forget it.
     ///
-    /// The nodes are the seeds and the peers the node was given, while
-    /// no consensus file names others: three of them at the most,
-    /// chosen by the wallet's id and the epoch. A node the wallet is
+    /// The nodes are the seeds, while no consensus file names others:
+    /// all of them, where they are two or three, as they are meant to
+    /// be (of more, three chosen by the wallet's id and the epoch).
+    /// Whoever sends to the wallet tries one of them by chance, and
+    /// another if that one does not answer. A node the wallet is
     /// reached at need not be a peer of this one, and nothing here asks
     /// whether it is: it is an address, which gives its own token to
     /// whoever says to it that a wallet is there. (Whichever worker
@@ -4427,10 +4429,17 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
     /// Takes `addr` as an address to try: a seed, a peer given by hand
     /// (both kept whatever they do), or one saved from an earlier run.
     pub fn add_peer(&mut self, addr: SocketAddrV4, seed: bool, now: Micros) -> bool {
-        if seed {
-            self.shared.seeds.lock().unwrap_or_else(|e| e.into_inner()).insert(addr);
-        }
         self.of(&addr).peers.add(addr, seed, now).is_ok()
+    }
+
+    /// Takes `addr` as a seed: an address to try, and, while no
+    /// consensus file names relays, a node wallets are reached at. All
+    /// of a network are to have the same seeds: where a wallet is
+    /// reached is found by everyone from them. (A peer given by hand is
+    /// one node's own, and is nowhere wallets are looked for.)
+    pub fn add_seed(&mut self, addr: SocketAddrV4, now: Micros) -> bool {
+        self.shared.seeds.lock().unwrap_or_else(|e| e.into_inner()).insert(addr);
+        self.add_peer(addr, true, now)
     }
 
     /// Looks to everything that is due at `now`, and says when to be

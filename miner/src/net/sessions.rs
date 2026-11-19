@@ -605,7 +605,11 @@ impl Post {
 impl Mail {
     /// A message to send.
     pub fn post(&mut self, to: Digest, kind: u8, tag: [u8; 32], body: Vec<u8>, known: Option<Vec<u8>>) {
-        let (sealed, tried, turn, state, via) = (None, None, 0, Posted::Waiting, None);
+        // (Of the nodes the wallet is reached at, one by chance first:
+        // the others if that one does not answer.)
+        let mut chance = [0u8; 1];
+        let _ = crate::random::fill(&mut chance);
+        let (sealed, tried, turn, state, via) = (None, None, chance[0] as usize, Posted::Waiting, None);
         self.posts.push(Post { to, via, kind, body, tag, known, sealed, began: None, tried, turn, missed: 0, state });
     }
 

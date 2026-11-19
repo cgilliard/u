@@ -728,7 +728,7 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     for seed in &c.seeds {
         for found in seed.to_socket_addrs().into_iter().flatten() {
             if let SocketAddr::V4(found) = found {
-                node.add_peer(found, true, now());
+                node.add_seed(found, now());
             }
         }
     }

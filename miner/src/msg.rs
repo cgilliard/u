@@ -256,20 +256,26 @@ pub fn points(id: &Digest, epoch: u32, nodes: usize) -> Vec<usize> {
     chosen
 }
 
+/// For how many blocks either side of where one epoch gives way to
+/// the next a wallet is reached by the nodes of both: time enough for
+/// a way to be opened to the new ones, and for whoever sends to be a
+/// block ahead or behind.
+pub const OVERLAP: u32 = 2;
+
 /// The epochs a wallet is to be reached by the nodes of, when the
-/// chain is `height` blocks high: the one that height is of, and for a
-/// few blocks either side of where one epoch gives way to the next
-/// ([`crate::consensus::GRACE`]), the other too. Whoever sends looks
-/// where the epoch of its own chain says, and its chain may be a block
-/// ahead or behind: the wallet is there either way.
+/// chain is `height` blocks high: the one that height is of, and for
+/// [`OVERLAP`] blocks either side of where one epoch gives way to the
+/// next, the other too. Whoever sends looks where the epoch of its own
+/// chain says, and its chain may be a block ahead or behind: the
+/// wallet is there either way.
 pub fn reached_epochs(height: u32) -> Vec<u32> {
-    use crate::consensus::{EPOCH, GRACE};
+    use crate::consensus::EPOCH;
     let (epoch, into) = (height / EPOCH, height % EPOCH);
     let mut epochs = vec![epoch];
-    if into < GRACE && epoch > 0 {
+    if into < OVERLAP && epoch > 0 {
         epochs.push(epoch - 1);
     }
-    if into >= EPOCH - GRACE {
+    if into >= EPOCH - OVERLAP {
         epochs.push(epoch + 1);
     }
     epochs
@@ -299,7 +305,8 @@ mod tests {
     /// behind, finds it at the nodes its own chain says.
     #[test]
     fn a_wallet_is_reached_by_the_nodes_of_both_epochs_where_they_meet() {
-        use crate::consensus::{EPOCH, GRACE};
+        use crate::consensus::EPOCH;
+        const GRACE: u32 = OVERLAP;
         assert_eq!(reached_epochs(0), [0]);
         assert_eq!(reached_epochs(GRACE), [0]);
         assert_eq!(reached_epochs(EPOCH - GRACE - 1), [0]);

@@ -197,14 +197,32 @@ pub fn read(bundle: &[u8], now: u64) -> Option<Checked> {
     if delegation.is_empty() {
         return Some(Checked { label, name, holder, seq, expires, by: signer, delegated: false });
     }
+    let word = delegated(delegation, now).filter(|word| word.name == name && word.signer == signer)?;
+    Some(Checked { label, name, holder, seq, expires: expires.min(word.expires), by: word.by, delegated: true })
+}
+
+/// The word of a name's holder that another key signs for the name,
+/// read and checked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Delegated {
+    pub name: Vec<u8>,
+    /// The id of the key that signs for the name.
+    pub signer: Digest,
+    pub expires: u64,
+    /// The id of the key that says so: the name's holder, if this is
+    /// what the name says on the chain.
+    pub by: Digest,
+}
+
+/// Reads and checks the word that a key signs for a name, at `now`:
+/// none if it is not one, is not signed by the key it carries, or is
+/// past its time or says too long a one.
+pub fn delegated(delegation: &[u8], now: u64) -> Option<Delegated> {
     let mut r = Reader(delegation);
-    let (of, named) = (r.name()?, digest_from_bytes(r.take(32)?)?);
-    let until = r.u64()?;
+    let (name, signer) = (r.name()?.to_vec(), digest_from_bytes(r.take(32)?)?);
+    let expires = r.u64()?;
     let by = id_of(r.signed(delegation, CTX_DELEGATE)?);
-    if of != name || named != signer || !in_time(until, now) {
-        return None;
-    }
-    Some(Checked { label, name, holder, seq, expires: expires.min(until), by, delegated: true })
+    in_time(expires, now).then_some(Delegated { name, signer, expires, by })
 }
 
 #[cfg(test)]

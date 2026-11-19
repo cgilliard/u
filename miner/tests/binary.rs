@@ -408,8 +408,10 @@ impl Prompted {
         // (Its wallet spends what one block has: these chains are short.)
         command.args(["--min-confirmations", "1"]);
         command.args(["--listen", listen]);
+        // (The nodes it is told of are its seeds too: wallets are
+        // reached at the seeds, and every node here is given the same.)
         for peer in peers {
-            command.args(["--peer", peer]);
+            command.args(["--peer", peer, "--seed", peer]);
         }
         if !mines {
             command.arg("--no-mine");
@@ -811,8 +813,24 @@ fn a_payment_is_sent_to_an_address() {
     // Not to nobody, nor to itself.
     assert!(payer.ask("send 5 tab1nothing").starts_with("error: 'tab1nothing' is no address"));
     assert!(payer.ask("send 5 @nobody").starts_with("error: nobody is not registered"));
+    // To itself, if it likes: answered, signed and pooled as any.
     let own = payer.ask("address").trim().to_string();
-    assert!(payer.ask(&format!("send 5 {own}")).starts_with("error: that is this wallet's own address"));
+    assert!(payer.ask(&format!("send 1 {own}")).contains(&format!("begun: 1 and a fee of")));
+    let began = Instant::now();
+    loop {
+        let log = std::fs::read_to_string(dirs[1].join("tabernacle.log")).unwrap();
+        if log.contains(&format!(" answered by {own}, signed and pooled: transaction ")) {
+            assert!(log.contains(&format!(" from {own} answered: 1 to this wallet")), "{log}");
+            break;
+        }
+        assert!(began.elapsed() < Duration::from_secs(60), "the wallet does not pay itself: {log}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // (Mined, and what it paid is the wallet's to spend again.)
+    while !payer.ask("slates").starts_with("no payments begun") || payer.confirmed() == "0" {
+        assert!(began.elapsed() < Duration::from_secs(120), "{}", payer.ask("slates"));
+        std::thread::sleep(Duration::from_millis(300));
+    }
     let sent = Instant::now();
     let begun = payer.ask(&format!("send 5 {to}"));
     assert!(begun.contains("begun: 5 and a fee of") && begun.contains(&to), "{begun}");
@@ -820,7 +838,7 @@ fn a_payment_is_sent_to_an_address() {
     // whoever reads the run.
     let pooled = loop {
         let log = std::fs::read_to_string(dirs[1].join("tabernacle.log")).unwrap();
-        if log.contains(" signed and pooled: transaction ") {
+        if log.contains(&format!(" answered by {to}, signed and pooled: transaction ")) {
             break sent.elapsed();
         }
         assert!(sent.elapsed() < Duration::from_secs(60), "the answer has not come: {log}");
@@ -1035,6 +1053,29 @@ fn a_wallet_is_paid_by_a_name_under_a_name() {
         log.contains(" to bob@mailhub was not delivered (that wallet is not there): given up")
     });
     assert!(hub.ask("send 1 bob@nothing").starts_with("error: nothing is not registered"));
+    // The hub says that alice's key signs for `mailhub`: alice then
+    // gives a name under it, to the hub's wallet, which is paid by it.
+    let word = dirs[1].join("mailhub.word").display().to_string();
+    let said = hub.ask(&format!("subname delegate mailhub {alice_is} 10 {word}"));
+    assert!(said.starts_with(&format!("for 10 days the key of {alice_is} signs for mailhub")), "{said}");
+    assert!(hub.ask(&format!("subname signer {word}")).starts_with("error: "), "it names another wallet");
+    let taken = alice.ask(&format!("subname signer {word}"));
+    assert!(taken.starts_with("this wallet signs for mailhub for 10.0 days more, by the word of"), "{taken}");
+    assert!(alice.ask("subnames").contains("signs for mailhub, by the word of"));
+    let given = alice.ask(&format!("subname set desk@mailhub {hub_is}"));
+    assert!(given.starts_with(&format!("desk@mailhub is {hub_is}")), "{given}");
+    wait("the hub is not reached by the name", &mut || hub.ask("subnames").contains("this wallet is desk@mailhub"));
+    wait("the hub is not reached by the name", &mut || hub.ask("subnames").contains("reached by it at 1 nodes"));
+    // (The hub pays its own name: to itself, by a certificate of
+    // another key's, which answers to the hub's word.)
+    let held = alice.confirmed();
+    assert!(hub.ask("send 2 desk@mailhub").contains("to desk@mailhub"));
+    wait("the name signed for by word is not paid", &mut || {
+        let log = std::fs::read_to_string(dirs[1].join("tabernacle.log")).unwrap();
+        log.contains(&format!(": desk@mailhub is {hub_is}"))
+            && log.contains(&format!(" answered by {hub_is}, signed and pooled"))
+    });
+    assert_eq!(alice.confirmed(), held);
     // The wallet is the name no longer, if it says so: and is not
     // paid by it.
     assert_eq!(alice.ask("subname drop alice@mailhub"), "this wallet is alice@mailhub no longer\n");

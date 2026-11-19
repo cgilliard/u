@@ -2073,7 +2073,7 @@ fn a_name_under_a_name(relays: bool) {
         false => {
             for i in 0..7 {
                 (2..7).filter(|seed| *seed != i).for_each(|seed| {
-                    w.nodes[i].add_peer(at(seed), true, 0);
+                    w.nodes[i].add_seed(at(seed), 0);
                 });
             }
         }

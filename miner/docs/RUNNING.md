@@ -598,8 +598,10 @@ with three relays at the least. Until a file is in force, and whenever
 none is, the mode is init.
 
 **Being reached.** A wallet is reached through nodes that stand
-between wallets: while no consensus file names relays, the seeds and
-the peers the node was given, three of them at the most, chosen by the
+between wallets: while no consensus file names relays, the seeds
+(those built in, and those of `--seed`, which every node of a network
+that uses it is to be given the same; a `--peer` is one node's own and
+no wallet is looked for there), three of them at the most, chosen by the
 wallet's address and changed every 144 blocks. The node says to each,
 every half minute, that its wallet is there, and gives it what the
 wallet announces: a key to seal to, made anew every hour, under the
@@ -645,7 +647,7 @@ for half an hour. What goes along a way is filled out to one of six
 lengths (a datagram; 8, 16, 32, 48 and 80 thousand bytes): going on to
 another relay, saying a wallet is there and asking after one are all
 of the second, both ways, and a relay that passes a thing on learns
-from its length only which of the six it is. For six blocks either
+from its length only which of the six it is. For two blocks either
 side of where the relays a wallet is reached at change (every 144
 blocks) it is reached at those of both, so that whoever pays, a block
 ahead or behind, finds it. In a build with the dev networks, on one of them,
@@ -670,9 +672,26 @@ the wallet it names: one asking, as for an address, and the same at
 the seeds and by ways through relays. Nothing is kept anywhere for a
 wallet that is not there: a name resolves while its wallet is reached.
 `subnames` says the names given and the names the wallet is; `subname
-del alice@mailhub` signs for one no longer (its last certificate holds
-until its time is past; giving the name to another wallet ends it at
-once, the newer certificate taking its place). A name that says
+del alice@mailhub` signs for one no longer. Its last certificate holds
+until its time is past, up to seven days: there is no taking a name
+back at once, since nothing is kept anywhere that could say it was
+taken back. (Giving the name to another wallet does end it for the
+first, the newer certificate taking its place where both are shown.)
+
+The wallet that holds a name need not be the one that signs all day.
+`subname delegate mailhub tab1… [DAYS] FILE`, at the wallet the name
+says, writes its word that the key of the wallet at that address signs
+for `mailhub`, and for no other name, for so many days (30 if not
+said, 90 at the most); it asks nothing of the chain, so that it can be
+said on a machine that is never on a network. `subname signer FILE`,
+at the other wallet, takes it: that wallet then gives names under
+`mailhub` with `subname set`, and each certificate goes with the word.
+There is no taking the word back before its time but by having the
+name say another address, which ends every certificate under it.
+
+A wallet may pay itself, by its address or a name it is: the payment
+goes round by the nodes it is reached at like any other, which shows
+that it is reached. A name that says
 another address on the chain is given under by that wallet from then
 on, and every certificate of the wallet before it is nothing.
 

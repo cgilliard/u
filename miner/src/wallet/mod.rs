@@ -97,6 +97,10 @@ const T_NAMES_GIVEN: usize = 13;
 /// number of its certificate and until when it holds (eight bytes
 /// each), and the certificate with what goes with it.
 const T_NAMES_HELD: usize = 14;
+/// The names this wallet's key signs for by the word of whoever holds
+/// them ([`crate::subnames::delegate`]): by an id made of the name,
+/// that word.
+const T_NAMES_SIGNED: usize = 15;
 
 /// A name this wallet has given out under a name it holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -831,6 +835,8 @@ struct Tables {
     /// names it is ([`Wallet::give_name`], [`Wallet::hold_name`]).
     names_given: BTreeMap<Id, Given>,
     names_held: BTreeMap<Id, Vec<u8>>,
+    /// The names this wallet signs for by their holders' word.
+    names_signed: BTreeMap<Id, Vec<u8>>,
     /// Which of the wallet's addresses it is at: the first, for a new
     /// wallet; one drawn at random, for a wallet made again from its
     /// words, so that it is at an address never used before.
@@ -915,6 +921,7 @@ impl Tables {
             T_SENT_TO => put_entries(self.sent_to.iter().map(|(slate, whom)| (slate, whom.to_vec()))),
             T_NAMES_GIVEN => put_entries(self.names_given.iter().map(|(at, given)| (at, given.to_bytes()))),
             T_NAMES_HELD => put_entries(self.names_held.iter().map(|(at, bundle)| (at, bundle.clone()))),
+            T_NAMES_SIGNED => put_entries(self.names_signed.iter().map(|(at, word)| (at, word.clone()))),
             T_ADDRESS => match self.address {
                 0 => Vec::new(),
                 at => at.to_le_bytes().to_vec(),
@@ -950,6 +957,9 @@ impl Tables {
         }
         for (at, given) in get_entries(&table(T_NAMES_GIVEN)?).ok_or(WalletError::Corrupt("names given"))? {
             t.names_given.insert(at, Given::from_bytes(given).ok_or(WalletError::Corrupt("name given"))?);
+        }
+        for (at, word) in get_entries(&table(T_NAMES_SIGNED)?).ok_or(WalletError::Corrupt("names signed for"))? {
+            t.names_signed.insert(at, word.to_vec());
         }
         for (at, held) in get_entries(&table(T_NAMES_HELD)?).ok_or(WalletError::Corrupt("names held"))? {
             if held.len() < 16 {
@@ -1937,8 +1947,18 @@ impl<B: Backend> Wallet<B> {
     /// name's certificate if this wallet's address is what the name
     /// says on the chain: whoever calls sees to that.) Kept, to be
     /// signed again as its time runs out ([`Wallet::names_to_renew`]).
-    /// The certificate as it travels.
-    pub fn give_name(&mut self, label: &[u8], name: &[u8], holder: &crate::hash::Digest, unix: u64) -> Result<Vec<u8>> {
+    /// The certificate as it travels: with `word`, the word of the
+    /// name's holder that this wallet's key signs for the name, where
+    /// it is by that word and not as the holder that this wallet
+    /// signs.
+    pub fn give_name(
+        &mut self,
+        label: &[u8],
+        name: &[u8],
+        holder: &crate::hash::Digest,
+        unix: u64,
+        word: Option<&[u8]>,
+    ) -> Result<Vec<u8>> {
         use crate::subnames::{HOLDS, bundle, certify, point};
         let at = digest_to_bytes(&point(label, name));
         let seq = self.t.names_given.get(&at).map_or(0, |given| given.seq + 1).max(unix);
@@ -1947,7 +1967,26 @@ impl<B: Backend> Wallet<B> {
         let mut t = self.t.clone();
         t.names_given.insert(at, Given { label: label.to_vec(), name: name.to_vec(), holder: *holder, seq, expires });
         self.commit(t, &[T_NAMES_GIVEN])?;
-        Ok(bundle(&certificate, None))
+        Ok(bundle(&certificate, word))
+    }
+
+    /// Keeps the word of a name's holder that this wallet's key signs
+    /// for the name: in place of an earlier one for that name.
+    pub fn sign_for(&mut self, name: &[u8], word: &[u8]) -> Result<()> {
+        let mut t = self.t.clone();
+        t.names_signed.insert(digest_to_bytes(&crate::subnames::point(b"", name)), word.to_vec());
+        self.commit(t, &[T_NAMES_SIGNED])
+    }
+
+    /// The word by which this wallet's key signs for `name`, if it was
+    /// given one.
+    pub fn signs_for(&self, name: &[u8]) -> Option<&[u8]> {
+        self.t.names_signed.get(&digest_to_bytes(&crate::subnames::point(b"", name))).map(|word| &word[..])
+    }
+
+    /// Every such word.
+    pub fn signs_for_all(&self) -> Vec<Vec<u8>> {
+        self.t.names_signed.values().cloned().collect()
     }
 
     /// The names this wallet has given out, in the order of their ids.

@@ -759,12 +759,12 @@ fn names_under_names_are_kept() {
     let mut owner = new();
     let mut alice = new();
     let unix = 1_800_000_000;
-    let first = owner.give_name(b"alice", b"mailhub", &alice.id(), unix).unwrap();
+    let first = owner.give_name(b"alice", b"mailhub", &alice.id(), unix, None).unwrap();
     let checked = read(&first, unix).unwrap();
     assert_eq!((checked.full(), checked.holder, checked.by), ("alice@mailhub".to_string(), alice.id(), owner.id()));
     assert_eq!((checked.seq, checked.expires, checked.delegated), (unix, unix + HOLDS, false));
     // Again at once: a higher number. Not due again until a day on.
-    let again = read(&owner.give_name(b"alice", b"mailhub", &alice.id(), unix).unwrap(), unix).unwrap();
+    let again = read(&owner.give_name(b"alice", b"mailhub", &alice.id(), unix, None).unwrap(), unix).unwrap();
     assert_eq!(again.seq, unix + 1);
     assert!(owner.names_to_renew(unix + RENEWED).is_empty());
     assert_eq!(owner.names_to_renew(unix + RENEWED + 1).len(), 1);
@@ -774,15 +774,27 @@ fn names_under_names_are_kept() {
     assert!(!owner.hold_name(&checked, &first, 5).unwrap(), "it names another wallet");
     assert!(alice.hold_name(&checked, &first, 5).unwrap());
     assert!(!alice.hold_name(&checked, &first, 5).unwrap(), "no newer than the one held");
-    let newer = owner.give_name(b"alice", b"mailhub", &alice.id(), unix).unwrap();
+    let newer = owner.give_name(b"alice", b"mailhub", &alice.id(), unix, None).unwrap();
     assert!(alice.hold_name(&read(&newer, unix).unwrap(), &newer, 5).unwrap());
-    let other = owner.give_name(b"al", b"mailhub", &alice.id(), unix).unwrap();
+    let other = owner.give_name(b"al", b"mailhub", &alice.id(), unix, None).unwrap();
     assert!(!alice.hold_name(&read(&other, unix).unwrap(), &other, 1).unwrap(), "one name is the most");
     assert!(alice.hold_name(&read(&other, unix).unwrap(), &other, 2).unwrap());
     let held = reopened(&alice, "").unwrap().names_held();
     assert_eq!(held, alice.names_held());
     assert_eq!(held.len(), 2);
     assert!(held.contains(&(point(b"alice", b"mailhub"), unix + 2, newer)));
+    // By the word of a name's holder, a wallet that does not hold the
+    // name signs for it: the word goes with what it signs.
+    let mut signer = new();
+    let word = crate::subnames::delegate(&owner.identity_key(), b"mailhub", &signer.id(), unix + 86_400);
+    signer.sign_for(b"mailhub", &word).unwrap();
+    assert_eq!(reopened(&signer, "").unwrap().signs_for(b"mailhub"), Some(&word[..]));
+    assert_eq!((signer.signs_for(b"mailhut"), signer.signs_for_all().len()), (None, 1));
+    let by_word = signer
+        .give_name(b"carol", b"mailhub", &alice.id(), unix, signer.signs_for(b"mailhub").map(<[u8]>::to_vec).as_deref())
+        .unwrap();
+    let carol = read(&by_word, unix).unwrap();
+    assert_eq!((carol.by, carol.delegated, carol.expires), (owner.id(), true, unix + 86_400));
     // Let go of, on either side.
     assert!(alice.drop_name(b"alice", b"mailhub").unwrap() && !alice.drop_name(b"alice", b"mailhub").unwrap());
     assert!(owner.take_name_back(b"al", b"mailhub").unwrap() && !owner.take_name_back(b"al", b"mailhub").unwrap());
