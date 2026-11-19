@@ -53,9 +53,10 @@ At each, `address` says its wallet's address (`tab1…`); `status` says
 4. To nobody: at W1, `send 1 <any address nobody holds>`: an error in
    the log within a few seconds, `was not delivered (that wallet is
    not there): given up, nothing was spent`; `slates` is empty.
-5. A name: at H, `name-commit mailhub`; after a block, `name-reveal
-   mailhub`; when `names` says `owned`, `name-update mailhub <H's
-   address>`. Then at W1, `send 2 @mailhub`.
+5. A name: at H, `name-commit mailhub` (it will say H's address,
+   nothing else being said); after a block, `name-reveal mailhub`.
+   When `names` says `owned`, at W1, `send 2 @mailhub`. (A name that
+   is registered already is refused at the commit.)
 6. A name under it: at H, `subname set alice@mailhub <W2's address>`.
    At W2, `subnames` says `this wallet is alice@mailhub … reached by it
    at 2 nodes`. At W1, `send 3 alice@mailhub`: W1's log says

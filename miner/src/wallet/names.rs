@@ -501,7 +501,7 @@ impl<B: Backend> Wallet<B> {
         if self.t.commits.is_empty() && self.t.names.is_empty() {
             return Ok(0);
         }
-        let mut changed = 0;
+        let (mut changed, mut gave_up) = (0, false);
         let mut t = self.t.clone();
         // A pending commit whose reveal landed after all.
         for c in self.pending_commits() {
@@ -554,13 +554,28 @@ impl<B: Backend> Wallet<B> {
                     changed += 1;
                 }
             } else if entry.transferring || entry.stage != NameStage::Offered {
-                // Signed away, or registered by someone else first.
+                // Signed away, or registered by someone else first. Of
+                // the second: this wallet's own reveal of the name, if
+                // no block has it, never will be in one, and is given
+                // up, so that what it would have spent is free again.
+                if entry.stage == NameStage::Revealed && !entry.transferring {
+                    let reveals = |sent: &&Sent| {
+                        let of_it = |op: &NameOp| matches!(op, NameOp::Reveal { record, .. } if record.name.as_bytes() == &entry.name[..]);
+                        sent.tx.ops.iter().any(of_it)
+                    };
+                    let dead: Vec<Commitment> = t.sent.values().filter(reveals).map(|sent| sent.txid).collect();
+                    for txid in dead {
+                        gave_up |= Self::unsend_in(&mut t, &txid);
+                    }
+                }
                 t.names.remove(&entry.name);
                 changed += 1;
             }
         }
         if changed > 0 {
-            self.commit(t, &[T_COMMITS, T_NAMES])?;
+            let tables: &[usize] =
+                if gave_up { &[T_COMMITS, T_NAMES, T_OUTPUTS, T_SENT] } else { &[T_COMMITS, T_NAMES] };
+            self.commit(t, tables)?;
         }
         Ok(changed)
     }

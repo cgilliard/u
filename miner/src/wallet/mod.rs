@@ -1702,6 +1702,33 @@ impl<B: Backend> Wallet<B> {
         Ok(signed)
     }
 
+    /// Gives up a transaction this wallet signed and nobody took: one
+    /// the pool refused, so that no block can ever hold it. What it
+    /// would have spent is the wallet's to spend again, and what it
+    /// would have made is forgotten. (Never of one that was sent on:
+    /// that one may yet be mined, and is taken back with a replacement,
+    /// [`Wallet::cancel_sent`].) Whether there was such a transaction.
+    pub fn unsend(&mut self, txid: &Commitment) -> Result<bool> {
+        let mut t = self.t.clone();
+        let was = Self::unsend_in(&mut t, txid);
+        self.commit(t, &[T_OUTPUTS, T_SENT])?;
+        Ok(was)
+    }
+
+    /// [`Wallet::unsend`], in tables not yet written.
+    fn unsend_in(t: &mut Tables, txid: &Commitment) -> bool {
+        let Some(sent) = t.sent.remove(&digest_to_bytes(txid)) else { return false };
+        for c in &sent.inputs {
+            if let Some(o) = t.outputs.get_mut(&digest_to_bytes(c)) {
+                o.state = State::Unspent;
+            }
+        }
+        for made in &sent.tx.outputs {
+            t.outputs.remove(&digest_to_bytes(&made.commitment));
+        }
+        true
+    }
+
     /// Abandons a pending slate: its inputs become spendable again and its
     /// change record is dropped.
     pub fn cancel_slate(&mut self, id: &[u8; 32]) -> Result<()> {

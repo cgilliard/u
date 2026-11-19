@@ -251,6 +251,9 @@ pub enum Skip {
     /// Not fetched (yet).
     NotHeld,
     Invalid(ParseError),
+    /// No more than half the window's blocks voted, for any file: so
+    /// many must.
+    TooFew(u32),
 }
 
 impl std::fmt::Display for Skip {
@@ -258,13 +261,17 @@ impl std::fmt::Display for Skip {
         match self {
             Skip::NotHeld => f.write_str("not fetched"),
             Skip::Invalid(e) => write!(f, "invalid: {e}"),
+            Skip::TooFew(needed) => write!(f, "too few blocks voted: {needed} of the window's must, for any file"),
         }
     }
 }
 
-/// The file in force: the most voted of the window's files that is held
-/// and valid, ties to the most recently committed; init mode when there
-/// is none.
+/// The file in force. If more than half the window's blocks voted, for
+/// any file: the most voted of the files that is held and valid, ties
+/// to the most recently committed. If no more than half voted, or
+/// there is no such file: init mode. (So it is those who make most of
+/// the blocks who say which relays there are, and a few blocks of
+/// somebody else's while nobody is voting say nothing.)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Current {
     pub mode: Mode,
@@ -278,13 +285,22 @@ pub struct Current {
 }
 
 impl Current {
-    /// Decides from the votes, given the bytes of each file held.
-    pub fn decide(votes: &Votes, mut held: impl FnMut(&Hash) -> Option<Vec<u8>>) -> Current {
+    /// How many of a window of `of` blocks must vote, for any file,
+    /// for one to be in force: more than half.
+    pub fn needed(of: u32) -> u32 {
+        of / 2 + 1
+    }
+
+    /// Decides from the votes over a window of `of` blocks, given the
+    /// bytes of each file held.
+    pub fn decide(votes: &Votes, of: u32, mut held: impl FnMut(&Hash) -> Option<Vec<u8>>) -> Current {
         let mut skipped = Vec::new();
+        let (needed, cast) = (Self::needed(of), votes.cast());
         for &(hash, n, _) in &votes.counts {
             match held(&hash).map(|b| File::parse(&b)) {
                 None => skipped.push((hash, n, Skip::NotHeld)),
                 Some(Err(e)) => skipped.push((hash, n, Skip::Invalid(e))),
+                Some(Ok(_)) if cast < needed => skipped.push((hash, n, Skip::TooFew(needed))),
                 Some(Ok(file)) => {
                     return Current { mode: file.mode, winner: Some((hash, n)), file: Some(file), skipped };
                 }
@@ -393,11 +409,14 @@ mod tests {
         assert_eq!(File::parse(&[0xffu8, 0xfe]), Err(ParseError::NotText));
         assert!(matches!(File::parse(&vec![b' '; MAX_CONSENSUS + 1]), Err(ParseError::TooLarge(_))));
         assert_eq!(ParseError::TooFewRelays(2).to_string(), "onion mode lists 2 relays, fewer than the 3 needed");
-        // The decision: the most voted file held and valid, whatever its
-        // mode; files not held or invalid count for nothing.
+        // The decision: if more than half the window's blocks voted, for
+        // any file, the most voted file held and valid, whatever its
+        // mode; files not held or invalid count for nothing. If no more
+        // than half voted, nothing is in force.
         let (x, y, z) = ([1u8; 32], [2u8; 32], [3u8; 32]);
         let cast = [(1, x), (2, x), (3, x), (4, y), (5, y), (6, z)];
         let votes = Votes::tally((1, 6), cast.into_iter().map(|(h, file)| (id(h), h, Some(file))));
+        assert_eq!((Current::needed(7), Current::needed(144), Current::needed(6), votes.cast()), (4, 73, 4, 6));
         fn files<'a>(
             x: Option<&'a [u8]>,
             y: Option<&'a [u8]>,
@@ -406,28 +425,45 @@ mod tests {
             move |h: &Hash| [x, y, z][h[0] as usize - 1].map(|b| b.to_vec())
         }
         let none = Current { mode: Mode::Init, winner: None, file: None, skipped: vec![] };
-        assert_eq!(Current::decide(&Votes::default(), |_| None), none);
+        assert_eq!(Current::decide(&Votes::default(), 6, |_| None), none);
         // Nothing held: init, and every file is to be fetched.
-        let c = Current::decide(&votes, files(None, None, None));
+        let c = Current::decide(&votes, 6, files(None, None, None));
         assert_eq!((c.mode, c.winner), (Mode::Init, None));
         assert_eq!(c.unfetched().collect::<Vec<_>>(), vec![&x, &y, &z]);
         // The leader is not held: the next, valid, is in force meanwhile,
         // and the leader is still wanted.
-        let c = Current::decide(&votes, files(None, Some(onion.as_bytes()), None));
+        let c = Current::decide(&votes, 6, files(None, Some(onion.as_bytes()), None));
         assert_eq!((c.mode, c.winner), (Mode::Onion, Some((y, 2))));
         assert_eq!(c.file.as_ref().unwrap().relays.len(), 3);
         assert_eq!(c.unfetched().collect::<Vec<_>>(), vec![&x]);
         // The leader is invalid: it counts for nothing.
-        let c = Current::decide(&votes, files(Some(b"mode tor\n"), Some(onion.as_bytes()), None));
+        let c = Current::decide(&votes, 6, files(Some(b"mode tor\n"), Some(onion.as_bytes()), None));
         assert_eq!(c.winner, Some((y, 2)));
         assert!(matches!(c.skipped[..], [(h, 3, Skip::Invalid(ParseError::BadMode(1)))] if h == x));
         assert_eq!(c.unfetched().count(), 0);
         // An explicit vote for init wins like any other.
-        let c = Current::decide(&votes, files(Some(b"mode init\n"), Some(onion.as_bytes()), None));
+        let c = Current::decide(&votes, 6, files(Some(b"mode init\n"), Some(onion.as_bytes()), None));
         assert_eq!((c.mode, c.winner), (Mode::Init, Some((x, 3))));
         // Only invalid files: init, with nothing in force.
-        let c = Current::decide(&votes, files(Some(b"x"), Some(b"y"), Some(b"z")));
+        let c = Current::decide(&votes, 6, files(Some(b"x"), Some(b"y"), Some(b"z")));
         assert_eq!((c.mode, c.winner, c.skipped.len()), (Mode::Init, None, 3));
+        // The most voted wins though it has fewer than half itself: it
+        // is that most of the blocks voted, for whatever, that counts.
+        // (Six of eleven blocks voted, three of them for the first.)
+        let c = Current::decide(&votes, 11, files(Some(onion.as_bytes()), Some(b"mode init\n"), None));
+        assert_eq!((c.mode, c.winner), (Mode::Onion, Some((x, 3))));
+        // No more than half the window's blocks voted: nothing is in
+        // force, whatever they voted for. (Six of twelve is half; six
+        // of a hundred and forty-four, a few blocks of somebody's.)
+        for of in [12, 144] {
+            let c = Current::decide(&votes, of, files(Some(onion.as_bytes()), Some(onion.as_bytes()), None));
+            assert_eq!((c.mode, c.winner), (Mode::Init, None), "of {of}");
+            let needed = Current::needed(of);
+            assert!(
+                matches!(c.skipped[..2], [(_, 3, Skip::TooFew(n)), (_, 2, Skip::TooFew(m))] if n == needed && m == needed)
+            );
+            assert_eq!(c.unfetched().collect::<Vec<_>>(), vec![&z], "one not held is still wanted");
+        }
     }
 
     #[test]

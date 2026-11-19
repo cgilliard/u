@@ -156,7 +156,8 @@ impl<B: Backend + 'static, V> Chain<B, V> {
             _ => self.consensus_votes_at(end, crate::consensus::WINDOW)?,
         };
         let mut failed = None;
-        let current = crate::consensus::Current::decide(&votes, |hash| match self.consensus_file(hash) {
+        let of = crate::consensus::WINDOW;
+        let current = crate::consensus::Current::decide(&votes, of, |hash| match self.consensus_file(hash) {
             Ok(file) => file,
             Err(e) => {
                 failed = Some(e);

@@ -93,8 +93,10 @@ pub const HELP: &str = "commands:
   name NAME                 look a name up on the chain
   name-commit NAME [VALUE [FEE]]
                             start registering NAME: pool a transaction committing to
-                            it, which says nothing of the name (VALUE: 64 hex digits,
-                            what the name is to say; `-` or nothing for nothing yet)
+                            it, which says nothing of the name (VALUE: what the name
+                            is to say, an address or 64 hex digits; this wallet's
+                            address if not said, so that the name is paid by; `-`
+                            for nothing)
   name-reveal NAME [WAIT [FEE]]
                             reveal a committed name once its commit is WAIT blocks
                             old: at least 1; as many as the wallet waits before it
@@ -283,7 +285,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             },
             ("names", []) => self.names(),
             ("name", [name]) => self.name(name),
-            ("name-commit", [name]) => self.name_commit(name, "-", None),
+            ("name-commit", [name]) => self.name_commit(name, "", None),
             ("name-commit", [name, value]) => self.name_commit(name, value, None),
             ("name-commit", [name, value, fee]) => self.name_commit(name, value, Some(fee)),
             ("name-reveal", [name]) => self.name_reveal(name, "", None),
@@ -291,7 +293,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             ("name-reveal", [name, wait, fee]) => self.name_reveal(name, wait, Some(fee)),
             ("name-update", [name, value]) => self.name_update(name, value, None),
             ("name-update", [name, value, fee]) => self.name_update(name, value, Some(fee)),
-            ("name-offer", [name, file]) => self.name_offer(name, file, "-"),
+            ("name-offer", [name, file]) => self.name_offer(name, file, ""),
             ("name-offer", [name, file, value]) => self.name_offer(name, file, value),
             ("name-transfer", [file]) => self.name_transfer(file, None),
             ("name-transfer", [file, fee]) => self.name_transfer(file, Some(fee)),
@@ -519,6 +521,24 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
                 lines.push(format!("  relay {} {}", crate::address::encode(&relay.id), relay.addr));
             }
         }
+        // Where this node's wallet is reached, by what is in force.
+        if let Some((by_ways, nodes)) = self.hold.rendezvous() {
+            let reached = nodes.iter().filter(|node| node.1).count();
+            let each: Vec<String> = nodes
+                .iter()
+                .map(|(node, reached)| format!("{node}{}", if *reached { "" } else { " (not reached)" }))
+                .collect();
+            let how = match by_ways {
+                true => "relays of the file in force, by ways through the others",
+                false => "the seeds: no file names relays",
+            };
+            lines.push(match nodes.is_empty() {
+                true => format!("rendezvous points: none ({how})"),
+                false => {
+                    format!("rendezvous points ({how}), reached at {reached} of {}: {}", nodes.len(), each.join(", "))
+                }
+            });
+        }
         // What is being voted for now, towards the next boundary.
         let running = chain.consensus_votes(height + 1 - boundary(height)).map_err(|e| e.to_string())?;
         for (hash, n, _) in &running.counts {
@@ -534,8 +554,10 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
                 commas(next as u64)
             )),
             false => {
-                let would =
-                    crate::consensus::Current::decide(&running, |hash| chain.consensus_file(hash).ok().flatten());
+                let would = crate::consensus::Current::decide(&running, WINDOW, |hash| {
+                    chain.consensus_file(hash).ok().flatten()
+                });
+                let needed = crate::consensus::Current::needed(WINDOW);
                 for (hash, n, why) in &would.skipped {
                     lines.push(format!(
                         "  as it stands not counted: {} ({} votes): {why}",
@@ -543,12 +565,20 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
                         commas(*n as u64)
                     ));
                 }
-                let by = would.winner.map_or("no file that counts".to_string(), |(hash, _)| hex(&hash));
-                lines.push(format!(
-                    "as the votes stand, from block {} the mode will be {}, by {by}",
-                    commas(next as u64),
-                    would.mode
-                ));
+                match would.winner {
+                    Some((hash, _)) => lines.push(format!(
+                        "as the votes stand, from block {} the mode will be {}, by {}",
+                        commas(next as u64),
+                        would.mode,
+                        hex(&hash)
+                    )),
+                    None => lines.push(format!(
+                        "as the votes stand, from block {} the mode will be init: {} of the {WINDOW} blocks have voted, \
+                         and {needed} must for a file to be in force",
+                        commas(next as u64),
+                        commas(running.cast() as u64)
+                    )),
+                }
             }
         }
         // What the blocks made here vote for: of those begun since it
@@ -638,7 +668,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             ("unverified", b.unverified),
             ("reserved", b.reserved),
             ("locked", b.locked),
-            ("lost", b.lost),
+            ("orphaned", b.lost),
         ];
         for (what, amount) in rest {
             if amount > 0 {
@@ -657,7 +687,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             let held = wallet.held(&o, &snap).map_err(|e| e.to_string())?;
             let what = match (o.state, held) {
                 (State::Unspent, true) => "confirmed",
-                (State::Unspent, false) if wallet.is_lost(&o.commitment) => "lost",
+                (State::Unspent, false) if wallet.is_lost(&o.commitment) => "orphaned",
                 (State::Unspent, false) => "pending",
                 (State::Reserved, _) => "reserved",
                 (State::Spent, true) => "locked",
@@ -997,7 +1027,7 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         });
         word.map(Some).ok_or_else(|| {
             format!(
-                "{name} is not this wallet's to give names under: it says {}, this wallet is {}, and has no word of                  that wallet's that holds (subname signer FILE)",
+                "{name} is not this wallet's to give names under: it says {}, this wallet is {}, and has no word of that wallet's that holds (subname signer FILE)",
                 crate::address::encode(&says),
                 wallet.address()
             )
@@ -1463,7 +1493,18 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
         let snap = state.snapshot().map_err(|e| e.to_string())?;
         match Registry::record(&snap, name.as_bytes()).map_err(|e| e.to_string())? {
             Some(record) => {
-                Ok(format!("{name} says {}\n  its owner's key: {}", Self::hex(&record.value), Self::hex(&record.owner)))
+                // (As an address too, which is what it mostly is.)
+                let zero = record.value == [crate::poseidon2::Fp::ZERO; 8];
+                let address = if zero {
+                    String::new()
+                } else {
+                    format!("\n  as an address: {}", crate::address::encode(&record.value))
+                };
+                Ok(format!(
+                    "{name} says {}{address}\n  its owner's key: {}",
+                    Self::hex(&record.value),
+                    Self::hex(&record.owner)
+                ))
             }
             None => Ok(format!("{name} is not registered")),
         }
@@ -1494,24 +1535,51 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
                 (self.log)(&said);
                 Ok(said)
             }
+            // (Refused: no block can hold it. The wallet is as it was
+            // before: what the transaction would have spent is its to
+            // spend, and the name is where it stood.)
             Err(why) => {
-                let failed = format!("{done}, but the pool does not take transaction {id}: {why}");
+                wallet.unsend(&signed.tx.txid()).map_err(|e| e.to_string())?;
+                wallet.undo_name_op(&op).map_err(|e| e.to_string())?;
+                let what = done.split(':').next().unwrap_or(done);
+                let failed = format!("{what}: the pool does not take the transaction: {why}. Nothing was done");
                 (self.log)(&format!("Error: {failed}"));
                 Err(failed)
             }
         }
     }
 
+    /// An error if `name` is registered already, to another wallet's
+    /// key: there is no use committing to it, or revealing it.
+    fn free_to_take(&self, name: &str) -> Result<(), String> {
+        let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
+        let snap = state.snapshot().map_err(|e| e.to_string())?;
+        match Registry::record(&snap, name.as_bytes()).map_err(|e| e.to_string())? {
+            Some(_) => Err(format!("{name} is registered already, to another wallet: see `name {name}`")),
+            None => Ok(()),
+        }
+    }
+
     fn name_commit(&self, name: &str, value: &str, fee: Option<&&str>) -> Said {
-        let (value, fee) = (Self::value(value)?, Self::fee(fee)?);
+        let fee = Self::fee(fee)?;
+        self.free_to_take(name)?;
         self.observe()?;
         let mut wallet = self.wallet()?;
+        // (What it is to say, if that is not said: this wallet's
+        // address, so that the name is one to be paid by.)
+        let value = match value {
+            "" => wallet.id(),
+            value => Self::value(value)?,
+        };
         let op = wallet.name_commit(name.as_bytes(), value, (self.unix)()).map_err(|e| e.to_string())?;
         self.carry(&mut wallet, op, fee, &format!("Name {name}: committed to"))
     }
 
     fn name_reveal(&self, name: &str, wait: &str, fee: Option<&&str>) -> Said {
         let fee = Self::fee(fee)?;
+        // (Registered by another since it was committed to: the commit
+        // is kept as it is, and nothing is signed.)
+        self.free_to_take(name)?;
         self.observe()?;
         let mut wallet = self.wallet()?;
         // Not said: as long as the wallet waits before it spends an
@@ -1538,8 +1606,13 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
     }
 
     fn name_offer(&self, name: &str, file: &str, value: &str) -> Said {
-        let value = Self::value(value)?;
-        let record = self.wallet()?.name_offer(name.as_bytes(), value, (self.unix)()).map_err(|e| e.to_string())?;
+        let mut wallet = self.wallet()?;
+        let value = match value {
+            "" => wallet.id(),
+            value => Self::value(value)?,
+        };
+        let record = wallet.name_offer(name.as_bytes(), value, (self.unix)()).map_err(|e| e.to_string())?;
+        drop(wallet);
         let b64 = crate::wallet::base64_encode(&record.to_bytes());
         let mut text = format!("-----BEGIN {OFFER_MARKER}-----\n");
         for line in b64.as_bytes().chunks(64) {

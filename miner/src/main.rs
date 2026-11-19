@@ -886,9 +886,9 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
                     let c = did.changed;
                     for (n, what) in [
                         (c.undone, "payments sent are in no block any more: they are to be mined again"),
-                        (c.lost, "outputs are in no block any more: lost, unless a block makes them again"),
-                        (c.returned, "outputs that were lost are in the chain again"),
-                        (c.forgotten, "outputs lost for too long are forgotten"),
+                        (c.lost, "outputs are in no block any more: orphaned, unless a block makes them again"),
+                        (c.returned, "outputs that were orphaned are in the chain again"),
+                        (c.forgotten, "outputs orphaned for too long are forgotten"),
                     ] {
                         if n > 0 {
                             main.log(&format!("The wallet: {n} {what}"));

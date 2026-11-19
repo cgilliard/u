@@ -4828,6 +4828,30 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
         self.shared.names.lock().unwrap().insert(name.to_vec(), value);
     }
 
+    /// The nodes this node's wallet is to be reached at now, and
+    /// whether it is reached at each: the relays of the file in force
+    /// that its address and the chain's height choose, by ways through
+    /// the others (true); or, while no file names relays, the seeds
+    /// (false). None of a node that is no wallet's.
+    pub fn rendezvous(&self) -> Option<(bool, Vec<(SocketAddrV4, bool)>)> {
+        let relays = Arc::clone(&self.shared.relays.lock().unwrap_or_else(|e| e.into_inner()));
+        let seeds: Vec<SocketAddrV4> =
+            self.shared.seeds.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
+        let height = self.chain.tip().map_or(0, |tip| tip.height);
+        let wallet = self.shared.participant.lock().unwrap_or_else(|e| e.into_inner());
+        let own = wallet.as_ref()?;
+        let by_ways = !relays.is_empty();
+        let of = if by_ways { relays.len() } else { seeds.len() };
+        let mut nodes: Vec<SocketAddrV4> = Vec::new();
+        for epoch in crate::msg::reached_epochs(height) {
+            for i in crate::msg::points(&own.id(), epoch, of) {
+                let node = if by_ways { relays[i].1 } else { Some(seeds[i]) };
+                nodes.extend(node.filter(|node| !nodes.contains(node)));
+            }
+        }
+        Some((by_ways, nodes.into_iter().map(|node| (node, own.is_held(&node))).collect()))
+    }
+
     /// A node at which another node has announced this node's wallet
     /// since this one did, if one has since this was last asked: two
     /// copies of one wallet are running at once.

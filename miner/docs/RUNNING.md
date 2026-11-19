@@ -820,6 +820,15 @@ wallet`; a payment given up is said as that.
 steps, so that nobody who sees the first can take the name before the
 second:
 
+A name says this wallet's address unless something else is said for
+it (`name-commit alice tab1…`, or `-` for nothing): so that it is a
+name to be paid by, `send 5 @alice`. A name that is registered already
+is refused when it is committed to, and again when it is revealed, by
+this wallet looking at the chain: a commit says nothing of its name,
+so no node could. If another wallet registers the name between the
+two, nothing is signed, and nothing spent; and whatever the pool will
+not take leaves the wallet as it was.
+
 1. `name-commit alice` pools a transaction that commits to the name
    and says nothing of it.
 2. `name-reveal alice` pools one that reveals it, once the commit has
@@ -886,9 +895,9 @@ it, and nothing has to be done:
 
 ```
 [2026-11-17 21:04:10:318] The wallet: 1 payments sent are in no block any more: they are to be mined again
-[2026-11-17 21:04:10:318] The wallet: 1 outputs are in no block any more: lost, unless a block makes them again
+[2026-11-17 21:04:10:318] The wallet: 1 outputs are in no block any more: orphaned, unless a block makes them again
 [2026-11-17 21:04:10:402] The wallet: payment sent 8be2a771 was in no block and not pooled: pooled again
-[2026-11-17 21:14:51:977] The wallet: 1 outputs that were lost are in the chain again
+[2026-11-17 21:14:51:977] The wallet: 1 outputs that were orphaned are in the chain again
 ```
 
 **What a balance says.** Spendable: unspent, and in the chain for as

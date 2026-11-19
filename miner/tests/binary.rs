@@ -550,7 +550,7 @@ fn a_payment_survives_the_chain_going_over_to_another_branch() {
     // The first payment is mined again, on that branch: the other has
     // it, where it now is.
     wait("the payment is not mined on the other branch", &mut || {
-        log(1).contains("outputs that were lost are in the chain again")
+        log(1).contains("outputs that were orphaned are in the chain again")
     });
     assert_eq!(other.confirmed(), "12.5");
     assert!(third.height() > ours);
@@ -601,7 +601,7 @@ fn a_name_is_registered_changed_and_given_at_the_prompt() {
 
     // Committed to: which says nothing of the name. Revealed once the
     // commit has been in the chain for as long as the network asks.
-    let committed = maker.ask("name-commit alice");
+    let committed = maker.ask("name-commit alice -");
     assert!(committed.starts_with("Name alice: committed to: transaction "), "{committed}");
     assert!(maker.ask("names").contains("committed, not yet revealed"));
     assert!(maker.ask("name-commit alice").starts_with("error: the wallet has already committed"));
@@ -628,7 +628,7 @@ fn a_name_is_registered_changed_and_given_at_the_prompt() {
     // Given to the other node's wallet: which writes the record, for
     // the owner to sign over.
     let offer = dirs[1].join("alice.offer").display().to_string();
-    assert!(other.ask(&format!("name-offer alice {offer}")).starts_with("Name alice: an offer written"));
+    assert!(other.ask(&format!("name-offer alice {offer} -")).starts_with("Name alice: an offer written"));
     assert!(other.ask("names").contains("offered to this wallet"));
     assert!(maker.ask(&format!("name-transfer {offer}")).starts_with("Name alice: signed over: transaction "));
     assert!(maker.ask("names").contains("being given away"));
@@ -1007,13 +1007,10 @@ fn a_wallet_is_paid_by_a_name_under_a_name() {
     assert!(hub.ask("name-commit mailhub").starts_with("Name mailhub: committed to"));
     wait("the name is not revealed", &mut || hub.ask("name-reveal mailhub").starts_with("Name mailhub: revealed"));
     wait("the name is not registered", &mut || hub.ask("names").contains("  owned  "));
-    // (Until it says the hub's address, the hub gives no names under it.)
-    let early = hub.ask(&format!("subname set alice@mailhub {alice_is}"));
-    assert!(early.starts_with("error: mailhub is not this wallet's to give names under"), "{early}");
-    assert!(hub.ask(&format!("name-update mailhub {hub_is}")).starts_with("Name mailhub: changed"));
+    // (Committed to with nothing said of what it is to say, it says the
+    // hub's address: a name to be paid by, and to give names under.)
     wait("the name does not say the address", &mut || {
-        let says = alice.ask("name mailhub");
-        !says.contains(&"0".repeat(64)) && says.starts_with("mailhub says ")
+        alice.ask("name mailhub").contains(&format!("as an address: {hub_is}"))
     });
     assert_eq!(hub.ask("subnames"), "no names under names: none given, and this wallet is none\n");
     // What is no name under a name, or not the hub's to give.
