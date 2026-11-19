@@ -143,7 +143,11 @@ const OPTIONS: &[(&str, &[Opt])] = &[
                 takes: Takes::Values("HOST:PORT"),
                 help: "a seed to look up besides the built-in ones; may be repeated",
             },
-            Opt { name: "no-seeds", takes: Takes::Nothing, help: "do not use the built-in seeds" },
+            Opt {
+                name: "no-seeds",
+                takes: Takes::Nothing,
+                help: "do not use the built-in seeds (the main network has two;\nthe others none)",
+            },
             Opt {
                 name: "relay",
                 takes: Takes::Nothing,
@@ -454,6 +458,11 @@ impl Network {
     }
 }
 
+/// The seeds of the main network, built in: the nodes a new node
+/// begins from, and, while no consensus file names relays, the nodes
+/// every wallet is reached at. All of the network have the same.
+pub const SEEDS: [&str; 2] = ["tabernacle1.root.sx:3737", "tabernacle2.root.sx:3737"];
+
 /// How a node is configured: everything it was told, and the default
 /// of everything it was not.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -628,6 +637,13 @@ impl Given {
 }
 
 impl Configuration {
+    /// The seeds the node begins from: those built in, of the main
+    /// network unless told not to, and those it was given.
+    pub fn all_seeds(&self) -> Vec<String> {
+        let built_in = SEEDS.iter().filter(|_| self.built_in_seeds && self.network == Network::Mainnet);
+        built_in.map(|seed| seed.to_string()).chain(self.seeds.iter().cloned()).collect()
+    }
+
     /// The configuration `args` asks for (the command line, without the
     /// program's own name), or why there is none. `home` is the user's
     /// own directory, if there is one, and `here` the directory the
@@ -968,7 +984,7 @@ impl Configuration {
             ("Stat Summary", format!("{} seconds", commas(self.stats.summary / 1000))),
             ("Built-in Seeds", yes(self.built_in_seeds)),
         ]);
-        lines.extend(self.seeds.iter().map(|seed| ("Seed", seed.clone())));
+        lines.extend(self.all_seeds().into_iter().map(|seed| ("Seed", seed)));
         lines.extend(self.peers.iter().map(|peer| ("Peer", peer.to_string())));
         lines.extend([
             ("Max Peers", commas(p.max as u64)),

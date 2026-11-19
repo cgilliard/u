@@ -599,8 +599,10 @@ none is, the mode is init.
 
 **Being reached.** A wallet is reached through nodes that stand
 between wallets: while no consensus file names relays, the seeds
-(those built in, and those of `--seed`, which every node of a network
-that uses it is to be given the same; a `--peer` is one node's own and
+(those built in: of the main network `tabernacle1.root.sx:3737` and
+`tabernacle2.root.sx:3737`, unless `--no-seeds`, and of the others
+none; and those of `--seed`, which every node of a network that uses
+it is to be given the same; a `--peer` is one node's own and
 no wallet is looked for there), three of them at the most, chosen by the
 wallet's address and changed every 144 blocks. The node says to each,
 every half minute, that its wallet is there, and gives it what the
@@ -916,9 +918,7 @@ command of the program (the library can).
 
 1. **The rest of the wallet** (above).
 2. **What is left of `THREADS.md`** (its 8.3).
-3. **The peers file and the built-in seeds.** `--peer` and `--seed` are
-   what a node begins from today.
-4. **The genesis tool** itself, in its package.
+3. **The genesis tool** itself, in its package.
 
 ## Debugging: a node at the size of an old chain
 

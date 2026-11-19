@@ -725,7 +725,7 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
         }
     }
     // A seed that cannot be found now is one fewer to begin from.
-    for seed in &c.seeds {
+    for seed in &c.all_seeds() {
         for found in seed.to_socket_addrs().into_iter().flatten() {
             if let SocketAddr::V4(found) = found {
                 node.add_seed(found, now());

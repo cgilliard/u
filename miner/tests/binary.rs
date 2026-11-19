@@ -74,6 +74,7 @@ fn a_node_starts_says_it_is_ready_and_ends_when_told() {
     let node = Command::new(TABMINER)
         .args(["--no-mine", "--no-wallet", "--no-prompt"])
         .args(["--data-dir", &data, "--listen", &listen, "--max-peers", "2000"])
+        .arg("--no-seeds")
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
@@ -131,6 +132,7 @@ fn a_node_starts_says_it_is_ready_and_ends_when_told() {
     // never that it is ready.
     let first = Command::new(TABMINER)
         .args(["--no-mine", "--no-prompt", "--data-dir", &data, "--listen", &listen])
+        .arg("--no-seeds")
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
@@ -140,6 +142,7 @@ fn a_node_starts_says_it_is_ready_and_ends_when_told() {
     assert!(lines.by_ref().any(|l| l.unwrap().ends_with("Server is ready!")));
     let second = Command::new(TABMINER)
         .args(["--no-mine", "--no-prompt", "--data-dir", &other.display().to_string(), "--listen", &listen])
+        .arg("--no-seeds")
         .output()
         .unwrap();
     let said = String::from_utf8(second.stderr).unwrap();
