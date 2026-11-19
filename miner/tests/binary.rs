@@ -878,7 +878,16 @@ fn a_payment_is_sent_to_an_address() {
     let file = dirs[1].join("payment.proof").display().to_string();
     assert!(payer.ask(&format!("payment-proof {txid} {file}")).starts_with("the proof of "));
     assert!(std::fs::read_to_string(&file).unwrap().starts_with("-----BEGIN TAB PAYMENT PROOF-----\n"));
-    let shown = paid.ask(&format!("verify-proof {file}"));
+    // (Once the node that checks has the block: it may be a moment
+    // behind the one that made the proof.)
+    let began = Instant::now();
+    let shown = loop {
+        let shown = paid.ask(&format!("verify-proof {file}"));
+        if !shown.contains("the chain here has no block") || began.elapsed() > Duration::from_secs(60) {
+            break shown;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    };
     assert!(
         shown.starts_with(&format!("the proof holds: {own} paid 5 to {to}, note: \"deposit 4821\", in block ")),
         "{shown}"
@@ -907,7 +916,16 @@ fn a_payment_is_sent_to_an_address() {
     let txid = line.split_whitespace().next().unwrap().to_string();
     let file = dirs[1].join("burn.proof").display().to_string();
     assert!(payer.ask(&format!("burn-proof {txid} {file}")).starts_with("the proof of "));
-    let shown = paid.ask(&format!("verify-proof {file}"));
+    // (Once the node that checks has the block: it may be a moment
+    // behind the one that made the proof.)
+    let began = Instant::now();
+    let shown = loop {
+        let shown = paid.ask(&format!("verify-proof {file}"));
+        if !shown.contains("the chain here has no block") || began.elapsed() > Duration::from_secs(60) {
+            break shown;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    };
     assert!(
         shown.starts_with("the proof holds: 2 was burned for alice@mailhub, for \"a year of hosting\", in block "),
         "{shown}"
