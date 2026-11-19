@@ -926,11 +926,11 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             commas(confirmations as u64)
         );
         Ok(match &proof.claim {
-            Claim::Payment { note, receipt, .. } => {
+            Claim::Payment { note, receipt, payer, .. } => {
                 let note = if note.is_empty() { String::new() } else { format!(", note: \"{}\"", shown(note)) };
                 format!(
-                    "the proof holds: {} was paid to {}{note}, in {block}. The wallet that was paid says so, to \
-                     whoever holds this proof",
+                    "the proof holds: {} paid {} to {}{note}, in {block}. Both wallets say so, each by its own key",
+                    crate::address::encode(&payer.recipient()),
                     coins(proof.amount as u128),
                     crate::address::encode(&receipt.recipient())
                 )

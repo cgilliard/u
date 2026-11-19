@@ -13,10 +13,14 @@
 //! It says so in a receipt ([`Receipt`]): its signature, by the key
 //! its address is the hash of, over the output, the slate, what the
 //! slate said (its note), and a tag of whoever pays. The tag is the
-//! hash of a secret the paying wallet keeps ([`sender_tag`]): the
-//! receipt names nobody, and whoever shows the secret with it is the
-//! one it was given to. A proof of payment ([`Proof`]) is the output,
-//! its path, the receipt and the secret.
+//! hash of the paying wallet's address with a secret it keeps
+//! ([`sender_tag`]): the wallet that is paid cannot tell whose it is,
+//! and it is fixed from then on. A proof of payment ([`Proof`]) is the
+//! output, its path, the receipt, the secret, and the paying wallet's
+//! own signature over the same, by the key its address is the hash
+//! of: that address paid that one, so much, for what the note says,
+//! in that block. The note is whatever the wallet that is paid asked
+//! to be paid by: the number of an invoice, or a challenge of its.
 //!
 //! A burn is the payment that nobody is paid: an output to the key
 //! hash that no key hashes to, so that nobody ever spends it, with a
@@ -52,16 +56,19 @@ pub const BURN_KEY_HASH: Digest = [Fp::ZERO; 8];
 /// The longest a slate's note, and what a burn is for, may be.
 pub const MAX_NOTE: usize = 255;
 const CTX_RECEIPT: &[u8] = b"tab receipt";
+const CTX_PAYER: &[u8] = b"tab payer";
 const PAYMENT_MARKER: &str = "TAB PAYMENT PROOF";
 const BURN_MARKER: &str = "TAB BURN PROOF";
 const FORMAT_PAYMENT: u8 = 1;
 const FORMAT_BURN: u8 = 2;
 
 /// What a paying wallet is known by in a slate and a receipt: the hash
-/// of a secret it keeps, and shows to whomever it proves the payment
-/// to.
-pub fn sender_tag(secret: &[u8; 32]) -> Digest {
-    hash_domain_of(DOM_SENDER, packed(secret))
+/// of its address and of a secret it keeps. Nobody has the address
+/// from it; shown with the secret, to whomever the payment is proven
+/// to, it is that address and no other.
+pub fn sender_tag(address: &Digest, secret: &[u8; 32]) -> Digest {
+    let both = [&digest_to_bytes(address)[..], &secret[..]].concat();
+    hash_domain_of(DOM_SENDER, packed(&both))
 }
 
 /// The wallet that is paid says it is: its Dilithium key, and its
@@ -102,6 +109,25 @@ impl Receipt {
     /// The address of the wallet that signed it.
     pub fn recipient(&self) -> Digest {
         id_of(&self.key)
+    }
+
+    /// The word of the wallet that pays, over the same: that the
+    /// payment is its own. Its key and its signature, as a receipt is
+    /// the paid wallet's.
+    pub fn sign_as_payer(
+        key: &mldsa::SecretKey,
+        output: &Output,
+        slate: &[u8; 32],
+        sender: &Digest,
+        note: &[u8],
+    ) -> Receipt {
+        let signature = key.sign(&Self::message(output, slate, sender, note), CTX_PAYER).to_vec();
+        Receipt { key: key.public_key().to_vec(), signature }
+    }
+
+    /// Whether it is the paying wallet's word for that payment.
+    pub fn verify_as_payer(&self, output: &Output, slate: &[u8; 32], sender: &Digest, note: &[u8]) -> bool {
+        mldsa::verify(&self.key, &Self::message(output, slate, sender, note), CTX_PAYER, &self.signature)
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -220,9 +246,11 @@ impl Burn {
 /// Whose an output is, by what is shown of it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Claim {
-    /// A payment: the wallet that was paid says so, to whoever holds
-    /// `secret`, of the slate of this id and note.
-    Payment { secret: [u8; 32], slate: [u8; 32], note: Vec<u8>, receipt: Receipt },
+    /// A payment: the wallet that was paid says so (`receipt`), of the
+    /// slate of this id and note, to the wallet whose address with
+    /// `secret` is the tag it signed; and that wallet says it is its
+    /// own (`payer`, whose key its address is the hash of).
+    Payment { secret: [u8; 32], slate: [u8; 32], note: Vec<u8>, receipt: Receipt, payer: Receipt },
     /// A burn: what its memo is the hash of.
     Burn(Burn),
 }
@@ -285,8 +313,12 @@ impl Proof {
             return Err(ProofError::NotInBlock);
         }
         match &self.claim {
-            Claim::Payment { secret, slate, note, receipt } => {
-                let sound = self.key_hash != BURN_KEY_HASH && receipt.verify(&output, slate, &sender_tag(secret), note);
+            Claim::Payment { secret, slate, note, receipt, payer } => {
+                // (The tag the paid wallet signed is of the paying
+                // wallet's address: the one whose key signs here.)
+                let tag = sender_tag(&payer.recipient(), secret);
+                let paid = self.key_hash != BURN_KEY_HASH && receipt.verify(&output, slate, &tag, note);
+                let sound = paid && payer.verify_as_payer(&output, slate, &tag, note);
                 sound.then_some(()).ok_or(ProofError::Receipt)
             }
             Claim::Burn(_) if self.key_hash != BURN_KEY_HASH => Err(ProofError::NotBurned),
@@ -306,12 +338,13 @@ impl Proof {
         out.extend_from_slice(&memo_to_bytes(&self.memo));
         self.path.iter().for_each(|sibling| out.extend_from_slice(&digest_to_bytes(sibling)));
         match &self.claim {
-            Claim::Payment { secret, slate, note, receipt } => {
+            Claim::Payment { secret, slate, note, receipt, payer } => {
                 out.extend_from_slice(secret);
                 out.extend_from_slice(slate);
                 out.push(note.len() as u8);
                 out.extend_from_slice(note);
                 out.extend_from_slice(&receipt.to_bytes());
+                out.extend_from_slice(&payer.to_bytes());
             }
             Claim::Burn(burn) => out.extend_from_slice(&burn.to_bytes()),
         }
@@ -340,7 +373,8 @@ impl Proof {
                 let n = take(1)?[0] as usize;
                 let note = take(n)?.to_vec();
                 let receipt = Receipt::from_bytes(take(Receipt::SIZE)?)?;
-                Claim::Payment { secret, slate, note, receipt }
+                let payer = Receipt::from_bytes(take(Receipt::SIZE)?)?;
+                Claim::Payment { secret, slate, note, receipt, payer }
             }
             FORMAT_BURN => Claim::Burn(Burn::read_bytes(&mut r)?),
             _ => return None,
@@ -400,40 +434,43 @@ mod tests {
     }
 
     /// A receipt is the paid wallet's word for one payment: this
-    /// output, this slate, this note, to whoever holds this secret.
+    /// output, this slate, this note, to the wallet of this tag.
     #[test]
     fn a_receipt_is_for_one_payment() {
-        let key = mldsa::keygen(&[1; 32]);
+        let (key, payer) = (mldsa::keygen(&[1; 32]), id_of(mldsa::keygen(&[2; 32]).public_key()));
         let output = Output::to_key_hash(&[Fp::new(9); 8], 5000);
         let (secret, slate) = ([3u8; 32], [4u8; 32]);
-        let receipt = Receipt::sign(&key, &output, &slate, &sender_tag(&secret), b"deposit 4821");
+        let tag = sender_tag(&payer, &secret);
+        let receipt = Receipt::sign(&key, &output, &slate, &tag, b"invoice 4821");
         assert_eq!(receipt.recipient(), id_of(key.public_key()));
-        assert!(receipt.verify(&output, &slate, &sender_tag(&secret), b"deposit 4821"));
+        assert!(receipt.verify(&output, &slate, &tag, b"invoice 4821"));
         assert_eq!(Receipt::from_bytes(&receipt.to_bytes()), Some(receipt.clone()));
-        // Not for another output, slate, note, or holder.
-        assert!(!receipt.verify(
-            &Output::to_key_hash(&[Fp::new(9); 8], 5001),
-            &slate,
-            &sender_tag(&secret),
-            b"deposit 4821"
-        ));
-        assert!(!receipt.verify(&output, &[5; 32], &sender_tag(&secret), b"deposit 4821"));
-        assert!(!receipt.verify(&output, &slate, &sender_tag(&secret), b"deposit 4822"));
-        assert!(!receipt.verify(&output, &slate, &sender_tag(&[6; 32]), b"deposit 4821"));
-        assert_ne!(sender_tag(&secret), sender_tag(&[6; 32]));
+        // Not for another output, slate, note, or paying wallet.
+        assert!(!receipt.verify(&Output::to_key_hash(&[Fp::new(9); 8], 5001), &slate, &tag, b"invoice 4821"));
+        assert!(!receipt.verify(&output, &[5; 32], &tag, b"invoice 4821"));
+        assert!(!receipt.verify(&output, &slate, &tag, b"invoice 4822"));
+        assert!(!receipt.verify(&output, &slate, &sender_tag(&payer, &[6; 32]), b"invoice 4821"));
+        assert!(!receipt.verify(&output, &slate, &sender_tag(&id_of(key.public_key()), &secret), b"invoice 4821"));
+        // The tag is of the address and the secret, and says neither.
+        assert_ne!(tag, payer);
+        assert_ne!(tag, sender_tag(&payer, &[6; 32]));
+        // The paid wallet's word is not the paying wallet's, nor that its.
+        assert!(!receipt.verify_as_payer(&output, &slate, &tag, b"invoice 4821"));
         assert_eq!(Receipt::from_bytes(&receipt.to_bytes()[1..]), None);
     }
 
     /// A proof of payment holds against the root of the block that
-    /// made the output, with the receipt and the secret; and against
-    /// nothing else.
+    /// made the output: that address paid that one, by the word of
+    /// both; and against nothing else, nor for anybody else.
     #[test]
     fn a_payment_is_proven_against_its_block() {
-        let key = mldsa::keygen(&[1; 32]);
+        let (paid_key, payer_key) = (mldsa::keygen(&[1; 32]), mldsa::keygen(&[2; 32]));
         let output = Output::to_key_hash(&[Fp::new(9); 8], 5000);
-        let (secret, slate, note) = ([3u8; 32], [4u8; 32], b"deposit 4821".to_vec());
-        let receipt = Receipt::sign(&key, &output, &slate, &sender_tag(&secret), &note);
-        let claim = Claim::Payment { secret, slate, note, receipt };
+        let (secret, slate, note) = ([3u8; 32], [4u8; 32], b"invoice 4821".to_vec());
+        let tag = sender_tag(&id_of(payer_key.public_key()), &secret);
+        let receipt = Receipt::sign(&paid_key, &output, &slate, &tag, &note);
+        let payer = Receipt::sign_as_payer(&payer_key, &output, &slate, &tag, &note);
+        let claim = Claim::Payment { secret, slate, note, receipt, payer };
         let (proof, root) = alone(&output, 77, 12_345, claim);
         assert_eq!(proof.check(&root), Ok(()));
         // As text, with whatever is around it; and as bytes.
@@ -454,16 +491,29 @@ mod tests {
         ] {
             assert_eq!(other.check(&root), Err(ProofError::NotInBlock));
         }
-        // In the block, and not whose the proof says: another secret,
+        // In the block, and not what the proof says: another secret,
         // another note, another slate.
-        let Claim::Payment { secret, slate, note, receipt } = proof.claim.clone() else { unreachable!() };
-        for claim in [
-            Claim::Payment { secret: [8; 32], slate, note: note.clone(), receipt: receipt.clone() },
-            Claim::Payment { secret, slate, note: b"deposit 1".to_vec(), receipt: receipt.clone() },
-            Claim::Payment { secret, slate: [8; 32], note: note.clone(), receipt: receipt.clone() },
-        ] {
-            assert_eq!(Proof { claim, ..proof.clone() }.check(&root), Err(ProofError::Receipt));
-        }
+        let Claim::Payment { secret, slate, note, receipt, payer } = proof.claim.clone() else { unreachable!() };
+        let with = |secret, slate, note: &[u8], payer: &Receipt| {
+            let claim =
+                Claim::Payment { secret, slate, note: note.to_vec(), receipt: receipt.clone(), payer: payer.clone() };
+            Proof { claim, ..proof.clone() }.check(&root)
+        };
+        assert_eq!(with(secret, slate, &note, &payer), Ok(()));
+        assert_eq!(with([8; 32], slate, &note, &payer), Err(ProofError::Receipt));
+        assert_eq!(with(secret, slate, b"invoice 1", &payer), Err(ProofError::Receipt));
+        assert_eq!(with(secret, [8; 32], &note, &payer), Err(ProofError::Receipt));
+        // Shown by another wallet as its own payment: the paid wallet's
+        // receipt is not for that wallet, whatever it signs.
+        let thief = mldsa::keygen(&[9; 32]);
+        let stolen = Receipt::sign_as_payer(&thief, &output, &slate, &tag, &note);
+        assert_eq!(with(secret, slate, &note, &stolen), Err(ProofError::Receipt));
+        let own_tag = sender_tag(&id_of(thief.public_key()), &secret);
+        let resigned = Receipt::sign_as_payer(&thief, &output, &slate, &own_tag, &note);
+        assert_eq!(with(secret, slate, &note, &resigned), Err(ProofError::Receipt));
+        // And the paying wallet's word is needed: the paid wallet's own
+        // signature in its place is not it.
+        assert_eq!(with(secret, slate, &note, &receipt), Err(ProofError::Receipt));
     }
 
     /// A burn is to the credit of whom its memo says, for what it

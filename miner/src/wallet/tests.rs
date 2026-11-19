@@ -840,8 +840,13 @@ fn payments_are_receipted_and_kept_to_be_proven() {
     let kept = alice.payments();
     assert_eq!((kept.len(), kept[0].txid, kept[0].proven, kept[0].landed), (1, signed.tx.txid(), false, None));
     assert!(alice.payments_to_prove().is_empty());
-    let Claim::Payment { secret, slate: of, note, receipt: held } = kept[0].proof.claim.clone() else { panic!() };
-    assert_eq!((sender_tag(&secret), of, &note[..], held), (slate.sender, slate.id, &b"deposit 4821"[..], receipt));
+    let Claim::Payment { secret, slate: of, note, receipt: held, payer } = kept[0].proof.claim.clone() else {
+        panic!()
+    };
+    assert_eq!((of, &note[..], held), (slate.id, &b"deposit 4821"[..], receipt));
+    // (Whose the payment is: Alice's address, by her own word, and by
+    // the tag the slate carried, which is of her address and a secret.)
+    assert_eq!((payer.recipient(), sender_tag(&alice.id(), &secret)), (alice.id(), slate.sender));
     // A block takes it: where its output is, is known, and its path
     // is asked for. (Here the state is that output alone.)
     chain.take(&signed.tx, &mut [&mut alice, &mut bob]);

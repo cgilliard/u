@@ -880,7 +880,7 @@ fn a_payment_is_sent_to_an_address() {
     assert!(std::fs::read_to_string(&file).unwrap().starts_with("-----BEGIN TAB PAYMENT PROOF-----\n"));
     let shown = paid.ask(&format!("verify-proof {file}"));
     assert!(
-        shown.starts_with(&format!("the proof holds: 5 was paid to {to}, note: \"deposit 4821\", in block ")),
+        shown.starts_with(&format!("the proof holds: {own} paid 5 to {to}, note: \"deposit 4821\", in block ")),
         "{shown}"
     );
     // (Changed, it does not hold; and what is no proof is none.)

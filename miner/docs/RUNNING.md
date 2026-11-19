@@ -672,21 +672,28 @@ says it, `outputs` shows it beside what was paid, and its receipt is
 over it. It is how a wallet that is paid by many, and told by none who
 they are, knows which payment is whose.
 
-**Proofs.** A wallet that is paid answers with a receipt: its
-signature, by the key its address is the hash of, over the output, the
-slate, its note, and the hash of a secret the paying wallet keeps. The
-paying wallet signs only with that. When a block has the payment it
-takes the output's path to that block's state root (which it can for
-as long as the chain can be taken back to that block: a week of
-blocks, if not told otherwise), and from then on has a proof:
-`payments` lists them, `payment-proof TXID [FILE]` writes one, text
-between `-----BEGIN TAB PAYMENT PROOF-----` and its end, and
+**Proofs.** A proof of payment says: address A paid address B, so
+much, for what the note says, in block X. A wallet that is paid
+answers with a receipt: its signature, by the key its address is the
+hash of, over the output, the slate, its note, and a tag of whoever
+pays. The tag is the hash of the paying wallet's address with a secret
+it keeps: the wallet that is paid cannot tell whose it is, and it
+cannot be made another's afterwards. The paying wallet signs only with
+that receipt, and adds its own signature over the same. When a block
+has the payment it takes the output's path to that block's state root
+(which it can for as long as the chain can be taken back to that
+block: a week of blocks, if not told otherwise), and from then on has
+a proof: `payments` lists them, `payment-proof TXID [FILE]` writes
+one, text between `-----BEGIN TAB PAYMENT PROOF-----` and its end, and
 `verify-proof FILE` at any node checks one against that node's headers
-and nothing else, and says what it shows: how much, to which address,
-with what note, in which block, with how many confirmations. It shows
-that the wallet of that address said it was paid, to whoever holds the
-proof; it names no paying address, and says nothing of what became of
-the output. `burn AMOUNT "PURPOSE" [FOR [FEE]]` pays nobody: an output
+and nothing else, and says what it shows: which address paid which,
+how much, with what note, in which block, with how many confirmations.
+The paying address is said to nobody until its wallet gives out the
+proof. The note is the challenge: a wallet that wants to be paid for
+one thing gives out a number, or the hash of an invoice it signed, and
+is paid with `send AMOUNT ADDRESS "that"`; both signatures are over
+it, and the proof shows it. A proof says nothing of what became of the
+output. `burn AMOUNT "PURPOSE" [FOR [FEE]]` pays nobody: an output
 no key can spend, whose memo is the hash of whom it is to the credit of
 (an address, `@name` or `label@name`, as written: a name is credited as
 a name, whoever holds it then or later; this wallet's address if nobody

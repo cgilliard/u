@@ -1742,7 +1742,9 @@ impl<B: Backend> Wallet<B> {
         t.slates.insert(id, pending);
         self.commit(t, &[T_OUTPUTS, T_SLATES])?;
         let inputs = picked.iter().map(|c| (self.key(&c.nonce).public_key(), c.amount)).collect();
-        let (sender, change) = (crate::proofs::sender_tag(&secret), u32::from(change.is_some()));
+        // (Whoever pays, in the slate: this wallet's address, hashed
+        // with the secret. The wallet that is paid has neither of it.)
+        let (sender, change) = (crate::proofs::sender_tag(&self.id(), &secret), u32::from(change.is_some()));
         Ok(Slate { id, stage: 1, amount, fee, sender, note, receipt: None, inputs, outputs, change })
     }
 
@@ -1796,12 +1798,16 @@ impl<B: Backend> Wallet<B> {
         // secret for it. (Whose the receipt is, is for whoever sent
         // the slate to hold against whom it sent it to.)
         let made = slate.outputs.last().ok_or(WalletError::BadSlate("no recipient output"))?.clone();
-        let tag = crate::proofs::sender_tag(&pending.secret);
+        let tag = crate::proofs::sender_tag(&self.id(), &pending.secret);
         let claim = match (burn, &slate.receipt) {
             (Some(burn), _) => crate::proofs::Claim::Burn(burn),
             (None, Some(receipt)) if receipt.verify(&made, &slate.id, &tag, &pending.note) => {
                 let (secret, note, receipt) = (pending.secret, pending.note.clone(), receipt.clone());
-                crate::proofs::Claim::Payment { secret, slate: slate.id, note, receipt }
+                // This wallet's own word that the payment is its own:
+                // kept with the receipt, for the proof.
+                let key = self.identity_key();
+                let payer = crate::proofs::Receipt::sign_as_payer(&key, &made, &slate.id, &tag, &note);
+                crate::proofs::Claim::Payment { secret, slate: slate.id, note, receipt, payer }
             }
             (None, _) => return Err(WalletError::BadSlate("no receipt for this payment")),
         };
